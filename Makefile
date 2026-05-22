@@ -1,4 +1,4 @@
-.PHONY: help dev test test-unit test-integration lint format db-start db-stop db-reset studio install
+.PHONY: help dev test test-unit test-integration lint format db-start db-stop db-reset studio install e2e
 
 PY := PYTHONPATH=. uv run
 
@@ -14,6 +14,7 @@ help:
 	@echo "make db-stop          - supabase stop"
 	@echo "make db-reset         - wipe + reapply supabase/schema.sql + seed"
 	@echo "make studio           - open Supabase Studio"
+	@echo "make e2e              - scenario CLI for iOS verification (pass args via ARGS=...)"
 
 install:
 	uv sync
@@ -54,3 +55,10 @@ db-reset:
 
 studio:
 	open http://localhost:54343
+
+# Scenario CLI used to verify the iOS app end-to-end against the live
+# local stack. Usage:
+#   make e2e ARGS="reset"
+#   make e2e ARGS="fire-event --patient maggie --kind fall --location 'Kitchen'"
+e2e:
+	$(PY) e2e $(ARGS)

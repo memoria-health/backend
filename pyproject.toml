@@ -15,7 +15,11 @@ dependencies = [
     "httpx>=0.27",
     "python-dotenv>=1.2.2",
     "logfire[fastapi,sqlalchemy,asyncpg]>=2.0",
+    "typer>=0.15",
 ]
+
+[project.scripts]
+e2e = "scripts.e2e.cli:app"
 
 [dependency-groups]
 dev = [
@@ -31,7 +35,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src"]
+packages = ["src", "scripts"]
 
 [tool.ruff]
 line-length = 100
