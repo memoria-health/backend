@@ -30,7 +30,11 @@ async def list_for_patient(
             Detector.patient_id == patient_id,
             Patient.caregiver_id == caregiver_id,
         )
-        .order_by(Detector.created_at.asc())
+        # `id` is a stable tie-breaker — `onboarding.seed_detectors_for_patient`
+        # currently stamps all four presets with the same `now`, so without a
+        # secondary sort the heap-scan order can drift after autovacuum and
+        # the iOS list reorders. Adding `id` makes the ordering deterministic.
+        .order_by(Detector.created_at.asc(), Detector.id.asc())
     )
     return result.scalars().all()
 

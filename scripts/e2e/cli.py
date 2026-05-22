@@ -447,5 +447,160 @@ def list_state(
     _run(go())
 
 
+# ─── Phase 0: pairing + clip ingest scenarios ─────────────────────
+
+
+@app.command("mint-pairing-code")
+def mint_pairing_code(
+    patient: Annotated[str, typer.Option(help="Patient name (substring).")],
+    room: Annotated[str, typer.Option(help="Room label, e.g. 'Kitchen'.")] = "Kitchen",
+    icon: Annotated[str, typer.Option(help="SF Symbol or icon name.")] = "tv",
+) -> None:
+    """Insert a `cameras` row with a 6-digit pairing code, valid for 10
+    minutes. Prints the code so the wall phone can pair against it.
+
+    Skips the HTTP layer — writes directly through the same ORM the
+    `/v1/patients/{id}/cameras/pairing-code` route uses. Useful when
+    you want a code without standing up the caregiver app first.
+    """
+    import secrets
+    from datetime import datetime, timedelta, timezone
+    from src.db.camera import Camera
+    from sqlalchemy import func, select
+
+    async def go() -> None:
+        async with get_sessionmaker()() as session:
+            p = await _find_patient(session, patient)
+            now = datetime.now(timezone.utc)
+            max_display = (await session.execute(
+                select(func.coalesce(func.max(Camera.display_id), 0)).where(
+                    Camera.patient_id == p.id
+                )
+            )).scalar_one()
+            code = str(secrets.randbelow(900_000) + 100_000)
+            cam_id = uuid4()
+            short = cam_id.hex[:8]
+            cam = Camera(
+                id=cam_id,
+                patient_id=p.id,
+                display_id=max_display + 1,
+                room=room,
+                icon_name=icon,
+                online=False,
+                last_seen_at=None,
+                created_at=now,
+                pairing_code=code,
+                pairing_expires_at=now + timedelta(minutes=10),
+                api_key_hash=None,
+                livekit_identity=f"cam_{short}",
+                livekit_room=f"patient_{p.id}",
+                state="open",
+                no_people_count=0,
+                state_changed_at=now,
+                close_threshold=6,
+                battery_percent=None,
+            )
+            session.add(cam)
+            await session.commit()
+            typer.echo(json.dumps({
+                "pairing_code": code,
+                "expires_at": (now + timedelta(minutes=10)).isoformat(),
+                "camera_id": str(cam_id),
+                "patient_id": str(p.id),
+                "room": room,
+            }, indent=2))
+
+    _run(go())
+
+
+@app.command("simulate-pair")
+def simulate_pair(
+    pairing_code: Annotated[str, typer.Option("--pairing-code", help="6-digit code.")],
+    backend: Annotated[
+        str, typer.Option("--backend", help="Backend base URL."),
+    ] = "http://127.0.0.1:8002",
+) -> None:
+    """Call POST /v1/cameras/pair as a wall phone would. Useful for
+    smoke-testing the pairing exchange without standing up the iOS
+    camera app.
+
+    Requires `make dev` running. Prints the api_key so subsequent
+    commands (like `simulate-clip`) can authenticate.
+    """
+    import httpx
+
+    async def go() -> None:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.post(
+                f"{backend.rstrip('/')}/v1/cameras/pair",
+                json={"pairing_code": pairing_code},
+            )
+            if r.status_code != 200:
+                typer.secho(
+                    f"pair failed: {r.status_code} {r.text}",
+                    fg=typer.colors.RED, err=True,
+                )
+                raise typer.Exit(code=1)
+            typer.echo(json.dumps(r.json(), indent=2))
+
+    _run(go())
+
+
+@app.command("simulate-clip")
+def simulate_clip(
+    api_key: Annotated[str, typer.Option("--api-key", help="Camera api_key from simulate-pair.")],
+    camera_id: Annotated[UUID, typer.Option("--camera", help="Camera UUID.")],
+    fixture: Annotated[
+        str, typer.Option("--fixture", help="Fixture name under scripts/e2e/fixtures/."),
+    ] = "fall.mp4",
+    motion: Annotated[bool, typer.Option("--motion/--no-motion")] = True,
+    backend: Annotated[
+        str, typer.Option("--backend", help="Backend base URL."),
+    ] = "http://127.0.0.1:8002",
+) -> None:
+    """POST a fixture MP4 to /v1/clips/ingest as the wall phone would.
+
+    The provided api_key must bcrypt-match the camera's stored hash
+    (i.e. came from a prior simulate-pair on the same camera).
+    Requires a real clip at scripts/e2e/fixtures/<fixture>.
+    """
+    from pathlib import Path
+
+    import httpx
+
+    fixture_path = Path(__file__).parent / "fixtures" / fixture
+    if not fixture_path.exists():
+        typer.secho(
+            f"fixture not found: {fixture_path}\n"
+            f"Drop a small MP4 there. Example: ffmpeg -f lavfi -i testsrc=s=640x480:r=15:d=15 "
+            f"-pix_fmt yuv420p -t 15 {fixture_path}",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=1)
+
+    async def go() -> None:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            with open(fixture_path, "rb") as f:
+                r = await client.post(
+                    f"{backend.rstrip('/')}/v1/clips/ingest",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    files={"file": ("clip.mp4", f, "video/mp4")},
+                    data={
+                        "camera_id": str(camera_id),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "motion_in_clip": "true" if motion else "false",
+                    },
+                )
+            if r.status_code != 200:
+                typer.secho(
+                    f"ingest failed: {r.status_code} {r.text}",
+                    fg=typer.colors.RED, err=True,
+                )
+                raise typer.Exit(code=1)
+            typer.echo(json.dumps(r.json(), indent=2))
+
+    _run(go())
+
+
 if __name__ == "__main__":
     app()

@@ -16,6 +16,23 @@ dependencies = [
     "python-dotenv>=1.2.2",
     "logfire[fastapi,sqlalchemy,asyncpg]>=2.0",
     "typer>=0.15",
+    # ── Phase 0 detector pipeline ────────────────────────────────────
+    # `google-genai` is the current Gemini Python SDK (replaces the older
+    # `google-generativeai`). Supports inline video parts and JSON
+    # response schemas — matches the dashboard's TS path.
+    "google-genai>=1.0",
+    "openai>=1.55",
+    # FastAPI's multipart/form-data parser. Required for the clip ingest
+    # endpoint that takes a 15s MP4 upload from the wall phone.
+    "python-multipart>=0.0.18",
+    # bcrypt is used for the per-camera api_key_hash stored on `cameras`.
+    # Matches the dashboard's bcryptjs(rounds=10) — see scripts/e2e/cli.py
+    # for the verification path.
+    "bcrypt>=4.2",
+    # LiveKit server SDK — token minting. Phase 0 uses only the
+    # `AccessToken` class. Phase 2's detector worker will add livekit-rtc
+    # for the subscriber-bot.
+    "livekit-api>=1.0",
 ]
 
 [project.scripts]

@@ -121,46 +121,104 @@ create trigger patients_set_updated_at
 
 
 -- ── cameras ──────────────────────────────────────────────────────
--- One row per wall-mounted phone. Rows are written by the wall-phone
--- pairing flow (a later plan). For v0 they're populated by the seed
--- script so the iOS UI can render. The iOS app never POSTs cameras.
+-- One row per wall-mounted phone. Rows are inserted by the caregiver
+-- app's "Pair a new phone" flow (POST /v1/patients/{id}/cameras/pairing-code),
+-- which mints a 6-digit `pairing_code` valid for 10 minutes. The wall
+-- phone then exchanges the code via POST /v1/cameras/pair, receiving a
+-- bcrypt-hashed long-lived `api_key` it uses for clip uploads and
+-- LiveKit token minting.
 create table public.cameras (
-  id           uuid primary key default gen_random_uuid(),
-  patient_id   uuid not null references public.patients(id) on delete cascade,
-  display_id   int  not null,                  -- per-patient sequence: "Cam 01"
-  room         text not null,
-  icon_name    text not null default 'tv',
-  online       boolean not null default false,
-  last_seen_at timestamptz,
-  created_at   timestamptz not null default now(),
+  id                  uuid primary key default gen_random_uuid(),
+  patient_id          uuid not null references public.patients(id) on delete cascade,
+  display_id          int  not null,                  -- per-patient sequence: "Cam 01"
+  room                text not null,
+  icon_name           text not null default 'tv',
+  online              boolean not null default false,
+  last_seen_at        timestamptz,
+  created_at          timestamptz not null default now(),
+  -- ── Pairing flow ────────────────────────────────────────────────
+  -- pairing_code is set when the caregiver mints a code; cleared when
+  -- the wall phone successfully exchanges it. Unique while non-null so
+  -- two open pairing windows can never collide on the same code.
+  pairing_code        text,                                              -- 6 digits
+  pairing_expires_at  timestamptz,
+  -- bcrypt hash of the long-lived API key handed to the wall phone
+  -- after successful pairing. NULL until pairing completes.
+  api_key_hash        text,
+  -- LiveKit identity + room name minted at pairing-code creation time
+  -- (so the caregiver app can show a stable identity while waiting).
+  -- room = "patient_<patient_id>"; identity = "cam_<short>".
+  livekit_identity    text,
+  livekit_room        text,
+  -- ── Detector state machine ──────────────────────────────────────
+  -- Mirrors the dashboard's per-camera open/closed state. `closed`
+  -- skips the LLM call until people / motion reappear. Promoted to
+  -- nemara-backend so the detector worker (Phase 2) can share the
+  -- same persistent state across worker restarts.
+  state               text not null default 'open'
+        check (state in ('open', 'closed')),
+  no_people_count     int  not null default 0,
+  state_changed_at    timestamptz not null default now(),
+  close_threshold     int  not null default 6,        -- ticks of no people + no motion → closed
+  battery_percent     int  check (battery_percent between 0 and 100),
   unique (patient_id, display_id)
 );
 
 create index cameras_patient_id_idx on public.cameras(patient_id);
 
+-- Only one camera can hold a given pairing_code at a time (collision
+-- avoidance for the 10-min pairing window).
+create unique index cameras_pairing_code_uniq
+  on public.cameras(pairing_code)
+  where pairing_code is not null;
+
 
 -- ── detectors ────────────────────────────────────────────────────
 -- Mix of preset (created by the seed-on-patient-creation service) and
 -- custom (created by the caregiver via POST /v1/patients/{id}/detectors).
+--
+-- The "runtime contract" columns (identifier, prompt_fragment,
+-- schema_json, always_on, is_builtin) feed the detector pipeline. The
+-- prompt fragments are duplicated across patients (one row per
+-- patient × detector) — at the current scale (small N), a bulk UPDATE
+-- to retune a prompt is cheap and avoids a parallel "definitions"
+-- table per the plan's "extend, don't add" directive.
 create table public.detectors (
-  id            uuid primary key default gen_random_uuid(),
-  patient_id    uuid not null references public.patients(id) on delete cascade,
-  name          text not null,
-  icon_name     text not null,
-  description   text not null,
-  category      detector_category    not null,
-  source        detector_source      not null,
-  shape         detector_shape       not null,
-  where_scope   text not null,
-  when_scope    text not null,
-  sensitivity   detector_sensitivity not null default 'standard',
-  is_on         boolean not null default true,
-  custom_prompt text,                              -- only meaningful when source = 'custom'
-  created_at    timestamptz not null default now(),
-  updated_at    timestamptz not null default now()
+  id              uuid primary key default gen_random_uuid(),
+  patient_id      uuid not null references public.patients(id) on delete cascade,
+  name            text not null,
+  icon_name       text not null,
+  description     text not null,
+  category        detector_category    not null,
+  source          detector_source      not null,
+  shape           detector_shape       not null,
+  where_scope     text not null,
+  when_scope      text not null,
+  sensitivity     detector_sensitivity not null default 'standard',
+  is_on           boolean not null default true,
+  custom_prompt   text,                              -- only meaningful when source = 'custom'
+  -- ── Runtime contract (detector pipeline reads these) ────────────
+  -- Stable identifier the LLM JSON-schema reference. For presets:
+  -- 'people_present' | 'fall' | 'wandering'. For custom detectors:
+  -- 'custom_<short>' generated server-side on POST.
+  identifier      text,
+  prompt_fragment text,
+  schema_json     jsonb,
+  -- people_present is always_on=true (included even if is_on=false)
+  -- because the state machine requires its output.
+  always_on       boolean not null default false,
+  is_builtin      boolean not null default true,
+  created_at      timestamptz not null default now(),
+  updated_at      timestamptz not null default now()
 );
 
 create index detectors_patient_id_idx on public.detectors(patient_id);
+
+-- A patient can't have two detectors with the same identifier
+-- ("fall" appears at most once per patient).
+create unique index detectors_patient_identifier_uniq
+  on public.detectors(patient_id, identifier)
+  where identifier is not null;
 
 create trigger detectors_set_updated_at
   before update on public.detectors
@@ -195,6 +253,38 @@ create table public.events (
 -- cursor pagination on `(occurred_at desc, id)`.
 create index events_patient_occurred_at_idx
   on public.events(patient_id, occurred_at desc, id);
+
+
+-- ── analyses ─────────────────────────────────────────────────────
+-- Per-tick LLM output from the detector pipeline. One row per ~10s
+-- per camera. Not user-facing (events are the user-facing layer);
+-- consumed by the detector worker (state machine, active-camera
+-- resolution for Talk) and Supabase Studio for debugging. Not added
+-- to the Realtime publication — too noisy for the caregiver app.
+create table public.analyses (
+  id              uuid primary key default gen_random_uuid(),
+  caregiver_id    uuid not null references public.caregivers(id) on delete cascade,
+  patient_id      uuid not null references public.patients(id)   on delete cascade,
+  camera_id       uuid not null references public.cameras(id)    on delete cascade,
+  -- `skipped` is the closed-state short-circuit (no LLM was called).
+  -- The row is still persisted so Studio + the detector worker (Phase 2)
+  -- can see the tick. See `src/api/clips.py`.
+  provider        text not null check (provider in ('gemini', 'openai', 'skipped')),
+  description     text not null,
+  detector_fields jsonb not null default '{}'::jsonb,
+  people_present  boolean not null,
+  motion_in_clip  boolean not null,
+  state_after     text not null check (state_after in ('open', 'closed')),
+  captured_at     timestamptz not null,
+  created_at      timestamptz not null default now()
+);
+
+-- Newest-first per camera (active-camera resolution + debugging UIs).
+create index analyses_camera_created_idx
+  on public.analyses(camera_id, created_at desc);
+-- Patient-scoped active-camera resolution scans by patient + recency.
+create index analyses_patient_captured_idx
+  on public.analyses(patient_id, captured_at desc);
 
 
 -- ══════════════════════════════════════════════════════════════════
@@ -237,6 +327,10 @@ create policy events_owner on public.events
   ) with check (
     patient_id in (select id from public.patients where caregiver_id = auth.uid())
   );
+
+alter table public.analyses enable row level security;
+create policy analyses_owner on public.analyses
+  for all using (caregiver_id = auth.uid()) with check (caregiver_id = auth.uid());
 
 
 -- ══════════════════════════════════════════════════════════════════

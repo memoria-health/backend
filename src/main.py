@@ -14,10 +14,14 @@ from fastapi import FastAPI
 # effects only.
 from src.api.cameras import router as cameras_router
 from src.api.caregivers import router as caregivers_router
+from src.api.clips import router as clips_router
 from src.api.detectors import router as detectors_router
 from src.api.events import router as events_router
 from src.api.health import router as health_router
+from src.api.livekit import router as livekit_router
+from src.api.pairing import router as pairing_router
 from src.api.patients import router as patients_router
+from src.db import analysis as _analysis  # noqa: F401
 from src.db import camera as _camera  # noqa: F401
 from src.db import caregiver as _caregiver  # noqa: F401
 from src.db import detector as _detector  # noqa: F401
@@ -49,6 +53,10 @@ def create_app() -> FastAPI:
     app.include_router(detectors_router)
     app.include_router(events_router)
     app.include_router(cameras_router)
+    # Phase 0 detector pipeline + pairing flow + LiveKit token minting.
+    app.include_router(pairing_router)
+    app.include_router(clips_router)
+    app.include_router(livekit_router)
     return app
 
 

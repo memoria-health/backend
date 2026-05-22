@@ -27,7 +27,8 @@ install:
 dev: db-start
 	$(PY) uvicorn src.main:app --reload --host 0.0.0.0 --port 8002
 
-test: test-unit test-integration
+test:
+	$(PY) pytest test/ -v
 
 test-unit:
 	$(PY) pytest test/unit -v

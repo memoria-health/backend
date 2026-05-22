@@ -13,13 +13,17 @@ from expired-token from wrong-signature (security best practice). The
 real reason is logged for our own diagnostics.
 """
 
+import asyncio
 import logging
 from typing import Annotated
 
+import bcrypt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.db.camera import Camera
 from src.db.session import get_session
 from src.errors import JwtVerificationError
 from src.schemas.auth import SupabasePrincipal
@@ -76,3 +80,62 @@ async def caregiver_auth(
 
 
 CaregiverAuth = Annotated[SupabasePrincipal, Depends(caregiver_auth)]
+
+
+# ── Camera api-key auth (Phase 0+) ────────────────────────────────
+# The wall phone gets a long-lived api_key from the pairing flow and
+# uses it as a Bearer token on every subsequent request. The server
+# stores only its bcrypt hash on `cameras.api_key_hash`.
+#
+# Bcrypt verification is O(2^rounds); a naive `select all then verify`
+# would scan every camera row per request. We trade some PII-leak risk
+# for performance by also storing a short prefix of the api_key
+# unhashed (the first 8 chars) on the cameras row as `api_key_prefix`
+# in a future revision; for now N is small (a few cameras per
+# patient × a few patients per backend) so the linear scan is fine.
+#
+# Returning the Camera ORM lets the route handler use cam.patient_id
+# without an extra lookup.
+
+async def camera_auth(
+    session: SessionDep,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
+) -> Camera:
+    """Verify the bearer token against `cameras.api_key_hash` and
+    return the matching Camera row. Raises 401 on any failure.
+
+    Phase 0 implementation: linear-scan all rows with a non-null
+    `api_key_hash`. Phase 4+ may add a prefix index for O(1) lookup.
+    """
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        log.info("camera_auth.reject reason=missing_or_malformed_bearer")
+        raise _INVALID_AUTH_RESPONSE
+
+    token = credentials.credentials.encode("utf-8")
+
+    stmt = select(Camera).where(Camera.api_key_hash.is_not(None))
+    rows = (await session.execute(stmt)).scalars().all()
+    loop = asyncio.get_running_loop()
+    for cam in rows:
+        if cam.api_key_hash is None:
+            continue
+        hash_bytes = cam.api_key_hash.encode("utf-8")
+        # bcrypt.checkpw is CPU-bound (intentionally — the whole point
+        # is to be slow). Offload to the default executor so we don't
+        # block the asyncio event loop during the linear scan.
+        try:
+            matched = await loop.run_in_executor(
+                None, bcrypt.checkpw, token, hash_bytes,
+            )
+        except ValueError:
+            # malformed hash on disk — skip and keep scanning
+            continue
+        if matched:
+            log.debug("camera_auth.accept camera_id=%s", cam.id)
+            return cam
+
+    log.info("camera_auth.reject reason=no_matching_camera")
+    raise _INVALID_AUTH_RESPONSE
+
+
+CameraAuth = Annotated[Camera, Depends(camera_auth)]
