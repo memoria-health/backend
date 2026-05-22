@@ -1,6 +1,6 @@
 .PHONY: help dev test test-unit test-integration lint format db-start db-stop db-reset studio install
 
-PY := uv run
+PY := PYTHONPATH=. uv run
 
 help:
 	@echo "make install          - uv sync"
@@ -53,4 +53,4 @@ db-reset:
 	$(PY) python scripts/seed.py
 
 studio:
-	open http://localhost:54323
+	open http://localhost:54343
