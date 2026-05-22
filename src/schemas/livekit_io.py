@@ -42,3 +42,7 @@ class MintTokenResponse(BaseModel):
 
     token: str
     url: str
+    # ISO-8601 expiry — clients refresh at TTL/2 to keep ahead of the
+    # 1-hour grant. Computed server-side from `_TTL_SECONDS` in
+    # `src/api/livekit.py`, not pulled out of the minted JWT.
+    expires_at: str

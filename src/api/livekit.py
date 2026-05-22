@@ -16,7 +16,7 @@ short-circuits the first failure; here we WANT to try both.
 """
 
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Annotated
 from uuid import UUID
 
@@ -116,7 +116,14 @@ async def mint_livekit_token(
         .with_ttl(timedelta(seconds=_TTL_SECONDS))
     )
     jwt = at.to_jwt()
-    return MintTokenResponse(token=jwt, url=settings.livekit_url)
+    expires_at = (
+        datetime.now(timezone.utc) + timedelta(seconds=_TTL_SECONDS)
+    ).isoformat()
+    return MintTokenResponse(
+        token=jwt,
+        url=settings.livekit_url,
+        expires_at=expires_at,
+    )
 
 
 async def _resolve_camera_or_401(

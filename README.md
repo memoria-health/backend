@@ -34,7 +34,8 @@ nemara-backend/
 │   │   ├── events.py        #   /v1/events...
 │   │   ├── pairing.py       #   /v1/cameras/pair  (Phase 0)
 │   │   ├── clips.py         #   /v1/clips/ingest  (Phase 0)
-│   │   └── livekit.py       #   /v1/livekit/token (Phase 0)
+│   │   ├── livekit.py       #   /v1/livekit/token (Phase 0/1/3)
+│   │   └── talk.py          #   /v1/patients/{id}/talk/{start,end} (Phase 3)
 │   ├── db/                  # SQLAlchemy ORM models (one per table)
 │   ├── repos/               # pure async queries; no business logic
 │   ├── schemas/             # pydantic v2 request/response models
@@ -104,12 +105,27 @@ Phase 2 will swap the HTTP-clip transport for a long-running
 LiveKit-subscribing detector worker — same modules, different input
 loop.
 
+## Caregiver Talk mode (Phase 3)
+
+- `POST /v1/patients/{id}/talk/start` — caregiver-auth, returns
+  `{active_camera_id: UUID | null}`. The server picks the camera with
+  the freshest `analyses.people_present=true` row in the last 30s
+  (see `src/services/active_camera.py`) and sends a LiveKit data
+  packet to that camera with `is_active=true`; every other camera in
+  the patient's room gets `is_active=false`. When no row qualifies,
+  the packet fans out to every camera with `is_active=true` so the
+  caregiver is heard immediately.
+- `POST /v1/patients/{id}/talk/end` — sends `is_active=false` to every
+  paired camera. Idempotent; safe to call twice.
+- Packet shape (sent on the `set_talk_active` LiveKit topic):
+  `{"type": "set_talk_active", "is_active": bool}`. Cameras gate
+  local audio playback on the most recent flag — the SFU never mutes
+  tracks, so routing changes are O(ms).
+
 ## Out of scope (later)
 
 - **Phase 2:** Detector worker as a LiveKit subscriber-bot (kills the
   HTTP-clip transport).
-- **Phase 3:** Caregiver Talk mode (full-duplex audio routed to the
-  patient's active camera).
 - **Phase 4:** LiveKit Track Egress → S3 event clips. APNs push.
   Webhook receiver (`/v1/livekit/webhooks`) for online/offline state.
 - Photo upload via Supabase Storage.
