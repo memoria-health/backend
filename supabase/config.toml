@@ -1,0 +1,50 @@
+# Supabase local-dev configuration for nemara-backend.
+# Ports differ from wolf so both can run side-by-side: wolf uses the
+# default Supabase ports; nemara picks a separate offset.
+#
+# Detailed reference: https://supabase.com/docs/guides/local-development/cli/config
+
+project_id = "nemara-backend"
+
+[api]
+enabled = true
+port = 54341          # wolf uses 54321
+schemas = ["public", "graphql_public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[db]
+port = 54342          # wolf uses 54322
+shadow_port = 54340   # wolf uses 54320
+major_version = 17
+
+[db.pooler]
+enabled = false
+
+[studio]
+enabled = true
+port = 54343          # wolf uses 54323
+api_url = "http://127.0.0.1"
+
+[auth]
+enabled = true
+site_url = "http://127.0.0.1:8002"
+additional_redirect_urls = ["nemara://"]
+jwt_expiry = 3600
+enable_signup = true
+
+[auth.email]
+enable_signup = true
+double_confirm_changes = true
+enable_confirmations = false   # local dev: don't require email confirmation
+
+[realtime]
+enabled = true
+
+[storage]
+enabled = true
+file_size_limit = "50MiB"
+
+[inbucket]
+enabled = true
+port = 54344          # wolf uses 54324

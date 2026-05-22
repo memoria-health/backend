@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Env
+.env
+.env.local
+
+# Supabase local
+supabase/.branches
+supabase/.temp
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Coverage
+.coverage
+htmlcov/
