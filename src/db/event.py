@@ -11,6 +11,7 @@ from sqlalchemy import Boolean, DateTime, ForeignKey, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.db.base import Base
+from src.db.enums import DetectorCategoryEnum, DetectorSourceEnum, ReviewChoiceEnum
 
 
 class Event(Base):
@@ -18,8 +19,8 @@ class Event(Base):
 
     id: Mapped[UUID] = mapped_column(primary_key=True)
     patient_id: Mapped[UUID] = mapped_column(ForeignKey("patients.id", ondelete="CASCADE"))
-    category: Mapped[str] = mapped_column(String(20))
-    source: Mapped[str] = mapped_column(String(20))
+    category: Mapped[str] = mapped_column(DetectorCategoryEnum)
+    source: Mapped[str] = mapped_column(DetectorSourceEnum)
     icon_name: Mapped[str] = mapped_column(String(80))
     title: Mapped[str] = mapped_column(String(200))
     location: Mapped[str] = mapped_column(String(120))
@@ -36,6 +37,6 @@ class Event(Base):
     camera_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("cameras.id", ondelete="SET NULL"), default=None
     )
-    review_choice: Mapped[str | None] = mapped_column(String(20), default=None)
+    review_choice: Mapped[str | None] = mapped_column(ReviewChoiceEnum, default=None)
     review_notes: Mapped[str | None] = mapped_column(String(2000), default=None)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)

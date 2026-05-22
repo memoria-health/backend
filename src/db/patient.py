@@ -13,6 +13,7 @@ from sqlalchemy import Date, DateTime, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.db.base import Base
+from src.db.enums import PatientStateEnum, RelationKindEnum
 
 
 class Patient(Base):
@@ -22,8 +23,8 @@ class Patient(Base):
     caregiver_id: Mapped[UUID] = mapped_column(ForeignKey("caregivers.id", ondelete="CASCADE"))
     full_name: Mapped[str] = mapped_column(String(200))
     preferred_name: Mapped[str] = mapped_column(String(80))
-    relation: Mapped[str] = mapped_column(String(20))
-    state: Mapped[str] = mapped_column(String(20))
+    relation: Mapped[str] = mapped_column(RelationKindEnum)
+    state: Mapped[str] = mapped_column(PatientStateEnum)
     status_line: Mapped[str] = mapped_column(String(200))
     cameras_paused: Mapped[bool] = mapped_column()
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

@@ -12,6 +12,12 @@ from sqlalchemy import Boolean, DateTime, ForeignKey, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.db.base import Base
+from src.db.enums import (
+    DetectorCategoryEnum,
+    DetectorSensitivityEnum,
+    DetectorShapeEnum,
+    DetectorSourceEnum,
+)
 
 
 class Detector(Base):
@@ -22,12 +28,12 @@ class Detector(Base):
     name: Mapped[str] = mapped_column(String(120))
     icon_name: Mapped[str] = mapped_column(String(80))
     description: Mapped[str] = mapped_column(String(500))
-    category: Mapped[str] = mapped_column(String(20))      # detector_category
-    source: Mapped[str] = mapped_column(String(20))        # detector_source
-    shape: Mapped[str] = mapped_column(String(20))         # detector_shape
+    category: Mapped[str] = mapped_column(DetectorCategoryEnum)
+    source: Mapped[str] = mapped_column(DetectorSourceEnum)
+    shape: Mapped[str] = mapped_column(DetectorShapeEnum)
     where_scope: Mapped[str] = mapped_column(String(80))
     when_scope: Mapped[str] = mapped_column(String(80))
-    sensitivity: Mapped[str] = mapped_column(String(20))   # detector_sensitivity
+    sensitivity: Mapped[str] = mapped_column(DetectorSensitivityEnum)
     is_on: Mapped[bool] = mapped_column(Boolean)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

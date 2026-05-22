@@ -48,3 +48,10 @@ file_size_limit = "50MiB"
 [inbucket]
 enabled = true
 port = 54344          # wolf uses 54324
+
+[db.seed]
+# Apply our single-file schema as part of `supabase db reset`. Per
+# feedback_no_db_migrations_yet — pre-MVP, no migration files; we
+# edit schema.sql in place and rebuild.
+enabled = true
+sql_paths = ["./schema.sql", "./seed.sql"]
