@@ -85,6 +85,28 @@ class Settings(BaseSettings):
     # keep the same for parity.
     pairing_code_ttl_seconds: int = Field(ge=60, le=3600, default=600)
 
+    # ── Supabase Storage (Phase 4) ──────────────────────────────
+    # Two private buckets, signed URLs at read time. Bucket names are
+    # overridable so test envs can point at scratch buckets. Buckets
+    # are created manually in Supabase Studio per environment — there
+    # is no SDK bucket-bootstrap step.
+    storage_bucket_patient_photos: str = Field(default="patient-photos", min_length=1)
+    storage_bucket_incident_clips: str = Field(default="incident-clips", min_length=1)
+    # Per-payload size ceilings enforced at the storage layer. Photo
+    # cap matches wolf (1 MiB). Clip cap fits a ~30s combined pre+post
+    # MP4 at the encoder's bitrate with comfortable headroom.
+    storage_max_photo_bytes: int = Field(ge=1024, le=10 * 1024 * 1024, default=1 * 1024 * 1024)
+    storage_max_clip_bytes: int = Field(ge=1024, le=100 * 1024 * 1024, default=25 * 1024 * 1024)
+    # Upload timeouts: photos finish in <1s on dev WiFi; clips on
+    # cellular need more headroom. Both come from settings so a slow
+    # CI VM can bump them via env without code changes.
+    storage_upload_timeout_seconds: float = Field(gt=0, le=120, default=10.0)
+    storage_clip_upload_timeout_seconds: float = Field(gt=0, le=300, default=60.0)
+    # Default TTL for signed URLs handed to the caregiver app. 10 min
+    # is comfortable for "tap event → watch clip" and short enough
+    # that a shared URL goes stale fast.
+    storage_signed_url_default_ttl_seconds: int = Field(ge=30, le=3600, default=600)
+
 
 def get_settings() -> Settings:
     return Settings()

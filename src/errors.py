@@ -19,3 +19,16 @@ class JwtVerificationError(NemaraError):
     Raised by `src.services.auth.verify_supabase_jwt`. Caller decides
     how to surface (401 at the API layer, log + reject elsewhere).
     """
+
+
+# ─── Storage ─────────────────────────────────────────────────────
+
+
+class StorageError(NemaraError):
+    """A Supabase Storage operation failed.
+
+    Raised by `src.services.storage` for both payload validation
+    (empty / oversized / wrong content type) and provider-side
+    failures (timeout, non-2xx, transport error). The API layer maps
+    most of these to 4xx/5xx; the caller decides which.
+    """
