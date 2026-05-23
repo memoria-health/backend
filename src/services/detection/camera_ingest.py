@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING
 from uuid import UUID
 
 from src.db.camera import Camera
-from src.services import push
+from src.services import clip_archival, push
 from src.services.detection.analyses_store import add_analysis
 from src.services.detection.audio_buffer import AudioBuffer
 from src.services.detection.event_promotion import maybe_promote_analysis
@@ -273,6 +273,23 @@ class CameraIngest:
                     ),
                     name=f"push-dispatch-{self.camera_id}",
                 )
+                # Clip archival: reuse the MP4 we already built for
+                # the LLM as the pre-event clip; spawn one task per
+                # fired event so the same camera can have two events
+                # fire at the same tick (rare but possible — fall +
+                # agitation) without one stomping the other's wait.
+                for fired_event in promotion.fired:
+                    asyncio.create_task(
+                        clip_archival.archive_event(
+                            event_id=fired_event.id,
+                            pre_event_mp4=mp4_bytes,
+                            frame_buffer=self.frame_buffer,
+                            audio_buffer=self.audio_buffer,
+                            sessionmaker=self._sessionmaker,
+                            settings=self._settings,
+                        ),
+                        name=f"clip-archive-{fired_event.id}",
+                    )
 
             log.info(
                 "%s DONE provider=%s people=%s(%s) motion=%s state=%s/%s "

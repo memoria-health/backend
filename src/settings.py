@@ -125,6 +125,13 @@ class Settings(BaseSettings):
     # we refresh slightly under that to leave headroom.
     apns_jwt_lifetime_seconds: int = Field(ge=60, le=3600, default=3300)
 
+    # ── Clip archival (Phase 4) ─────────────────────────────────
+    # Wait this many seconds after an event fires before snapshotting
+    # the post-event buffer window. Matches livekit_worker_window_seconds
+    # by default so pre.mp4 (T-15s..T) and post.mp4 (T..T+15s) are
+    # contiguous. Test overrides bump it down to ~0.1 to avoid waiting.
+    clip_post_event_wait_seconds: float = Field(gt=0, le=120, default=15.0)
+
 
 def get_settings() -> Settings:
     return Settings()

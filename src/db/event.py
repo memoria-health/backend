@@ -40,3 +40,6 @@ class Event(Base):
     review_choice: Mapped[str | None] = mapped_column(ReviewChoiceEnum, default=None)
     review_notes: Mapped[str | None] = mapped_column(String(2000), default=None)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    # Bucket-relative key in `incident-clips`; NULL until clip archival
+    # completes (post-event window captured + ffmpeg concat uploaded).
+    clip_storage_key: Mapped[str | None] = mapped_column(String, default=None)

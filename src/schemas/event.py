@@ -54,7 +54,19 @@ class EventResponse(BaseModel):
     review_choice: ReviewChoice | None
     review_notes: Notes | None
     reviewed_at: datetime | None
+    clip_storage_key: str | None
     created_at: datetime
+
+
+class ClipURLResponse(BaseModel):
+    """Returned from `GET /v1/events/{id}/clip-url`. Signed URL is
+    short-lived (default 10 min via storage_signed_url_default_ttl_seconds);
+    the caregiver app fetches a fresh one on every player open."""
+
+    model_config = ConfigDict(frozen=True)
+
+    url: str
+    expires_in_seconds: int
 
 
 class EventListResponse(BaseModel):

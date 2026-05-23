@@ -246,6 +246,12 @@ create table public.events (
   review_choice review_choice,
   review_notes  text,
   reviewed_at   timestamptz,
+  -- Bucket-relative key in `incident-clips` (e.g.
+  -- "events/{event_id}.mp4"). NULL until the post-event capture +
+  -- concat completes; `has_clip` flips to TRUE in the same UPDATE.
+  -- Read at iOS-fetch time by `GET /v1/events/{id}/clip-url`, which
+  -- mints a short-lived Supabase Storage signed URL.
+  clip_storage_key text,
   created_at    timestamptz not null default now()
 );
 

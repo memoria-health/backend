@@ -13,15 +13,17 @@ from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, status
 
-from src.api.deps import CaregiverAuth, SessionDep
+from src.api.deps import CaregiverAuth, SessionDep, SettingsDep
 from src.db.event import Event
 from src.repos import event_repo
 from src.schemas.event import (
+    ClipURLResponse,
     EventFilter,
     EventListResponse,
     EventResponse,
     UpdateEventRequest,
 )
+from src.services import storage
 
 router = APIRouter(prefix="/v1", tags=["event"])
 
@@ -119,3 +121,41 @@ async def patch_event(
         )
     await session.commit()
     return _to_response(e)
+
+
+@router.get("/events/{event_id}/clip-url", response_model=ClipURLResponse)
+async def get_event_clip_url(
+    event_id: UUID,
+    auth: CaregiverAuth,
+    session: SessionDep,
+    settings: SettingsDep,
+) -> ClipURLResponse:
+    """Mint a short-lived signed URL for the event's clip.
+
+    Returns:
+        - 200 + signed URL when `has_clip=true` and the caregiver owns the event.
+        - 404 when the event doesn't exist (or isn't owned by the caregiver).
+        - 409 when the clip is still processing (`has_clip=false`).
+
+    Mints a fresh URL every call rather than caching — iOS only asks
+    when the player opens, and the TTL is short enough that re-mints
+    are cheap.
+    """
+    e = await event_repo.find_by_id(session, event_id, caregiver_id=auth.id)
+    if e is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="event_not_found",
+        )
+    if not e.has_clip or e.clip_storage_key is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="clip_not_ready",
+        )
+    url = await storage.signed_url(
+        bucket=settings.storage_bucket_incident_clips,
+        key=e.clip_storage_key,
+        settings=settings,
+    )
+    return ClipURLResponse(
+        url=url,
+        expires_in_seconds=settings.storage_signed_url_default_ttl_seconds,
+    )
