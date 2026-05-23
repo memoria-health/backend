@@ -35,7 +35,7 @@ nemara-backend/
 │   │   ├── pairing.py       #   /v1/cameras/pair  (Phase 0)
 │   │   ├── clips.py         #   /v1/clips/ingest  (Phase 0)
 │   │   ├── livekit.py       #   /v1/livekit/token (Phase 0/1/3)
-│   │   └── talk.py          #   /v1/patients/{id}/talk/{start,end} (Phase 3)
+│   │   └── talk.py          #   /v1/patients/{id}/active-camera + /talk/{start,end} (Phase 3)
 │   ├── db/                  # SQLAlchemy ORM models (one per table)
 │   ├── repos/               # pure async queries; no business logic
 │   ├── schemas/             # pydantic v2 request/response models
@@ -107,14 +107,23 @@ loop.
 
 ## Caregiver Talk mode (Phase 3)
 
-- `POST /v1/patients/{id}/talk/start` — caregiver-auth, returns
-  `{active_camera_id: UUID | null}`. The server picks the camera with
-  the freshest `analyses.people_present=true` row in the last 30s
-  (see `src/services/active_camera.py`) and sends a LiveKit data
-  packet to that camera with `is_active=true`; every other camera in
-  the patient's room gets `is_active=false`. When no row qualifies,
-  the packet fans out to every camera with `is_active=true` so the
-  caregiver is heard immediately.
+The iOS Live tab is a phone-call metaphor: the caregiver swipes a
+carousel of camera tiles and taps a call button overlaid on the
+currently-displayed tile. Audio routes to **the camera the caregiver
+picked** — server-side best-guess is a suggestion for the carousel's
+initial page, not a routing decision.
+
+- `GET /v1/patients/{id}/active-camera` — caregiver-auth. Returns
+  `{"camera_id": UUID | null}` — the camera with the freshest
+  `analyses.people_present=true` row in the last 30s (see
+  `src/services/active_camera.py`). iOS uses this to default the
+  Live-tab carousel; `null` falls back to the first online camera
+  client-side.
+- `POST /v1/patients/{id}/talk/start` — caregiver-auth. Body
+  `{"camera_id": UUID}`. Server sends `is_active=true` to the
+  specified camera and `is_active=false` to every other camera in the
+  patient's room. Re-POSTing with a different `camera_id` transfers
+  an active call atomically (no `/end` needed between transfers).
 - `POST /v1/patients/{id}/talk/end` — sends `is_active=false` to every
   paired camera. Idempotent; safe to call twice.
 - Packet shape (sent on the `set_talk_active` LiveKit topic):

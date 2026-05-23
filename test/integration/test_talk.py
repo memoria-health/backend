@@ -1,16 +1,13 @@
 """Integration tests for caregiver Talk mode.
 
-POST /v1/patients/{id}/talk/start and /talk/end. The interesting
-behaviours are:
+Three endpoints:
+  - GET  /v1/patients/{id}/active-camera   — suggestion for the iOS carousel
+  - POST /v1/patients/{id}/talk/start      — opens a call to an explicit camera
+  - POST /v1/patients/{id}/talk/end        — closes any open call
 
-- ownership check (cross-caregiver → 403)
-- active-camera routing (most recent analyses row wins)
-- fan-out fallback when no active row exists
-- end_talk sends is_active=false to every paired camera
-- 503 when LiveKit env not configured
-
-The LiveKit data-send is mocked via monkeypatch — we capture the
-arguments to assert routing decisions without hitting LiveKit Cloud.
+The LiveKit data-send is mocked via monkeypatch — we capture every
+`SendDataRequest` to assert routing decisions without hitting LiveKit
+Cloud.
 """
 
 from __future__ import annotations
@@ -44,18 +41,15 @@ class _SentPacket:
 
 @dataclass
 class _DataSendMock:
-    """Captures every send_data call. The endpoint uses
-    `lkapi.LiveKitAPI(...).room.send_data(SendDataRequest(...))`; we
-    monkeypatch `LiveKitAPI` so each constructor returns a fresh
-    `_FakeAPI` that records into this mock.
+    """Captures every `send_data` call. The endpoint constructs
+    `lkapi.LiveKitAPI(url, key, secret)` per packet; we monkeypatch the
+    class to return a fake whose `room.send_data` appends here.
     """
 
     sent: list[_SentPacket] = field(default_factory=list)
     closed: int = 0
 
     def install(self, monkeypatch) -> None:
-        # The endpoint constructs `lkapi.LiveKitAPI(url, key, secret)`.
-        # Replace the class with a factory that returns our fake.
         mock_self = self
 
         class _FakeRoomService:
@@ -86,10 +80,9 @@ async def data_send_mock(monkeypatch) -> _DataSendMock:
 
 @pytest.fixture
 def livekit_configured_app(app, monkeypatch):
-    """The Talk endpoint short-circuits to 503 unless the LiveKit
-    triple (url, api_key, api_secret) is configured. Tests run against
-    a Settings instance that may or may not have those set; override
-    to ensure the endpoint reaches the send_data path.
+    """Talk endpoints short-circuit to 503 unless LiveKit env is set.
+    Override Settings so the tests reach the send_data path even when
+    the local env is bare.
     """
     from src.api.deps import get_settings_dep
 
@@ -134,21 +127,18 @@ async def _pair_camera(
     return UUID(pair["camera_id"]), pair["livekit_identity"]
 
 
-# ─── Tests ────────────────────────────────────────────────────────
+# ─── GET /active-camera ───────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_start_routes_to_active_camera(
-    livekit_configured_app, client: AsyncClient, auth_user,
-    session: AsyncSession, data_send_mock,
+async def test_get_active_camera_returns_freshest_qualifying(
+    client: AsyncClient, auth_user, session: AsyncSession,
 ) -> None:
-    """Two cameras paired. A recent analyses row says cam_a has people
-    visible. talk/start should send is_active=true to cam_a, false to
-    cam_b.
+    """When the patient has a recent `analyses.people_present=true`
+    row, the endpoint echoes that camera_id.
     """
     headers, pid = await _provision_caregiver_and_patient(client, auth_user)
-    cam_a, identity_a = await _pair_camera(client, headers, pid, "Kitchen")
-    cam_b, identity_b = await _pair_camera(client, headers, pid, "Bedroom")
+    cam_a, _ = await _pair_camera(client, headers, pid, "Kitchen")
 
     uid, _ = auth_user
     session.add(Analysis(
@@ -157,7 +147,7 @@ async def test_start_routes_to_active_camera(
         patient_id=pid,
         camera_id=cam_a,
         provider="gemini",
-        description="person walking",
+        description="walking",
         detector_fields={},
         people_present=True,
         motion_in_clip=True,
@@ -167,11 +157,68 @@ async def test_start_routes_to_active_camera(
     ))
     await session.commit()
 
-    r = await client.post(f"/v1/patients/{pid}/talk/start", headers=headers)
+    r = await client.get(f"/v1/patients/{pid}/active-camera", headers=headers)
     assert r.status_code == 200, r.text
-    assert r.json()["active_camera_id"] == str(cam_a)
+    assert r.json() == {"camera_id": str(cam_a)}
 
-    # Two packets sent — one is_active=true to cam_a, one is_active=false to cam_b.
+
+@pytest.mark.asyncio
+async def test_get_active_camera_returns_null_when_no_qualifying_row(
+    client: AsyncClient, auth_user,
+) -> None:
+    """No analyses row → `camera_id: null`. iOS falls back to the
+    first online camera in the patient's list.
+    """
+    headers, pid = await _provision_caregiver_and_patient(client, auth_user)
+    await _pair_camera(client, headers, pid, "Kitchen")
+
+    r = await client.get(f"/v1/patients/{pid}/active-camera", headers=headers)
+    assert r.status_code == 200, r.text
+    assert r.json() == {"camera_id": None}
+
+
+@pytest.mark.asyncio
+async def test_get_active_camera_returns_403_for_unowned_patient(
+    client: AsyncClient, auth_user_factory,
+) -> None:
+    """Caregiver B querying A's patient → 403."""
+    uid_a, email_a = await auth_user_factory()
+    headers_a = {"Authorization": f"Bearer {mint_test_jwt(uid_a, email_a)}"}
+    await client.post("/v1/me", headers=headers_a, json={"display_name": "A"})
+    pid_a = UUID((await client.post("/v1/patients", headers=headers_a, json={
+        "full_name": "A Patient", "preferred_name": "A", "relation": "parent",
+    })).json()["id"])
+
+    uid_b, email_b = await auth_user_factory()
+    headers_b = {"Authorization": f"Bearer {mint_test_jwt(uid_b, email_b)}"}
+    await client.post("/v1/me", headers=headers_b, json={"display_name": "B"})
+
+    r = await client.get(f"/v1/patients/{pid_a}/active-camera", headers=headers_b)
+    assert r.status_code == 403
+
+
+# ─── POST /talk/start ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_start_routes_to_specified_camera(
+    livekit_configured_app, client: AsyncClient, auth_user, data_send_mock,
+) -> None:
+    """Caregiver picks cam_a explicitly. Server sends `is_active=true`
+    to cam_a, `is_active=false` to cam_b. The `analyses` table is
+    not consulted — routing is request-driven.
+    """
+    headers, pid = await _provision_caregiver_and_patient(client, auth_user)
+    cam_a, identity_a = await _pair_camera(client, headers, pid, "Kitchen")
+    _, identity_b = await _pair_camera(client, headers, pid, "Bedroom")
+
+    r = await client.post(
+        f"/v1/patients/{pid}/talk/start",
+        headers=headers,
+        json={"camera_id": str(cam_a)},
+    )
+    assert r.status_code == 204, r.text
+
     assert len(data_send_mock.sent) == 2
     by_identity = {p.destination_identities[0]: p for p in data_send_mock.sent}
     assert by_identity[identity_a].payload == {"type": "set_talk_active", "is_active": True}
@@ -182,35 +229,113 @@ async def test_start_routes_to_active_camera(
 
 
 @pytest.mark.asyncio
-async def test_start_fans_out_when_no_active_known(
+async def test_start_returns_422_when_camera_id_missing(
     livekit_configured_app, client: AsyncClient, auth_user, data_send_mock,
 ) -> None:
-    """No qualifying analyses row → every paired camera gets
-    is_active=true so the caregiver is heard somewhere immediately.
+    """`camera_id` is required. Empty body → 422, no packet sent."""
+    headers, pid = await _provision_caregiver_and_patient(client, auth_user)
+    await _pair_camera(client, headers, pid, "Kitchen")
+
+    r = await client.post(f"/v1/patients/{pid}/talk/start", headers=headers, json={})
+    assert r.status_code == 422
+    assert data_send_mock.sent == []
+
+
+@pytest.mark.asyncio
+async def test_start_returns_403_when_camera_not_owned_by_patient(
+    livekit_configured_app, client: AsyncClient, auth_user_factory,
+    data_send_mock,
+) -> None:
+    """A camera_id belonging to a different patient (or random uuid) →
+    403, no packet sent. Defends against an iOS-side bug picking up a
+    stale camera_id from another patient's roster.
+    """
+    uid_a, email_a = await auth_user_factory()
+    headers_a = {"Authorization": f"Bearer {mint_test_jwt(uid_a, email_a)}"}
+    await client.post("/v1/me", headers=headers_a, json={"display_name": "A"})
+    pid_a = UUID((await client.post("/v1/patients", headers=headers_a, json={
+        "full_name": "A1", "preferred_name": "A1", "relation": "parent",
+    })).json()["id"])
+    pid_other = UUID((await client.post("/v1/patients", headers=headers_a, json={
+        "full_name": "A2", "preferred_name": "A2", "relation": "parent",
+    })).json()["id"])
+    other_cam, _ = await _pair_camera(client, headers_a, pid_other, "Kitchen")
+
+    # Try to start a call on patient A1's room with patient A2's camera.
+    r = await client.post(
+        f"/v1/patients/{pid_a}/talk/start",
+        headers=headers_a,
+        json={"camera_id": str(other_cam)},
+    )
+    assert r.status_code == 403
+    assert data_send_mock.sent == []
+
+
+@pytest.mark.asyncio
+async def test_start_returns_403_for_unowned_patient(
+    livekit_configured_app, client: AsyncClient, auth_user_factory,
+    data_send_mock,
+) -> None:
+    """Caregiver B starting a call on A's patient → 403, no packet."""
+    uid_a, email_a = await auth_user_factory()
+    headers_a = {"Authorization": f"Bearer {mint_test_jwt(uid_a, email_a)}"}
+    await client.post("/v1/me", headers=headers_a, json={"display_name": "A"})
+    pid_a = UUID((await client.post("/v1/patients", headers=headers_a, json={
+        "full_name": "A Patient", "preferred_name": "A", "relation": "parent",
+    })).json()["id"])
+    cam_a, _ = await _pair_camera(client, headers_a, pid_a, "Kitchen")
+
+    uid_b, email_b = await auth_user_factory()
+    headers_b = {"Authorization": f"Bearer {mint_test_jwt(uid_b, email_b)}"}
+    await client.post("/v1/me", headers=headers_b, json={"display_name": "B"})
+
+    r = await client.post(
+        f"/v1/patients/{pid_a}/talk/start",
+        headers=headers_b,
+        json={"camera_id": str(cam_a)},
+    )
+    assert r.status_code == 403
+    assert data_send_mock.sent == []
+
+
+@pytest.mark.asyncio
+async def test_start_transfers_call_when_called_again_with_different_camera(
+    livekit_configured_app, client: AsyncClient, auth_user, data_send_mock,
+) -> None:
+    """Re-POSTing with a different `camera_id` transfers the call.
+    Each call broadcasts to every camera, so the previous target's
+    gate closes atomically with the new target's opening.
     """
     headers, pid = await _provision_caregiver_and_patient(client, auth_user)
-    _, identity_a = await _pair_camera(client, headers, pid, "Kitchen")
-    _, identity_b = await _pair_camera(client, headers, pid, "Bedroom")
+    cam_a, identity_a = await _pair_camera(client, headers, pid, "Kitchen")
+    cam_b, identity_b = await _pair_camera(client, headers, pid, "Bedroom")
 
-    r = await client.post(f"/v1/patients/{pid}/talk/start", headers=headers)
-    assert r.status_code == 200, r.text
-    assert r.json()["active_camera_id"] is None
+    await client.post(
+        f"/v1/patients/{pid}/talk/start",
+        headers=headers, json={"camera_id": str(cam_a)},
+    )
+    data_send_mock.sent.clear()
 
+    r = await client.post(
+        f"/v1/patients/{pid}/talk/start",
+        headers=headers, json={"camera_id": str(cam_b)},
+    )
+    assert r.status_code == 204, r.text
     assert len(data_send_mock.sent) == 2
-    for packet in data_send_mock.sent:
-        assert packet.payload == {"type": "set_talk_active", "is_active": True}
-        assert packet.room == f"patient_{pid}"
-        assert packet.topic == "set_talk_active"
-    identities = {p.destination_identities[0] for p in data_send_mock.sent}
-    assert identities == {identity_a, identity_b}
+    by_identity = {p.destination_identities[0]: p for p in data_send_mock.sent}
+    assert by_identity[identity_a].payload == {"type": "set_talk_active", "is_active": False}
+    assert by_identity[identity_b].payload == {"type": "set_talk_active", "is_active": True}
+
+
+# ─── POST /talk/end ───────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_end_sends_is_active_false_to_all(
     livekit_configured_app, client: AsyncClient, auth_user, data_send_mock,
 ) -> None:
-    """`/talk/end` always sends is_active=false to every paired camera
-    so a previous active session can't leave a stale gate open.
+    """`/talk/end` sends `is_active=false` to every paired camera so a
+    previous call can't leave a stale gate open.
     """
     headers, pid = await _provision_caregiver_and_patient(client, auth_user)
     _, identity_a = await _pair_camera(client, headers, pid, "Kitchen")
@@ -226,28 +351,7 @@ async def test_end_sends_is_active_false_to_all(
         assert packet.payload == {"type": "set_talk_active", "is_active": False}
 
 
-@pytest.mark.asyncio
-async def test_start_returns_403_for_unowned_patient(
-    livekit_configured_app, client: AsyncClient, auth_user_factory,
-    data_send_mock,
-) -> None:
-    """Caregiver B asking to Talk to A's patient → 403, no packet
-    sent. This is the load-bearing isolation check.
-    """
-    uid_a, email_a = await auth_user_factory()
-    headers_a = {"Authorization": f"Bearer {mint_test_jwt(uid_a, email_a)}"}
-    await client.post("/v1/me", headers=headers_a, json={"display_name": "A"})
-    pid_a = UUID((await client.post("/v1/patients", headers=headers_a, json={
-        "full_name": "A Patient", "preferred_name": "A", "relation": "parent",
-    })).json()["id"])
-
-    uid_b, email_b = await auth_user_factory()
-    headers_b = {"Authorization": f"Bearer {mint_test_jwt(uid_b, email_b)}"}
-    await client.post("/v1/me", headers=headers_b, json={"display_name": "B"})
-
-    r = await client.post(f"/v1/patients/{pid_a}/talk/start", headers=headers_b)
-    assert r.status_code == 403
-    assert data_send_mock.sent == []
+# ─── 503 when LiveKit unconfigured ────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -255,7 +359,7 @@ async def test_503_when_livekit_not_configured(
     app, client: AsyncClient, auth_user, monkeypatch, data_send_mock,
 ) -> None:
     """Without LIVEKIT_URL/KEY/SECRET the endpoint short-circuits to
-    503 — and no data packet is sent.
+    503 and no packet is sent.
     """
     from src.api.deps import get_settings_dep
 
@@ -270,9 +374,12 @@ async def test_503_when_livekit_not_configured(
     app.dependency_overrides[get_settings_dep] = lambda: unconfigured
 
     headers, pid = await _provision_caregiver_and_patient(client, auth_user)
-    await _pair_camera(client, headers, pid, "Kitchen")
+    cam_a, _ = await _pair_camera(client, headers, pid, "Kitchen")
 
-    r = await client.post(f"/v1/patients/{pid}/talk/start", headers=headers)
+    r = await client.post(
+        f"/v1/patients/{pid}/talk/start",
+        headers=headers, json={"camera_id": str(cam_a)},
+    )
     assert r.status_code == 503
     assert data_send_mock.sent == []
 

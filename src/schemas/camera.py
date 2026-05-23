@@ -25,5 +25,11 @@ class CameraResponse(BaseModel):
     room: Room
     icon_name: IconName
     online: bool
+    # `cam_<8 hex>` once the pairing handshake completes; None on rows
+    # that hold an open pairing code but haven't been claimed by a
+    # wall phone yet. Exposed to the caregiver app so the Live tab
+    # can map a Camera row to a subscribed LiveKit track without
+    # reconstructing the identity from the UUID prefix client-side.
+    livekit_identity: str | None
     last_seen_at: datetime | None
     created_at: datetime

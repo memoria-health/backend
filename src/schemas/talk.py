@@ -1,21 +1,10 @@
 """Pydantic boundary models for caregiver Talk mode (Phase 3).
 
-Talk mode is a full-duplex audio toggle between the caregiver and the
-wall phone(s) in a patient's household:
-
-- `POST /v1/patients/{patient_id}/talk/start` — server picks an
-  active camera (most recent analyses row with people_present=true in
-  the last 30s) and sends a LiveKit data packet to that camera with
-  `is_active=true`. Other cameras get `is_active=false`. If no active
-  camera is known, the packet is sent to every camera with
-  `is_active=true` (fan-out fallback).
-- `POST /v1/patients/{patient_id}/talk/end` — server sends
-  `is_active=false` to every camera in the room.
-
-Cameras subscribe to the caregiver's audio track via LiveKit
-(canSubscribe=true on the camera grant) and gate playback locally on
-`is_active`. Routing is enforced camera-side via volume; no
-server-side track muting.
+Talk is a phone-call metaphor driven entirely from the iOS Live tab.
+The caregiver picks which camera they're calling (via the carousel);
+the server's only job is to flip `is_active=true` on that camera and
+`is_active=false` on every sibling. See `src/api/talk.py` for the
+endpoint behaviour.
 """
 
 from uuid import UUID
@@ -23,13 +12,27 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict
 
 
-class TalkStartResponse(BaseModel):
-    """Returned to the caregiver app after `/talk/start`.
-
-    The UI uses `active_camera_id` to label the on-air banner —
-    "Talking to Kitchen" if known, "Talking to all rooms" if None.
+class ActiveCameraResponse(BaseModel):
+    """Returned by `GET /v1/patients/{id}/active-camera`. The iOS Live
+    tab uses `camera_id` to default the carousel to the right tile.
+    `None` means no qualifying analyses row in the last 30s; the
+    caller falls back to the first online camera in the patient's
+    list.
     """
 
     model_config = ConfigDict(frozen=True)
 
-    active_camera_id: UUID | None
+    camera_id: UUID | None
+
+
+class TalkStartRequest(BaseModel):
+    """Body of `POST /v1/patients/{id}/talk/start`. `camera_id` is the
+    explicit routing target — server sends `is_active=true` to that
+    camera and `is_active=false` to every other camera paired to the
+    patient. Re-POSTing with a new `camera_id` transfers an active
+    call atomically.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    camera_id: UUID
