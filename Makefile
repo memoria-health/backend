@@ -1,4 +1,4 @@
-.PHONY: help dev test test-unit test-integration lint format db-start db-stop db-reset studio install e2e
+.PHONY: help dev test test-unit test-integration lint format db-start db-stop db-reset studio install e2e fresh fresh-seed down
 
 PY := PYTHONPATH=. uv run
 
@@ -15,6 +15,9 @@ help:
 	@echo "make db-reset         - wipe + reapply supabase/schema.sql + seed"
 	@echo "make studio           - open Supabase Studio"
 	@echo "make e2e              - scenario CLI for iOS verification (pass args via ARGS=...)"
+	@echo "make fresh            - reset + bring up supabase + backend + ngrok (no seed)"
+	@echo "make fresh-seed       - same as fresh + seed demo data"
+	@echo "make down             - stop supabase + backend + ngrok"
 
 install:
 	uv sync
@@ -63,3 +66,15 @@ studio:
 #   make e2e ARGS="fire-event --patient maggie --kind fall --location 'Kitchen'"
 e2e:
 	$(PY) e2e $(ARGS)
+
+# Full clean restart of the local stack — kills uvicorn, wipes Supabase
+# volumes (storage + db), re-applies schema, recreates storage buckets.
+# `make dev` is still a separate step (runs the backend in foreground).
+fresh:
+	./scripts/local-start.sh
+
+fresh-seed:
+	./scripts/local-start.sh --seed
+
+down:
+	./scripts/local-start.sh --down

@@ -2,20 +2,53 @@
 
 FastAPI + Supabase backend for the **Nemara caregiver iOS app** and the **detector subscriber-bot**.
 
-Identity, patients, cameras, detectors, events, plus the Phase 0–3 detector pipeline: 6-digit camera pairing, per-camera api-keys, LiveKit token minting, an in-process **LiveKit subscriber-bot** (Phase 2) that pulls frames + audio off the SFU and runs the same Gemini → OpenAI provider fallback ported from `nemara-temp-dashboard`, and Phase 3 caregiver Talk mode. APNs push and event-clip archival via LiveKit Track Egress (Phase 4) are out of scope here.
+Identity, patients, cameras, detectors, events, plus the Phase 0–4 detector pipeline: 6-digit camera pairing, per-camera api-keys, LiveKit token minting, an in-process **LiveKit subscriber-bot** (Phase 2) that pulls frames + audio off the SFU and runs the same Gemini → OpenAI provider fallback ported from `nemara-temp-dashboard`, Phase 3 caregiver Talk mode, and Phase 4 — APNs push, event-clip archival via Supabase Storage, and patient photo upload.
 
 ## Quick start
 
+One command brings everything up: Supabase + buckets + schema + backend + ngrok tunnel.
+
 ```bash
-brew install uv supabase
-make install                  # uv sync
-cp .env.example .env          # fill in values from `supabase status -o env`
-supabase start                # one-time local Postgres + Supabase services
-make db-reset                 # apply supabase/schema.sql + seed demo data
-make dev                      # uvicorn on :8002 with --reload
+brew install uv supabase ngrok       # one-time
+ngrok config add-authtoken <token>   # one-time, from dashboard.ngrok.com
+make install                          # uv sync
+# fill in .env (see "Configuration" below)
+make fresh-seed                       # full stack up, with demo data
+```
+
+What `make fresh-seed` does:
+
+1. Kills any stale uvicorn / ngrok / Supabase from a prior run.
+2. `supabase start` + `supabase db reset` (applies `supabase/schema.sql`).
+3. Creates the two private Storage buckets (`patient-photos`, `incident-clips`) via REST.
+4. Seeds demo data (`scripts/seed.py`) — Jane Patel + Maggie + detectors + events.
+5. Starts the backend (uvicorn on `:8002`, logs to `.dev/backend.log`).
+6. Starts ngrok pointing at `:8002` (logs to `.dev/ngrok.log`).
+7. Prints the public ngrok URL — paste `<url>/v1/livekit/webhooks` into LiveKit Cloud's webhook config so the subscriber-bot can be discovered.
+
+Other targets:
+
+```bash
+make fresh           # same as fresh-seed but skip demo data
+make down            # stop everything cleanly
+make dev             # alt foreground uvicorn (skip the script if you want logs in your face)
 ```
 
 Health check: `curl http://localhost:8002/health` → `{"status":"ok"}`.
+
+## Configuration
+
+`.env` lives at the repo root (gitignored). Copy from `.env.example` and fill:
+
+| Block | Where to get it |
+|---|---|
+| `NEMARA_DB_URL` + Supabase keys | From `supabase status -o env` after `supabase start` once. Port 54342 not 54322. |
+| `NEMARA_GEMINI_API_KEY` | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
+| `NEMARA_OPENAI_API_KEY` | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) |
+| `NEMARA_LIVEKIT_*` | LiveKit Cloud project → Settings → Keys. |
+| `NEMARA_APNS_*` | Apple Developer → Keys → create one with Push capability. `NEMARA_APNS_AUTH_KEY` is the *contents* of the `.p8` file, BEGIN/END lines preserved, between double quotes. |
+
+All Phase 4 settings (storage bucket names, photo/clip size caps, signed-URL TTL, APNs, clip-archival wait) have sensible defaults via `src/settings.py` — only override in `.env` if you need to.
 
 ## Where things live
 

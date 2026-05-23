@@ -11,6 +11,9 @@ __pycache__/
 .env
 .env.local
 
+# Local-start.sh runtime state (PIDs + log files for backend + ngrok)
+.dev/
+
 # Supabase local
 supabase/.branches
 supabase/.temp
