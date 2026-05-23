@@ -125,3 +125,106 @@ async def test_raises_clear_error_when_ffmpeg_missing(monkeypatch) -> None:
     f = FrameSnapshot(width=320, height=240, data=_yuv420_blob(320, 240), captured_at=100.0)
     with pytest.raises(Mp4RemuxError, match="ffmpeg binary not found"):
         await frames_to_mp4([f], fps=5)
+
+
+# ── audio path ────────────────────────────────────────────────────────
+
+
+def _silence_pcm(seconds: float, sample_rate: int = 16000) -> bytes:
+    """`seconds` of silent int16 mono PCM at the given rate."""
+    return b"\x00\x00" * int(seconds * sample_rate)
+
+
+@_pytestmark_ffmpeg
+@pytest.mark.asyncio
+async def test_pcm_produces_mp4_with_both_streams() -> None:
+    """When PCM is provided, the resulting MP4 must contain both a
+    video stream and an AAC audio stream. The Gemini prompt's
+    `speech_heard` / `speech_transcript` fields depend on audio
+    actually reaching the LLM through the MP4."""
+    width, height, fps = 320, 240, 5
+    frames = [
+        FrameSnapshot(
+            width=width, height=height,
+            data=_yuv420_blob(width, height),
+            captured_at=100.0 + i / fps,
+        )
+        for i in range(15)  # 3s of video
+    ]
+    pcm = _silence_pcm(3.0)
+    mp4 = await frames_to_mp4(frames, fps=fps, pcm=pcm)
+
+    info = _ffprobe(mp4)
+    streams = info["streams"]
+    assert len(streams) == 2
+    kinds = {s["codec_type"] for s in streams}
+    assert kinds == {"video", "audio"}
+
+    video = next(s for s in streams if s["codec_type"] == "video")
+    audio = next(s for s in streams if s["codec_type"] == "audio")
+    assert video["codec_name"] in {"h264", "avc1"}
+    assert video["width"] == width
+    assert video["height"] == height
+    assert audio["codec_name"] == "aac"
+    assert int(audio["sample_rate"]) == 16000
+    assert audio["channels"] == 1
+
+
+@_pytestmark_ffmpeg
+@pytest.mark.asyncio
+async def test_no_pcm_keeps_video_only() -> None:
+    """Without PCM the output stays video-only — no audio stream gets
+    added accidentally. Important because the dashboard era's `-an`
+    flag was the only thing keeping audio out of the LLM input; the
+    new code path must preserve that when audio isn't buffered yet."""
+    width, height, fps = 320, 240, 5
+    frames = [
+        FrameSnapshot(
+            width=width, height=height,
+            data=_yuv420_blob(width, height),
+            captured_at=100.0 + i / fps,
+        )
+        for i in range(15)
+    ]
+    mp4 = await frames_to_mp4(frames, fps=fps, pcm=None)
+    info = _ffprobe(mp4)
+    streams = info["streams"]
+    assert len(streams) == 1
+    assert streams[0]["codec_type"] == "video"
+
+
+@_pytestmark_ffmpeg
+@pytest.mark.asyncio
+async def test_empty_pcm_keeps_video_only() -> None:
+    """Empty PCM (audio buffer warming up) takes the no-audio branch
+    rather than handing ffmpeg an empty `-i` input that would fail.
+    """
+    width, height, fps = 320, 240, 5
+    frames = [
+        FrameSnapshot(
+            width=width, height=height,
+            data=_yuv420_blob(width, height),
+            captured_at=100.0 + i / fps,
+        )
+        for i in range(15)
+    ]
+    mp4 = await frames_to_mp4(frames, fps=fps, pcm=b"")
+    info = _ffprobe(mp4)
+    assert len(info["streams"]) == 1
+    assert info["streams"][0]["codec_type"] == "video"
+
+
+@_pytestmark_ffmpeg
+@pytest.mark.asyncio
+async def test_pcm_rejects_invalid_sample_rate() -> None:
+    f = FrameSnapshot(width=320, height=240, data=_yuv420_blob(320, 240), captured_at=100.0)
+    with pytest.raises(ValueError, match="pcm_sample_rate"):
+        await frames_to_mp4([f], fps=5, pcm=_silence_pcm(1.0), pcm_sample_rate=0)
+
+
+@_pytestmark_ffmpeg
+@pytest.mark.asyncio
+async def test_pcm_rejects_invalid_channel_count() -> None:
+    f = FrameSnapshot(width=320, height=240, data=_yuv420_blob(320, 240), captured_at=100.0)
+    with pytest.raises(ValueError, match="pcm_num_channels"):
+        await frames_to_mp4([f], fps=5, pcm=_silence_pcm(1.0), pcm_num_channels=0)

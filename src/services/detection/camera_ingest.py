@@ -34,6 +34,7 @@ from uuid import UUID
 
 from src.db.camera import Camera
 from src.services.detection.analyses_store import add_analysis
+from src.services.detection.audio_buffer import AudioBuffer
 from src.services.detection.event_promotion import maybe_promote_analysis
 from src.services.detection.frame_buffer import FrameBuffer
 from src.services.detection.motion_cache import MotionCache
@@ -76,6 +77,9 @@ class CameraIngest:
         self.frame_buffer = FrameBuffer(
             window_seconds=settings.livekit_worker_window_seconds,
             target_fps=settings.livekit_worker_target_fps,
+        )
+        self.audio_buffer = AudioBuffer(
+            window_seconds=settings.livekit_worker_window_seconds,
         )
         self._lock = asyncio.Lock()
         self._tick_task: asyncio.Task[None] | None = None
@@ -134,12 +138,14 @@ class CameraIngest:
                 return
 
             log.info(
-                "%s START detectors=%s motion=%s prior_state=%s buffered_frames=%d",
+                "%s START detectors=%s motion=%s prior_state=%s "
+                "buffered_frames=%d buffered_audio_chunks=%d",
                 self._log_tag,
                 [d.identifier for d in detectors],
                 motion_in_clip,
                 cam.state,
                 len(self.frame_buffer),
+                len(self.audio_buffer),
             )
 
             if cam.state == "closed" and not motion_in_clip:
@@ -172,7 +178,7 @@ class CameraIngest:
                 )
                 return
 
-            # Build the MP4 from the buffered window.
+            # Build the MP4 from the buffered window (video + audio).
             window = self.frame_buffer.snapshot_last_seconds(
                 self._settings.livekit_worker_window_seconds,
             )
@@ -183,10 +189,16 @@ class CameraIngest:
                     self._log_tag,
                 )
                 return
+            pcm = self.audio_buffer.snapshot_last_seconds(
+                self._settings.livekit_worker_window_seconds,
+            )
             try:
                 mp4_bytes = await frames_to_mp4(
                     window,
                     fps=self._settings.livekit_worker_target_fps,
+                    pcm=pcm if pcm else None,
+                    pcm_sample_rate=self.audio_buffer.sample_rate,
+                    pcm_num_channels=self.audio_buffer.num_channels,
                 )
             except (Mp4RemuxError, ValueError) as exc:
                 log.warning("%s mp4_remux failed: %s", self._log_tag, exc)

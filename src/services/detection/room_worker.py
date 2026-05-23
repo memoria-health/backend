@@ -5,10 +5,11 @@ listens for cameras to publish tracks, and spins up one `CameraIngest`
 per camera. It also routes inbound `motion_state` data packets from
 each wall phone into the shared `MotionCache`.
 
-We do NOT subscribe to audio in v0 — the Gemini path's `speech_heard`
-/ `speech_transcript` fields will go unfilled until a follow-up adds
-PCM-into-ffmpeg in `mp4_remux.py`. The visual detectors (fall,
-wandering, agitation, medication) are unaffected.
+Audio is consumed alongside video: `rtc.AudioStream` is asked for
+16 kHz mono int16 PCM, and each chunk is copied into the per-camera
+`AudioBuffer`. `mp4_remux.py` then layers it into the MP4 alongside
+the video frames so the Gemini prompt's `speech_heard` /
+`speech_transcript` fields actually fire.
 
 Camera identity convention (set at pairing time in
 `src/api/cameras.py`): `cam_<8 hex chars of camera.id.hex>`. We
@@ -78,6 +79,10 @@ class RoomWorker:
         # Per-identity in-flight video consumer tasks. Stopped on
         # participant_disconnected so we don't leak.
         self._video_tasks_by_identity: dict[str, asyncio.Task[None]] = {}
+        # Audio consumer tasks mirror the video map. Audio and video
+        # arrive as separate `track_subscribed` events; either can
+        # arrive first and the other is wired up when it shows.
+        self._audio_tasks_by_identity: dict[str, asyncio.Task[None]] = {}
         self._stopped = False
 
     # ── lifecycle ──────────────────────────────────────────────────
@@ -101,9 +106,13 @@ class RoomWorker:
         self._stopped = True
         # Cancel video consumers first so they don't try to push into
         # buffers as we tear ingests down.
-        for task in self._video_tasks_by_identity.values():
+        consumer_tasks = (
+            list(self._video_tasks_by_identity.values())
+            + list(self._audio_tasks_by_identity.values())
+        )
+        for task in consumer_tasks:
             task.cancel()
-        for task in self._video_tasks_by_identity.values():
+        for task in consumer_tasks:
             try:
                 await task
             except (asyncio.CancelledError, Exception):
@@ -111,6 +120,7 @@ class RoomWorker:
                 # this stage; the worker is shutting down anyway.
                 pass
         self._video_tasks_by_identity.clear()
+        self._audio_tasks_by_identity.clear()
         for ingest in self._ingests_by_identity.values():
             await ingest.stop()
         self._ingests_by_identity.clear()
@@ -189,11 +199,17 @@ class RoomWorker:
                 self.room_name, ingest.camera_id, identity,
             )
         elif track.kind == rtc.TrackKind.KIND_AUDIO:
-            # v0: don't buffer audio. See module docstring.
+            prev = self._audio_tasks_by_identity.get(identity)
+            if prev is not None and not prev.done():
+                prev.cancel()
+            consumer = asyncio.create_task(
+                self._consume_audio(track, ingest),
+                name=f"audio-consumer-{identity}",
+            )
+            self._audio_tasks_by_identity[identity] = consumer
             log.info(
-                "room_worker.audio_subscribed (not buffered) "
-                "room=%s identity=%s",
-                self.room_name, identity,
+                "room_worker.audio_subscribed room=%s camera=%s identity=%s",
+                self.room_name, ingest.camera_id, identity,
             )
 
     async def _handle_participant_left(self, participant: rtc.RemoteParticipant) -> None:
@@ -201,13 +217,14 @@ class RoomWorker:
         ingest = self._ingests_by_identity.pop(identity, None)
         if ingest is None:
             return
-        task = self._video_tasks_by_identity.pop(identity, None)
-        if task is not None and not task.done():
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
+        for task_map in (self._video_tasks_by_identity, self._audio_tasks_by_identity):
+            task = task_map.pop(identity, None)
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
         await ingest.stop()
         log.info(
             "room_worker.participant_left room=%s camera=%s identity=%s",
@@ -247,6 +264,40 @@ class RoomWorker:
         self._motion_cache.put(
             ingest.camera_id, in_motion=in_motion, received_at=time.monotonic(),
         )
+
+    # ── audio consumer ─────────────────────────────────────────────
+
+    async def _consume_audio(self, track: rtc.Track, ingest: CameraIngest) -> None:
+        """Pull PCM chunks off the LiveKit AudioStream and push into
+        the per-camera buffer. The SDK resamples to the shape we ask
+        for; we always ask for 16 kHz mono int16 — the format Gemini's
+        audio path is happiest with and the cheapest to encode into the
+        clip MP4.
+        """
+        stream = rtc.AudioStream(
+            track,
+            sample_rate=ingest.audio_buffer.sample_rate,
+            num_channels=ingest.audio_buffer.num_channels,
+        )
+        try:
+            async for event in stream:
+                frame = event.frame
+                # `frame.data` is a memoryview into the SDK's reused
+                # buffer; copy into bytes so the snapshot can outlive
+                # the next frame.
+                ingest.audio_buffer.push(
+                    data=bytes(frame.data),
+                    captured_at=time.monotonic(),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception(
+                "room_worker.audio_consumer_died room=%s camera=%s",
+                self.room_name, ingest.camera_id,
+            )
+        finally:
+            await stream.aclose()
 
     # ── video consumer ─────────────────────────────────────────────
 
