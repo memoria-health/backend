@@ -35,6 +35,30 @@ def _to_response(p: Patient) -> PatientResponse:
     return PatientResponse.model_validate(p, from_attributes=True)
 
 
+_UPLOAD_CHUNK_BYTES = 64 * 1024
+
+
+async def _read_capped_upload(file: UploadFile, *, max_bytes: int) -> bytes:
+    """Drain an `UploadFile` in 64 kB chunks, raising 413 the moment
+    the running total crosses `max_bytes`. Prevents `await
+    file.read()` from materializing an arbitrarily large multipart
+    body in RAM before the size check runs."""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(_UPLOAD_CHUNK_BYTES)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"image_bytes too large: > {max_bytes} bytes (max {max_bytes})",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 @router.get("", response_model=list[PatientResponse])
 async def list_patients(
     auth: CaregiverAuth,
@@ -179,7 +203,11 @@ async def upload_patient_photo(
         )
 
     content_type = photo.content_type or ""
-    body = await photo.read()
+    # Stream the multipart body in chunks so a malicious 500 MB upload
+    # can't OOM the backend before we get a chance to reject it. The
+    # storage layer's size check is the second line of defense; this
+    # one prevents the buffer from existing in the first place.
+    body = await _read_capped_upload(photo, max_bytes=settings.storage_max_photo_bytes)
     try:
         key = await storage.upload_patient_photo(
             patient_id=patient_id,

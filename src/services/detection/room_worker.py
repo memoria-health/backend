@@ -55,6 +55,21 @@ _WORKER_TOKEN_TTL = timedelta(hours=12)
 # in `nemara-camera-app/NemaraCam/LiveKit/LiveKitPublisher.swift`.
 _MOTION_STATE_TOPIC = "motion_state"
 
+# Reconnect backoff for the supervisor loop. Starts at 2s and
+# doubles to a 60s cap on consecutive connect failures; resets on a
+# clean connect.
+_RECONNECT_BACKOFF_INITIAL = 2.0
+_RECONNECT_BACKOFF_MAX = 60.0
+
+# Per-track consumer (audio / video) backoff. The room may stay
+# connected while a single track's stream throws — usually a brief
+# decode hiccup. Retry in-place a few times before giving up; the
+# next track_subscribed event (or a room reconnect) will spawn a
+# fresh consumer either way.
+_CONSUMER_RETRY_BACKOFF_INITIAL = 1.0
+_CONSUMER_RETRY_BACKOFF_MAX = 16.0
+_CONSUMER_MAX_RETRIES = 5
+
 
 class RoomWorker:
     """One worker, one LiveKit room, N cameras."""
@@ -84,28 +99,118 @@ class RoomWorker:
         # arrive first and the other is wired up when it shows.
         self._audio_tasks_by_identity: dict[str, asyncio.Task[None]] = {}
         self._stopped = False
+        # Supervisor task that owns the connect → wait-for-disconnect →
+        # cleanup → reconnect lifecycle. Spawned by start(), cancelled
+        # by stop(). All room state lives behind this single task; the
+        # outer worker just sees it spin until told otherwise.
+        self._supervisor_task: asyncio.Task[None] | None = None
 
     # ── lifecycle ──────────────────────────────────────────────────
 
     async def start(self) -> None:
-        if self._room is not None:
+        """Spawn the connection supervisor. Returns immediately; the
+        actual LiveKit handshake happens asynchronously.
+
+        Connection failures are NOT raised here — the supervisor's
+        backoff loop handles them so the parent DetectorWorker doesn't
+        have to retry. Surfaces only as logs.
+        """
+        if self._supervisor_task is not None:
             return
-        token = self._mint_viewer_token()
-        room = rtc.Room()
-        self._wire_room_handlers(room)
-        await room.connect(self._settings.livekit_url, token)
-        self._room = room
-        log.info(
-            "room_worker.start room=%s url=%s identity=%s",
-            self.room_name, self._settings.livekit_url, self._identity(),
+        self._supervisor_task = asyncio.create_task(
+            self._maintain_connection(),
+            name=f"room-supervisor-{self.room_name}",
         )
 
     async def stop(self) -> None:
         if self._stopped:
             return
         self._stopped = True
-        # Cancel video consumers first so they don't try to push into
-        # buffers as we tear ingests down.
+        if self._supervisor_task is not None:
+            self._supervisor_task.cancel()
+            try:
+                await self._supervisor_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._supervisor_task = None
+        await self._teardown_active_session()
+        log.info("room_worker.stop room=%s", self.room_name)
+
+    # ── connection supervisor ──────────────────────────────────────
+
+    async def _maintain_connection(self) -> None:
+        """Outer reconnect loop. Each pass:
+
+        1. Mints a fresh viewer JWT (cached creds the SDK had locally
+           may already be expired after a long disconnect).
+        2. Creates a fresh `rtc.Room`, wires handlers, calls `connect`.
+        3. Waits for a `disconnected` event from the SDK.
+        4. Tears down any ingests + consumer tasks the previous
+           connection's `track_subscribed` handlers had spawned.
+        5. Sleeps a backoff interval, then loops.
+
+        Backoff doubles from 2s up to 60s on consecutive failures so
+        we don't hammer LiveKit Cloud during an outage; on a clean
+        connect the backoff resets.
+        """
+        backoff = _RECONNECT_BACKOFF_INITIAL
+        while not self._stopped:
+            try:
+                disconnect_reason = await self._connect_and_wait()
+                log.warning(
+                    "room_worker.disconnected room=%s reason=%s — reconnecting",
+                    self.room_name, disconnect_reason,
+                )
+                # A clean session reached steady state, so reset
+                # backoff: this disconnect was a network blip, not a
+                # repeated mint/connect failure.
+                backoff = _RECONNECT_BACKOFF_INITIAL
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception(
+                    "room_worker.connect_failed room=%s — retry in %.1fs",
+                    self.room_name, backoff,
+                )
+            finally:
+                await self._teardown_active_session()
+            if self._stopped:
+                break
+            try:
+                await asyncio.sleep(backoff)
+            except asyncio.CancelledError:
+                raise
+            backoff = min(backoff * 2, _RECONNECT_BACKOFF_MAX)
+
+    async def _connect_and_wait(self) -> str:
+        """One connect cycle. Returns the disconnect reason the SDK
+        gives us when the room drops; raises on connect-time failures
+        so the supervisor backs off."""
+        token = self._mint_viewer_token()
+        room = rtc.Room()
+        disconnected = asyncio.Event()
+        disconnect_reason: dict[str, str] = {"reason": "unknown"}
+
+        @room.on("disconnected")
+        def _on_disconnected(reason: object = None) -> None:
+            disconnect_reason["reason"] = str(reason) if reason is not None else "unknown"
+            disconnected.set()
+
+        self._wire_room_handlers(room)
+        await room.connect(self._settings.livekit_url, token)
+        self._room = room
+        log.info(
+            "room_worker.connected room=%s url=%s identity=%s",
+            self.room_name, self._settings.livekit_url, self._identity(),
+        )
+
+        await disconnected.wait()
+        return disconnect_reason["reason"]
+
+    async def _teardown_active_session(self) -> None:
+        """Cancel consumer tasks, stop ingests, disconnect the room.
+        Safe to call multiple times — every step is no-op when there's
+        nothing to clean up."""
         consumer_tasks = (
             list(self._video_tasks_by_identity.values())
             + list(self._audio_tasks_by_identity.values())
@@ -116,18 +221,24 @@ class RoomWorker:
             try:
                 await task
             except (asyncio.CancelledError, Exception):
-                # Cancellation + tear-down errors are uninteresting at
-                # this stage; the worker is shutting down anyway.
                 pass
         self._video_tasks_by_identity.clear()
         self._audio_tasks_by_identity.clear()
-        for ingest in self._ingests_by_identity.values():
-            await ingest.stop()
+        for ingest in list(self._ingests_by_identity.values()):
+            try:
+                await ingest.stop()
+            except Exception:
+                log.exception(
+                    "room_worker.ingest_stop_failed room=%s camera=%s",
+                    self.room_name, ingest.camera_id,
+                )
         self._ingests_by_identity.clear()
         if self._room is not None:
-            await self._room.disconnect()
+            try:
+                await self._room.disconnect()
+            except Exception:
+                log.exception("room_worker.room_disconnect_failed room=%s", self.room_name)
             self._room = None
-        log.info("room_worker.stop room=%s", self.room_name)
 
     # ── LiveKit event handlers ─────────────────────────────────────
 
@@ -269,67 +380,105 @@ class RoomWorker:
 
     async def _consume_audio(self, track: rtc.Track, ingest: CameraIngest) -> None:
         """Pull PCM chunks off the LiveKit AudioStream and push into
-        the per-camera buffer. The SDK resamples to the shape we ask
-        for; we always ask for 16 kHz mono int16 — the format Gemini's
-        audio path is happiest with and the cheapest to encode into the
-        clip MP4.
+        the per-camera buffer. Wrapped in a bounded retry loop so a
+        transient decode error doesn't permanently silence audio for
+        the rest of the camera's session — we re-open the stream up
+        to `_CONSUMER_MAX_RETRIES` times with exponential backoff.
+
+        16 kHz mono int16 is the shape Gemini's audio path is happiest
+        with and the cheapest to encode into the clip MP4.
         """
-        stream = rtc.AudioStream(
-            track,
-            sample_rate=ingest.audio_buffer.sample_rate,
-            num_channels=ingest.audio_buffer.num_channels,
+        await self._consume_with_retry(
+            label="audio",
+            ingest=ingest,
+            open_stream=lambda: rtc.AudioStream(
+                track,
+                sample_rate=ingest.audio_buffer.sample_rate,
+                num_channels=ingest.audio_buffer.num_channels,
+            ),
+            consume_one=lambda event: ingest.audio_buffer.push(
+                data=bytes(event.frame.data),
+                captured_at=time.monotonic(),
+            ),
         )
-        try:
-            async for event in stream:
-                frame = event.frame
-                # `frame.data` is a memoryview into the SDK's reused
-                # buffer; copy into bytes so the snapshot can outlive
-                # the next frame.
-                ingest.audio_buffer.push(
-                    data=bytes(frame.data),
-                    captured_at=time.monotonic(),
-                )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception(
-                "room_worker.audio_consumer_died room=%s camera=%s",
-                self.room_name, ingest.camera_id,
-            )
-        finally:
-            await stream.aclose()
 
     # ── video consumer ─────────────────────────────────────────────
 
     async def _consume_video(self, track: rtc.Track, ingest: CameraIngest) -> None:
         """Pull frames off the LiveKit VideoStream, convert to I420,
-        copy into bytes, and push into the per-camera buffer. Runs
-        until cancelled (participant left, worker shutting down).
-        """
-        stream = rtc.VideoStream(track)
-        try:
-            async for event in stream:
-                frame = event.frame
-                # Convert to I420 if needed. `frame.convert` allocates
-                # a fresh frame; we then copy `.data` into a bytes
-                # object so the buffer can outlive the SDK frame.
-                if frame.type != rtc.VideoBufferType.I420:
-                    frame = frame.convert(rtc.VideoBufferType.I420)
-                ingest.frame_buffer.push(
-                    width=frame.width,
-                    height=frame.height,
-                    data=bytes(frame.data),
-                    captured_at=time.monotonic(),
-                )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception(
-                "room_worker.video_consumer_died room=%s camera=%s",
-                self.room_name, ingest.camera_id,
+        copy into bytes, and push into the per-camera buffer. Same
+        bounded retry pattern as `_consume_audio`."""
+
+        def _push_video(event: rtc.VideoEvent) -> None:
+            frame = event.frame
+            if frame.type != rtc.VideoBufferType.I420:
+                frame = frame.convert(rtc.VideoBufferType.I420)
+            ingest.frame_buffer.push(
+                width=frame.width,
+                height=frame.height,
+                data=bytes(frame.data),
+                captured_at=time.monotonic(),
             )
-        finally:
-            await stream.aclose()
+
+        await self._consume_with_retry(
+            label="video",
+            ingest=ingest,
+            open_stream=lambda: rtc.VideoStream(track),
+            consume_one=_push_video,
+        )
+
+    async def _consume_with_retry(
+        self,
+        *,
+        label: str,
+        ingest: CameraIngest,
+        open_stream,
+        consume_one,
+    ) -> None:
+        """Shared retry harness for `_consume_audio` / `_consume_video`.
+
+        Each retry opens a fresh stream — the SDK invalidates an
+        AudioStream / VideoStream after a consume-side error, and
+        re-using it surfaces the same exception immediately.
+        Cancellation propagates cleanly (participant_left + worker
+        teardown both flow through here).
+        """
+        retries = 0
+        backoff = _CONSUMER_RETRY_BACKOFF_INITIAL
+        while True:
+            stream = open_stream()
+            try:
+                async for event in stream:
+                    consume_one(event)
+                # Stream ended cleanly (LiveKit closed the track) —
+                # exit the retry loop; track_subscribed will fire
+                # again if the publisher re-publishes.
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                retries += 1
+                log.exception(
+                    "room_worker.%s_consumer_error room=%s camera=%s retry=%d",
+                    label, self.room_name, ingest.camera_id, retries,
+                )
+                if retries >= _CONSUMER_MAX_RETRIES:
+                    log.error(
+                        "room_worker.%s_consumer_giving_up room=%s camera=%s "
+                        "after %d retries",
+                        label, self.room_name, ingest.camera_id, retries,
+                    )
+                    return
+            finally:
+                try:
+                    await stream.aclose()
+                except Exception:
+                    pass
+            try:
+                await asyncio.sleep(backoff)
+            except asyncio.CancelledError:
+                raise
+            backoff = min(backoff * 2, _CONSUMER_RETRY_BACKOFF_MAX)
 
     # ── helpers ────────────────────────────────────────────────────
 
