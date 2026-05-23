@@ -107,6 +107,24 @@ class Settings(BaseSettings):
     # that a shared URL goes stale fast.
     storage_signed_url_default_ttl_seconds: int = Field(ge=30, le=3600, default=600)
 
+    # ── APNs (Phase 4) ──────────────────────────────────────────
+    # Apple Developer credentials for HTTP/2 push. team_id +
+    # apns_key_id identify the auth key file; apns_auth_key is the
+    # PEM contents of the .p8 (ES256 ECDSA P-256 private key) as a
+    # single string in the env (newlines preserved). bundle_id matches
+    # the caregiver app's CFBundleIdentifier. environment is "sandbox"
+    # for Xcode dev builds and "production" for TestFlight + App Store.
+    # All default empty so tests / local dev don't need real APNs creds;
+    # the push dispatcher noops when team_id is empty.
+    apns_team_id: str = Field(default="")
+    apns_key_id: str = Field(default="")
+    apns_auth_key: str = Field(default="")
+    apns_bundle_id: str = Field(default="com.elephantlabs.nemara.caregiver")
+    apns_environment: Literal["sandbox", "production"] = "sandbox"
+    # Token TTL refresh policy. Apple rejects JWTs older than 60 min;
+    # we refresh slightly under that to leave headroom.
+    apns_jwt_lifetime_seconds: int = Field(ge=60, le=3600, default=3300)
+
 
 def get_settings() -> Settings:
     return Settings()

@@ -287,6 +287,32 @@ create index analyses_patient_captured_idx
   on public.analyses(patient_id, captured_at desc);
 
 
+-- ── caregiver_devices ────────────────────────────────────────────
+-- One row per APNs device token the caregiver has registered. A
+-- caregiver may have multiple tokens (phone + iPad + a re-installed
+-- app on the same phone) — `(caregiver_id)` is NOT unique. The token
+-- itself IS unique so that a re-registration from the same device
+-- (token regenerated post-install) idempotently replaces the prior row.
+create table public.caregiver_devices (
+  id              uuid primary key default gen_random_uuid(),
+  caregiver_id    uuid not null references public.caregivers(id) on delete cascade,
+  apns_token      text not null,
+  bundle_id       text not null,
+  -- "sandbox" for Xcode-built debug builds, "production" for TestFlight /
+  -- App Store. The push dispatcher uses this to pick the right APNs
+  -- endpoint (`api.sandbox.push.apple.com` vs `api.push.apple.com`).
+  environment     text not null check (environment in ('sandbox','production')),
+  created_at      timestamptz not null default now(),
+  updated_at      timestamptz not null default now()
+);
+create unique index caregiver_devices_token_uniq on public.caregiver_devices(apns_token);
+create index caregiver_devices_caregiver_idx on public.caregiver_devices(caregiver_id);
+
+create trigger caregiver_devices_set_updated_at
+  before update on public.caregiver_devices
+  for each row execute function public.set_updated_at();
+
+
 -- ══════════════════════════════════════════════════════════════════
 -- ROW-LEVEL SECURITY
 -- ══════════════════════════════════════════════════════════════════
@@ -330,6 +356,10 @@ create policy events_owner on public.events
 
 alter table public.analyses enable row level security;
 create policy analyses_owner on public.analyses
+  for all using (caregiver_id = auth.uid()) with check (caregiver_id = auth.uid());
+
+alter table public.caregiver_devices enable row level security;
+create policy caregiver_devices_owner on public.caregiver_devices
   for all using (caregiver_id = auth.uid()) with check (caregiver_id = auth.uid());
 
 

@@ -37,6 +37,10 @@ dependencies = [
     # to pull frames + PCM off the SFU instead of receiving multipart
     # clip uploads from the wall phone.
     "livekit>=1.0",
+    # HTTP/2 support for httpx. APNs requires HTTP/2 on the push
+    # endpoint, and Phase 4's clip-archival path benefits from
+    # connection multiplexing against Supabase Storage as well.
+    "h2>=4.1",
 ]
 
 [project.scripts]

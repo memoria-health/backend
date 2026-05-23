@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING
 from uuid import UUID
 
 from src.db.camera import Camera
+from src.services import push
 from src.services.detection.analyses_store import add_analysis
 from src.services.detection.audio_buffer import AudioBuffer
 from src.services.detection.event_promotion import maybe_promote_analysis
@@ -257,6 +258,21 @@ class CameraIngest:
                 detector_fields=result.detector_fields,
             )
             await session.commit()
+
+            # Fan APNs out after the events row is committed — a
+            # rolled-back tick must not leave a phantom push trail.
+            # Fire-and-forget: tick latency stays bound by Gemini, not
+            # by Apple's push endpoint.
+            if promotion.fired:
+                fired_ids = [ev.id for ev in promotion.fired]
+                asyncio.create_task(
+                    push.dispatch_event_pushes(
+                        sessionmaker=self._sessionmaker,
+                        event_ids=fired_ids,
+                        settings=self._settings,
+                    ),
+                    name=f"push-dispatch-{self.camera_id}",
+                )
 
             log.info(
                 "%s DONE provider=%s people=%s(%s) motion=%s state=%s/%s "

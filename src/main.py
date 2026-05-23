@@ -16,6 +16,7 @@ from fastapi import FastAPI
 from src.api.cameras import router as cameras_router
 from src.api.caregivers import router as caregivers_router
 from src.api.detectors import router as detectors_router
+from src.api.devices import router as devices_router
 from src.api.events import router as events_router
 from src.api.health import router as health_router
 from src.api.livekit import router as livekit_router
@@ -26,10 +27,12 @@ from src.api.talk import router as talk_router
 from src.db import analysis as _analysis  # noqa: F401
 from src.db import camera as _camera  # noqa: F401
 from src.db import caregiver as _caregiver  # noqa: F401
+from src.db import caregiver_device as _caregiver_device  # noqa: F401
 from src.db import detector as _detector  # noqa: F401
 from src.db import event as _event  # noqa: F401
 from src.db import patient as _patient  # noqa: F401
 from src.db.session import get_engine, get_sessionmaker
+from src.services import push
 from src.services.detection.worker import DetectorWorker
 from src.settings import get_settings
 
@@ -52,6 +55,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         await worker.stop()
+        await push.close()
         await engine.dispose()
 
 
@@ -67,6 +71,8 @@ def create_app() -> FastAPI:
     app.include_router(detectors_router)
     app.include_router(events_router)
     app.include_router(cameras_router)
+    # APNs device-token registration.
+    app.include_router(devices_router)
     # Pairing flow + LiveKit token minting.
     app.include_router(pairing_router)
     app.include_router(livekit_router)
