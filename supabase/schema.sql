@@ -109,6 +109,11 @@ create table public.patients (
   battery_percent int  check (battery_percent between 0 and 100),
   -- Caregiver-editable.
   cameras_paused  boolean not null default false,
+  -- Bucket-relative key in `patient-photos` (e.g. "{patient_id}.jpg").
+  -- NULL until the caregiver uploads an avatar; the roster + header
+  -- fall back to initials while NULL. The signed URL is minted at
+  -- read time by GET /v1/patients/{id}/photo-url.
+  photo_storage_key text,
   created_at      timestamptz not null default now(),
   updated_at      timestamptz not null default now()
 );

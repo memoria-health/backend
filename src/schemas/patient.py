@@ -54,8 +54,21 @@ class PatientResponse(BaseModel):
     last_event_at: datetime | None
     battery_percent: BatteryPct | None
     cameras_paused: bool
+    photo_storage_key: str | None
     created_at: datetime
     updated_at: datetime
+
+
+class PhotoURLResponse(BaseModel):
+    """Returned by `GET /v1/patients/{id}/photo-url`. Signed URL is
+    short-lived (default 10 min). The caregiver app re-mints on every
+    AsyncImage refresh; iOS's NSURLCache handles the bytes-side
+    caching."""
+
+    model_config = ConfigDict(frozen=True)
+
+    url: str
+    expires_in_seconds: int
 
 
 class CreatePatientRequest(BaseModel):

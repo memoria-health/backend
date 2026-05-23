@@ -10,20 +10,23 @@ All endpoints require CaregiverAuth. 404 (not 403) for cross-account
 attempts so a probing client can't discover patient IDs.
 """
 
+import logging
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, File, HTTPException, UploadFile, status
 
-from src.api.deps import CaregiverAuth, SessionDep
+from src.api.deps import CaregiverAuth, SessionDep, SettingsDep
 from src.db.patient import Patient
+from src.errors import StorageError
 from src.repos import patient_repo
 from src.schemas.patient import (
     CreatePatientRequest,
     PatientResponse,
+    PhotoURLResponse,
     UpdatePatientRequest,
 )
-from src.services import onboarding
+from src.services import onboarding, storage
 
 router = APIRouter(prefix="/v1/patients", tags=["patient"])
 
@@ -145,3 +148,142 @@ async def delete_patient(
             detail="patient_not_found",
         )
     await session.commit()
+
+
+# ── Patient avatar (POST/GET/DELETE /v1/patients/{id}/photo) ────────
+
+
+@router.post(
+    "/{patient_id}/photo",
+    response_model=PatientResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def upload_patient_photo(
+    patient_id: UUID,
+    auth: CaregiverAuth,
+    session: SessionDep,
+    settings: SettingsDep,
+    photo: UploadFile = File(...),
+) -> PatientResponse:
+    """Upload (or replace) the patient's avatar.
+
+    Multipart with one part: `photo` (JPEG/PNG, ≤ storage_max_photo_bytes
+    enforced server-side — iOS down-samples before upload). The same
+    storage key is reused across re-uploads (one photo per patient),
+    so this idempotently overwrites.
+    """
+    p = await patient_repo.find_by_id(session, patient_id, caregiver_id=auth.id)
+    if p is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="patient_not_found",
+        )
+
+    content_type = photo.content_type or ""
+    body = await photo.read()
+    try:
+        key = await storage.upload_patient_photo(
+            patient_id=patient_id,
+            image_bytes=body,
+            content_type=content_type,
+            settings=settings,
+        )
+    except StorageError as exc:
+        msg = str(exc)
+        if "too large" in msg:
+            raise HTTPException(
+                # 413 — name changed in Starlette; both constants resolve
+                # to 413 so the wire code is identical either way.
+                status_code=413,
+                detail=msg,
+            ) from exc
+        if "unsupported content type" in msg or "empty" in msg:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=msg,
+            ) from exc
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail=msg,
+        ) from exc
+
+    p = await patient_repo.update_partial(
+        session, patient_id,
+        caregiver_id=auth.id,
+        fields={"photo_storage_key": key},
+    )
+    if p is None:
+        # Patient deleted mid-flight — the upload is now orphaned but
+        # that's tolerable (key is keyed by patient_id; new patient
+        # with same UUID can't happen).
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="patient_not_found",
+        )
+    await session.commit()
+    return _to_response(p)
+
+
+@router.get("/{patient_id}/photo-url", response_model=PhotoURLResponse)
+async def get_patient_photo_url(
+    patient_id: UUID,
+    auth: CaregiverAuth,
+    session: SessionDep,
+    settings: SettingsDep,
+) -> PhotoURLResponse:
+    """Mint a short-lived signed URL for the patient's avatar. 404 if
+    the patient doesn't exist or isn't owned; 404 (not 409) if the
+    avatar hasn't been uploaded yet — the caregiver app falls back to
+    initials on any non-200."""
+    p = await patient_repo.find_by_id(session, patient_id, caregiver_id=auth.id)
+    if p is None or p.photo_storage_key is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="photo_not_found",
+        )
+    url = await storage.signed_url(
+        bucket=settings.storage_bucket_patient_photos,
+        key=p.photo_storage_key,
+        settings=settings,
+    )
+    return PhotoURLResponse(
+        url=url,
+        expires_in_seconds=settings.storage_signed_url_default_ttl_seconds,
+    )
+
+
+@router.delete(
+    "/{patient_id}/photo",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
+)
+async def delete_patient_photo(
+    patient_id: UUID,
+    auth: CaregiverAuth,
+    session: SessionDep,
+    settings: SettingsDep,
+) -> None:
+    """Remove the avatar. Clears `photo_storage_key` and deletes the
+    underlying Supabase Storage object. Idempotent — 204 even when
+    there was no prior photo."""
+    p = await patient_repo.find_by_id(session, patient_id, caregiver_id=auth.id)
+    if p is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="patient_not_found",
+        )
+    if p.photo_storage_key is None:
+        return
+    prior_key = p.photo_storage_key
+    await patient_repo.update_partial(
+        session, patient_id, caregiver_id=auth.id, fields={"photo_storage_key": None},
+    )
+    await session.commit()
+    # Storage delete after DB commit — if it fails, the row already
+    # forgot the key; the orphaned object can be cleaned up out-of-band.
+    try:
+        await storage.delete_object(
+            bucket=settings.storage_bucket_patient_photos,
+            key=prior_key,
+            settings=settings,
+        )
+    except StorageError as exc:
+        # Don't fail the API call; the caller's intent is satisfied
+        # (DB row says no photo).
+        logging.getLogger(__name__).warning(
+            "patient_photo.delete_object_failed key=%s err=%s", prior_key, exc,
+        )

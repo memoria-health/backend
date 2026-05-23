@@ -35,3 +35,4 @@ class Patient(Base):
     home_address: Mapped[str | None] = mapped_column(String(500), default=None)
     last_event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     battery_percent: Mapped[int | None] = mapped_column(Integer, default=None)
+    photo_storage_key: Mapped[str | None] = mapped_column(String, default=None)
