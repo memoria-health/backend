@@ -287,7 +287,15 @@ create table public.analyses (
   motion_in_clip  boolean not null,
   state_after     text not null check (state_after in ('open', 'closed')),
   captured_at     timestamptz not null,
-  created_at      timestamptz not null default now()
+  created_at      timestamptz not null default now(),
+  -- Idempotency guard: at most one analysis per camera per moment.
+  -- The in-process per-camera asyncio.Lock prevents overlap on a
+  -- live worker, but a worker restart at the wrong moment can
+  -- otherwise produce a duplicate row for the same tick. This
+  -- constraint is belt-and-braces: the second INSERT fails cleanly
+  -- with sqlalchemy.exc.IntegrityError, which the tick body's
+  -- exception handler swallows.
+  constraint analyses_camera_captured_at_uniq unique (camera_id, captured_at)
 );
 
 -- Newest-first per camera (active-camera resolution + debugging UIs).
