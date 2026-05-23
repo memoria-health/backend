@@ -6,10 +6,11 @@ the orchestration layer above `src/repos/` (DB CRUD) and `src/db/`
 `nemara-temp-dashboard/lib/{detectors,providers,camera-state,extract-frames}.ts`
 1:1 so the port is reviewable side-by-side.
 
-Phase 0 wires this synchronously into `POST /v1/clips/ingest`. Phase 2
-will run it as a long-running asyncio worker that subscribes to
-LiveKit rooms — the same modules just driven by a different input
-loop.
+Driven by an in-process asyncio task tree (`DetectorWorker`) that
+joins LiveKit rooms as a viewer participant and runs the pipeline
+on a per-camera 10s tick. The provider / state-machine / analyses /
+event-promotion modules are transport-agnostic — `camera_ingest.py`
+is the orchestrator that ties them together.
 
 Module layout:
     prompt.py            — BASE_PROMPT + people_present (always-on) +
@@ -23,4 +24,11 @@ Module layout:
     state_machine.py     — open/closed transitions per camera
     analyses_store.py    — INSERT into `analyses`
     event_promotion.py   — analysis → event row when something fires
+    ── Subscriber-bot ──
+    worker.py            — DetectorWorker (lifespan entry)
+    room_worker.py       — one RoomWorker per LiveKit room
+    camera_ingest.py     — one CameraIngest per camera; the tick body
+    frame_buffer.py      — I420 ring of recent video frames
+    mp4_remux.py         — frames → MP4 via ffmpeg stdin pipe
+    motion_cache.py      — per-camera motion_state heartbeat cache
 """

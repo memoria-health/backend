@@ -76,7 +76,6 @@ async def pair_camera(
         camera_id=cam.id,
         patient_id=cam.patient_id,
         livekit_url=settings.livekit_url,
-        livekit_token_endpoint=f"{backend_base_url}/v1/livekit/token",
         livekit_identity=cam.livekit_identity or f"cam_{cam.id.hex[:8]}",
         livekit_room=cam.livekit_room or f"patient_{cam.patient_id}",
         backend_base_url=backend_base_url,

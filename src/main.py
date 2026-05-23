@@ -39,10 +39,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Touch the engine so the lazy `lru_cache` factory binds at startup
     # instead of on the first request — surfaces bad NEMARA_DB_URL early.
     engine = get_engine()
-    # Phase 2: in-process detector subscriber-bot. Default off; flip
-    # NEMARA_LIVEKIT_WORKER_ENABLED=true to enable. Webhook handler
-    # in `/v1/livekit/webhooks` reads `app.state.detector_worker` to
-    # dispatch participant_joined/left events.
+    # Phase 2: in-process detector subscriber-bot. Webhook-driven; the
+    # `/v1/livekit/webhooks` route reads `app.state.detector_worker`
+    # to dispatch participant_joined/left events. Worker idles at
+    # zero cost when no rooms are active.
     worker = DetectorWorker(
         settings=get_settings(), sessionmaker=get_sessionmaker(),
     )

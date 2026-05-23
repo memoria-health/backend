@@ -116,9 +116,10 @@ the camera's `motion_state` data-packet heartbeats.
      `closed`; `event_promotion.py` writes `events` rows with
      30-second dedup per `(patient, detector)`.
 
-Defaults are operator-controlled: `NEMARA_LIVEKIT_WORKER_ENABLED=false`
-keeps the worker dormant. Flip it to `true` on the backend to start
-joining rooms as webhooks arrive.
+The worker is webhook-driven and zero-cost when idle: until a wall
+phone is paired and publishing, no rooms are joined and no SDK
+connections are open. Configure LiveKit Cloud's webhook URL to point
+at `{backend}/v1/livekit/webhooks` to wire it up.
 
 ## Caregiver Talk mode (Phase 3)
 

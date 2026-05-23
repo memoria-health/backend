@@ -78,7 +78,6 @@ class PairResponse(BaseModel):
     camera_id: UUID
     patient_id: UUID
     livekit_url: str
-    livekit_token_endpoint: str  # absolute URL the phone POSTs to for fresh JWTs
     livekit_identity: str
     livekit_room: str
     backend_base_url: str

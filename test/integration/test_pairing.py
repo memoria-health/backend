@@ -55,7 +55,7 @@ def fast_bcrypt(monkeypatch):
     monkeypatch.setattr(
         "src.api.deps.get_settings_dep", lambda: fast,
     )
-    # The pairing/clips/livekit routes use SettingsDep (which calls
+    # The pairing + livekit routes use SettingsDep (which calls
     # get_settings_dep via FastAPI Depends) — overriding the dep is
     # how we wire the fast settings through.
     return fast
@@ -217,12 +217,10 @@ async def test_pair_exchanges_code_for_api_key(
     assert UUID(body["patient_id"]) == UUID(pid)
     # In tests LIVEKIT_URL may be empty; just assert the field is a string.
     assert isinstance(body["livekit_url"], str)
-    assert body["livekit_token_endpoint"].endswith("/v1/livekit/token")
     assert body["livekit_identity"] == f"cam_{camera_id.hex[:8]}"
     assert body["livekit_room"] == f"patient_{pid}"
     assert body["backend_base_url"].startswith("http://")
     assert "/v1/cameras/pair" not in body["backend_base_url"]
-    assert body["livekit_token_endpoint"].startswith(body["backend_base_url"])
 
     # DB-side: api_key bcrypts against the stored hash; pairing fields
     # are NULL after exchange.

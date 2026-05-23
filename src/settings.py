@@ -61,11 +61,10 @@ class Settings(BaseSettings):
 
     # ── Detector subscriber-bot (Phase 2) ───────────────────────
     # The bot lives inside the FastAPI process as an asyncio task tree
-    # that subscribes to LiveKit rooms and runs the same detector
-    # pipeline `/v1/clips/ingest` used to. Default off — flip
-    # NEMARA_LIVEKIT_WORKER_ENABLED=true on the backend to turn it on.
-    livekit_worker_enabled: bool = Field(default=False)
-    # 10s tick cadence matches Phase 0's wall-phone clip cadence.
+    # that subscribes to LiveKit rooms and runs the detector pipeline.
+    # It's webhook-driven (joins rooms only when LiveKit Cloud tells us
+    # a camera has connected), so it idles at zero cost until a wall
+    # phone is paired and publishing.
     livekit_worker_tick_seconds: int = Field(ge=5, le=60, default=10)
     # Sliding window the tick re-muxes to MP4 for Gemini. 15s matches
     # the dashboard's clip length.

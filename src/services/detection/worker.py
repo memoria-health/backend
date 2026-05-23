@@ -11,11 +11,14 @@ lifespan. It owns:
 The worker doesn't poll the DB on a timer. Discovery is webhook-driven
 — `src/api/livekit_webhooks.py` calls `ensure_room_joined()` and
 `ensure_room_left_if_empty()` as LiveKit Cloud fires
-`participant_joined` / `participant_left`.
+`participant_joined` / `participant_left`. Until a wall phone is
+paired and publishing, the worker is genuinely zero-cost: no rooms
+joined, no SDK connections open.
 
-Gated by `NEMARA_LIVEKIT_WORKER_ENABLED`. When false, `start()` is a
-no-op and `ensure_*` methods log+return — the rest of the backend is
-unaffected.
+`start()` short-circuits if `LIVEKIT_URL` / `LIVEKIT_API_KEY` /
+`LIVEKIT_API_SECRET` aren't configured — the worker has nothing to
+mint tokens with, so we log loudly and skip the lifespan attach
+rather than letting the first webhook crash.
 """
 
 from __future__ import annotations
@@ -55,15 +58,8 @@ class DetectorWorker:
         self._lock = asyncio.Lock()
         self._started = False
 
-    @property
-    def enabled(self) -> bool:
-        return self._settings.livekit_worker_enabled
-
     async def start(self) -> None:
         if self._started:
-            return
-        if not self.enabled:
-            log.info("detector_worker.start skipped (worker disabled)")
             return
         if not (self._settings.livekit_url
                 and self._settings.livekit_api_key
@@ -74,7 +70,7 @@ class DetectorWorker:
             )
             return
         self._started = True
-        log.info("detector_worker.start enabled — awaiting webhook discovery")
+        log.info("detector_worker.start awaiting webhook discovery")
 
     async def stop(self) -> None:
         if not self._started:

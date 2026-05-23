@@ -1,13 +1,12 @@
 """ORM model for the `analyses` table.
 
-One row per detector-pipeline tick (~10s per camera). Inserted by the
-`POST /v1/clips/ingest` route handler in Phase 0 (synchronous LLM call
-inside the route) and by the detector worker in Phase 2 (asyncio task
-subscribing to LiveKit rooms).
+One row per detector-pipeline tick (~10s per camera). Inserted by
+`CameraIngest._run_tick` in `src/services/detection/camera_ingest.py`
+as the subscriber-bot consumes LiveKit tracks.
 
 Not exposed on the wire to the caregiver app — `events` is the
 user-facing surface. Analyses are for debugging (Supabase Studio) and
-the detector worker itself (active-camera resolution for Talk
+for the detector worker itself (active-camera resolution for Talk
 routing).
 """
 
