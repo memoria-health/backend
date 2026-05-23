@@ -29,10 +29,14 @@ dependencies = [
     # Matches the dashboard's bcryptjs(rounds=10) — see scripts/e2e/cli.py
     # for the verification path.
     "bcrypt>=4.2",
-    # LiveKit server SDK — token minting. Phase 0 uses only the
-    # `AccessToken` class. Phase 2's detector worker will add livekit-rtc
-    # for the subscriber-bot.
+    # LiveKit server SDK — token minting + `WebhookReceiver` for
+    # signature validation on the `/v1/livekit/webhooks` route.
     "livekit-api>=1.0",
+    # LiveKit participant SDK — the detector subscriber-bot
+    # (Phase 2) uses `rtc.Room`, `rtc.VideoStream`, `rtc.AudioStream`
+    # to pull frames + PCM off the SFU instead of receiving multipart
+    # clip uploads from the wall phone.
+    "livekit>=1.0",
 ]
 
 [project.scripts]

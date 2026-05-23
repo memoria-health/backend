@@ -1,8 +1,8 @@
 # nemara-backend
 
-FastAPI + Supabase backend for the **Nemara caregiver iOS app** and **wall-phone clip ingest**.
+FastAPI + Supabase backend for the **Nemara caregiver iOS app** and the **detector subscriber-bot**.
 
-Identity, patients, cameras, detectors, events, plus the Phase 0 detector pipeline: 6-digit camera pairing, per-camera api-keys, LiveKit token minting, and clip ingest (`POST /v1/clips/ingest`) with the Gemini → OpenAI provider fallback ported from `nemara-temp-dashboard`. The detector worker that subscribes to LiveKit egress (Phase 2) and APNs push (Phase 4) are out of scope here.
+Identity, patients, cameras, detectors, events, plus the Phase 0–3 detector pipeline: 6-digit camera pairing, per-camera api-keys, LiveKit token minting, an in-process **LiveKit subscriber-bot** (Phase 2) that pulls frames + audio off the SFU and runs the same Gemini → OpenAI provider fallback ported from `nemara-temp-dashboard`, and Phase 3 caregiver Talk mode. APNs push and event-clip archival via LiveKit Track Egress (Phase 4) are out of scope here.
 
 ## Quick start
 
@@ -33,8 +33,8 @@ nemara-backend/
 │   │   ├── detectors.py     #   /v1/detectors...
 │   │   ├── events.py        #   /v1/events...
 │   │   ├── pairing.py       #   /v1/cameras/pair  (Phase 0)
-│   │   ├── clips.py         #   /v1/clips/ingest  (Phase 0)
 │   │   ├── livekit.py       #   /v1/livekit/token (Phase 0/1/3)
+│   │   ├── livekit_webhooks.py #   /v1/livekit/webhooks (Phase 2 — subscriber-bot discovery)
 │   │   └── talk.py          #   /v1/patients/{id}/active-camera + /talk/{start,end} (Phase 3)
 │   ├── db/                  # SQLAlchemy ORM models (one per table)
 │   ├── repos/               # pure async queries; no business logic
@@ -46,10 +46,17 @@ nemara-backend/
 │   │       ├── prompt.py       # build_prompt_and_schema + BASE_PROMPT + always-on people_present
 │   │       ├── registry.py     # load enabled detectors for a camera
 │   │       ├── providers/      # gemini.py, openai.py, _parse.py, types.py
-│   │       ├── frame_extraction.py
+│   │       ├── frame_extraction.py  # ffmpeg subprocess (used by OpenAI fallback)
 │   │       ├── state_machine.py # open↔closed per-camera state
 │   │       ├── analyses_store.py # INSERT into analyses
-│   │       └── event_promotion.py # analysis → events row promotion
+│   │       ├── event_promotion.py # analysis → events row promotion
+│   │       │   ── Phase 2 subscriber-bot ──
+│   │       ├── worker.py          # DetectorWorker — lifespan entry, owns the task tree
+│   │       ├── room_worker.py     # one RoomWorker per LiveKit room
+│   │       ├── camera_ingest.py   # one CameraIngest per camera; 10s tick loop
+│   │       ├── frame_buffer.py    # I420 ring of recent video frames
+│   │       ├── mp4_remux.py       # frames → MP4 via ffmpeg stdin pipe
+│   │       └── motion_cache.py    # per-camera latest motion_state heartbeat
 │   └── utils/
 ├── supabase/
 │   ├── config.toml          # local Supabase config
@@ -75,35 +82,43 @@ nemara-backend/
 - **Snake_case JSON** on the wire (FastAPI / Pydantic default). iOS Codable models map to camelCase via explicit `CodingKeys`.
 - **Pinned to Python 3.13** via `.python-version`. Python 3.14 silently skips `.pth` files starting with `_`, which breaks hatchling's editable install (`_editable_impl_*`). Don't bump until upstream fixes this.
 
-## Detector pipeline (Phase 0)
+## Detector pipeline
 
-The dashboard's detector pipeline lives here, in Python, behind
-`POST /v1/clips/ingest`:
+The dashboard's detector pipeline lives here, in Python, behind an
+in-process **LiveKit subscriber-bot** (Phase 2). The wall phone
+publishes to a `patient_<id>` LiveKit room; the backend joins the
+same room as a viewer-role participant and consumes video frames +
+the camera's `motion_state` data-packet heartbeats.
 
-1. **Auth:** wall phone presents `Bearer <api_key>` (bcrypt-hashed on
-   the camera row; minted via `POST /v1/cameras/pair` after a
-   caregiver-generated 6-digit code).
-2. **Detector load:** `services/detection/registry.py` picks up that
-   camera's enabled detectors (the `people_present` always-on block
-   is implicit — see `prompt.py`).
-3. **Provider call:** `gemini.py` first (MP4 inline, env-tunable fps),
-   falls back to `openai.py` (ffmpeg-extracted frames @ 5fps × 480px).
-   `_parse.py` validates the JSON output and clamps `*_confidence` to
-   `[0, 1]`.
-4. **State machine:** `state_machine.py` flips `cameras.state` between
-   `open` and `closed` based on `cameras.close_threshold` consecutive
-   ticks with no people + no motion. Closed cameras short-circuit the
-   LLM call.
-5. **Analyses row:** every tick (or skipped tick) lands in `analyses`
-   for Studio / detector-worker (Phase 2) consumption.
-6. **Event promotion:** `event_promotion.py` watches for
-   `<id>_detected: true` (+ confidence gate for built-ins) and inserts
-   a row into `events`; Realtime broadcasts to the iOS caregiver app.
-   30-second dedup per `(patient, detector)`.
+1. **Discovery:** `/v1/livekit/webhooks` receives LiveKit Cloud's
+   `participant_joined` / `participant_left` events. When a
+   `cam_<...>` identity joins a `patient_<...>` room, the worker
+   spawns a `RoomWorker` for that room (or attaches if already joined).
+2. **Subscription:** `RoomWorker` joins the room and listens for
+   `track_subscribed`. The first track from a new participant resolves
+   to a `CameraIngest` via DB lookup on `cameras.livekit_identity`.
+3. **Frame buffer:** `CameraIngest` consumes `rtc.VideoStream` frames,
+   converts to I420, copies into bytes, and pushes into a
+   time-bounded `FrameBuffer` (window 15s, target 5fps).
+4. **Motion state:** `RoomWorker` also listens for `motion_state`
+   data packets the wall phone publishes every ~5s; the latest value
+   per camera lands in a shared `MotionCache` (TTL 15s).
+5. **Tick:** every 10s per camera, the tick body — which **calls the
+   same registry / state-machine / analyses-store / event-promotion
+   functions** the Phase 0 HTTP route used to — runs:
+   - Detector load from `services/detection/registry.py`.
+   - Closed-state short-circuit when no motion is cached.
+   - Frames → MP4 via `mp4_remux.py` (ffmpeg stdin pipe).
+   - `gemini.py` first, falls back to `openai.py` on any exception.
+     `_parse.py` validates the JSON output and clamps
+     `*_confidence` to `[0, 1]`.
+   - `state_machine.py` flips `cameras.state` between `open` and
+     `closed`; `event_promotion.py` writes `events` rows with
+     30-second dedup per `(patient, detector)`.
 
-Phase 2 will swap the HTTP-clip transport for a long-running
-LiveKit-subscribing detector worker — same modules, different input
-loop.
+Defaults are operator-controlled: `NEMARA_LIVEKIT_WORKER_ENABLED=false`
+keeps the worker dormant. Flip it to `true` on the backend to start
+joining rooms as webhooks arrive.
 
 ## Caregiver Talk mode (Phase 3)
 
@@ -133,10 +148,10 @@ initial page, not a routing decision.
 
 ## Out of scope (later)
 
-- **Phase 2:** Detector worker as a LiveKit subscriber-bot (kills the
-  HTTP-clip transport).
 - **Phase 4:** LiveKit Track Egress → S3 event clips. APNs push.
-  Webhook receiver (`/v1/livekit/webhooks`) for online/offline state.
+  Multi-replica horizontal scaling (the current subscriber-bot is
+  single-process; horizontal scale would need a Redis claim or
+  Postgres advisory lock on `camera_id`).
 - Photo upload via Supabase Storage.
 - Custom-detector LLM prompt compilation (caregiver's free-text →
   runtime config).

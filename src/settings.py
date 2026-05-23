@@ -59,6 +59,24 @@ class Settings(BaseSettings):
     # key/secret; the receiver verifies via livekit-api's TokenVerifier.
     livekit_webhook_api_key: str = Field(default="")  # falls back to livekit_api_key
 
+    # ── Detector subscriber-bot (Phase 2) ───────────────────────
+    # The bot lives inside the FastAPI process as an asyncio task tree
+    # that subscribes to LiveKit rooms and runs the same detector
+    # pipeline `/v1/clips/ingest` used to. Default off — flip
+    # NEMARA_LIVEKIT_WORKER_ENABLED=true on the backend to turn it on.
+    livekit_worker_enabled: bool = Field(default=False)
+    # 10s tick cadence matches Phase 0's wall-phone clip cadence.
+    livekit_worker_tick_seconds: int = Field(ge=5, le=60, default=10)
+    # Sliding window the tick re-muxes to MP4 for Gemini. 15s matches
+    # the dashboard's clip length.
+    livekit_worker_window_seconds: int = Field(ge=5, le=60, default=15)
+    # Target fps after publish-side downsampling in the frame buffer.
+    # 5 matches `openai_frames_fps`; Gemini accepts the same rate.
+    livekit_worker_target_fps: int = Field(ge=1, le=15, default=5)
+    # TTL for the per-camera motion_state cache. Wall phones publish
+    # motion heartbeats every ~5s; missing/stale → motion_in_clip=false.
+    livekit_motion_state_ttl_seconds: int = Field(ge=5, le=60, default=15)
+
     # ── Pairing / camera api-key auth (Phase 0+) ────────────────
     # bcrypt rounds for the per-camera api_key_hash. 10 matches the
     # dashboard's bcryptjs default; bumping costs CPU on every clip
