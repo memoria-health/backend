@@ -4,6 +4,18 @@ FastAPI + Supabase backend for the Nemara caregiver iOS app and the in-process L
 
 See [ARCHITECTURE.md](./ARCHITECTURE.md) for the file tree, conventions, detector pipeline, and Talk-mode wiring.
 
+> **Start here.** This repo is the entry point — bring it up first, then build the two iOS apps ([`nemara-camera-app`](../nemara-camera-app), [`nemara-caregiver-app`](../nemara-caregiver-app)).
+
+## Before a new teammate can run this
+
+Three admin invites that only the project owner can do — not steps the teammate themselves runs:
+
+1. **LiveKit Cloud** → Project Settings → Members → invite by email. The `.env` in this repo points at *your* LiveKit project; without project membership, the teammate can't update the webhook URL each time their ngrok session rotates.
+2. **Apple Developer** → People → invite. The `co.elephantlabs.nemara.camera` + `co.elephantlabs.nemara` bundle IDs and the bundled APNs key all live under Team `V8N59CF74G`. Either invite the teammate to the team (simpler), or they'll fork to their own team + bundle IDs + APNs key — see each iOS README for that branch.
+3. **GitHub** → Settings → Collaborators → invite to all three repos. Send the three clone URLs once they accept.
+
+The teammate also needs a free [ngrok](https://dashboard.ngrok.com/signup) account for their own authtoken (free tier is fine, one tunnel at a time).
+
 ## What you're getting
 
 After `make fresh-seed` completes you'll have:
