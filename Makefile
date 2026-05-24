@@ -1,4 +1,4 @@
-.PHONY: help dev test test-unit test-integration lint format db-start db-stop db-reset studio install e2e fresh fresh-seed down
+.PHONY: help dev test test-unit test-integration lint format db-start db-stop db-reset studio install e2e fresh fresh-seed down icon
 
 PY := PYTHONPATH=. uv run
 
@@ -18,6 +18,7 @@ help:
 	@echo "make fresh            - reset + bring up supabase + backend + ngrok (no seed)"
 	@echo "make fresh-seed       - same as fresh + seed demo data"
 	@echo "make down             - stop supabase + backend + ngrok"
+	@echo "make icon             - regenerate nemara-caregiver-app AppIcon-1024.png from spec"
 
 install:
 	uv sync
@@ -78,3 +79,10 @@ fresh-seed:
 
 down:
 	./scripts/local-start.sh --down
+
+# Regenerate the caregiver-app AppIcon-1024.png from the spec in
+# scripts/gen_app_icon.py. Edit the constants at the top of that file
+# to change the design; this target re-renders against the Fraunces
+# variable font (downloaded to /tmp on first run).
+icon:
+	$(PY) --with Pillow python scripts/gen_app_icon.py
