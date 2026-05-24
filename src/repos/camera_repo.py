@@ -55,3 +55,27 @@ async def delete_by_id(
     await session.execute(delete(Camera).where(Camera.id == camera_id))
     await session.flush()
     return True
+
+
+async def update_partial(
+    session: AsyncSession,
+    camera_id: UUID,
+    *,
+    caregiver_id: UUID,
+    disabled: bool | None = None,
+) -> Camera | None:
+    """Partial-update a caregiver-owned camera. Returns the refreshed
+    row, or None if the camera doesn't exist for this caregiver.
+
+    Only the user-facing toggle fields are updatable here. Lifecycle
+    fields (state, no_people_count, livekit_identity, pairing_code, …)
+    are owned by the detector pipeline / pairing flow and are not
+    touched by this method.
+    """
+    cam = await find_by_id(session, camera_id, caregiver_id=caregiver_id)
+    if cam is None:
+        return None
+    if disabled is not None:
+        cam.disabled = disabled
+    await session.flush()
+    return cam

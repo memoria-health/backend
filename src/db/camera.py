@@ -68,3 +68,14 @@ class Camera(Base):
     )
     close_threshold: Mapped[int] = mapped_column(Integer, default=6)
     battery_percent: Mapped[int | None] = mapped_column(Integer, default=None)
+
+    # ── User-facing "off" toggle ─────────────────────────────────
+    # Per-camera disable controlled from the web dashboard / iOS
+    # caregiver app. When true, the detector worker stays subscribed
+    # to the LiveKit room (keeps the frame buffer warm) but the
+    # per-tick loop short-circuits BEFORE the LLM call — see
+    # `services/detection/camera_ingest.py:_run_tick`. Web hides
+    # disabled cameras from the live grid + analyses feed.
+    disabled: Mapped[bool] = mapped_column(
+        Boolean, server_default=text("false"), default=False,
+    )

@@ -21,7 +21,7 @@ from sqlalchemy import func, select
 from src.api.deps import CaregiverAuth, SessionDep, SettingsDep
 from src.db.camera import Camera
 from src.repos import camera_repo, patient_repo
-from src.schemas.camera import CameraResponse
+from src.schemas.camera import CameraResponse, UpdateCameraRequest
 from src.schemas.pairing import (
     CreatePairingCodeRequest,
     CreatePairingCodeResponse,
@@ -157,3 +157,36 @@ async def delete_camera(
             detail="camera_not_found",
         )
     await session.commit()
+
+
+@router.patch(
+    "/cameras/{camera_id}",
+    response_model=CameraResponse,
+)
+async def update_camera(
+    camera_id: UUID,
+    body: UpdateCameraRequest,
+    auth: CaregiverAuth,
+    session: SessionDep,
+) -> CameraResponse:
+    """Partial-update a caregiver-owned camera.
+
+    Currently the only mutable field exposed is `disabled` (the
+    user-facing off toggle). The detector pipeline reads this on
+    every tick and short-circuits the LLM call when true. The
+    LiveKit connection stays alive — disabling is a logical /
+    user-visibility switch, not a hardware off.
+    """
+    cam = await camera_repo.update_partial(
+        session,
+        camera_id,
+        caregiver_id=auth.id,
+        disabled=body.disabled,
+    )
+    if cam is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="camera_not_found",
+        )
+    await session.commit()
+    return CameraResponse.model_validate(cam, from_attributes=True)

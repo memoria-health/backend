@@ -166,6 +166,15 @@ create table public.cameras (
   state_changed_at    timestamptz not null default now(),
   close_threshold     int  not null default 6,        -- ticks of no people + no motion → closed
   battery_percent     int  check (battery_percent between 0 and 100),
+  -- ── User-facing "off" toggle ─────────────────────────────────────
+  -- Per-camera disable controlled from the caregiver app / web
+  -- dashboard. The LiveKit subscriber-bot stays in the room and the
+  -- frame buffer keeps filling, but the per-tick loop in
+  -- `services/detection/camera_ingest.py:_run_tick` short-circuits
+  -- BEFORE the LLM call when this is true (or when the patient's
+  -- `cameras_paused` is true). Caregiver-web hides disabled cameras
+  -- from the live grid + analyses feed.
+  disabled            boolean not null default false,
   unique (patient_id, display_id)
 );
 

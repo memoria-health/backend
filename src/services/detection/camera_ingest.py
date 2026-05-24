@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING
 from uuid import UUID
 
 from src.db.camera import Camera
+from src.db.patient import Patient
 from src.services import clip_archival, push
 from src.services.detection.analyses_store import add_analysis
 from src.services.detection.audio_buffer import AudioBuffer
@@ -144,22 +145,76 @@ class CameraIngest:
             detectors = await get_enabled_detectors_for_camera(session, self.camera_id)
 
             # Closed-state short-circuit. Fetch the camera's CURRENT
-            # state to decide whether to short-circuit the LLM.
+            # state to decide whether to short-circuit the LLM. Also
+            # fetch the patient so we can honor the per-patient
+            # "cameras_paused" toggle (global monitoring off).
             cam = await session.get(Camera, self.camera_id)
             if cam is None:
                 log.warning("%s camera row vanished mid-flight", self._log_tag)
                 return
+            patient = await session.get(Patient, self.patient_id)
+            if patient is None:
+                log.warning("%s patient row vanished mid-flight", self._log_tag)
+                return
 
             log.info(
                 "%s START detectors=%s motion=%s prior_state=%s "
-                "buffered_frames=%d buffered_audio_chunks=%d",
+                "buffered_frames=%d buffered_audio_chunks=%d "
+                "disabled=%s paused=%s",
                 self._log_tag,
                 [d.identifier for d in detectors],
                 motion_in_clip,
                 cam.state,
                 len(self.frame_buffer),
                 len(self.audio_buffer),
+                cam.disabled,
+                patient.cameras_paused,
             )
+
+            # User-facing "off" short-circuit. Either the per-camera
+            # disable flag OR the patient-wide pause flag suppresses the
+            # LLM call. We still write a synthetic "skipped" row so the
+            # debug feed shows ticks happening (and the state machine
+            # stays consistent — counters keep advancing). The LiveKit
+            # connection + frame buffer stay alive in case the user
+            # re-enables mid-tick.
+            if cam.disabled or patient.cameras_paused:
+                reason = "camera_disabled" if cam.disabled else "monitoring_paused"
+                description = (
+                    "(disabled — LLM skipped)"
+                    if cam.disabled
+                    else "(monitoring paused — LLM skipped)"
+                )
+                state_after = await apply_tick_update(
+                    session,
+                    camera_id=self.camera_id,
+                    people_present=False,
+                    motion_in_clip=False,
+                )
+                await add_analysis(
+                    session,
+                    camera_id=self.camera_id,
+                    provider="skipped",
+                    description=description,
+                    detector_fields={
+                        "people_present": False,
+                        "skipped_reason": reason,
+                    },
+                    people_present=False,
+                    people_count=0,
+                    motion_in_clip=False,
+                    state_after=state_after.state,
+                    captured_at=captured_at,
+                )
+                await session.commit()
+                log.info(
+                    "%s SKIP user-off (%s) — state=%s/%s",
+                    self._log_tag,
+                    reason,
+                    state_after.state,
+                    state_after.no_people_count,
+                )
+                return
 
             if cam.state == "closed" and not motion_in_clip:
                 state_after = await apply_tick_update(
