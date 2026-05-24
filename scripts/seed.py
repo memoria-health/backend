@@ -150,41 +150,41 @@ async def seed_patient(session: AsyncSession, caregiver_id: UUID) -> Patient:
         )
 
     # Events — covers the iOS Events tab's state matrix.
+    # `has_clip` is False on every seeded row: a real clip only exists
+    # when the detector pipeline runs against a paired camera and the
+    # archival path uploads an MP4 to Supabase Storage. Faking has_clip
+    # without writing a file makes iOS's GET /v1/events/{id}/clip-url
+    # land 409 (clip_not_ready), which is correct backend behavior but
+    # confuses anyone clicking seeded events expecting playback.
     event_specs = [
-        # (category, source, icon, title, location, mins_ago, has_clip, narrative, opened, reviewed, choice, notes)
+        # (category, source, icon, title, location, mins_ago, narrative, opened, reviewed, choice, notes)
         ("safety",  "preset", "figure.fall",         "Possible fall",     "Living room",     42,
-         True,
          "A sharp downward motion at 14:32, followed by three minutes of stillness on the floor near the coffee table. No spoken response when we tried room audio at 14:33.",
          False, False, None, None),
         ("safety",  "preset", "figure.walk.motion",  "Agitation episode", "Bedroom",         120,
-         True,
          "Maggie paced from the doorway to the window for about four minutes around 13:10. Voice raised twice without clear words. Settled with the radio.",
          True,  False, None, None),
         ("routine", "preset", "pills",               "Medication",        "Kitchen",         420,
-         False,
          "Maggie took her morning pills at 08:05, with tea, sitting at the kitchen counter — exactly her usual pattern.",
          False, False, None, None),
         ("safety",  "custom", "moon.stars",          "Late kitchen visit","Kitchen",         780,
-         True,
          "Brief light in the kitchen at 02:30. Maggie got a glass of water and returned to bed within four minutes.",
          True,  True,  "correct", None),
         ("safety",  "preset", "door.left.hand.open", "Front door opened", "Hallway",         1380,
-         True,
          "Front door opened at 16:15. Maggie greeted someone (the home aide on her usual Tuesday visit), they came in, door closed within 20 seconds.",
          True,  True,  "correct", None),
         ("routine", "preset", "pills",               "Medication",        "Kitchen",         1440,
-         False,
          "Evening pills taken at 20:05.",
          True,  True,  "correct", None),
         ("safety",  "preset", "figure.walk.motion",  "Agitation episode", "Living room",     4320,
-         True,
          "A brief pacing episode around the news hour — calmed within five minutes.",
          True,  True,  "correct", None),
     ]
     for (
-        category, source, icon, title, location, mins_ago, has_clip,
+        category, source, icon, title, location, mins_ago,
         narrative, opened, reviewed, choice, notes,
     ) in event_specs:
+        has_clip = False  # see comment on event_specs
         occurred = now - timedelta(minutes=mins_ago)
         session.add(
             Event(
