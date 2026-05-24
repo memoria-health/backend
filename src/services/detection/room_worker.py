@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import secrets
 import time
 from datetime import timedelta
 from typing import TYPE_CHECKING
@@ -104,6 +105,16 @@ class RoomWorker:
         # by stop(). All room state lives behind this single task; the
         # outer worker just sees it spin until told otherwise.
         self._supervisor_task: asyncio.Task[None] | None = None
+        # Per-instance random suffix on the LiveKit identity. Prevents
+        # the DuplicateIdentity reconnect loop that happens when a
+        # previous backend process was killed ungracefully — LiveKit
+        # Cloud holds the old worker's identity slot for ~20s after the
+        # TCP drops, and a new backend trying to join with the SAME
+        # deterministic identity gets kicked, reconnects, kicks the old
+        # ghost, ad infinitum. With a unique suffix per worker instance
+        # there's no collision: the new worker connects under a fresh
+        # name, the ghost times out in the background, no loop.
+        self._identity_suffix = secrets.token_hex(3)
 
     # ── lifecycle ──────────────────────────────────────────────────
 
@@ -525,11 +536,13 @@ class RoomWorker:
         )
 
     def _identity(self) -> str:
-        # `detector_worker_<8 hex of room>`. The room name already
-        # looks like `patient_<32 hex>` so this is a stable
-        # short-string of provenance for LiveKit logs.
+        # `detector_worker_<8 hex of room>_<6 hex random per worker instance>`.
+        # The room-derived prefix keeps LiveKit logs readable ("this
+        # bot belongs to which room"). The random suffix makes the
+        # identity unique per backend process / RoomWorker instance —
+        # see the comment on `self._identity_suffix` in __init__.
         short = self.room_name.removeprefix("patient_")[:8]
-        return f"{_WORKER_IDENTITY_PREFIX}{short}"
+        return f"{_WORKER_IDENTITY_PREFIX}{short}_{self._identity_suffix}"
 
     @staticmethod
     def _participant_identity(participant: rtc.RemoteParticipant | None) -> str:
