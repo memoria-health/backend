@@ -103,25 +103,37 @@ class CameraIngest:
         self._motion_cache.drop(self.camera_id)
 
     async def _tick_loop(self) -> None:
+        # Fire-and-forget: every `tick_seconds`, kick off a tick as its
+        # own task and immediately go back to sleeping. The previous
+        # tick's Gemini call may still be in flight — that's intentional,
+        # so cadence stays at exactly `tick_seconds` regardless of LLM
+        # latency. Combined with the 15s window setting this means
+        # consecutive ticks overlap by `window - tick_seconds` (default
+        # 5s of overlap).
+        #
+        # Trade-off: the old serializing lock prevented overlapping
+        # state-machine writes. With concurrent ticks, two `apply_tick_update`
+        # calls can race on `cameras.state` / `no_people_count`. For testing
+        # this is acceptable; the analyses uniq-by-(camera, captured_at)
+        # still prevents duplicate rows since captured_at is microsecond-precise.
         tick_seconds = self._settings.livekit_worker_tick_seconds
         try:
             while True:
                 await asyncio.sleep(tick_seconds)
-                # If a prior tick is still running (slow LLM, etc.),
-                # skip this cycle rather than queueing — matches the
-                # plan's "no overlap" guarantee.
-                if self._lock.locked():
-                    log.info("%s SKIP previous tick still in flight", self._log_tag)
-                    continue
-                async with self._lock:
-                    try:
-                        await self._run_tick()
-                    except Exception as exc:
-                        # Tick failures must NEVER kill the loop. Log
-                        # and move on; next tick will get another shot.
-                        log.exception("%s tick failed: %s", self._log_tag, exc)
+                asyncio.create_task(
+                    self._run_tick_safely(),
+                    name=f"tick-{self.camera_id}",
+                )
         except asyncio.CancelledError:
             raise
+
+    async def _run_tick_safely(self) -> None:
+        try:
+            await self._run_tick()
+        except Exception as exc:
+            # Tick failures must NEVER kill the loop. Log
+            # and move on; next tick will get another shot.
+            log.exception("%s tick failed: %s", self._log_tag, exc)
 
     async def _run_tick(self) -> None:
         """One tick — mirrors `src/api/clips.py:ingest_clip` body."""

@@ -5,10 +5,22 @@ start/stop) and registers routers. Stays small on purpose — every
 new aggregate appends one `include_router` line.
 """
 
+import logging
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+
+# Connect Python's root logger to stdout so application loggers
+# (`logging.getLogger(__name__)` calls throughout src/) actually emit.
+# Uvicorn configures its own access/error loggers separately; this
+# covers everything else (detector worker tick logs, webhook handlers,
+# clip archival, push dispatch, etc.). Honors NEMARA_LOG_LEVEL.
+logging.basicConfig(
+    level=os.getenv("NEMARA_LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
 # Register every ORM model in SQLAlchemy metadata at startup so foreign
 # keys resolve when the first INSERT/SELECT runs. Imported for side

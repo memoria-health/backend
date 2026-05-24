@@ -402,9 +402,11 @@ alter publication supabase_realtime add table
   public.patients,
   public.cameras,
   public.detectors,
-  public.events;
+  public.events,
+  public.analyses;
 
 alter table public.patients   replica identity full;
 alter table public.cameras    replica identity full;
 alter table public.detectors  replica identity full;
 alter table public.events     replica identity full;
+alter table public.analyses   replica identity full;
