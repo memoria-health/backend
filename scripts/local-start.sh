@@ -183,6 +183,17 @@ fi
 step "Starting backend on :8002"
 # Plain uvicorn (not `make dev`) so we control PID + log redirection.
 # Logs go to .dev/backend.log; PID to .dev/backend.pid.
+#
+# Auto-detect this Mac's LAN IP and override NEMARA_SUPABASE_URL so
+# iOS devices on the same Wi-Fi reach the local Supabase by IP, not
+# the loopback baked into .env. Pydantic-settings reads env vars
+# before .env values, so this overrides without touching the committed
+# file. Falls back to whatever's in .env if no Wi-Fi interface is up.
+LAN_IP=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)
+if [[ -n "${LAN_IP:-}" ]]; then
+  export NEMARA_SUPABASE_URL="http://${LAN_IP}:54341"
+  ok "Supabase URL pinned to LAN: $NEMARA_SUPABASE_URL"
+fi
 PYTHONPATH=. nohup uv run uvicorn src.main:app \
   --host 0.0.0.0 --port 8002 --no-access-log \
   > "$DEV_DIR/backend.log" 2>&1 &

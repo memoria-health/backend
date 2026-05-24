@@ -8,7 +8,10 @@ __pycache__/
 .mypy_cache/
 
 # Env
-.env
+# .env is intentionally tracked in this PRIVATE repo so partner clones
+# work out-of-the-box. Move it back to gitignored before flipping the
+# repo public — all secrets in it (LiveKit keys, Gemini/OpenAI keys,
+# APNs .p8 contents) need rotation in that case.
 .env.local
 
 # Local-start.sh runtime state (PIDs + log files for backend + ngrok)
