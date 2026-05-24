@@ -87,11 +87,37 @@ async def test_rejects_empty_frame_list() -> None:
 
 @_pytestmark_ffmpeg
 @pytest.mark.asyncio
-async def test_rejects_mismatched_frame_dimensions() -> None:
-    f1 = FrameSnapshot(width=320, height=240, data=_yuv420_blob(320, 240), captured_at=100.0)
-    f2 = FrameSnapshot(width=400, height=300, data=_yuv420_blob(400, 300), captured_at=100.2)
-    with pytest.raises(ValueError, match="expected 320x240"):
-        await frames_to_mp4([f1, f2], fps=5)
+async def test_mixed_dimensions_filters_to_most_recent_size() -> None:
+    """WebRTC adaptive bitrate can change publish resolution mid-stream,
+    so the frame buffer may contain mixed sizes. mp4_remux now filters
+    the window to only frames matching the MOST RECENT (last) frame's
+    size — that's the current publish state and what the LLM should
+    see. Older off-size frames are dropped silently with an info log.
+    """
+    # 5 small startup frames + 10 steady-state frames at the larger
+    # publish resolution. Expectation: ffmpeg encodes the 10 large
+    # frames; the 5 startup frames are dropped.
+    small = [
+        FrameSnapshot(
+            width=320, height=240,
+            data=_yuv420_blob(320, 240),
+            captured_at=100.0 + i / 5,
+        )
+        for i in range(5)
+    ]
+    big = [
+        FrameSnapshot(
+            width=640, height=480,
+            data=_yuv420_blob(640, 480),
+            captured_at=101.0 + i / 5,
+        )
+        for i in range(10)
+    ]
+    mp4 = await frames_to_mp4(small + big, fps=5)
+    info = _ffprobe(mp4)
+    video = next(s for s in info["streams"] if s["codec_type"] == "video")
+    assert video["width"] == 640
+    assert video["height"] == 480
 
 
 @_pytestmark_ffmpeg

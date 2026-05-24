@@ -261,10 +261,18 @@ async def test_dispatch_noops_when_apns_not_configured(
 
     monkeypatch.setattr(push, "_get_client", _get_client_override)
 
-    # Default settings have empty apns_team_id → dispatcher is a noop.
+    # Build a Settings with APNs explicitly empty. We can't rely on
+    # get_settings() here because a real .env (after the e2e setup
+    # walkthrough) carries real APNs credentials and the test would
+    # then exercise the configured path instead of the noop path.
     base = get_settings()
+    overrides = base.model_dump()
+    overrides["apns_team_id"] = ""
+    overrides["apns_key_id"] = ""
+    overrides["apns_auth_key"] = ""
+    noop_settings = Settings(**overrides)
     await push.dispatch_event_pushes(
-        sessionmaker=sm, event_ids=[event_id], settings=base,
+        sessionmaker=sm, event_ids=[event_id], settings=noop_settings,
     )
     assert fake.calls == []
 

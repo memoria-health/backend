@@ -27,11 +27,14 @@ much simpler and the audio blob is tiny (~32 kB/s).
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import tempfile
 from collections.abc import Sequence
 
 from src.services.detection.frame_buffer import FrameSnapshot
+
+log = logging.getLogger(__name__)
 
 
 class Mp4RemuxError(RuntimeError):
@@ -72,14 +75,25 @@ async def frames_to_mp4(
         if pcm_num_channels <= 0:
             raise ValueError(f"pcm_num_channels must be > 0, got {pcm_num_channels}")
 
-    width = frames[0].width
-    height = frames[0].height
-    for i, f in enumerate(frames[1:], start=1):
-        if f.width != width or f.height != height:
-            raise ValueError(
-                f"frame {i} has size {f.width}x{f.height}; expected "
-                f"{width}x{height} to match frame 0"
-            )
+    # WebRTC's adaptive bitrate can change publish resolution mid-
+    # stream — the buffer may contain a mix of (e.g.) 320x180 startup
+    # frames + later 1280x720 steady-state frames. ffmpeg's rawvideo
+    # input needs constant dimensions, so filter the window to only
+    # frames matching the MOST RECENT frame's size and drop the rest.
+    # Last frame's resolution is what the LLM should see — that's the
+    # current publish state.
+    width = frames[-1].width
+    height = frames[-1].height
+    filtered = [f for f in frames if f.width == width and f.height == height]
+    if len(filtered) < len(frames):
+        log.info(
+            "mp4_remux: dropped %d/%d frames at non-current size; "
+            "kept %d at %dx%d",
+            len(frames) - len(filtered), len(frames), len(filtered), width, height,
+        )
+    frames = filtered  # type: ignore[assignment]
+    if not frames:
+        raise ValueError("frames_to_mp4: no frames at the most-recent resolution")
 
     expected_bytes_per_frame = width * height * 3 // 2  # I420 = 1.5 bpp
     for i, f in enumerate(frames):

@@ -20,12 +20,16 @@ with 204 but not acted on — Phase 4 may grow the dispatcher.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Header, HTTPException, Request, status
 from livekit import api as lkapi
+from sqlalchemy import update
 
 from src.api.deps import SettingsDep
+from src.db.camera import Camera
+from src.db.session import get_sessionmaker
 
 log = logging.getLogger(__name__)
 
@@ -85,14 +89,37 @@ async def receive_livekit_webhook(
 
     if event.event == "participant_joined" and participant_identity.startswith("cam_"):
         await worker.ensure_room_joined(room_name)
+        await _set_camera_online(participant_identity, online=True)
         log.info(
             "livekit_webhook participant_joined room=%s identity=%s -> joined",
             room_name, participant_identity,
         )
     elif event.event == "participant_left" and participant_identity.startswith("cam_"):
         await worker.ensure_room_left_if_empty(room_name)
+        await _set_camera_online(participant_identity, online=False)
         log.info(
             "livekit_webhook participant_left room=%s identity=%s -> left-check",
             room_name, participant_identity,
         )
     # Other event types are no-ops in v0.
+
+
+async def _set_camera_online(livekit_identity: str, *, online: bool) -> None:
+    """Flip `cameras.online` based on the participant's join/leave.
+    Also bumps `last_seen_at` on join so the caregiver UI's "last
+    seen" indicator reflects reality. Silently no-ops if no camera
+    row matches the identity (defense against a leaked LiveKit room
+    or a race against unpair).
+    """
+    sm = get_sessionmaker()
+    async with sm() as session:
+        stmt = (
+            update(Camera)
+            .where(Camera.livekit_identity == livekit_identity)
+            .values(
+                online=online,
+                last_seen_at=datetime.now(timezone.utc) if online else Camera.last_seen_at,
+            )
+        )
+        await session.execute(stmt)
+        await session.commit()
