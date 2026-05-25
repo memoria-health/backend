@@ -107,19 +107,35 @@ async def receive_livekit_webhook(
 async def _set_camera_online(livekit_identity: str, *, online: bool) -> None:
     """Flip `cameras.online` based on the participant's join/leave.
     Also bumps `last_seen_at` on join so the caregiver UI's "last
-    seen" indicator reflects reality. Silently no-ops if no camera
-    row matches the identity (defense against a leaked LiveKit room
-    or a race against unpair).
+    seen" indicator reflects reality.
+
+    On `online=True` (participant_joined) we also reset the
+    open/closed state machine: `state='open'`, `no_people_count=0`.
+    A new camera session deserves a fresh evaluation — without this,
+    a camera that previously closed after 6 no-people ticks would
+    inherit `state='closed'` across disconnects and the LLM would
+    skip almost every tick until Gemini happened to spot a person.
+
+    Silently no-ops if no camera row matches the identity (defense
+    against a leaked LiveKit room or a race against unpair).
     """
+    now = datetime.now(timezone.utc)
     sm = get_sessionmaker()
     async with sm() as session:
+        if online:
+            values = {
+                "online": True,
+                "last_seen_at": now,
+                "state": "open",
+                "no_people_count": 0,
+                "state_changed_at": now,
+            }
+        else:
+            values = {"online": False}
         stmt = (
             update(Camera)
             .where(Camera.livekit_identity == livekit_identity)
-            .values(
-                online=online,
-                last_seen_at=datetime.now(timezone.utc) if online else Camera.last_seen_at,
-            )
+            .values(**values)
         )
         await session.execute(stmt)
         await session.commit()

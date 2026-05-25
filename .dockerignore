@@ -1,0 +1,22 @@
+# Don't bake local-dev artifacts into the production image.
+.venv/
+.git/
+.gitignore
+.env
+.env.*
+*.log
+.prod-server.log
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.DS_Store
+tests/
+docs/
+# NOTE: README.md is REQUIRED at build time — pyproject.toml references
+# it as the project's `readme` field, and hatchling validates the file
+# exists when uv builds the project. Exclude it and the build fails
+# with "Readme file does not exist: README.md".
+# ARCHITECTURE.md is dev-only docs; safe to drop.
+ARCHITECTURE.md
