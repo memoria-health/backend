@@ -175,6 +175,16 @@ create table public.cameras (
   -- `cameras_paused` is true). Caregiver-web hides disabled cameras
   -- from the live grid + analyses feed.
   disabled            boolean not null default false,
+  -- ── Desired connection state (privacy / battery / cost) ─────────
+  -- Stronger than `disabled`: when 'disconnected', the wall phone
+  -- itself LEAVES the LiveKit room. No video bytes are encoded,
+  -- uploaded, or seen by LiveKit Cloud. The phone polls
+  -- /v1/cameras/me/desired-state every 2s and reconciles by calling
+  -- room.connect() / room.disconnect() to match. Reconnect latency
+  -- ~ 2-5s after the caregiver flips this back to 'connected'.
+  -- See NemaraCam/.../DesiredStateMonitor.swift.
+  desired_state       text not null default 'connected'
+    check (desired_state in ('connected', 'disconnected')),
   unique (patient_id, display_id)
 );
 
@@ -237,6 +247,35 @@ create unique index detectors_patient_identifier_uniq
 create trigger detectors_set_updated_at
   before update on public.detectors
   for each row execute function public.set_updated_at();
+
+
+-- ── cameras_detectors (per-camera detector assignment) ──────────────
+-- Many-to-many between cameras and detectors. Lets caregivers turn a
+-- detector ON for some cameras and OFF for others — e.g., "wandering"
+-- only on the hallway camera, "medication" only on the kitchen camera.
+--
+-- Before this table existed, every detector with `is_on=true` ran on
+-- every camera under the patient. To preserve that behavior on
+-- existing data, the seed below inserts (camera, detector) pairs for
+-- every existing combination; new detectors auto-assign to every
+-- camera of their patient (and vice-versa) via the API layer.
+--
+-- The runtime contract:
+--   - `detectors.is_on=false`  → never runs anywhere (master kill switch)
+--   - `detectors.always_on=true` → runs everywhere regardless of this table
+--                                  (people_present today; not stored as a row
+--                                   so doesn't appear here)
+--   - row in this table        → detector runs on that specific camera
+--   - no row                   → detector does NOT run on that camera
+create table public.cameras_detectors (
+  camera_id   uuid not null references public.cameras(id)   on delete cascade,
+  detector_id uuid not null references public.detectors(id) on delete cascade,
+  created_at  timestamptz not null default now(),
+  primary key (camera_id, detector_id)
+);
+
+create index cameras_detectors_camera_id_idx   on public.cameras_detectors(camera_id);
+create index cameras_detectors_detector_id_idx on public.cameras_detectors(detector_id);
 
 
 -- ── events ───────────────────────────────────────────────────────
@@ -374,6 +413,26 @@ create policy detectors_owner on public.detectors
     patient_id in (select id from public.patients where caregiver_id = auth.uid())
   );
 
+-- cameras_detectors: scoped through the camera's patient → caregiver.
+-- Joining via cameras (not detectors) is fine — both FKs point to the
+-- same patient by construction, and going through cameras matches the
+-- pattern used by `cameras_owner` above.
+alter table public.cameras_detectors enable row level security;
+create policy cameras_detectors_owner on public.cameras_detectors
+  for all using (
+    camera_id in (
+      select c.id from public.cameras c
+      join public.patients p on p.id = c.patient_id
+      where p.caregiver_id = auth.uid()
+    )
+  ) with check (
+    camera_id in (
+      select c.id from public.cameras c
+      join public.patients p on p.id = c.patient_id
+      where p.caregiver_id = auth.uid()
+    )
+  );
+
 alter table public.events enable row level security;
 create policy events_owner on public.events
   for all using (
@@ -411,11 +470,13 @@ alter publication supabase_realtime add table
   public.patients,
   public.cameras,
   public.detectors,
+  public.cameras_detectors,
   public.events,
   public.analyses;
 
-alter table public.patients   replica identity full;
-alter table public.cameras    replica identity full;
-alter table public.detectors  replica identity full;
-alter table public.events     replica identity full;
-alter table public.analyses   replica identity full;
+alter table public.patients          replica identity full;
+alter table public.cameras           replica identity full;
+alter table public.detectors         replica identity full;
+alter table public.cameras_detectors replica identity full;
+alter table public.events            replica identity full;
+alter table public.analyses          replica identity full;

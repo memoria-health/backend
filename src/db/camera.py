@@ -79,3 +79,16 @@ class Camera(Base):
     disabled: Mapped[bool] = mapped_column(
         Boolean, server_default=text("false"), default=False,
     )
+
+    # ── Desired connection state (privacy / battery / cost) ─────────
+    # Stronger than `disabled`: when 'disconnected', the wall phone
+    # itself LEAVES the LiveKit room. No video bytes are encoded,
+    # uploaded, or seen by LiveKit Cloud. The phone polls
+    # /v1/cameras/me/desired-state every 1s and reconciles by calling
+    # room.connect() / room.disconnect() to match. Reconcile latency
+    # ~ 1-2s after the caregiver flips this back to 'connected'.
+    # Two-value enum enforced at the DB layer via CHECK constraint;
+    # Pydantic Literal also enforces at the API boundary.
+    desired_state: Mapped[str] = mapped_column(
+        String(16), server_default=text("'connected'"), default="connected",
+    )

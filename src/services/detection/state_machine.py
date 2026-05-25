@@ -3,11 +3,20 @@
 The state controls when the LLM runs:
 
   - `open`:    LLM runs every tick (10s).
-  - `closed`:  LLM is skipped until people OR motion reappear.
+  - `closed`:  LLM is skipped until the LLM sees people again.
 
-Transitions:
-  - `closed → open`: any tick with `people_present=true` OR `motion_in_clip=true`.
-  - `open → closed`: `close_threshold` consecutive ticks with both false.
+Transitions (people-only as of the motion-gate removal):
+  - `closed → open`: any tick with `people_present=true`.
+  - `open → closed`: `close_threshold` consecutive ticks with
+                     `people_present=false`.
+
+The motion-in-clip signal is **deliberately ignored here**. Motion is a
+cheap pre-filter from the wall phone, but it's much noisier than the
+LLM's people verdict — curtain twitches, light flicker, camera sensor
+noise, etc. all show up as motion but obviously aren't people. Letting
+motion keep the camera "open" forever burned Gemini calls on empty
+rooms. The LLM's `people_present` is the authoritative gate now;
+motion stays in `analyses.motion_in_clip` purely as telemetry.
 
 Persistent state lives on the `cameras` row (state, no_people_count,
 state_changed_at).
@@ -63,14 +72,14 @@ class CameraStateAfter:
 # This makes the increment race-free even when two backend tasks
 # call `apply_tick_update` for the same camera concurrently.
 #
-# Logic mirrors the previous Python loop exactly:
-#   has_activity (people_present OR motion_in_clip):
+# Logic (people-only gating, motion ignored):
+#   people_present:
 #     count → 0
 #     state → 'open' (if was closed, otherwise unchanged)
 #     state_changed_at → now (if a transition happened)
 #   else if state == 'closed':
 #     count → close_threshold  (clamp; was already at it, just safety)
-#   else (state == 'open', no activity):
+#   else (state == 'open', no people):
 #     count → LEAST(count + 1, close_threshold)
 #     state → 'closed' if count + 1 >= close_threshold else 'open'
 #     state_changed_at → now if transition
@@ -79,19 +88,19 @@ _ATOMIC_UPDATE_SQL = text(
     UPDATE public.cameras
     SET
         no_people_count = CASE
-            WHEN :has_activity THEN 0
+            WHEN :people_present THEN 0
             WHEN state = 'closed' THEN close_threshold
             ELSE LEAST(no_people_count + 1, close_threshold)
         END,
         state = CASE
-            WHEN :has_activity THEN 'open'
+            WHEN :people_present THEN 'open'
             WHEN state = 'open' AND no_people_count + 1 >= close_threshold
                 THEN 'closed'
             ELSE state
         END,
         state_changed_at = CASE
-            WHEN :has_activity AND state = 'closed' THEN :now
-            WHEN NOT :has_activity AND state = 'open'
+            WHEN :people_present AND state = 'closed' THEN :now
+            WHEN NOT :people_present AND state = 'open'
                 AND no_people_count + 1 >= close_threshold THEN :now
             ELSE state_changed_at
         END,
@@ -112,19 +121,24 @@ async def apply_tick_update(
     """Atomic state machine update for one tick. Caller owns the
     transaction (we don't commit here).
 
+    Only `people_present` drives the state transitions. `motion_in_clip`
+    is accepted to keep the call-site signature stable (it's still
+    logged into `analyses.motion_in_clip` as telemetry) but is NOT
+    consulted by the SQL update.
+
     Race-free under concurrent ticks — see module docstring.
 
     Raises ValueError if the camera row doesn't exist (signals a bug;
     the api-key auth path should have already resolved it).
     """
-    has_activity = people_present or motion_in_clip
+    del motion_in_clip  # explicitly unused; see module docstring
     now = datetime.now(timezone.utc)
 
     result = await session.execute(
         _ATOMIC_UPDATE_SQL,
         {
             "camera_id": camera_id,
-            "has_activity": has_activity,
+            "people_present": people_present,
             "now": now,
         },
     )

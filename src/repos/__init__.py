@@ -6,6 +6,7 @@ caller (typically a service).
 """
 
 from src.repos import (
+    camera_detector_repo,
     camera_repo,
     caregiver_repo,
     detector_repo,
@@ -14,6 +15,7 @@ from src.repos import (
 )
 
 __all__ = [
+    "camera_detector_repo",
     "camera_repo",
     "caregiver_repo",
     "detector_repo",

@@ -18,10 +18,16 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import func, select
 
-from src.api.deps import CaregiverAuth, SessionDep, SettingsDep
+from src.api.deps import CameraAuth, CaregiverAuth, SessionDep, SettingsDep
 from src.db.camera import Camera
-from src.repos import camera_repo, patient_repo
-from src.schemas.camera import CameraResponse, UpdateCameraRequest
+from src.repos import camera_detector_repo, camera_repo, patient_repo
+from src.schemas.camera import (
+    CameraDetectorsResponse,
+    CameraResponse,
+    DesiredStateResponse,
+    SetCameraDetectorsRequest,
+    UpdateCameraRequest,
+)
 from src.schemas.pairing import (
     CreatePairingCodeRequest,
     CreatePairingCodeResponse,
@@ -129,8 +135,22 @@ async def create_pairing_code(
         state_changed_at=now,
         close_threshold=6,
         battery_percent=None,
+        # Default to connected so a freshly-paired phone starts
+        # streaming immediately. Server default would cover this too —
+        # set it explicitly so the row's full state is grep-able from
+        # this construction site.
+        desired_state="connected",
     )
     session.add(cam)
+    await session.flush()  # Ensure the camera row is visible to the assignment query below.
+    # Auto-assign only the PRESET detectors (Falls, Wandering, etc.) to
+    # the new camera — caregivers expect those to "just work" on every
+    # camera. Custom detectors stay opt-in: a caregiver who built a
+    # `stove_on` detector for the kitchen doesn't expect it to start
+    # running on the bedroom camera the moment a bedroom phone is paired.
+    await camera_detector_repo.assign_preset_detectors_of_patient_to_camera(
+        session, camera_id, patient_id,
+    )
     await session.commit()
 
     return CreatePairingCodeResponse(
@@ -159,6 +179,98 @@ async def delete_camera(
     await session.commit()
 
 
+@router.get(
+    "/cameras/me/desired-state",
+    response_model=DesiredStateResponse,
+)
+async def get_my_desired_state(
+    auth: CameraAuth,
+) -> DesiredStateResponse:
+    """Polled by the wall phone every 1s. `CameraAuth` already
+    resolves the bearer api_key against `cameras.api_key_hash` and
+    returns the Camera row — we just echo `desired_state` back. No
+    DB write here.
+
+    Path is literal `/me/` not `/{camera_id}/` so the camera doesn't
+    have to know its own UUID; the api_key uniquely identifies it.
+    Path collision with `/cameras/{camera_id}/*` is impossible
+    because every existing `{camera_id}/...` route ends in a different
+    literal suffix (detectors), and `/cameras/{camera_id}` (2-segment)
+    can't match this 3-segment path.
+
+    Type-cast at the boundary: `auth.desired_state` is a `str` from
+    the ORM. Pydantic Literal coerces — if the DB row somehow holds
+    anything other than the two valid values (impossible because of
+    the CHECK constraint, but if a migration ever drifts), Pydantic
+    raises 500 here. Fail-loud aligned.
+    """
+    return DesiredStateResponse(
+        desired_state=auth.desired_state,  # type: ignore[arg-type]
+        polled_at=datetime.now(timezone.utc),
+    )
+
+
+@router.get(
+    "/cameras/{camera_id}/detectors",
+    response_model=CameraDetectorsResponse,
+)
+async def list_camera_detectors(
+    camera_id: UUID,
+    auth: CaregiverAuth,
+    session: SessionDep,
+) -> CameraDetectorsResponse:
+    """Return the detector IDs assigned to this camera. Empty if the
+    camera doesn't belong to the caller — same 404-via-empty pattern
+    used elsewhere to avoid leaking camera existence."""
+    cam = await camera_repo.find_by_id(session, camera_id, caregiver_id=auth.id)
+    if cam is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="camera_not_found",
+        )
+    ids = await camera_detector_repo.list_detector_ids_for_camera(
+        session, camera_id, caregiver_id=auth.id,
+    )
+    return CameraDetectorsResponse(detector_ids=list(ids))
+
+
+@router.put(
+    "/cameras/{camera_id}/detectors",
+    response_model=CameraDetectorsResponse,
+)
+async def set_camera_detectors(
+    camera_id: UUID,
+    body: SetCameraDetectorsRequest,
+    auth: CaregiverAuth,
+    session: SessionDep,
+) -> CameraDetectorsResponse:
+    """Replace the camera's detector assignment set.
+
+    Validates ownership + that every detector belongs to the camera's
+    patient. Takes effect on the next tick — the registry reads the
+    join table per call, no in-process cache to invalidate.
+    """
+    try:
+        final = await camera_detector_repo.replace_assignments_for_camera(
+            session,
+            camera_id,
+            body.detector_ids,
+            caregiver_id=auth.id,
+        )
+    except ValueError as e:
+        msg = str(e)
+        # The two errors raise_value_errors can throw map to different statuses.
+        if "not owned" in msg:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="camera_not_found",
+            ) from e
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="invalid_detector_ids",
+        ) from e
+    await session.commit()
+    return CameraDetectorsResponse(detector_ids=list(final))
+
+
 @router.patch(
     "/cameras/{camera_id}",
     response_model=CameraResponse,
@@ -171,17 +283,20 @@ async def update_camera(
 ) -> CameraResponse:
     """Partial-update a caregiver-owned camera.
 
-    Currently the only mutable field exposed is `disabled` (the
-    user-facing off toggle). The detector pipeline reads this on
-    every tick and short-circuits the LLM call when true. The
-    LiveKit connection stays alive — disabling is a logical /
-    user-visibility switch, not a hardware off.
+    Two mutable fields, both user-facing toggles:
+      - `disabled`: pauses LLM ticks. LiveKit stays connected.
+        Instant on/off, no battery savings.
+      - `desired_state`: 'disconnected' makes the wall phone leave
+        the LiveKit room entirely. Phone polls
+        /v1/cameras/me/desired-state every 1s; reconnect latency
+        ~1-2s. Full battery + privacy savings.
     """
     cam = await camera_repo.update_partial(
         session,
         camera_id,
         caregiver_id=auth.id,
         disabled=body.disabled,
+        desired_state=body.desired_state,
     )
     if cam is None:
         raise HTTPException(

@@ -59,6 +59,14 @@ class DetectorResponse(BaseModel):
     sensitivity: DetectorSensitivity
     is_on: bool
     custom_prompt: Prompt | None
+    # Runtime-contract identifier — `fall` / `wandering` / `agitation` /
+    # `medication` for presets, `custom_<8hex>` for compiled custom
+    # detectors. NULL on a freshly-inserted custom detector that's still
+    # being compiled in the background (see create_detector + the
+    # async-compile flow). The dashboard needs this to resolve
+    # custom-detector reasoning fields in analyses.detector_fields
+    # back to a human-readable name.
+    identifier: str | None = None
     created_at: datetime
     updated_at: datetime
 

@@ -31,3 +31,6 @@ supabase/.temp
 # Coverage
 .coverage
 htmlcov/
+
+# runtime log from local dev
+.prod-server.log

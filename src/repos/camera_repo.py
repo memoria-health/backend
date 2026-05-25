@@ -63,6 +63,7 @@ async def update_partial(
     *,
     caregiver_id: UUID,
     disabled: bool | None = None,
+    desired_state: str | None = None,
 ) -> Camera | None:
     """Partial-update a caregiver-owned camera. Returns the refreshed
     row, or None if the camera doesn't exist for this caregiver.
@@ -71,11 +72,18 @@ async def update_partial(
     fields (state, no_people_count, livekit_identity, pairing_code, …)
     are owned by the detector pipeline / pairing flow and are not
     touched by this method.
+
+    `desired_state` is validated at the API boundary (Pydantic
+    Literal) AND at the DB layer (CHECK constraint), so by the time
+    we reach here it's already guaranteed to be 'connected' or
+    'disconnected' — no defensive validation needed.
     """
     cam = await find_by_id(session, camera_id, caregiver_id=caregiver_id)
     if cam is None:
         return None
     if disabled is not None:
         cam.disabled = disabled
+    if desired_state is not None:
+        cam.desired_state = desired_state
     await session.flush()
     return cam

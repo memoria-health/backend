@@ -38,6 +38,7 @@ from src.api.patients import router as patients_router
 from src.api.talk import router as talk_router
 from src.db import analysis as _analysis  # noqa: F401
 from src.db import camera as _camera  # noqa: F401
+from src.db import camera_detector as _camera_detector  # noqa: F401
 from src.db import caregiver as _caregiver  # noqa: F401
 from src.db import caregiver_device as _caregiver_device  # noqa: F401
 from src.db import detector as _detector  # noqa: F401

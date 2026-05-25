@@ -9,19 +9,27 @@ All endpoints require CaregiverAuth and 404 (not 403) for cross-account
 attempts.
 """
 
+import asyncio
+import logging
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, HTTPException, status
+from sqlalchemy import update
 
-from src.api.deps import CaregiverAuth, SessionDep
+from src.api.deps import CaregiverAuth, SessionDep, SettingsDep
 from src.db.detector import Detector
-from src.repos import detector_repo, patient_repo
+from src.db.session import get_sessionmaker
+from src.repos import camera_detector_repo, detector_repo, patient_repo
 from src.schemas.detector import (
     CreateDetectorRequest,
     DetectorResponse,
     UpdateDetectorRequest,
 )
+from src.services.detector_compiler import compile_custom_detector
+from src.settings import Settings
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1", tags=["detector"])
 
@@ -53,8 +61,30 @@ async def create_detector(
     auth: CaregiverAuth,
     body: CreateDetectorRequest,
     session: SessionDep,
+    settings: SettingsDep,
 ) -> DetectorResponse:
-    """Create a custom detector. Server forces `source = custom`."""
+    """Create a custom detector. **Returns immediately**; compile runs
+    in the background.
+
+    Why async compile: the LLM call that turns the caregiver's
+    natural-language prompt into the runtime contract
+    (`identifier`, `prompt_fragment`, `schema_json`) takes 3–5s. Holding
+    the HTTP request open that long makes the dashboard's "Create"
+    modal feel stuck. Instead we INSERT the row with NULL identifier,
+    return 201 right away (~50ms), and fire-and-forget the compile in a
+    background task. The dashboard sees the new row via Realtime, shows
+    a "Compiling…" badge while `identifier IS NULL`, and the badge
+    drops when the background UPDATE lands.
+
+    `registry.get_enabled_detectors_for_camera` already filters
+    `identifier IS NOT NULL`, so a compiling detector is invisible to
+    the tick pipeline until compile completes — no half-baked LLM
+    calls.
+
+    Custom detectors are NOT auto-assigned to cameras. They're opt-in
+    per camera via `/cameras/[id]`. Preset detectors (auto-seeded on
+    patient create) still run on all cameras by default.
+    """
     # 404 if the parent patient isn't owned by the caller — never leak
     # patient existence.
     patient = await patient_repo.find_by_id(session, patient_id, caregiver_id=auth.id)
@@ -81,10 +111,98 @@ async def create_detector(
         created_at=now,
         updated_at=now,
         custom_prompt=body.custom_prompt,
+        # Runtime-contract fields stay NULL until the background
+        # compile finishes — registry filter keeps it out of ticks
+        # in the interim.
+        identifier=None,
+        prompt_fragment=None,
+        schema_json=None,
+        always_on=False,
+        is_builtin=False,
     )
     await detector_repo.insert(session, det)
+
+    # Auto-assign based on the "Where" hint. Saves the caregiver from
+    # opening /cameras/[id] after creating each detector — they
+    # already told us which room(s) they want it on.
+    #   - "ALL ROOMS" → every camera under the patient
+    #   - "Kitchen"   → every camera whose room == "Kitchen"
+    # If `where_scope` is a legacy string that doesn't match any
+    # current camera room, no rows get inserted and the user can still
+    # assign manually from the cameras page.
+    if body.where_scope == "ALL ROOMS":
+        await camera_detector_repo.assign_detector_to_cameras(
+            session, det.id, patient_id, room=None,
+        )
+    else:
+        await camera_detector_repo.assign_detector_to_cameras(
+            session, det.id, patient_id, room=body.where_scope,
+        )
     await session.commit()
+
+    # Kick off the compile. asyncio.create_task lets the request return
+    # before the LLM call completes — we don't await it. The background
+    # task uses its own session (session-per-task pattern) since the
+    # request's SessionDep will be closed by the time we'd write back.
+    asyncio.create_task(
+        _compile_and_update_detector(
+            detector_id=det.id,
+            name=body.name,
+            description=body.description,
+            user_text=body.custom_prompt,
+            settings=settings,
+        )
+    )
+
     return _to_response(det)
+
+
+async def _compile_and_update_detector(
+    *,
+    detector_id: UUID,
+    name: str,
+    description: str,
+    user_text: str,
+    settings: Settings,
+) -> None:
+    """Background task: run Gemini compile + UPDATE the detector row.
+
+    Owns its own AsyncSession (the request's session is gone by now).
+    If compile fails, the row stays with NULL `identifier` — the
+    dashboard's "Compiling…" badge then becomes "Compile failed" so
+    the user knows to retry (vs. silently never firing). Errors are
+    logged but not re-raised — there's no caller to surface them to.
+    """
+    try:
+        compiled = await compile_custom_detector(
+            name=name, description=description,
+            user_text=user_text, settings=settings,
+        )
+    except Exception as e:
+        log.error(
+            "detector_compile_background.failed detector_id=%s name=%r err=%s",
+            detector_id, name, e,
+        )
+        return
+
+    # Write back. Use a fresh session — the request's session is closed.
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        await session.execute(
+            update(Detector)
+            .where(Detector.id == detector_id)
+            .values(
+                identifier=compiled.identifier,
+                prompt_fragment=compiled.prompt_fragment,
+                schema_json=compiled.schema_json,
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+        await session.commit()
+    log.info(
+        "detector_compile_background.ok detector_id=%s identifier=%s",
+        detector_id, compiled.identifier,
+    )
 
 
 @router.patch(
