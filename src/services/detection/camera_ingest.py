@@ -272,27 +272,33 @@ class CameraIngest:
                 log.warning("%s mp4_remux failed: %s", self._log_tag, exc)
                 return
 
-            # Provider fallback: Gemini → OpenAI.
+            # Provider fallback: OpenAI → Gemini. OpenAI's gpt-5.4-nano
+            # is the cheaper of the two on a per-tick basis (the OpenAI
+            # path also samples frames at lower fps + 480px width, vs
+            # Gemini's full MP4 ingest), so we try it first and fall
+            # back to Gemini only when OpenAI errors. Both providers
+            # accept the same MP4 bytes — `openai_provider` extracts
+            # frames internally via `extract_frames`.
             used_provider: str
             result: ProviderResult
             try:
-                used_provider = "gemini"
-                result = await gemini_provider(
+                used_provider = "openai"
+                result = await openai_provider(
                     mp4=mp4_bytes, detectors=detectors,
                     log_tag=self._log_tag, settings=self._settings,
                 )
-            except Exception as gem_err:
-                log.warning("%s gemini failed, trying openai: %s", self._log_tag, gem_err)
+            except Exception as oa_err:
+                log.warning("%s openai failed, trying gemini: %s", self._log_tag, oa_err)
                 try:
-                    used_provider = "openai"
-                    result = await openai_provider(
+                    used_provider = "gemini"
+                    result = await gemini_provider(
                         mp4=mp4_bytes, detectors=detectors,
                         log_tag=self._log_tag, settings=self._settings,
                     )
-                except Exception as oa_err:
+                except Exception as gem_err:
                     log.error(
-                        "%s both providers failed: gemini=%s openai=%s",
-                        self._log_tag, gem_err, oa_err,
+                        "%s both providers failed: openai=%s gemini=%s",
+                        self._log_tag, oa_err, gem_err,
                     )
                     return
 
