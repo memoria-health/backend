@@ -82,6 +82,20 @@ class DesiredStateResponse(BaseModel):
     polled_at: datetime
 
 
+class UpdateMyDesiredStateRequest(BaseModel):
+    """PATCH /v1/cameras/me/desired-state body. The wall phone calls this
+    whenever the on-device Start/Stop button is tapped, so the cameras
+    row stays in sync with the actual phone state. Without this, the
+    web dashboard kept showing stale 'Disconnect' buttons after the
+    phone stopped itself, and a subsequent caregiver tap acted on
+    out-of-date intent.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    desired_state: DesiredState
+
+
 class CameraDetectorsResponse(BaseModel):
     """GET /v1/cameras/{id}/detectors body — list of detector IDs
     currently assigned to the camera. Frontend cross-references against

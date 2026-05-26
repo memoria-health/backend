@@ -27,6 +27,7 @@ from src.schemas.camera import (
     DesiredStateResponse,
     SetCameraDetectorsRequest,
     UpdateCameraRequest,
+    UpdateMyDesiredStateRequest,
 )
 from src.schemas.pairing import (
     CreatePairingCodeRequest,
@@ -206,6 +207,33 @@ async def get_my_desired_state(
     """
     return DesiredStateResponse(
         desired_state=auth.desired_state,  # type: ignore[arg-type]
+        polled_at=datetime.now(timezone.utc),
+    )
+
+
+@router.patch(
+    "/cameras/me/desired-state",
+    response_model=DesiredStateResponse,
+)
+async def update_my_desired_state(
+    body: UpdateMyDesiredStateRequest,
+    auth: CameraAuth,
+    session: SessionDep,
+) -> DesiredStateResponse:
+    """Wall phone updates its own `desired_state`. Mirrors what
+    PATCH /v1/cameras/{id} does for the caregiver, but scoped to the
+    caller's api_key so the phone doesn't need its own UUID. Called
+    on Start/Stop taps so the web dashboard's tile menu stays in
+    sync with reality — otherwise the menu shows stale buttons and
+    the next caregiver click acts on out-of-date intent.
+
+    `auth` is the Camera ORM row loaded by `camera_auth`; it's already
+    attached to this request's session, so mutating + commit persists.
+    """
+    auth.desired_state = body.desired_state
+    await session.commit()
+    return DesiredStateResponse(
+        desired_state=body.desired_state,
         polled_at=datetime.now(timezone.utc),
     )
 
