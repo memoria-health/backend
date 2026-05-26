@@ -22,6 +22,28 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 
+# Silence verbose third-party loggers that flood every tick.
+#
+# - boxmot installs a RichHandler on its own logger at import time
+#   (with propagate=False) and re-logs the OSNet weights load +
+#   BoT-SORT config every time a new tracker is constructed (per-tick
+#   today). We strip its handler so its records flow through our
+#   single root config, then raise the level to WARNING.
+# - ultralytics chatters at INFO about model loading.
+#
+# Imports here are intentional: triggering them now means boxmot's
+# configure_logging() has finished installing its RichHandler before
+# we override.
+import boxmot  # noqa: F401, E402
+import ultralytics  # noqa: F401, E402
+
+for _noisy in ("boxmot", "ultralytics"):
+    _lg = logging.getLogger(_noisy)
+    _lg.setLevel(logging.WARNING)
+    for _h in list(_lg.handlers):
+        _lg.removeHandler(_h)
+    _lg.propagate = True
+
 # Register every ORM model in SQLAlchemy metadata at startup so foreign
 # keys resolve when the first INSERT/SELECT runs. Imported for side
 # effects only.
