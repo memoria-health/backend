@@ -107,6 +107,51 @@ class Settings(BaseSettings):
     # that a shared URL goes stale fast.
     storage_signed_url_default_ttl_seconds: int = Field(ge=30, le=3600, default=600)
 
+    # ── Re-ID (Phase 1+) ────────────────────────────────────────
+    # Feature flag: when False, the enrollment API still accepts
+    # photos but the inference pipeline does NOT consult the gallery
+    # at tick time. Lets us roll the schema + API out without flipping
+    # the detector behavior until we're ready.
+    reid_enabled: bool = Field(default=False)
+    # Hard timeout for the per-tick Re-ID call. If exceeded, the tick
+    # proceeds with no identity_map and detectors fire identity-agnostic
+    # (same as today). Larger than the current ~36s offline-CPU pace so
+    # GPU-on-Railway can land well under, with CPU as a fallback for
+    # local dev.
+    reid_timeout_seconds: float = Field(gt=0, le=30, default=5.0)
+    # Base cosine threshold for face matches. The adaptive curve in
+    # `services/reid/embeddings.py:effective_match_threshold` scales
+    # this up for clear faces (~0.50) and down for unclear ones
+    # (~0.24 floor); the value here is the "wall-cam normal" point.
+    reid_match_threshold_base: float = Field(gt=0, lt=1, default=0.40)
+    # Minimum SCRFD det_score for an enrollment selfie to be accepted.
+    # Lower than the experiment's 0.6 because we now use adaptive
+    # thresholds at match time — we want to accept a wider band of
+    # selfie quality so the gallery has variety.
+    reid_enrollment_min_det_score: float = Field(ge=0, le=1, default=0.4)
+    # TTL on the per-patient gallery cache. The gallery is read once
+    # at tick time and cached so repeat ticks for the same patient
+    # don't hammer Postgres. 60s is long enough that a fresh
+    # enrollment becomes visible within a minute, short enough that
+    # harvested rows show up promptly too.
+    reid_gallery_cache_ttl_seconds: int = Field(ge=1, le=600, default=60)
+    # Cosine score required to harvest a face crop back into the
+    # gallery as `source='harvested'`. Much higher than the lock
+    # threshold so only highly-confident matches enrich the gallery.
+    reid_harvest_enabled: bool = Field(default=True)
+    reid_harvest_threshold: float = Field(gt=0, le=1, default=0.80)
+    # Per-patient gallery cap. When inserting a harvested row would
+    # exceed this, the oldest harvested row is evicted (selfies are
+    # never evicted).
+    reid_gallery_cap: int = Field(ge=20, le=1000, default=200)
+    # Per-enrollment upload bounds. iOS captures 10-15 selfies; we
+    # cap at 20 so a buggy client can't flood the gallery in one shot.
+    reid_max_photos_per_enrollment: int = Field(ge=1, le=50, default=20)
+    # InsightFace model bundle. `buffalo_l` is the production accuracy
+    # tier (~280 MB); `buffalo_sc` is the lighter option (~40 MB) for
+    # memory-constrained deploys. Override via env if Railway OOMs.
+    reid_insightface_model: str = Field(default="buffalo_l")
+
     # ── APNs (Phase 4) ──────────────────────────────────────────
     # Apple Developer credentials for HTTP/2 push. team_id +
     # apns_key_id identify the auth key file; apns_auth_key is the

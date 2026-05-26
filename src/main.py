@@ -30,6 +30,7 @@ from src.api.caregivers import router as caregivers_router
 from src.api.detectors import router as detectors_router
 from src.api.devices import router as devices_router
 from src.api.events import router as events_router
+from src.api.face_embeddings import router as face_embeddings_router
 from src.api.health import router as health_router
 from src.api.livekit import router as livekit_router
 from src.api.livekit_webhooks import router as livekit_webhooks_router
@@ -44,6 +45,7 @@ from src.db import caregiver_device as _caregiver_device  # noqa: F401
 from src.db import detector as _detector  # noqa: F401
 from src.db import event as _event  # noqa: F401
 from src.db import patient as _patient  # noqa: F401
+from src.db import patient_face_embedding as _patient_face_embedding  # noqa: F401
 from src.db.session import get_engine, get_sessionmaker
 from src.services import push
 from src.services.detection.worker import DetectorWorker
@@ -93,6 +95,8 @@ def create_app() -> FastAPI:
     app.include_router(livekit_webhooks_router)
     # Phase 3 caregiver Talk mode.
     app.include_router(talk_router)
+    # Re-ID face enrollment + status.
+    app.include_router(face_embeddings_router)
     return app
 
 

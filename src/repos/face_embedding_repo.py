@@ -29,16 +29,22 @@ async def insert_processing(
     *,
     patient_id: UUID,
     source_path: str,
+    embedding_id: UUID | None = None,
 ) -> PatientFaceEmbedding:
     """Create a `processing` row for an uploaded selfie. The
     enrollment processor fills in the embedding + det_score
     asynchronously via `mark_ready` once SCRFD + ArcFace complete.
 
+    `embedding_id` is optional. The API layer pre-allocates it before
+    uploading to Storage so the storage object's filename matches the
+    row's PK (1:1), which keeps debug + cleanup straightforward.
+    Tests that don't care can leave it None and get a fresh UUID.
+
     Caller-scoped: the API layer has already validated
     caregiver-ownership of `patient_id` before calling.
     """
     row = PatientFaceEmbedding(
-        id=uuid4(),
+        id=embedding_id if embedding_id is not None else uuid4(),
         patient_id=patient_id,
         embedding=b"",                # placeholder until processed
         det_score=0.0,
