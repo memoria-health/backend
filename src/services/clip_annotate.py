@@ -2,29 +2,37 @@
 
 Display-only post-processing. Runs AFTER `clip_archival.concat_mp4s`
 has assembled the ±15s clip and BEFORE the bytes are uploaded to
-Supabase Storage. The detector pipeline is untouched — this lives on
-the archive path only so it doesn't pay any cost on ticks that don't
-fire an event.
+Supabase Storage. The detector pipeline is untouched.
 
-Per-frame Re-ID would be ~30s of inference for a typical 30s clip at
-native fps. To keep that bounded we sample inference at
-`reid_clip_annotate_fps` (default 2 fps), carry the most recent
-bbox forward to in-between frames, and decay it back to "no box"
-after `reid_clip_annotate_carry_seconds` (1.0s) without a fresh
-detection. The result: smooth annotation across the clip at <10s of
-extra work per archive.
+Approach (matches `nemara-reid-experiment`):
+  - ffmpeg decodes the input clip to a directory of high-quality JPEGs
+    at the source's native fps. No frame skipping, no re-timing.
+  - Every JPEG is processed by `BodyReIDPipeline` in temporal order so
+    BoT-SORT can carry track IDs across frames. We draw the locked
+    PATIENT track's bbox on each frame as it appears.
+  - ffmpeg re-encodes the JPEGs into the final MP4 in a SINGLE pass
+    with libx264 (`-crf 18 -preset slow`) plus audio passthrough from
+    the original input. No double-encode, no cv2.VideoWriter — the
+    bytes only round-trip once through an encoder.
 
-Failure-mode: any error here returns the original (un-annotated) MP4
-so we never lose a clip just because the post-processing crashed.
+Per-frame inference adds noticeable wall-clock to the archive path
+(~25–35s on CPU for a 30s clip at 15 fps). Archive is async and
+fire-and-forget, so the clip just becomes viewable a few seconds
+later than before. The accuracy upgrade matches what the experiment
+produces.
+
+Failure-mode: any error returns the original (un-annotated) MP4 so
+the caregiver never loses a clip to a display-layer issue.
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
+import json
 import logging
 import os
 import shutil
+import subprocess
 import tempfile
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -49,8 +57,11 @@ log = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class _AnnotateConfig:
-    sample_fps: float
-    carry_seconds: float
+    yolo_confidence: float
+    face_check_interval: int
+    hits_to_lock: int
+    face_min_det_score: float
+    face_checks_for_other: int
     match_threshold_base: float
     insightface_model: str
 
@@ -63,7 +74,7 @@ async def annotate_clip_for_display(
     settings: "Settings",
 ) -> bytes:
     """Return a new MP4 with a green rectangle tracking the patient's
-    face. Audio is preserved.
+    body throughout the clip. Audio is preserved.
 
     Returns the original bytes unchanged if:
       - annotation is disabled in settings
@@ -89,8 +100,11 @@ async def annotate_clip_for_display(
         return mp4_bytes
 
     cfg = _AnnotateConfig(
-        sample_fps=settings.reid_clip_annotate_fps,
-        carry_seconds=settings.reid_clip_annotate_carry_seconds,
+        yolo_confidence=settings.reid_yolo_confidence,
+        face_check_interval=settings.reid_face_check_interval,
+        hits_to_lock=settings.reid_hits_to_lock,
+        face_min_det_score=settings.reid_face_min_det_score,
+        face_checks_for_other=settings.reid_face_checks_for_other,
         match_threshold_base=settings.reid_match_threshold_base,
         insightface_model=settings.reid_insightface_model,
     )
@@ -122,108 +136,102 @@ async def _load_gallery(session, patient_id: UUID) -> np.ndarray:
     return np.stack(vectors)
 
 
+# ── Sync pipeline (ffmpeg + cv2 + body Re-ID) ─────────────────────
+
+
 def _annotate_clip_sync(
     mp4_bytes: bytes,
     gallery: np.ndarray,
     cfg: _AnnotateConfig,
 ) -> bytes:
-    """The cv2 + ffmpeg heavy lifting. Runs in a thread so we don't
-    block the event loop.
-    """
+    """Decode → per-frame inference + draw → re-encode. Runs in a
+    thread so we don't block the event loop."""
     workdir = tempfile.mkdtemp(prefix="nemara-annotate-")
     in_path = os.path.join(workdir, "input.mp4")
-    annotated_path = os.path.join(workdir, "annotated.mp4")
+    frames_dir = os.path.join(workdir, "frames")
     final_path = os.path.join(workdir, "final.mp4")
+    os.makedirs(frames_dir, exist_ok=True)
     try:
         with open(in_path, "wb") as f:
             f.write(mp4_bytes)
 
-        cap = cv2.VideoCapture(in_path)
-        if not cap.isOpened():
-            log.warning("clip_annotate: cv2 cannot open input")
+        fps = _probe_fps(in_path)
+        if fps is None or fps <= 0:
+            log.warning("clip_annotate: could not determine input fps")
             return mp4_bytes
 
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        if width == 0 or height == 0:
-            log.warning("clip_annotate: zero-sized input %dx%d", width, height)
+        # Step 1: extract every frame as a high-quality JPEG. -q:v 2
+        # is the second-best quality level (1=best, 31=worst); we want
+        # the inference inputs to be visually close to the source so
+        # YOLO + SCRFD aren't hampered by compression noise the source
+        # didn't have.
+        extract_rc = _ffmpeg_extract_frames(in_path, frames_dir)
+        if extract_rc != 0:
+            log.warning(
+                "clip_annotate: ffmpeg extract exit=%d, returning raw clip",
+                extract_rc,
+            )
             return mp4_bytes
 
-        # Sample inference at most every `sample_interval` frames.
-        sample_interval = max(1, int(round(fps / cfg.sample_fps)))
-        carry_frames = int(round(fps * cfg.carry_seconds))
-
-        # mp4v keeps quality decent and is universally readable. The
-        # final ffmpeg mux re-encodes with libx264 for delivery, so the
-        # intermediate codec is just a working format.
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(annotated_path, fourcc, fps, (width, height))
-        if not writer.isOpened():
-            log.warning("clip_annotate: cv2 cannot open writer")
-            cap.release()
+        jpegs = sorted(
+            os.path.join(frames_dir, name)
+            for name in os.listdir(frames_dir)
+            if name.endswith(".jpg")
+        )
+        if not jpegs:
+            log.warning("clip_annotate: no frames produced by ffmpeg")
             return mp4_bytes
 
-        # Build the same body Re-ID pipeline the per-tick inference
-        # uses, so the archived clip shows the same kind of body bbox
-        # the LLM sees during ticks. We sample inference at
-        # `sample_interval` frames and carry the bbox forward to
-        # in-between frames — fps native, inference subsampled.
+        # Step 2: per-frame inference. The pipeline carries BoT-SORT
+        # state across frames so the locked PATIENT track stays bound
+        # through brief face occlusions / fast motion.
         pipeline = BodyReIDPipeline(
             gallery=gallery,
             config=PipelineConfig(
-                sample_fps=max(1, int(round(cfg.sample_fps))),
-                yolo_confidence=0.4,
-                face_check_interval=5,
-                hits_to_lock=2,
-                face_min_det_score=0.5,
-                face_checks_for_other=5,
+                sample_fps=max(1, int(round(fps))),
+                yolo_confidence=cfg.yolo_confidence,
+                face_check_interval=cfg.face_check_interval,
+                hits_to_lock=cfg.hits_to_lock,
+                face_min_det_score=cfg.face_min_det_score,
+                face_checks_for_other=cfg.face_checks_for_other,
                 match_threshold_base=cfg.match_threshold_base,
                 insightface_model=cfg.insightface_model,
             ),
         )
 
-        last_bbox: tuple[int, int, int, int] | None = None
-        frames_since_bbox = 0
-        frame_idx = 0
+        for frame_idx, jpeg_path in enumerate(jpegs):
+            img = cv2.imread(jpeg_path)
+            if img is None:
+                continue
+            result = pipeline.process_frame(img, frame_idx)
+            if result.patient_bbox is not None:
+                x0, y0, x1, y1 = result.patient_bbox
+                cv2.rectangle(
+                    img,
+                    (int(x0), int(y0)),
+                    (int(x1), int(y1)),
+                    _BOX_COLOR_BGR,
+                    _BOX_THICKNESS,
+                )
+                # Save back. JPEG quality 95 keeps the source detail
+                # intact for the re-encode step that follows.
+                cv2.imwrite(jpeg_path, img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            # Frames without a patient lock are left as the source JPEG;
+            # nothing to re-save, avoids unnecessary disk I/O.
 
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-
-            if frame_idx % sample_interval == 0:
-                result = pipeline.process_frame(frame, frame_idx)
-                bbox_f = result.patient_bbox
-                if bbox_f is not None:
-                    last_bbox = (
-                        int(bbox_f[0]), int(bbox_f[1]),
-                        int(bbox_f[2]), int(bbox_f[3]),
-                    )
-                    frames_since_bbox = 0
-                else:
-                    frames_since_bbox += sample_interval
-            else:
-                frames_since_bbox += 1
-
-            if last_bbox is not None and frames_since_bbox <= carry_frames:
-                x0, y0, x1, y1 = last_bbox
-                cv2.rectangle(frame, (x0, y0), (x1, y1), _BOX_COLOR_BGR, _BOX_THICKNESS)
-
-            writer.write(frame)
-            frame_idx += 1
-
-        cap.release()
-        writer.release()
-
-        # Mux: take the annotated (video-only) MP4 plus the original
-        # audio stream and produce the final delivery file. -c copy
-        # everywhere except where we have to re-encode, and we don't
-        # — annotated MP4 is already video-only with no audio to copy.
-        # Original mp4 supplies audio via the second input.
-        proc = _ffmpeg_mux(annotated_path, in_path, final_path)
-        if proc != 0:
-            log.warning("clip_annotate: ffmpeg mux exit=%d, returning raw clip", proc)
+        # Step 3: re-encode JPEGs + original audio into final MP4 in
+        # one libx264 pass. -crf 18 is visually lossless for typical
+        # phone-camera content; -preset slow gives the encoder time
+        # to find good motion vectors. Audio is copied verbatim from
+        # the original input.
+        mux_rc = _ffmpeg_assemble(
+            frames_dir=frames_dir,
+            audio_source_path=in_path,
+            out_path=final_path,
+            fps=fps,
+        )
+        if mux_rc != 0:
+            log.warning("clip_annotate: ffmpeg assemble exit=%d", mux_rc)
             return mp4_bytes
 
         with open(final_path, "rb") as f:
@@ -232,24 +240,99 @@ def _annotate_clip_sync(
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def _ffmpeg_mux(video_path: str, audio_source_path: str, out_path: str) -> int:
-    """Take an annotated video-only MP4 and the original MP4 (which
-    may have audio), produce an output with the annotated video and
-    the original audio. Re-encodes video with libx264 ultrafast for a
-    universally-playable output; copies audio if present.
+# ── ffmpeg helpers ────────────────────────────────────────────────
 
-    Returns the ffmpeg exit code.
+
+def _probe_fps(path: str) -> float | None:
+    """Return the average frame rate of `path`'s first video stream.
+    None if ffprobe isn't available or the stream can't be read.
     """
-    import subprocess
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=avg_frame_rate",
+                "-of", "json",
+                path,
+            ],
+            capture_output=True,
+            check=True,
+            timeout=10,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        log.exception("clip_annotate: ffprobe failed for %s", path)
+        return None
+    try:
+        info = json.loads(proc.stdout)
+        rate = info["streams"][0]["avg_frame_rate"]
+    except (json.JSONDecodeError, KeyError, IndexError):
+        return None
+    # avg_frame_rate is "num/den". Both 0 means unknown.
+    try:
+        num_s, den_s = rate.split("/")
+        num = float(num_s)
+        den = float(den_s)
+    except (ValueError, AttributeError):
+        return None
+    if den == 0:
+        return None
+    return num / den
+
+
+def _ffmpeg_extract_frames(in_path: str, frames_dir: str) -> int:
+    """Extract every frame as a JPEG. -q:v 2 keeps the JPEGs close to
+    visually lossless so the inference inputs aren't degraded by
+    compression noise the source didn't have.
+    """
     proc = subprocess.run(
         [
             "ffmpeg", "-y",
             "-hide_banner", "-loglevel", "error",
-            "-i", video_path,
+            "-i", in_path,
+            "-q:v", "2",
+            os.path.join(frames_dir, "%06d.jpg"),
+        ],
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        log.warning(
+            "clip_annotate: extract stderr=%s",
+            proc.stderr.decode("utf-8", errors="replace")[:500],
+        )
+    return proc.returncode
+
+
+def _ffmpeg_assemble(
+    *,
+    frames_dir: str,
+    audio_source_path: str,
+    out_path: str,
+    fps: float,
+) -> int:
+    """Reassemble the (possibly annotated) JPEG sequence into an MP4,
+    muxing the original audio stream alongside. Single libx264
+    encode, no intermediate cv2 VideoWriter — preserves the source
+    quality much better than the previous mp4v→libx264 round-trip.
+
+    `?` on the audio mapping makes it optional; if the original clip
+    had no audio (silent buffer fallback), the output is video-only
+    and ffmpeg doesn't error.
+    """
+    proc = subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-hide_banner", "-loglevel", "error",
+            "-framerate", str(fps),
+            "-i", os.path.join(frames_dir, "%06d.jpg"),
             "-i", audio_source_path,
             "-map", "0:v:0",
-            "-map", "1:a:0?",  # `?` makes the audio mapping optional
-            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+            "-map", "1:a:0?",
+            "-c:v", "libx264",
+            "-preset", "slow",
+            "-crf", "18",
+            "-pix_fmt", "yuv420p",
             "-c:a", "copy",
             "-movflags", "+faststart",
             out_path,
@@ -258,7 +341,7 @@ def _ffmpeg_mux(video_path: str, audio_source_path: str, out_path: str) -> int:
     )
     if proc.returncode != 0:
         log.warning(
-            "clip_annotate: ffmpeg mux stderr=%s",
+            "clip_annotate: assemble stderr=%s",
             proc.stderr.decode("utf-8", errors="replace")[:500],
         )
     return proc.returncode
