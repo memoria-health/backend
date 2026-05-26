@@ -278,6 +278,54 @@ create index cameras_detectors_camera_id_idx   on public.cameras_detectors(camer
 create index cameras_detectors_detector_id_idx on public.cameras_detectors(detector_id);
 
 
+-- ── patient_face_embeddings (Re-ID gallery) ─────────────────────────
+-- One row per face embedding used for patient identification at tick time.
+-- Two kinds of rows, distinguished by `source`:
+--
+--   'selfie'    Uploaded by the caregiver from the iOS onboarding flow
+--               (10-15 angle-prompted captures). One row per uploaded
+--               photo that passed SCRFD's face detection threshold.
+--               `source_path` is the Supabase Storage object key.
+--
+--   'harvested' Inserted automatically when Re-ID locks a track with
+--               very high confidence (cosine >= 0.80). Closes the
+--               selfie-to-wall-cam domain gap over time. `source_path`
+--               is NULL — we don't keep the source frame, just the
+--               aligned ArcFace embedding.
+--
+-- Status field exists because selfie processing is async (background
+-- task downloads + runs SCRFD + ArcFace). Harvested rows are written
+-- inline with status='ready'.
+create table public.patient_face_embeddings (
+  id              uuid primary key default gen_random_uuid(),
+  patient_id      uuid not null references public.patients(id) on delete cascade,
+  -- 512-dim float32 ArcFace embedding, L2-normalized. Stored as bytea
+  -- (~2KB per row); small enough to scan in-Python without pgvector.
+  embedding       bytea not null,
+  -- SCRFD detection confidence at the moment the embedding was extracted.
+  -- Surfaced for diagnostics; not used as a gate at match time (the
+  -- adaptive threshold uses it internally instead).
+  det_score       real not null,
+  source          text not null check (source in ('selfie', 'harvested')),
+  source_path     text,                              -- Storage object key; selfies only
+  status          text not null default 'ready'
+                  check (status in ('processing', 'ready', 'failed')),
+  failure_reason  text,
+  created_at      timestamptz not null default now()
+);
+
+-- Hot-path index: gallery lookups always filter to ready rows for one patient.
+create index patient_face_embeddings_patient_ready_idx
+  on public.patient_face_embeddings(patient_id)
+  where status = 'ready';
+
+-- Used by the FIFO-evict-harvested logic when the per-patient gallery
+-- cap is exceeded. Partial index keeps it tight (selfies never evict).
+create index patient_face_embeddings_patient_harvested_idx
+  on public.patient_face_embeddings(patient_id, created_at)
+  where source = 'harvested' and status = 'ready';
+
+
 -- ── events ───────────────────────────────────────────────────────
 -- Rows are written by wall phones (a later plan). For v0, populated
 -- by the seed script. Caregiver app only reads + PATCHes them.
@@ -435,6 +483,17 @@ create policy cameras_detectors_owner on public.cameras_detectors
 
 alter table public.events enable row level security;
 create policy events_owner on public.events
+  for all using (
+    patient_id in (select id from public.patients where caregiver_id = auth.uid())
+  ) with check (
+    patient_id in (select id from public.patients where caregiver_id = auth.uid())
+  );
+
+-- patient_face_embeddings: scoped through the embedding's patient → caregiver.
+-- Mirrors the events_owner pattern: rows visible only to the caregiver who owns
+-- the patient.
+alter table public.patient_face_embeddings enable row level security;
+create policy patient_face_embeddings_owner on public.patient_face_embeddings
   for all using (
     patient_id in (select id from public.patients where caregiver_id = auth.uid())
   ) with check (
