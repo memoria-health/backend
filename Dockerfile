@@ -8,14 +8,20 @@
 # Built and run by Railway. The CMD reads $PORT at runtime (Railway
 # injects it; defaults to 8002 for local docker runs).
 
-FROM python:3.13-slim
+FROM python:3.12-slim
 
-# ffmpeg is required by src/services/detection/mp4_remux.py to remux
-# buffered LiveKit frames + audio into MP4 before the Gemini call.
-# Without it, the camera_ingest worker logs "mp4_remux failed: ffmpeg
-# binary not found on PATH" every tick and no analyses rows are written.
+# System deps:
+#   - ffmpeg: mp4_remux.py + frame_extraction.py (Re-ID inference and
+#     LLM frame extraction both shell out to ffmpeg)
+#   - libgomp1: OpenMP runtime, required by onnxruntime when running
+#     InsightFace under the CPU execution provider
+#   - libopenblas-dev: NumPy linear-algebra accelerator (matters at
+#     gallery-match scan time once a patient has 100+ embeddings)
+#   - libgl1, libglib2.0-0: required by opencv-python-headless for its
+#     non-GUI image decode path
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg \
+    && apt-get install -y --no-install-recommends \
+        ffmpeg libgomp1 libopenblas-dev libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # uv is the package manager this project uses; pre-installing it via
@@ -40,6 +46,19 @@ COPY README.md ./
 
 # Install the project itself into the venv.
 RUN uv sync --frozen --no-dev
+
+# Pre-download InsightFace's buffalo_l model bundle at image build
+# time. ~280 MB lands in /root/.insightface/models/buffalo_l and is
+# baked into the image so the first tick after deploy doesn't pay
+# the cold-download cost (which can be 30-60s on Railway). Adds
+# ~500 MB to the image size, which is acceptable for the latency
+# improvement at startup. If the model download fails (CDN
+# outage), the build fails fast — preferable to a slow first tick
+# in production.
+RUN uv run python -c "from insightface.app import FaceAnalysis; \
+    app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider']); \
+    app.prepare(ctx_id=0, det_size=(640, 640)); \
+    print('insightface buffalo_l warmed')"
 
 # Match the local-dev port for parity. Railway overrides via $PORT.
 EXPOSE 8002

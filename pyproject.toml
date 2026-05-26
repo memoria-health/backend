@@ -2,7 +2,7 @@
 name = "nemara-backend"
 version = "0.0.1"
 description = "Nemara caregiver-app backend (FastAPI + Supabase)"
-requires-python = ">=3.13"
+requires-python = ">=3.12,<3.13"
 readme = "README.md"
 dependencies = [
     "fastapi>=0.115",
@@ -41,6 +41,20 @@ dependencies = [
     # endpoint, and Phase 4's clip-archival path benefits from
     # connection multiplexing against Supabase Storage as well.
     "h2>=4.1",
+    # ── Re-ID pipeline (face identification) ─────────────────────────
+    # InsightFace bundles SCRFD (face detector) + ArcFace (face
+    # embedding) under a single FaceAnalysis API. The `buffalo_l`
+    # model pack is ~280MB and pre-downloaded at Dockerfile build
+    # time so the first tick after deploy doesn't pay the cold-
+    # download cost.
+    "insightface>=0.7.3",
+    "onnxruntime>=1.16",
+    # OpenCV is required by InsightFace for image decode + alignment.
+    # The `headless` variant skips GUI deps (no X11 in the container).
+    "opencv-python-headless>=4.9",
+    # numpy is already a transitive dep of several others; pin
+    # explicitly because the Re-ID code uses it directly.
+    "numpy>=1.26,<3.0",
 ]
 
 [project.scripts]
@@ -64,7 +78,7 @@ packages = ["src", "scripts"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py313"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "RUF"]
