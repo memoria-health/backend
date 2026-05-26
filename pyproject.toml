@@ -49,6 +49,12 @@ dependencies = [
     # download cost.
     "insightface>=0.7.3",
     "onnxruntime>=1.16",
+    # onnx 1.19 references `ml_dtypes.float4_e2m1fn` which only exists
+    # in ml_dtypes>=0.5; but torch / tensorflow / jax in the wider
+    # graph hold ml_dtypes at 0.4.x. Pinning onnx<1.19 keeps the
+    # resolver happy. Revisit once the ML-stack graph upgrades
+    # ml_dtypes.
+    "onnx<1.19",
     # OpenCV is required by InsightFace for image decode + alignment.
     # The `headless` variant skips GUI deps (no X11 in the container).
     "opencv-python-headless>=4.9",
