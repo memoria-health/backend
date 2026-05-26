@@ -160,17 +160,25 @@ async def _build_pre_event_mp4() -> bytes:
 
 @pytest_asyncio.fixture
 async def filled_buffers() -> AsyncIterator[tuple[FrameBuffer, AudioBuffer]]:
-    """A pre-populated post-event frame + audio buffer. The archival
-    code calls `snapshot_last_seconds(15)` against `time.monotonic()`,
-    so we push frames with captured_at very close to `now`."""
+    """A pre-populated post-event frame + audio buffer.
+
+    archive_event() sleeps for clip_post_event_wait_seconds and then
+    calls snapshot_last_seconds(clip_post_event_wait_seconds) against
+    time.monotonic(). In production the room-worker is continuously
+    pushing fresh frames during that sleep, so the snapshot always
+    finds recent ones. In the test we have no such background pusher,
+    so we future-date the fixture's captured_at values to outlive any
+    setup delay between fixture build and archive_event call (ffmpeg
+    pre-mp4 build can take a few hundred ms).
+    """
     import time
-    now = time.monotonic()
+    base = time.monotonic() + 2.0
     frames = FrameBuffer(window_seconds=15.0, target_fps=5)
     audio = AudioBuffer(window_seconds=15.0)
     for i in range(15):
         frames.push(
             width=320, height=240, data=_i420_blob(320, 240),
-            captured_at=now - 2.0 + i / 5,
+            captured_at=base + i / 5,
         )
     yield frames, audio
 
