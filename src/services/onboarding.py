@@ -103,7 +103,7 @@ async def update_caregiver(
 # cluttering the caregiver-facing detector list.
 
 _FALL_PROMPT_FRAGMENT = (
-    "The camera is wall-mounted with a fixed view — a person can fall PARTIALLY OR FULLY OUT OF FRAME during a real fall (e.g., they collapse below the camera's downward field of view).\n\n"
+    "The camera is wall-mounted with a fixed view — a person can fall PARTIALLY OR FULLY OUT OF FRAME during a real fall (e.g., they collapse below the camera's downward field of view). The fall itself needs to happen visibly on camera, though — a sound or off-camera commotion alone isn't enough on its own.\n\n"
     "fall_detected: boolean. Be INCLUSIVE. Set TRUE for any of:\n"
     "  - a person fully collapsing, slipping, tripping, stumbling hard, sliding down to the floor;\n"
     "  - suddenly dropping to the ground from standing / a chair / a bed;\n"
