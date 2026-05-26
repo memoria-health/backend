@@ -272,33 +272,41 @@ class CameraIngest:
                 log.warning("%s mp4_remux failed: %s", self._log_tag, exc)
                 return
 
-            # Provider fallback: OpenAI → Gemini. OpenAI's gpt-5.4-nano
-            # is the cheaper of the two on a per-tick basis (the OpenAI
-            # path also samples frames at lower fps + 480px width, vs
-            # Gemini's full MP4 ingest), so we try it first and fall
-            # back to Gemini only when OpenAI errors. Both providers
-            # accept the same MP4 bytes — `openai_provider` extracts
-            # frames internally via `extract_frames`.
+            # Provider fallback: Gemini → OpenAI. Gemini-3.5-flash
+            # processes the MP4 as actual video (native temporal
+            # reasoning + higher per-frame fidelity) which is
+            # materially better at the safety-critical detectors —
+            # wandering (did the body cross a doorway through a door
+            # swing?) and fall (sudden downward motion at a specific
+            # instant). gpt-5.4-nano on 75 low-detail jpegs handles
+            # state-style detectors (agitation, medication) fine but
+            # was producing false negatives on threshold-crossing
+            # events. Cost is ~2-3x higher per tick on Gemini, paid
+            # back by not missing real safety incidents. Keep OpenAI
+            # in the fallback slot for when Gemini errors / rate-
+            # limits. Both providers accept the same MP4 bytes —
+            # `openai_provider` extracts frames internally via
+            # `extract_frames`.
             used_provider: str
             result: ProviderResult
             try:
-                used_provider = "openai"
-                result = await openai_provider(
+                used_provider = "gemini"
+                result = await gemini_provider(
                     mp4=mp4_bytes, detectors=detectors,
                     log_tag=self._log_tag, settings=self._settings,
                 )
-            except Exception as oa_err:
-                log.warning("%s openai failed, trying gemini: %s", self._log_tag, oa_err)
+            except Exception as gem_err:
+                log.warning("%s gemini failed, trying openai: %s", self._log_tag, gem_err)
                 try:
-                    used_provider = "gemini"
-                    result = await gemini_provider(
+                    used_provider = "openai"
+                    result = await openai_provider(
                         mp4=mp4_bytes, detectors=detectors,
                         log_tag=self._log_tag, settings=self._settings,
                     )
-                except Exception as gem_err:
+                except Exception as oa_err:
                     log.error(
-                        "%s both providers failed: openai=%s gemini=%s",
-                        self._log_tag, oa_err, gem_err,
+                        "%s both providers failed: gemini=%s openai=%s",
+                        self._log_tag, gem_err, oa_err,
                     )
                     return
 
