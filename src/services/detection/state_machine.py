@@ -3,29 +3,47 @@
 The state controls when the LLM runs:
 
   - `open`:    LLM runs every tick (10s).
-  - `closed`:  LLM is **completely off**. Motion is the wake-up.
+  - `closed`:  LLM is off. Motion in this state triggers ONE
+               verification LLM call; the LLM's verdict decides
+               whether the camera actually transitions to open.
 
-Transitions:
-  - `closed → open`: any tick with `people_present=true` (LLM verdict)
-                     OR any tick with `motion_in_clip=true` (wall-phone
-                     wake-up signal). Motion-driven reactivation means
-                     the LLM resumes on this same tick — the caller
-                     transitions state *before* the LLM call, so the
-                     tick that detected motion runs as an open-state
-                     tick.
+Transitions (ALL driven by `people_present` — the LLM verdict):
+
+  - `closed → open`: any tick where the LLM returned
+                     `people_present=true`. Motion alone never flips
+                     the state. The LLM call that returned this
+                     verdict was triggered by motion (the gate in
+                     `camera_ingest.py:219` allows closed+motion to
+                     run the LLM), but the people verdict — not the
+                     motion signal — is what writes the transition.
+
   - `open → closed`: `close_threshold` consecutive ticks with
-                     `people_present=false` (and the LLM ran on each).
+                     `people_present=false` while in the `open`
+                     state. The counter increments on each no-people
+                     tick, clamped at `close_threshold`. Any single
+                     tick with `people_present=true` resets it to 0.
 
-Why motion is now allowed to reopen: under the previous
-"people-only" gate the state could only flip closed → open when the
-LLM said `people_present=true`. But the LLM never ran in closed
-state with no motion — and closed-with-motion still cost a full
-LLM call. With motion as the wake-up, closed truly means *no LLM
-calls at all* until something in the room moves. The trade-off is
-that a noisy on-phone motion detector (low threshold, pets,
-curtains, lighting flicker) can keep flipping the camera back
-open. That knob lives in `NemaraCam/Camera/MotionDetector.swift`
-(`motionThreshold`); raise it if false reopens become common.
+The "first LLM call verification" semantic falls out naturally:
+
+  closed + motion → camera_ingest runs the LLM (one call)
+    → LLM says people=true  → state flips to open, count=0,
+                                normal open-state ticking begins
+    → LLM says people=false → state stays closed, count clamped at
+                                close_threshold. No false 7-call
+                                open window for a phantom wake-up.
+
+The motion signal lives entirely in `camera_ingest.py:219` as the
+"should we even call the LLM this tick?" gate. Once the LLM has
+been called, motion is irrelevant to the state transition. This
+module accepts `motion_in_clip` purely for logging in the
+analyses row; the SQL ignores it.
+
+If false motion events become too frequent (noisy on-phone
+detector tripping on pets / curtains / lighting), the knob is
+`motionThreshold` in `NemaraCam/Camera/MotionDetector.swift`.
+Each false motion now costs one LLM call (the verification) —
+not the seven it cost under the previous "motion-auto-opens"
+rule.
 
 Persistent state lives on the `cameras` row (state, no_people_count,
 state_changed_at).
@@ -81,40 +99,47 @@ class CameraStateAfter:
 # This makes the increment race-free even when two backend tasks
 # call `apply_tick_update` for the same camera concurrently.
 #
-# Logic (motion-as-wake-up + people-confirmation):
-#   people_present (LLM saw a person this tick):
-#     count → 0, state → 'open', changed_at → now if transition
-#   else if state == 'closed' AND motion_in_clip (wall-phone wake-up):
-#     count → 0, state → 'open', changed_at → now (transition)
-#   else if state == 'closed' (closed + no motion — should never be
-#     reached via apply_tick_update since the ingest worker writes
-#     the synthetic skipped row directly without calling this; kept
-#     defensively to clamp the counter):
-#     count → close_threshold
-#   else (state == 'open', no people, motion either way):
+# Logic (motion = LLM wake-up; people verdict = state transition):
+#   people_present=true (LLM saw a person this tick):
+#     count → 0
+#     state → 'open' (transition from closed if applicable)
+#     changed_at → now if a closed→open transition happened
+#   else if state == 'closed' (this is the "motion-wake-up verification
+#     failed" case: the camera was closed, motion fired, the ingest
+#     worker ran the LLM, and the LLM came back with no people. We
+#     stay closed — no false open window).
+#     count → close_threshold (clamp)
+#     state → unchanged ('closed')
+#     changed_at → unchanged
+#   else (state == 'open', no people):
 #     count → LEAST(count + 1, close_threshold)
 #     state → 'closed' if count + 1 >= close_threshold else 'open'
-#     changed_at → now if transition
+#     changed_at → now if a transition happened
+#
+# Motion is NOT a state input here. The on-phone motion signal only
+# gates whether `camera_ingest._tick_loop` decides to call the LLM
+# this tick (see camera_ingest.py:219). Once the LLM has been called,
+# its `people_present` verdict is the sole driver of state. This means
+# a closed camera + false-positive motion → 1 verification LLM call,
+# people=false → stays closed (no 7-call open window for a phantom
+# wake-up).
 _ATOMIC_UPDATE_SQL = text(
     """
     UPDATE public.cameras
     SET
         no_people_count = CASE
             WHEN :people_present THEN 0
-            WHEN state = 'closed' AND :motion_in_clip THEN 0
             WHEN state = 'closed' THEN close_threshold
             ELSE LEAST(no_people_count + 1, close_threshold)
         END,
         state = CASE
             WHEN :people_present THEN 'open'
-            WHEN state = 'closed' AND :motion_in_clip THEN 'open'
             WHEN state = 'open' AND no_people_count + 1 >= close_threshold
                 THEN 'closed'
             ELSE state
         END,
         state_changed_at = CASE
             WHEN :people_present AND state = 'closed' THEN :now
-            WHEN state = 'closed' AND :motion_in_clip THEN :now
             WHEN NOT :people_present AND state = 'open'
                 AND no_people_count + 1 >= close_threshold THEN :now
             ELSE state_changed_at
