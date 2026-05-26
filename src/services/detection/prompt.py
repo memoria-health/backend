@@ -124,27 +124,31 @@ def build_identity_addendum(patient_in_clip: bool) -> str:
 
     Two states (per the plan's "two prompt states" design):
 
-      - patient_in_clip=True  -> tell the LLM to focus on the patient
+      - patient_in_clip=True  -> tell the LLM about the green box AND
+                                 to focus on the patient
       - patient_in_clip=False -> no addendum; today's behavior (score
                                  any visible person, including for
                                  safety detectors)
 
-    The addendum text is conservative: it tells the LLM what we know
-    without claiming things we don't. We do NOT draw a bounding box
-    in v0 — that's a v0.1 visual polish. The text-only hint is
-    sufficient for the LLM to bias its attention toward the patient.
+    The OpenAI path actually draws the green rectangle on every frame
+    via `frame_annotate.annotate_jpeg`. Gemini accepts the raw MP4
+    and the text guidance carries it — the box-on-frames pass would
+    require a decode/re-encode loop we haven't committed to yet.
     """
     if not patient_in_clip:
         return ""
     return (
         "\n\n"
         "Re-ID has identified the patient in this clip with high "
-        "confidence. Focus detector outcomes on the patient. Other "
-        "people may be present but should not be the subject of "
-        "behavioral findings unless they directly interact with the "
-        "patient. Safety findings (fall, agitation, distress) should "
-        "still be reported for the patient even if they happen "
-        "while the patient is partially out of frame."
+        "confidence. The patient is marked with a thin green "
+        "rectangle drawn around their face on every frame where the "
+        "rectangle is visible. Focus detector outcomes on the person "
+        "inside the green rectangle. Other people may be present but "
+        "should not be the subject of behavioral findings unless they "
+        "directly interact with the patient. Safety findings (fall, "
+        "agitation, distress) should still be reported for the "
+        "patient even if they happen while the patient is partially "
+        "out of frame."
     )
 
 

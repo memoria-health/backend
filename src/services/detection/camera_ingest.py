@@ -46,6 +46,7 @@ from src.services.detection.providers.openai import openai_provider
 from src.services.detection.providers.types import ProviderResult
 from src.services.detection.registry import get_enabled_detectors_for_camera
 from src.services.detection.state_machine import apply_tick_update
+from src.repos.face_embedding_repo import has_ready_enrollment
 from src.services.reid.inference import IdentityResult, ReIDInference
 
 if TYPE_CHECKING:
@@ -297,6 +298,58 @@ class CameraIngest:
                 identity.face_count,
             )
 
+            # Upstream identity gate. When Re-ID is confident the patient
+            # is NOT in this clip AND an enrollment exists, skip the LLM
+            # call entirely. Saves a per-tick OpenAI call (5-7s + cost)
+            # plus the archival path that follows (no event ever fires
+            # for a non-patient tick, so no clip is uploaded either —
+            # exactly the user's "never see a clip of a non-patient"
+            # contract).
+            #
+            # Safety contract preserved: `reid_ran=False` (timeout,
+            # crash, or no-enrollment-yet) bypasses this gate, so a
+            # Re-ID infrastructure failure can NEVER silence the
+            # detector pipeline. That's the load-bearing invariant the
+            # existing safety tests already cover.
+            #
+            # The `has_ready_enrollment` check is the day-zero clause:
+            # without it, a patient who hasn't enrolled yet would have
+            # every tick skipped because Re-ID always returns "not in
+            # clip" with an empty gallery.
+            if identity.reid_ran and not identity.patient_in_clip:
+                if await has_ready_enrollment(session, self.patient_id):
+                    state_after = await apply_tick_update(
+                        session,
+                        camera_id=self.camera_id,
+                        people_present=False,
+                        motion_in_clip=motion_in_clip,
+                    )
+                    synthetic_fields = {
+                        "people_present": False,
+                        "skipped_reason": "identity_not_patient",
+                        "identity_reid_ran": True,
+                        "identity_patient_in_clip": False,
+                        "identity_confidence": round(identity.confidence, 4),
+                    }
+                    await add_analysis(
+                        session,
+                        camera_id=self.camera_id,
+                        provider="skipped",
+                        description="(non-patient in frame — LLM skipped)",
+                        detector_fields=synthetic_fields,
+                        people_present=False,
+                        people_count=0,
+                        motion_in_clip=motion_in_clip,
+                        state_after=state_after.state,
+                        captured_at=captured_at,
+                    )
+                    await session.commit()
+                    log.info(
+                        "%s SKIP identity-gated, faces=%d confidence=%.3f",
+                        self._log_tag, identity.face_count, identity.confidence,
+                    )
+                    return
+
             # Provider fallback: OpenAI → Gemini. OpenAI's gpt-5.4-nano
             # is the cheaper of the two on a per-tick basis (the OpenAI
             # path also samples frames at lower fps + 480px width, vs
@@ -312,6 +365,7 @@ class CameraIngest:
                     mp4=mp4_bytes, detectors=detectors,
                     log_tag=self._log_tag, settings=self._settings,
                     patient_in_clip=identity.patient_in_clip,
+                    face_bbox=identity.face_bbox,
                 )
             except Exception as oa_err:
                 log.warning("%s openai failed, trying gemini: %s", self._log_tag, oa_err)
@@ -321,6 +375,7 @@ class CameraIngest:
                         mp4=mp4_bytes, detectors=detectors,
                         log_tag=self._log_tag, settings=self._settings,
                         patient_in_clip=identity.patient_in_clip,
+                        face_bbox=identity.face_bbox,
                     )
                 except Exception as gem_err:
                     log.error(

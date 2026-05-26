@@ -173,6 +173,32 @@ async def list_ready_for_patient_unscoped(
     return (await session.execute(stmt)).scalars().all()
 
 
+async def has_ready_enrollment(
+    session: AsyncSession,
+    patient_id: UUID,
+) -> bool:
+    """True iff the patient has at least one ready face embedding.
+
+    Used by both the upstream gate in `camera_ingest` (skip the LLM
+    when Re-ID is confident the patient isn't in frame) and the
+    downstream gate in `event_promotion` (suppress promotion of any
+    events the LLM did produce). Both gates fall back to today's
+    identity-agnostic behavior when no enrollment exists — that's the
+    day-zero contract.
+
+    Unscoped by caregiver: the pipeline has no caregiver session.
+    """
+    stmt = (
+        select(PatientFaceEmbedding.id)
+        .where(
+            PatientFaceEmbedding.patient_id == patient_id,
+            PatientFaceEmbedding.status == "ready",
+        )
+        .limit(1)
+    )
+    return (await session.execute(stmt)).scalar_one_or_none() is not None
+
+
 async def count_by_source(
     session: AsyncSession,
     patient_id: UUID,

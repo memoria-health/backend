@@ -9,10 +9,12 @@ The OpenAI path does NOT include the Gemini-only speech fields —
 no audio surface.
 """
 
+import asyncio
 from collections.abc import Sequence
 
 from openai import AsyncOpenAI
 
+from src.services.detection.frame_annotate import annotate_base64_async
 from src.services.detection.frame_extraction import extract_frames
 from src.services.detection.prompt import (
     DetectorSpec,
@@ -31,6 +33,7 @@ async def openai_provider(
     log_tag: str,
     settings: Settings,
     patient_in_clip: bool = False,
+    face_bbox: tuple[float, float, float, float] | None = None,
 ) -> ProviderResult:
     if not settings.openai_api_key:
         raise RuntimeError("NEMARA_OPENAI_API_KEY not configured")
@@ -41,15 +44,30 @@ async def openai_provider(
 
     frames = await extract_frames(mp4, fps=fps, max_width=480)
 
+    # If Re-ID locked the patient AND gave us a bbox, burn a thin
+    # green rectangle onto every frame at that location before sending
+    # to the LLM. Helps the model attribute detector outcomes (fall,
+    # agitation) to the correct person when multiple people are in
+    # frame. See `frame_annotate.py` for the why-not-just-one-frame
+    # discussion.
+    frame_payloads: list[tuple[str, str]] = [
+        (f.data_base64, f.mime_type) for f in frames
+    ]
+    if patient_in_clip and face_bbox is not None:
+        annotated = await asyncio.gather(
+            *(annotate_base64_async(b64, face_bbox) for b64, _mime in frame_payloads),
+        )
+        frame_payloads = [(b64, mime) for b64, (_, mime) in zip(annotated, frame_payloads)]
+
     image_parts = [
         {
             "type": "image_url",
             "image_url": {
-                "url": f"data:{frame.mime_type};base64,{frame.data_base64}",
+                "url": f"data:{mime};base64,{b64}",
                 "detail": "low",
             },
         }
-        for frame in frames
+        for b64, mime in frame_payloads
     ]
 
     client = AsyncOpenAI(api_key=settings.openai_api_key)

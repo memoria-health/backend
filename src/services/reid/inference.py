@@ -71,12 +71,19 @@ class IdentityResult:
 
     `face_count`: total faces detected across all sampled frames.
     Useful for "how busy is this clip" reasoning later.
+
+    `face_bbox`: pixel-space bbox `(x0, y0, x1, y1)` of the best-match
+    face in its sampled frame. Only set when `patient_in_clip=True`.
+    Coordinates are in the frame's native dimensions (sampled at
+    `reid_inference_sample_width`, same as the provider's frame
+    extraction), so callers can draw directly without rescaling.
     """
     reid_ran: bool
     patient_in_clip: bool
     confidence: float
     best_frame_index: int | None
     face_count: int
+    face_bbox: tuple[float, float, float, float] | None = None
 
     @classmethod
     def empty(cls) -> "IdentityResult":
@@ -90,6 +97,7 @@ class IdentityResult:
             confidence=0.0,
             best_frame_index=None,
             face_count=0,
+            face_bbox=None,
         )
 
 
@@ -243,6 +251,7 @@ class ReIDInference:
             confidence=max(0.0, best_score),
             best_frame_index=best_frame_idx,
             face_count=face_count,
+            face_bbox=best_hit.bbox if (any_match and best_hit is not None) else None,
         )
         log.info(
             "reid.label_clip patient=%s frames=%d face_count=%d "

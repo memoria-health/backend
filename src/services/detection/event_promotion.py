@@ -27,7 +27,7 @@ from src.db.camera import Camera
 from src.db.detector import Detector
 from src.db.event import Event
 from src.db.patient import Patient
-from src.db.patient_face_embedding import PatientFaceEmbedding
+from src.repos.face_embedding_repo import has_ready_enrollment
 
 _log = logging.getLogger(__name__)
 
@@ -91,7 +91,7 @@ async def maybe_promote_analysis(
     identity_reid_ran = bool(detector_fields.get("identity_reid_ran", False))
     identity_patient_in_clip = bool(detector_fields.get("identity_patient_in_clip", False))
     if identity_reid_ran and not identity_patient_in_clip:
-        gallery_exists = await _patient_has_ready_enrollment(session, patient_id)
+        gallery_exists = await has_ready_enrollment(session, patient_id)
         if gallery_exists:
             _log.info(
                 "event_promotion.identity_gated patient=%s camera=%s "
@@ -171,26 +171,6 @@ async def maybe_promote_analysis(
 
 def _is_truthy_bool(v: Any) -> bool:
     return isinstance(v, bool) and v is True
-
-
-async def _patient_has_ready_enrollment(
-    session: AsyncSession,
-    patient_id: UUID,
-) -> bool:
-    """True iff the patient has at least one ready face embedding.
-    Used by the identity gate to decide whether to fall back to
-    today's identity-agnostic behavior (no enrollment) or actively
-    suppress non-patient promotions.
-    """
-    stmt = (
-        select(PatientFaceEmbedding.id)
-        .where(
-            PatientFaceEmbedding.patient_id == patient_id,
-            PatientFaceEmbedding.status == "ready",
-        )
-        .limit(1)
-    )
-    return (await session.execute(stmt)).scalar_one_or_none() is not None
 
 
 async def _within_dedup_window(
