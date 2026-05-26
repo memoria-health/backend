@@ -30,6 +30,32 @@ from src.db.patient import Patient
 
 _log = logging.getLogger(__name__)
 
+# Human-friendly event titles. Every preset is prefixed with "Possible"
+# so the lock-screen alert, the in-app event header, and the history
+# row never assert a definitive medical/safety judgment — the model
+# can be wrong, and the caregiver is the human-in-the-loop. This
+# wording is intentional for liability reasons; do not strip it.
+_EVENT_TITLE_BY_IDENTIFIER: dict[str, str] = {
+    "fall":       "Possible Fall",
+    "wandering":  "Possible Wandering",
+    "agitation":  "Possible Agitation",
+    "medication": "Possible Medication Event",
+}
+
+
+def _event_title_for(detector: Detector) -> str:
+    """Pick the human-readable event title for a fire from this detector.
+    Preset detectors get their canonical "Possible …" wording. Custom
+    detectors fall back to prefixing the user-defined detector name.
+    """
+    if title := _EVENT_TITLE_BY_IDENTIFIER.get(detector.identifier):
+        return title
+    name = detector.name.strip()
+    if name.lower().startswith("possible"):
+        return name
+    return f"Possible {name}"
+
+
 # (detection-field-name, confidence-field-name, min-confidence)
 # Falling back to confidence-field-name = None means no confidence
 # gate (any True fires).
@@ -183,7 +209,7 @@ async def _insert_event(
         category=detector.category,
         source=detector.source,
         icon_name=detector.icon_name,
-        title=detector.name,
+        title=_event_title_for(detector),
         location=camera.room,
         occurred_at=occurred_at,
         # Phase 0: no clips yet (HTTP clip ingest doesn't archive).

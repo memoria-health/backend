@@ -190,8 +190,8 @@ async def _dispatch_one(
         return
 
     payload = build_event_payload(
-        title=patient.preferred_name,
-        body=event.narrative,
+        title=event.title,
+        body=f"{patient.preferred_name} — {event.narrative}",
         event_id=str(event.id),
         patient_id=str(patient.id),
     )
