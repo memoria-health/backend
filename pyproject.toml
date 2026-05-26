@@ -52,9 +52,22 @@ dependencies = [
     # OpenCV is required by InsightFace for image decode + alignment.
     # The `headless` variant skips GUI deps (no X11 in the container).
     "opencv-python-headless>=4.9",
+    # ── Body Re-ID stack (mirrors nemara-reid-experiment) ────────────
+    # ultralytics ships YOLO11n (~6MB weights) for person detection.
+    # boxmot wraps BoT-SORT + OSNet body-appearance Re-ID (~10MB weights
+    # for osnet_x0_25_msmt17). Both pull torch as a hard dep — that's
+    # what dominates the image size (~500MB for CPU-only torch). We
+    # accept this so the production pipeline matches the experiment
+    # exactly: body tracks carry the patient identity through frames
+    # where the face is occluded / pointed away / motion-blurred (e.g.,
+    # the exact moment of a fall).
+    "ultralytics>=8.3",
+    "boxmot>=11.0",
+    "torch>=2.0",
     # numpy is already a transitive dep of several others; pin
-    # explicitly because the Re-ID code uses it directly.
-    "numpy>=1.26,<3.0",
+    # explicitly because the Re-ID code uses it directly. <2.0 to
+    # match the boxmot constraint from the experiment's pyproject.
+    "numpy>=1.26,<2.0",
 ]
 
 [project.scripts]

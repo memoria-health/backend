@@ -33,7 +33,7 @@ async def openai_provider(
     log_tag: str,
     settings: Settings,
     patient_in_clip: bool = False,
-    face_bbox: tuple[float, float, float, float] | None = None,
+    patient_bbox: tuple[float, float, float, float] | None = None,
 ) -> ProviderResult:
     if not settings.openai_api_key:
         raise RuntimeError("NEMARA_OPENAI_API_KEY not configured")
@@ -44,18 +44,19 @@ async def openai_provider(
 
     frames = await extract_frames(mp4, fps=fps, max_width=480)
 
-    # If Re-ID locked the patient AND gave us a bbox, burn a thin
-    # green rectangle onto every frame at that location before sending
-    # to the LLM. Helps the model attribute detector outcomes (fall,
-    # agitation) to the correct person when multiple people are in
-    # frame. See `frame_annotate.py` for the why-not-just-one-frame
-    # discussion.
+    # If Re-ID locked the patient AND gave us a body bbox, burn a
+    # thin green rectangle onto every frame at that location before
+    # sending to the LLM. Helps the model attribute detector outcomes
+    # (fall, agitation) to the correct person when multiple people
+    # are in frame. See `frame_annotate.py` for the why-not-just-one-
+    # frame discussion. Box is the BODY bbox from YOLO (not face),
+    # matching what the experiment shows the user.
     frame_payloads: list[tuple[str, str]] = [
         (f.data_base64, f.mime_type) for f in frames
     ]
-    if patient_in_clip and face_bbox is not None:
+    if patient_in_clip and patient_bbox is not None:
         annotated = await asyncio.gather(
-            *(annotate_base64_async(b64, face_bbox) for b64, _mime in frame_payloads),
+            *(annotate_base64_async(b64, patient_bbox) for b64, _mime in frame_payloads),
         )
         frame_payloads = [(b64, mime) for b64, (_, mime) in zip(annotated, frame_payloads)]
 

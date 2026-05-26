@@ -118,7 +118,12 @@ class Settings(BaseSettings):
     # (same as today). Larger than the current ~36s offline-CPU pace so
     # GPU-on-Railway can land well under, with CPU as a fallback for
     # local dev.
-    reid_timeout_seconds: float = Field(gt=0, le=30, default=5.0)
+    # Hard timeout for the per-tick Re-ID pipeline. Body Re-ID
+    # (YOLO + BoT-SORT + face checks on a ~75-frame tick) lands
+    # around 6-10s on CPU; 15s gives reasonable headroom without
+    # letting a stuck tick block the next one indefinitely (tick
+    # interval is 10s but the loop is fire-and-forget).
+    reid_timeout_seconds: float = Field(gt=0, le=60, default=15.0)
     # Base cosine threshold for face matches. The adaptive curve in
     # `services/reid/embeddings.py:effective_match_threshold` scales
     # this up for clear faces (~0.50) and down for unclear ones
@@ -155,8 +160,30 @@ class Settings(BaseSettings):
     # frames is plenty to catch a face glimpse without spending the
     # 75-frames-at-5fps budget the LLM uses. 480 px wide matches the
     # OpenAI provider's frame size, so the ffmpeg pass is reusable.
-    reid_inference_sample_fps: int = Field(ge=1, le=15, default=1)
+    # 5 fps gives BoT-SORT enough temporal continuity to keep track
+    # IDs stable as the patient moves. 15s tick × 5 fps = 75 frames
+    # per tick, processed sequentially through YOLO + tracker.
+    reid_inference_sample_fps: int = Field(ge=1, le=15, default=5)
     reid_inference_sample_width: int = Field(ge=240, le=1920, default=480)
+    # ── Body Re-ID pipeline (mirrors the experiment) ───────────────
+    # YOLO confidence threshold for the person detector. Default
+    # matches the experiment's PersonDetector(confidence=0.4).
+    reid_yolo_confidence: float = Field(gt=0, le=1, default=0.4)
+    # Per-track face check cadence: every N frames per UNKNOWN track,
+    # run SCRFD inside the person bbox. 5 frames @ 5 fps = 1s
+    # between checks, same as the experiment.
+    reid_face_check_interval: int = Field(ge=1, le=60, default=5)
+    # Consecutive above-threshold face matches required to lock a
+    # track as PATIENT. 2 means a single false-positive embedding
+    # cannot lock the wrong identity.
+    reid_hits_to_lock: int = Field(ge=1, le=10, default=2)
+    # SCRFD detection confidence floor for a face check to count.
+    # Faces below this are ignored (motion blur, partial occlusion).
+    reid_face_min_det_score: float = Field(ge=0, le=1, default=0.5)
+    # Face checks (with no patient match) before a track locks as
+    # OTHER. Higher = slower OTHER locks but fewer wrong-OTHER calls
+    # if the patient was briefly face-occluded early in the tick.
+    reid_face_checks_for_other: int = Field(ge=1, le=20, default=5)
     # Per-frame Re-ID annotation of archived event clips. Display-only
     # post-processing; the detector pipeline never reads these. When
     # enabled, every event clip uploaded to Supabase Storage has a

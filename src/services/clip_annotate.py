@@ -36,7 +36,8 @@ import numpy as np
 from src.repos.face_embedding_repo import has_ready_enrollment, list_ready_for_patient_unscoped
 from src.services.detection.frame_annotate import _BOX_COLOR_BGR, _BOX_THICKNESS
 from src.services.reid import embeddings as reid_embeddings
-from src.services.reid.embeddings import embedding_from_bytes, topk_mean_cosine_match
+from src.services.reid.body_pipeline import BodyReIDPipeline, PipelineConfig
+from src.services.reid.embeddings import embedding_from_bytes
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -163,6 +164,25 @@ def _annotate_clip_sync(
             cap.release()
             return mp4_bytes
 
+        # Build the same body Re-ID pipeline the per-tick inference
+        # uses, so the archived clip shows the same kind of body bbox
+        # the LLM sees during ticks. We sample inference at
+        # `sample_interval` frames and carry the bbox forward to
+        # in-between frames — fps native, inference subsampled.
+        pipeline = BodyReIDPipeline(
+            gallery=gallery,
+            config=PipelineConfig(
+                sample_fps=max(1, int(round(cfg.sample_fps))),
+                yolo_confidence=0.4,
+                face_check_interval=5,
+                hits_to_lock=2,
+                face_min_det_score=0.5,
+                face_checks_for_other=5,
+                match_threshold_base=cfg.match_threshold_base,
+                insightface_model=cfg.insightface_model,
+            ),
+        )
+
         last_bbox: tuple[int, int, int, int] | None = None
         frames_since_bbox = 0
         frame_idx = 0
@@ -173,11 +193,13 @@ def _annotate_clip_sync(
                 break
 
             if frame_idx % sample_interval == 0:
-                bbox = _detect_patient_bbox(
-                    frame, gallery, cfg.match_threshold_base, cfg.insightface_model,
-                )
-                if bbox is not None:
-                    last_bbox = bbox
+                result = pipeline.process_frame(frame, frame_idx)
+                bbox_f = result.patient_bbox
+                if bbox_f is not None:
+                    last_bbox = (
+                        int(bbox_f[0]), int(bbox_f[1]),
+                        int(bbox_f[2]), int(bbox_f[3]),
+                    )
                     frames_since_bbox = 0
                 else:
                     frames_since_bbox += sample_interval
@@ -208,46 +230,6 @@ def _annotate_clip_sync(
             return f.read()
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
-
-
-def _detect_patient_bbox(
-    frame_bgr: np.ndarray,
-    gallery: np.ndarray,
-    match_threshold_base: float,
-    model_name: str,
-) -> tuple[int, int, int, int] | None:
-    """Run SCRFD + ArcFace on a single BGR frame, return the bbox of
-    the highest-scoring face that matches the gallery above the
-    adaptive threshold. None if no face matches.
-    """
-    # InsightFace expects BGR ndarray, same as what cv2 produces.
-    app = reid_embeddings.get_face_app(model_name)
-    faces = app.get(frame_bgr)
-    if not faces:
-        return None
-
-    best_score = -1.0
-    best_bbox: tuple[int, int, int, int] | None = None
-    for face in faces:
-        if face.embedding is None:
-            continue
-        emb = face.embedding.astype(np.float32)
-        # ArcFace embeddings are L2-normalized by the model itself, but
-        # be defensive in case a version change drops that.
-        norm = float(np.linalg.norm(emb))
-        if norm > 0:
-            emb = emb / norm
-
-        match = topk_mean_cosine_match(emb, gallery)
-        x1, y1, x2, y2 = (float(v) for v in face.bbox)
-        face_area = max(1.0, (x2 - x1) * (y2 - y1))
-        threshold = reid_embeddings.effective_match_threshold(
-            match_threshold_base, float(face.det_score), face_area,
-        )
-        if match.score >= threshold and match.score > best_score:
-            best_score = match.score
-            best_bbox = (int(x1), int(y1), int(x2), int(y2))
-    return best_bbox
 
 
 def _ffmpeg_mux(video_path: str, audio_source_path: str, out_path: str) -> int:

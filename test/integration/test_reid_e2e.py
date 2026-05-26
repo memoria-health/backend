@@ -238,26 +238,30 @@ async def test_tick_writes_identity_into_analyses(
     """We don't drive the full camera_ingest tick here (LiveKit
     plumbing is too invasive to fake), but we exercise the
     ReIDInference.label_clip path directly and confirm the result
-    shape is what camera_ingest will stash into detector_fields."""
-    from src.services.reid.inference import ReIDInference
+    shape is what camera_ingest will stash into detector_fields.
+
+    With the body Re-ID port we no longer test the per-frame internals
+    here (YOLO + BoT-SORT + InsightFace would require real models in
+    CI). Instead we mock `_run_pipeline_sync` to verify the async
+    wrapper + harvest hop honor the IdentityResult shape and that the
+    timeout/error fall-through paths still work."""
+    from src.services.reid.inference import ReIDInference, IdentityResult
     from src.db.session import get_sessionmaker
     from src.settings import get_settings
+    from src.services.detection import frame_extraction
 
     _patch_stack(monkeypatch)
 
     patient_id, headers = await _caregiver_setup(client, auth_user)
 
-    # Enroll one selfie so the gallery isn't empty.
+    # Enroll one selfie so the gallery isn't empty (label_clip
+    # short-circuits to empty() before pipeline if gallery is empty).
     files = [("photos", ("a.jpg", _TINY_JPEG, "image/jpeg"))]
     await client.post(
         f"/v1/patients/{patient_id}/face-embeddings",
         headers=headers, files=files,
     )
     await _wait_for_ready(client, headers, patient_id, expected=1)
-
-    # Drive ReIDInference directly against a synthetic MP4 (we monkey-
-    # patched frame_extraction so the bytes don't matter).
-    from src.services.detection import frame_extraction
 
     class _Frame:
         def __init__(self, data: bytes):
@@ -272,11 +276,33 @@ async def test_tick_writes_identity_into_analyses(
     settings = get_settings().model_copy(update={"reid_enabled": True})
     sm = get_sessionmaker()
     reid = ReIDInference(sessionmaker=sm, settings=settings)
+
+    # Bypass the heavy CV pipeline — emulate a clean PATIENT lock with
+    # a body bbox so the rest of ReIDInference (async wrapper,
+    # IdentityResult assembly, harvest hop) is what we exercise.
+    def fake_pipeline_sync(*, frames, gallery, patient_id, sample_fps):
+        return (
+            IdentityResult(
+                reid_ran=True,
+                patient_in_clip=True,
+                confidence=0.85,
+                best_frame_index=1,
+                face_count=2,
+                patient_bbox=(10.0, 20.0, 220.0, 480.0),
+            ),
+            None,  # no harvest payload
+        )
+    monkeypatch.setattr(reid, "_run_pipeline_sync", fake_pipeline_sync)
+
     result = await reid.label_clip(
         mp4_bytes=b"fake-mp4",
         patient_id=UUID(patient_id),
     )
 
-    assert result.reid_ran is True, "production tick should mark reid_ran=True"
-    assert result.patient_in_clip is True, "patched embed returns the gallery vector exactly"
-    assert result.confidence > 0.99, f"self-match should approach 1.0, got {result.confidence}"
+    assert result.reid_ran is True
+    assert result.patient_in_clip is True
+    assert result.confidence == 0.85
+    assert result.patient_bbox == (10.0, 20.0, 220.0, 480.0)
+    # Legacy alias for callers still referencing face_bbox.
+    assert result.face_bbox == result.patient_bbox
+    assert result.face_count == 2

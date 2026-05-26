@@ -50,15 +50,26 @@ RUN uv sync --frozen --no-dev
 # Pre-download InsightFace's buffalo_l model bundle at image build
 # time. ~280 MB lands in /root/.insightface/models/buffalo_l and is
 # baked into the image so the first tick after deploy doesn't pay
-# the cold-download cost (which can be 30-60s on Railway). Adds
-# ~500 MB to the image size, which is acceptable for the latency
-# improvement at startup. If the model download fails (CDN
-# outage), the build fails fast — preferable to a slow first tick
-# in production.
+# the cold-download cost (which can be 30-60s on Railway).
 RUN uv run python -c "from insightface.app import FaceAnalysis; \
     app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider']); \
     app.prepare(ctx_id=0, det_size=(640, 640)); \
     print('insightface buffalo_l warmed')"
+
+# Pre-download YOLO11n and OSNet weights for the body Re-ID pipeline.
+# YOLO11n: ~6 MB, lands at /app/yolo11n.pt. OSNet x0_25 MSMT17:
+# ~10 MB, lands wherever boxmot's PyTorchBackend caches by default
+# (typically /root/.cache/boxmot/ or the CWD). Same rationale as the
+# buffalo_l pre-cache: first tick after deploy shouldn't pay a cold
+# download.
+RUN uv run python -c "from ultralytics import YOLO; \
+    m = YOLO('yolo11n.pt'); \
+    print('yolo11n warmed')"
+RUN uv run python -c "import torch; \
+    from pathlib import Path; \
+    from boxmot.reid.backends.pytorch_backend import PyTorchBackend; \
+    PyTorchBackend(weights=Path('osnet_x0_25_msmt17.pt'), device=torch.device('cpu'), half=False); \
+    print('osnet x0_25 msmt17 warmed')"
 
 # Match the local-dev port for parity. Railway overrides via $PORT.
 EXPOSE 8002

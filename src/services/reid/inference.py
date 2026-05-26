@@ -1,28 +1,40 @@
-"""Per-tick Re-ID labeller. Decides whether the patient appears in
-the clip's video, with what confidence, and at what frame.
+"""Per-tick Re-ID labeller: YOLO person detect → BoT-SORT track →
+periodic face check per track → state machine → locked PATIENT bbox.
 
-Design choice for v0: face-only identification. We do NOT run YOLO
-person detection or BoT-SORT body re-ID at production tick time.
-Reasons:
+Verbatim port of `nemara-reid-experiment/src/reid/pipeline/identifier.py`
+adapted for the production tick budget (one 15-second clip per tick,
+state is intentionally per-tick).
 
-  1. The detector tick already has frames extracted (or extractable
-     via `frame_extraction.extract_frames`). A face-detection pass on
-     a handful of those frames is much cheaper than the full
-     YOLO+BoT-SORT+OSNet pipeline.
-  2. The output we need is a single boolean ("patient present in this
-     clip") plus a confidence score and best-frame index. We don't
-     need per-track stability across the clip — the LLM will reason
-     over the whole clip whether or not we label individual tracks.
-  3. Removes ~80% of the model footprint (no YOLO weights, no OSNet
-     weights, no BoT-SORT tracker state).
+Pipeline per tick:
 
-If we later need per-track labeling for SoM-style multi-person scenes,
-we can layer the full pipeline back in. v0 ships the simpler thing.
+  1. extract frames at `reid_inference_sample_fps` (default 5 fps).
+  2. for each frame in temporal order:
+       YOLO -> person bboxes
+       BoT-SORT.update(dets, frame) -> tracked bboxes with stable IDs
+       for each track:
+         if UNKNOWN and (frame_idx - last_face_check) >= face_check_interval:
+           face check inside the person bbox
+           if face matches gallery above adaptive threshold:
+             face_hits += 1; lock as PATIENT after `hits_to_lock` hits
+           else after `face_checks_for_other` checks: lock as OTHER
+       record the last frame's bbox for any locked PATIENT track
+  3. emit IdentityResult:
+       patient_in_clip = True iff at least one track locked PATIENT
+       patient_bbox    = body bbox of the most-recent locked PATIENT frame
+       confidence      = best face-match cosine score across the tick
+       face_count      = total face checks that returned at least one face
 
-Threading: each call runs `embed_image_bytes` per sampled frame
-concurrently via `asyncio.gather`. The InsightFace model is shared
-across calls (lazy-init singleton). Total per-tick latency bound by
-the slowest face check, not the sum.
+Why this matters vs the v0 face-only path: the body Re-ID embeddings
+inside BoT-SORT carry the patient identification through frames where
+the face is turned, occluded, or motion-blurred — exactly the failure
+mode that hid a patient fall earlier (face pointed toward the floor
+during the fall). Body Re-ID locks on the patient's clothing /
+silhouette and the label sticks for the rest of the tick.
+
+Threading: the whole per-tick pipeline runs in `asyncio.to_thread`.
+YOLO + BoT-SORT + InsightFace are all sync torch / numpy / onnxruntime
+work, so we keep them off the event loop with one thread hop instead
+of per-frame fan-out.
 """
 
 from __future__ import annotations
@@ -32,6 +44,7 @@ import base64
 import logging
 import time
 from dataclasses import dataclass
+from typing import Optional
 from uuid import UUID
 
 import numpy as np
@@ -41,6 +54,7 @@ from src.repos import face_embedding_repo
 from src.services.detection import frame_extraction
 from src.services.reid import embeddings as reid_embeddings
 from src.services.reid import harvester
+from src.services.reid.body_pipeline import BodyReIDPipeline, PipelineConfig
 from src.settings import Settings
 
 log = logging.getLogger(__name__)
@@ -50,74 +64,84 @@ log = logging.getLogger(__name__)
 class IdentityResult:
     """Per-tick identity decision for a single patient.
 
-    `reid_ran`: True iff Re-ID actually executed and produced a
-    verdict. False on timeout, crash, or no-enrollment-yet. The
-    downstream event_promotion gate keys off this: when False, it
-    falls back to identity-agnostic behavior (today's flow) instead
-    of suppressing promotions. This is the load-bearing safety
+    `reid_ran`: True iff the pipeline executed and produced a verdict.
+    False on timeout, crash, feature disabled, or no enrollment yet.
+    The upstream gate in `camera_ingest` keys off this: when False,
+    it bypasses identity-based suppression. Load-bearing safety
     invariant: a Re-ID infrastructure failure must NEVER silence the
     detector pipeline.
 
-    `patient_in_clip`: True iff at least one sampled frame had a face
-    that matched the gallery above the adaptive threshold. Only
-    meaningful when `reid_ran=True`.
+    `patient_in_clip`: True iff at least one BoT-SORT track was
+    locked as PATIENT during this tick. Only meaningful when
+    `reid_ran=True`.
 
-    `confidence`: best cosine score over all sampled frames. 0.0 when
-    no face matched. Surfaced in the analyses row's
-    `detector_fields.identity_confidence` for diagnostics.
+    `confidence`: best cosine face-match score across all face checks
+    in the tick. 0.0 when no match.
 
-    `best_frame_index`: which sampled frame produced the best match.
-    Useful for future SoM-style overlays; currently informational.
+    `best_frame_index`: which sampled frame produced the patient
+    lock's most recent body bbox. Useful diagnostics; primarily
+    informational.
 
-    `face_count`: total faces detected across all sampled frames.
-    Useful for "how busy is this clip" reasoning later.
+    `face_count`: total face checks that returned at least one face.
+    Used by the upstream gate to distinguish "Re-ID saw no faces"
+    (face_count=0, ambiguous) from "saw faces, none matched the
+    patient" (face_count>0, confident not-patient).
 
-    `face_bbox`: pixel-space bbox `(x0, y0, x1, y1)` of the best-match
-    face in its sampled frame. Only set when `patient_in_clip=True`.
-    Coordinates are in the frame's native dimensions (sampled at
-    `reid_inference_sample_width`, same as the provider's frame
-    extraction), so callers can draw directly without rescaling.
+    `patient_bbox`: pixel-space BODY bbox `(x0, y0, x1, y1)` of the
+    most-recently-seen locked PATIENT track. None when no track
+    locked. This is the BODY box from YOLO, not the face box — that
+    matches what the experiment draws and what the clip annotation
+    paths burn into the LLM frames + archived clips.
     """
     reid_ran: bool
     patient_in_clip: bool
     confidence: float
     best_frame_index: int | None
     face_count: int
-    face_bbox: tuple[float, float, float, float] | None = None
+    patient_bbox: tuple[float, float, float, float] | None = None
+
+    # Legacy alias so existing call sites that reference `face_bbox`
+    # keep compiling. The semantic shifted from "face bbox" to "body
+    # bbox" when we ported the experiment's YOLO + BoT-SORT pipeline.
+    @property
+    def face_bbox(self) -> tuple[float, float, float, float] | None:
+        return self.patient_bbox
 
     @classmethod
     def empty(cls) -> "IdentityResult":
-        """The 'Re-ID did not produce a verdict' shape. Used on
-        timeout, crash, or when the feature is disabled. The
-        event_promotion gate sees `reid_ran=False` and bypasses
-        identity-based suppression."""
         return cls(
             reid_ran=False,
             patient_in_clip=False,
             confidence=0.0,
             best_frame_index=None,
             face_count=0,
-            face_bbox=None,
+            patient_bbox=None,
         )
+
+
+@dataclass
+class _HarvestRequest:
+    """Surface for the post-thread harvest hop. The thread can't
+    cleanly call into the async sessionmaker (it's bound to the parent
+    loop), so we hand the payload back to the async caller."""
+    embedding: np.ndarray
+    det_score: float
+    match_score: float
 
 
 class ReIDInference:
     """In-process Re-ID labeler. One instance per FastAPI process —
-    loaded by `main.create_app` at startup so the first tick doesn't
-    pay the model-load cost.
+    constructed by `main.create_app` at startup so the first tick
+    doesn't pay the model-load cost.
 
-    The class owns the per-patient gallery cache. The InsightFace
-    model itself is owned by the `embeddings` module (lazy module-
-    level singleton).
+    Owns the per-patient gallery cache. The InsightFace, YOLO, and
+    OSNet models are owned by their respective modules (lazy
+    singletons).
     """
 
     def __init__(self, sessionmaker: async_sessionmaker, settings: Settings) -> None:
         self._sessionmaker = sessionmaker
         self._settings = settings
-        # gallery cache: patient_id -> (cached_at_monotonic, gallery_array)
-        # gallery_array is the stacked (N, 512) float32 matrix ready for
-        # cosine match. Empty array signals "no enrollment yet" and the
-        # caller falls back to identity-agnostic.
         self._gallery_cache: dict[UUID, tuple[float, np.ndarray]] = {}
         self._cache_lock = asyncio.Lock()
 
@@ -127,12 +151,12 @@ class ReIDInference:
         mp4_bytes: bytes,
         patient_id: UUID,
     ) -> IdentityResult:
-        """Run Re-ID on a 15-second tick clip. Returns the empty
-        result on timeout, infrastructure error, or no-enrollment.
+        """Run Re-ID on a tick clip. Returns the empty result on
+        timeout, infrastructure error, or no-enrollment.
 
-        The hard timeout is `settings.reid_timeout_seconds`. If
-        exceeded, we cancel and return empty so the caller (the tick
-        body) proceeds with identity-agnostic behavior.
+        Hard timeout is `settings.reid_timeout_seconds`. The full body
+        pipeline is heavier than the face-only path; calibrate that
+        setting accordingly.
         """
         if not self._settings.reid_enabled:
             return IdentityResult.empty()
@@ -148,7 +172,6 @@ class ReIDInference:
             )
             return IdentityResult.empty()
         except Exception as exc:
-            # Crashes degrade to identity-agnostic, never to silence.
             log.exception(
                 "reid.label_clip.error patient=%s err=%s", patient_id, exc,
             )
@@ -162,12 +185,8 @@ class ReIDInference:
     ) -> IdentityResult:
         gallery = await self._get_gallery(patient_id)
         if gallery.size == 0:
-            # No enrollment yet: identity-agnostic (today's behavior).
             return IdentityResult.empty()
 
-        # Sample frames at a low fps — face detection doesn't need 15
-        # fps; 1 fps over a 15s clip = 15 frames, more than enough to
-        # catch a glimpse of the patient if they're in frame.
         sample_fps = self._settings.reid_inference_sample_fps
         sample_width = self._settings.reid_inference_sample_width
         try:
@@ -183,83 +202,119 @@ class ReIDInference:
         if not frames:
             return IdentityResult.empty()
 
-        started = time.monotonic()
-        # Embed each frame concurrently. embed_image_bytes already wraps
-        # the sync work in asyncio.to_thread.
-        face_hits = await asyncio.gather(
-            *(
-                reid_embeddings.embed_image_bytes(
-                    base64.b64decode(f.data_base64),
-                    model_name=self._settings.reid_insightface_model,
+        # The whole pipeline (decode + YOLO + BoT-SORT + face checks +
+        # state machine) is sync work — hop into a thread once so the
+        # event loop stays responsive. The async harvest hop happens
+        # AFTER the thread returns; the sessionmaker is bound to this
+        # event loop and can't be safely reused from inside a thread.
+        result, harvest = await asyncio.to_thread(
+            self._run_pipeline_sync,
+            frames=frames,
+            gallery=gallery,
+            patient_id=patient_id,
+            sample_fps=sample_fps,
+        )
+        if harvest is not None:
+            try:
+                harvested = await self._harvest(
+                    patient_id=patient_id,
+                    embedding=harvest.embedding,
+                    det_score=harvest.det_score,
+                    match_score=harvest.match_score,
                 )
-                for f in frames
+                if harvested:
+                    await self.invalidate_gallery(patient_id)
+            except Exception:
+                log.exception("reid.harvest_failed patient=%s", patient_id)
+        return result
+
+    def _run_pipeline_sync(
+        self,
+        *,
+        frames,
+        gallery: np.ndarray,
+        patient_id: UUID,
+        sample_fps: int,
+    ) -> tuple[IdentityResult, Optional[_HarvestRequest]]:
+        import cv2  # local: heavy, only needed on the inference path
+        started = time.monotonic()
+
+        s = self._settings
+        pipeline = BodyReIDPipeline(
+            gallery=gallery,
+            config=PipelineConfig(
+                sample_fps=sample_fps,
+                yolo_confidence=s.reid_yolo_confidence,
+                face_check_interval=s.reid_face_check_interval,
+                hits_to_lock=s.reid_hits_to_lock,
+                face_min_det_score=s.reid_face_min_det_score,
+                face_checks_for_other=s.reid_face_checks_for_other,
+                match_threshold_base=s.reid_match_threshold_base,
+                insightface_model=s.reid_insightface_model,
             ),
-            return_exceptions=True,
         )
 
-        best_score: float = -1.0
-        best_frame_idx: int | None = None
-        best_hit = None
-        face_count = 0
-        any_match = False
-
-        for idx, hit in enumerate(face_hits):
-            if isinstance(hit, BaseException):
-                log.warning("reid.embed_failed frame=%d err=%s", idx, hit)
+        for frame_idx, frame in enumerate(frames):
+            try:
+                jpeg = base64.b64decode(frame.data_base64)
+                arr = np.frombuffer(jpeg, dtype=np.uint8)
+                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            except Exception:
+                log.exception("reid.frame_decode_failed frame=%d", frame_idx)
                 continue
-            if hit is None:
+            if img is None:
                 continue
-            face_count += 1
-            match = reid_embeddings.topk_mean_cosine_match(hit.embedding, gallery)
-            threshold = reid_embeddings.effective_match_threshold(
-                self._settings.reid_match_threshold_base,
-                hit.det_score,
-                hit.face_pixel_area,
-            )
-            log.debug(
-                "reid.frame patient=%s frame=%d det_score=%.3f score=%.3f thr=%.3f",
-                patient_id, idx, hit.det_score, match.score, threshold,
-            )
-            if match.score >= threshold and match.score > best_score:
-                best_score = match.score
-                best_frame_idx = idx
-                best_hit = hit
-                any_match = True
+            pipeline.process_frame(img, frame_idx)
 
-        # Adaptive learning: if the best match cleared the harvest
-        # threshold (0.80 default, much higher than the lock threshold),
-        # append the embedding to the gallery. This closes the
-        # selfie-to-wall-cam domain gap over a week of operation. The
-        # cache invalidation makes the new row visible on the very
-        # next tick instead of waiting for the TTL.
-        if best_hit is not None:
-            harvested = await harvester.maybe_harvest_embedding(
-                patient_id=patient_id,
-                embedding=best_hit.embedding,
-                det_score=best_hit.det_score,
-                match_score=best_score,
-                sessionmaker=self._sessionmaker,
-                settings=self._settings,
+        # Adaptive learning: hand the best face embedding we saw back
+        # to the async caller, which will run the harvester + cache
+        # invalidation outside this thread (SQLAlchemy session bound
+        # to the parent event loop).
+        harvest: Optional[_HarvestRequest] = None
+        if (
+            pipeline.has_any_patient_track
+            and pipeline.best_face_embedding is not None
+            and pipeline.best_score > 0
+        ):
+            harvest = _HarvestRequest(
+                embedding=pipeline.best_face_embedding,
+                det_score=pipeline.best_face_det_score,
+                match_score=pipeline.best_score,
             )
-            if harvested:
-                await self.invalidate_gallery(patient_id)
 
         elapsed_ms = (time.monotonic() - started) * 1000.0
         result = IdentityResult(
             reid_ran=True,
-            patient_in_clip=any_match,
-            confidence=max(0.0, best_score),
-            best_frame_index=best_frame_idx,
-            face_count=face_count,
-            face_bbox=best_hit.bbox if (any_match and best_hit is not None) else None,
+            patient_in_clip=pipeline.has_any_patient_track,
+            confidence=pipeline.best_score,
+            best_frame_index=pipeline.best_frame_idx,
+            face_count=pipeline.face_count,
+            patient_bbox=pipeline.latest_patient_bbox,
         )
         log.info(
             "reid.label_clip patient=%s frames=%d face_count=%d "
-            "patient_in_clip=%s confidence=%.3f elapsed_ms=%.0f",
-            patient_id, len(frames), face_count,
+            "tracks=%d patient_in_clip=%s confidence=%.3f elapsed_ms=%.0f",
+            patient_id, len(frames), pipeline.face_count, pipeline.num_tracks,
             result.patient_in_clip, result.confidence, elapsed_ms,
         )
-        return result
+        return result, harvest
+
+    async def _harvest(
+        self,
+        *,
+        patient_id: UUID,
+        embedding: np.ndarray,
+        det_score: float,
+        match_score: float,
+    ) -> bool:
+        return await harvester.maybe_harvest_embedding(
+            patient_id=patient_id,
+            embedding=embedding,
+            det_score=det_score,
+            match_score=match_score,
+            sessionmaker=self._sessionmaker,
+            settings=self._settings,
+        )
 
     # ── Gallery cache ───────────────────────────────────────────
 
@@ -268,15 +323,8 @@ class ReIDInference:
 
         Cached per-patient with a TTL from settings. Cache miss reads
         from `patient_face_embeddings` (status=ready). Empty array on
-        no-enrollment.
-
-        Concurrency: the cache lock guards both reads (TTL check) and
-        writes (post-DB-load store). The DB read happens OUTSIDE the
-        lock to keep tick-fan-out from serializing on a single
-        patient's cache miss. We re-check the cache after the DB read
-        so a concurrent `invalidate_gallery` between miss and store
-        doesn't get clobbered: the post-load store only takes effect
-        if no fresher entry landed in the meantime.
+        no-enrollment. See module docstring of the previous version
+        for the race-safety reasoning around `load_started_at`.
         """
         now = time.monotonic()
         ttl = self._settings.reid_gallery_cache_ttl_seconds
@@ -284,9 +332,6 @@ class ReIDInference:
             cached = self._gallery_cache.get(patient_id)
             if cached is not None and (now - cached[0]) < ttl:
                 return cached[1]
-            # Capture monotonic clock under the lock so a concurrent
-            # invalidate_gallery() between here and the DB read can
-            # be detected on the way back in.
             load_started_at = time.monotonic()
 
         async with self._sessionmaker() as session:
@@ -311,26 +356,14 @@ class ReIDInference:
             )
 
         async with self._cache_lock:
-            # If an invalidate or another store landed while we were
-            # loading, only overwrite if our snapshot is still the
-            # freshest. The timestamp comparison is monotonic, so a
-            # newer entry has a strictly larger value.
             existing = self._gallery_cache.get(patient_id)
             if existing is None or existing[0] <= load_started_at:
                 self._gallery_cache[patient_id] = (time.monotonic(), stacked)
-                return stacked
-            # Someone (invalidate cleared+set, or another tick) won
-            # the race. Return our freshly-loaded gallery for THIS
-            # call's use but don't clobber the cache. The next tick
-            # gets the newer cached value.
             return stacked
 
     async def invalidate_gallery(self, patient_id: UUID) -> None:
         """Drop the cached gallery for a patient. Called from the
         harvester when it appends a new row so the next tick picks it
-        up immediately rather than waiting for TTL.
-
-        Takes the cache lock so a concurrent `_get_gallery` post-load
-        store can detect the invalidation and skip the stale write."""
+        up immediately rather than waiting for TTL."""
         async with self._cache_lock:
             self._gallery_cache.pop(patient_id, None)

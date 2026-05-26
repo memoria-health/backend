@@ -162,6 +162,46 @@ def _embed_image_bytes_sync(image_bytes: bytes, model_name: str) -> FaceHit | No
     )
 
 
+def embed_in_box(
+    frame_bgr: np.ndarray,
+    bbox: tuple[float, float, float, float],
+    *,
+    model_name: str = "buffalo_l",
+) -> list[FaceHit]:
+    """Detect + embed every face inside a person bounding box.
+
+    Used by the body-Re-ID pipeline: YOLO + BoT-SORT give us a person
+    box; we then look for the face only inside that crop. Cheaper than
+    scanning the whole frame for faces, and avoids cross-tagging a
+    face from one person to another's track when two people stand
+    close together.
+
+    Returned bboxes are translated back into the parent frame's
+    coordinates so the caller can draw / log against the original
+    frame.
+    """
+    h, w = frame_bgr.shape[:2]
+    x1, y1, x2, y2 = bbox
+    x1i = max(0, int(x1))
+    y1i = max(0, int(y1))
+    x2i = min(w, int(x2))
+    y2i = min(h, int(y2))
+    if x2i <= x1i or y2i <= y1i:
+        return []
+    crop = frame_bgr[y1i:y2i, x1i:x2i]
+    app = get_face_app(model_name)
+    faces = app.get(crop)
+    out: list[FaceHit] = []
+    for f in faces:
+        fx1, fy1, fx2, fy2 = (float(v) for v in f.bbox)
+        out.append(FaceHit(
+            embedding=f.normed_embedding.astype(np.float32),
+            det_score=float(f.det_score),
+            bbox=(fx1 + x1i, fy1 + y1i, fx2 + x1i, fy2 + y1i),
+        ))
+    return out
+
+
 # ─── Embedding ↔ bytes helpers ──────────────────────────────────
 
 

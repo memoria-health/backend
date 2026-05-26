@@ -381,7 +381,7 @@ class CameraIngest:
                     mp4=mp4_bytes, detectors=detectors,
                     log_tag=self._log_tag, settings=self._settings,
                     patient_in_clip=identity.patient_in_clip,
-                    face_bbox=identity.face_bbox,
+                    patient_bbox=identity.patient_bbox,
                 )
             except Exception as oa_err:
                 log.warning("%s openai failed, trying gemini: %s", self._log_tag, oa_err)
@@ -391,7 +391,7 @@ class CameraIngest:
                         mp4=mp4_bytes, detectors=detectors,
                         log_tag=self._log_tag, settings=self._settings,
                         patient_in_clip=identity.patient_in_clip,
-                        face_bbox=identity.face_bbox,
+                        patient_bbox=identity.patient_bbox,
                     )
                 except Exception as gem_err:
                     log.error(
