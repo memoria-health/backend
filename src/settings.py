@@ -157,6 +157,23 @@ class Settings(BaseSettings):
     # OpenAI provider's frame size, so the ffmpeg pass is reusable.
     reid_inference_sample_fps: int = Field(ge=1, le=15, default=1)
     reid_inference_sample_width: int = Field(ge=240, le=1920, default=480)
+    # Per-frame Re-ID annotation of archived event clips. Display-only
+    # post-processing; the detector pipeline never reads these. When
+    # enabled, every event clip uploaded to Supabase Storage has a
+    # thin green box tracking the patient through the ±15 second
+    # window so caregivers always see who triggered the alert. Adds
+    # ~6-10s to the archive path (already async/fire-and-forget).
+    reid_clip_annotation_enabled: bool = Field(default=True)
+    # Sample inference at this rate; bbox is carried forward to
+    # in-between frames so the box stays drawn at native fps without
+    # paying inference on every frame. 2 fps × 30s = 60 inference
+    # calls per archive, ~3-5s of SCRFD/ArcFace work.
+    reid_clip_annotate_fps: float = Field(gt=0, le=10, default=2.0)
+    # How long the most-recent bbox is reused on frames where Re-ID
+    # didn't run (or didn't find the patient). Long enough to bridge
+    # a glance-away, short enough that the box disappears when the
+    # patient actually leaves frame.
+    reid_clip_annotate_carry_seconds: float = Field(gt=0, le=5, default=1.0)
 
     # ── APNs (Phase 4) ──────────────────────────────────────────
     # Apple Developer credentials for HTTP/2 push. team_id +

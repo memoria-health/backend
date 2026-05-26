@@ -93,7 +93,7 @@ _init_lock = threading.Lock()
 _face_app = None
 
 
-def _get_face_app(model_name: str):
+def get_face_app(model_name: str):
     """Lazily build and cache the InsightFace FaceAnalysis pipeline.
 
     Called inside `asyncio.to_thread` from `embed_image_bytes` so the
@@ -150,7 +150,7 @@ def _embed_image_bytes_sync(image_bytes: bytes, model_name: str) -> FaceHit | No
         log.warning("reid.embed.decode_failed bytes=%d", len(image_bytes))
         return None
 
-    app = _get_face_app(model_name)
+    app = get_face_app(model_name)
     faces = app.get(img)
     if not faces:
         return None

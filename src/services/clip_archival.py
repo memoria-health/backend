@@ -44,6 +44,7 @@ from uuid import UUID
 
 from src.db.event import Event
 from src.services import storage
+from src.services.clip_annotate import annotate_clip_for_display
 from src.services.detection.mp4_remux import Mp4RemuxError, frames_to_mp4
 
 if TYPE_CHECKING:
@@ -64,6 +65,7 @@ class ConcatError(RuntimeError):
 async def archive_event(
     *,
     event_id: UUID,
+    patient_id: UUID,
     pre_event_mp4: bytes,
     frame_buffer: "FrameBuffer",
     audio_buffer: "AudioBuffer",
@@ -71,8 +73,9 @@ async def archive_event(
     settings: "Settings",
 ) -> None:
     """Capture the post-event window, concat with the pre-event MP4
-    handed in, upload the result to Supabase Storage, and flip
-    `has_clip=true` on the events row.
+    handed in, burn a green bbox tracking the patient through the
+    ±15s window, upload the result, and flip `has_clip=true` on the
+    events row.
 
     Errors are caught and logged. The events row stays without a clip
     rather than the whole detector pipeline crashing — caregivers
@@ -81,10 +84,15 @@ async def archive_event(
     `pre_event_mp4` is what `_run_tick` already built and handed to
     the LLM. Reusing the bytes saves an ffmpeg encode and guarantees
     pre/post have identical codec params for `-c copy` concat.
+
+    `patient_id` drives the Re-ID gallery lookup at annotation time.
+    Annotation is best-effort: if it fails, the un-annotated clip is
+    uploaded so caregivers never lose a clip to display-layer issues.
     """
     try:
         await _archive_one(
             event_id=event_id,
+            patient_id=patient_id,
             pre_event_mp4=pre_event_mp4,
             frame_buffer=frame_buffer,
             audio_buffer=audio_buffer,
@@ -98,6 +106,7 @@ async def archive_event(
 async def _archive_one(
     *,
     event_id: UUID,
+    patient_id: UUID,
     pre_event_mp4: bytes,
     frame_buffer: "FrameBuffer",
     audio_buffer: "AudioBuffer",
@@ -137,8 +146,19 @@ async def _archive_one(
 
     combined_mp4 = await concat_mp4s(pre_event_mp4, post_event_mp4)
 
+    # Display-only post-processing: burn a green bbox tracking the
+    # patient across the clip. Best-effort — returns the input bytes
+    # unchanged if the patient has no enrollment, if annotation is
+    # disabled, or if any step crashes.
+    annotated_mp4 = await annotate_clip_for_display(
+        combined_mp4,
+        patient_id=patient_id,
+        sessionmaker=sessionmaker,
+        settings=settings,
+    )
+
     final_key = await storage.upload_clip(
-        event_id=event_id, mp4_bytes=combined_mp4, settings=settings,
+        event_id=event_id, mp4_bytes=annotated_mp4, settings=settings,
     )
 
     async with sessionmaker() as session:
@@ -156,7 +176,7 @@ async def _archive_one(
 
     log.info(
         "clip_archival.done event_id=%s key=%s bytes=%d",
-        event_id, final_key, len(combined_mp4),
+        event_id, final_key, len(annotated_mp4),
     )
 
 

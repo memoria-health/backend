@@ -101,7 +101,7 @@ def _install_fake_httpx(monkeypatch) -> dict[str, Any]:
 # ── seeding ───────────────────────────────────────────────────────────
 
 
-async def _seed_event(session: AsyncSession, auth_user_factory) -> UUID:
+async def _seed_event(session: AsyncSession, auth_user_factory) -> tuple[UUID, UUID]:
     uid, email = await auth_user_factory()
     now = datetime.now(timezone.utc)
     session.add(
@@ -134,7 +134,7 @@ async def _seed_event(session: AsyncSession, auth_user_factory) -> UUID:
         )
     )
     await session.commit()
-    return event_id
+    return event_id, patient_id
 
 
 def _i420_blob(width: int, height: int) -> bytes:
@@ -193,7 +193,7 @@ async def test_archive_event_uploads_and_flips_has_clip(
 ):
     sm = get_sessionmaker()
     async with sm() as s:
-        event_id = await _seed_event(s, auth_user_factory)
+        event_id, patient_id = await _seed_event(s, auth_user_factory)
 
     fake_httpx = _install_fake_httpx(monkeypatch)
     frame_buffer, audio_buffer = filled_buffers
@@ -208,6 +208,7 @@ async def test_archive_event_uploads_and_flips_has_clip(
 
     await archive_event(
         event_id=event_id,
+        patient_id=patient_id,
         pre_event_mp4=pre_mp4,
         frame_buffer=frame_buffer,
         audio_buffer=audio_buffer,
@@ -246,7 +247,7 @@ async def test_archive_event_noops_when_post_frames_missing(
     stays without a clip — caregiver still sees the alert text."""
     sm = get_sessionmaker()
     async with sm() as s:
-        event_id = await _seed_event(s, auth_user_factory)
+        event_id, patient_id = await _seed_event(s, auth_user_factory)
 
     fake_httpx = _install_fake_httpx(monkeypatch)
     # Empty buffers (no frames pushed).
@@ -260,6 +261,7 @@ async def test_archive_event_noops_when_post_frames_missing(
 
     await archive_event(
         event_id=event_id,
+        patient_id=patient_id,
         pre_event_mp4=pre_mp4,
         frame_buffer=frame_buffer,
         audio_buffer=audio_buffer,
@@ -314,7 +316,7 @@ async def test_archive_event_swallows_upload_failure(
     a fire-and-forget task; we log and move on."""
     sm = get_sessionmaker()
     async with sm() as s:
-        event_id = await _seed_event(s, auth_user_factory)
+        event_id, patient_id = await _seed_event(s, auth_user_factory)
 
     fake_httpx = _install_fake_httpx(monkeypatch)
     frame_buffer, audio_buffer = filled_buffers
@@ -331,6 +333,7 @@ async def test_archive_event_swallows_upload_failure(
     # Must not raise.
     await archive_event(
         event_id=event_id,
+        patient_id=patient_id,
         pre_event_mp4=pre_mp4,
         frame_buffer=frame_buffer,
         audio_buffer=audio_buffer,

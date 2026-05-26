@@ -446,6 +446,7 @@ class CameraIngest:
                     asyncio.create_task(
                         clip_archival.archive_event(
                             event_id=fired_event.id,
+                            patient_id=self.patient_id,
                             pre_event_mp4=mp4_bytes,
                             frame_buffer=self.frame_buffer,
                             audio_buffer=self.audio_buffer,
