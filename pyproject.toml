@@ -2,7 +2,7 @@
 name = "nemara-backend"
 version = "0.0.1"
 description = "Nemara caregiver-app backend (FastAPI + Supabase)"
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.12,<3.14"
 readme = "README.md"
 dependencies = [
     "fastapi>=0.115",
