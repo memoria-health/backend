@@ -73,7 +73,7 @@ def _validate_image_payload(
     return _ALLOWED_IMAGE_CONTENT_TYPES[content_type]
 
 
-async def _upload_object(
+async def upload_object(
     *,
     bucket: str,
     key: str,
@@ -159,7 +159,7 @@ async def upload_patient_photo(
         image_bytes, content_type, settings.storage_max_photo_bytes,
     )
     key = f"{patient_id}.{extension}"
-    await _upload_object(
+    await upload_object(
         bucket=settings.storage_bucket_patient_photos,
         key=key,
         body=image_bytes,
@@ -199,7 +199,7 @@ async def upload_clip(
             f"(max {settings.storage_max_clip_bytes})"
         )
     key = f"events/{event_id}/{sub_key}" if sub_key else f"events/{event_id}.mp4"
-    await _upload_object(
+    await upload_object(
         bucket=settings.storage_bucket_incident_clips,
         key=key,
         body=mp4_bytes,

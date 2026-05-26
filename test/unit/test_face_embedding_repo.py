@@ -42,9 +42,11 @@ async def _setup_patient(
 
 
 def _fake_embedding(seed: int) -> bytes:
-    """512 bytes (close enough to 512×4=2048 bytes for ArcFace in
-    real life — we test the byte-shape, not the math)."""
-    return bytes([seed % 256] * 512)
+    """Canonical 512 × float32 = 2048 bytes, matching what
+    `embeddings.embedding_from_bytes` validates. Using the wrong
+    length silently causes `reid.gallery_skip` warnings downstream
+    instead of round-trip failures here."""
+    return bytes([seed % 256] * (512 * 4))
 
 
 # ─── INSERTS ────────────────────────────────────────────────────

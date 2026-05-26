@@ -46,7 +46,7 @@ from src.services.detection.providers.openai import openai_provider
 from src.services.detection.providers.types import ProviderResult
 from src.services.detection.registry import get_enabled_detectors_for_camera
 from src.services.detection.state_machine import apply_tick_update
-from src.services.reid.inference import ReIDInference
+from src.services.reid.inference import IdentityResult, ReIDInference
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -278,19 +278,20 @@ class CameraIngest:
             # Re-ID identity check. Runs before the LLM call so the
             # patient_in_clip flag can flow into the prompt addendum.
             # Wrapped in try/except — Re-ID failures must NEVER break
-            # the tick. Empty result = identity-agnostic (today's
-            # behavior); the LLM still scores every detector.
+            # the tick. `IdentityResult.empty()` has reid_ran=False
+            # which makes event_promotion bypass the identity gate
+            # entirely (identity-agnostic / today's behavior).
             try:
                 identity = await self._reid.label_clip(
                     mp4_bytes=mp4_bytes, patient_id=self.patient_id,
                 )
             except Exception:
                 log.exception("%s reid.label_clip crashed", self._log_tag)
-                from src.services.reid.inference import IdentityResult
                 identity = IdentityResult.empty()
             log.info(
-                "%s reid patient_in_clip=%s confidence=%.3f face_count=%d",
+                "%s reid reid_ran=%s patient_in_clip=%s confidence=%.3f face_count=%d",
                 self._log_tag,
+                identity.reid_ran,
                 identity.patient_in_clip,
                 identity.confidence,
                 identity.face_count,
@@ -328,10 +329,12 @@ class CameraIngest:
                     )
                     return
 
-            # Stash identity_map in detector_fields so the analyses
-            # row carries it for the dashboard / event_promotion path.
-            # The dashboard can filter "patient agitation" vs anyone-
-            # else's-agitation by reading identity_confidence here.
+            # Stash identity in detector_fields so the analyses row
+            # carries it for the dashboard / event_promotion path.
+            # The `identity_reid_ran` flag is the gate signal that
+            # tells event_promotion whether to apply identity
+            # suppression at all (False = bypass, identity-agnostic).
+            result.detector_fields["identity_reid_ran"] = identity.reid_ran
             result.detector_fields["identity_patient_in_clip"] = identity.patient_in_clip
             result.detector_fields["identity_confidence"] = round(identity.confidence, 4)
 

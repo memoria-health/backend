@@ -55,7 +55,7 @@ async def upload_face_photo(
             f"image_bytes too large: {len(image_bytes)} bytes "
             f"(max {settings.storage_max_photo_bytes})"
         )
-    await base_storage._upload_object(
+    await base_storage.upload_object(
         bucket=settings.storage_bucket_patient_photos,
         key=key,
         body=image_bytes,

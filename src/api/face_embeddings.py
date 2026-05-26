@@ -27,6 +27,7 @@ from fastapi import APIRouter, File, HTTPException, UploadFile, status
 from sqlalchemy import func, select
 
 from src.api.deps import CaregiverAuth, SessionDep, SettingsDep
+from src.db.patient import Patient
 from src.db.patient_face_embedding import PatientFaceEmbedding
 from src.db.session import get_sessionmaker
 from src.errors import StorageError
@@ -298,25 +299,32 @@ async def delete_face_embedding(
 ) -> None:
     """Remove one embedding row + its storage object (selfie only).
     404 for not-found OR not-owned (no distinction by design)."""
-    # Find first so we can grab source_path before deleting.
-    rows = (
-        await session.execute(
-            select(PatientFaceEmbedding).where(
-                PatientFaceEmbedding.id == embedding_id,
-            )
+    # Single ownership-scoped read so cross-account rows are never
+    # materialized. The JOIN through patients.caregiver_id is the
+    # same guard `face_embedding_repo.delete_by_id` uses; doing it
+    # here too lets us grab `source_path` before the delete without
+    # leaking unowned rows into local state.
+    stmt = (
+        select(PatientFaceEmbedding)
+        .join(Patient, Patient.id == PatientFaceEmbedding.patient_id)
+        .where(
+            PatientFaceEmbedding.id == embedding_id,
+            Patient.caregiver_id == auth.id,
         )
-    ).scalars().all()
-    if not rows:
+    )
+    row = (await session.execute(stmt)).scalar_one_or_none()
+    if row is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="embedding_not_found",
         )
-    row = rows[0]
 
     deleted = await face_embedding_repo.delete_by_id(
         session, embedding_id, caregiver_id=auth.id,
     )
     if not deleted:
-        # Found but not owned by this caregiver — same 404 as missing.
+        # Shouldn't be reachable given the ownership-scoped read
+        # above, but defend in depth: race against another caregiver
+        # session deleting between read and delete.
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="embedding_not_found",
         )

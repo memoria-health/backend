@@ -156,6 +156,7 @@ async def test_enrolled_and_patient_in_clip_fall_fires(
 
     detector_fields = {
         **_FALL_FIELDS,
+        "identity_reid_ran": True,
         "identity_patient_in_clip": True,
         "identity_confidence": 0.75,
     }
@@ -179,10 +180,10 @@ async def test_enrolled_but_patient_absent_fall_suppressed(
     client: AsyncClient, auth_user, session: AsyncSession,
 ) -> None:
     """The household's other resident falls. Patient is enrolled; the
-    tick's Re-ID identity flag is False. The gate suppresses
-    promotion — caregiver should NOT get an alert about non-patient
-    falls. The adaptive threshold is what protects us from
-    false-negative on the patient."""
+    tick's Re-ID identity flag is False AND reid_ran=True (the gate
+    is active). Promotion is suppressed — caregiver should NOT get
+    an alert about non-patient falls. The adaptive threshold is what
+    protects us from false-negative on the patient."""
     patient_id, camera_id = await _setup_patient_with_camera(
         client, auth_user, session,
     )
@@ -199,6 +200,7 @@ async def test_enrolled_but_patient_absent_fall_suppressed(
 
     detector_fields = {
         **_FALL_FIELDS,
+        "identity_reid_ran": True,
         "identity_patient_in_clip": False,
         "identity_confidence": 0.0,
     }
@@ -213,4 +215,59 @@ async def test_enrolled_but_patient_absent_fall_suppressed(
     await session.commit()
     assert result.fired == [], (
         "with enrollment and patient absent, fall must NOT promote"
+    )
+
+
+# ─── (d) Enrollment + Re-ID timed out → fires (safety blocker) ──
+
+
+@pytest.mark.asyncio
+async def test_enrolled_but_reid_timed_out_fall_still_fires(
+    client: AsyncClient, auth_user, session: AsyncSession,
+) -> None:
+    """THE LOAD-BEARING SAFETY TEST.
+
+    Patient is enrolled. Re-ID timed out / crashed for this tick. The
+    tick produces identity_reid_ran=False (the empty IdentityResult).
+    The gate MUST bypass identity suppression and let safety
+    detectors promote identity-agnostic.
+
+    A regression here means: a transient Re-ID failure silences fall
+    detection on the enrolled patient. That's the failure mode the
+    plan explicitly forbids. If this test breaks, do NOT ship.
+    """
+    patient_id, camera_id = await _setup_patient_with_camera(
+        client, auth_user, session,
+    )
+    row = await face_embedding_repo.insert_processing(
+        session, patient_id=patient_id, source_path="x.jpg",
+    )
+    await face_embedding_repo.mark_ready(
+        session,
+        embedding_id=row.id,
+        embedding=_ready_embedding(3),
+        det_score=0.85,
+    )
+    await session.commit()
+
+    # Re-ID infrastructure failure: empty IdentityResult shape.
+    # reid_ran=False is the gate-bypass signal.
+    detector_fields = {
+        **_FALL_FIELDS,
+        "identity_reid_ran": False,
+        "identity_patient_in_clip": False,
+        "identity_confidence": 0.0,
+    }
+    result = await maybe_promote_analysis(
+        session,
+        patient_id=patient_id,
+        camera_id=camera_id,
+        occurred_at=datetime.now(timezone.utc),
+        description="patient fell during Re-ID outage",
+        detector_fields=detector_fields,
+    )
+    await session.commit()
+    assert len(result.fired) == 1, (
+        "Re-ID timeout/crash MUST fall back to identity-agnostic "
+        "promotion. Suppressing here is the catastrophic failure mode."
     )

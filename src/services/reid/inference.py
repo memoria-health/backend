@@ -50,8 +50,17 @@ log = logging.getLogger(__name__)
 class IdentityResult:
     """Per-tick identity decision for a single patient.
 
+    `reid_ran`: True iff Re-ID actually executed and produced a
+    verdict. False on timeout, crash, or no-enrollment-yet. The
+    downstream event_promotion gate keys off this: when False, it
+    falls back to identity-agnostic behavior (today's flow) instead
+    of suppressing promotions. This is the load-bearing safety
+    invariant: a Re-ID infrastructure failure must NEVER silence the
+    detector pipeline.
+
     `patient_in_clip`: True iff at least one sampled frame had a face
-    that matched the gallery above the adaptive threshold.
+    that matched the gallery above the adaptive threshold. Only
+    meaningful when `reid_ran=True`.
 
     `confidence`: best cosine score over all sampled frames. 0.0 when
     no face matched. Surfaced in the analyses row's
@@ -63,6 +72,7 @@ class IdentityResult:
     `face_count`: total faces detected across all sampled frames.
     Useful for "how busy is this clip" reasoning later.
     """
+    reid_ran: bool
     patient_in_clip: bool
     confidence: float
     best_frame_index: int | None
@@ -70,7 +80,12 @@ class IdentityResult:
 
     @classmethod
     def empty(cls) -> "IdentityResult":
+        """The 'Re-ID did not produce a verdict' shape. Used on
+        timeout, crash, or when the feature is disabled. The
+        event_promotion gate sees `reid_ran=False` and bypasses
+        identity-based suppression."""
         return cls(
+            reid_ran=False,
             patient_in_clip=False,
             confidence=0.0,
             best_frame_index=None,
@@ -219,10 +234,11 @@ class ReIDInference:
                 settings=self._settings,
             )
             if harvested:
-                self.invalidate_gallery(patient_id)
+                await self.invalidate_gallery(patient_id)
 
         elapsed_ms = (time.monotonic() - started) * 1000.0
         result = IdentityResult(
+            reid_ran=True,
             patient_in_clip=any_match,
             confidence=max(0.0, best_score),
             best_frame_index=best_frame_idx,
@@ -244,6 +260,14 @@ class ReIDInference:
         Cached per-patient with a TTL from settings. Cache miss reads
         from `patient_face_embeddings` (status=ready). Empty array on
         no-enrollment.
+
+        Concurrency: the cache lock guards both reads (TTL check) and
+        writes (post-DB-load store). The DB read happens OUTSIDE the
+        lock to keep tick-fan-out from serializing on a single
+        patient's cache miss. We re-check the cache after the DB read
+        so a concurrent `invalidate_gallery` between miss and store
+        doesn't get clobbered: the post-load store only takes effect
+        if no fresher entry landed in the meantime.
         """
         now = time.monotonic()
         ttl = self._settings.reid_gallery_cache_ttl_seconds
@@ -251,10 +275,11 @@ class ReIDInference:
             cached = self._gallery_cache.get(patient_id)
             if cached is not None and (now - cached[0]) < ttl:
                 return cached[1]
+            # Capture monotonic clock under the lock so a concurrent
+            # invalidate_gallery() between here and the DB read can
+            # be detected on the way back in.
+            load_started_at = time.monotonic()
 
-        # Load from DB outside the cache lock — the DB call could take
-        # tens of ms and we don't want to serialize ticks for different
-        # patients behind one DB read.
         async with self._sessionmaker() as session:
             rows = await face_embedding_repo.list_ready_for_patient_unscoped(
                 session, patient_id,
@@ -277,11 +302,26 @@ class ReIDInference:
             )
 
         async with self._cache_lock:
-            self._gallery_cache[patient_id] = (time.monotonic(), stacked)
-        return stacked
+            # If an invalidate or another store landed while we were
+            # loading, only overwrite if our snapshot is still the
+            # freshest. The timestamp comparison is monotonic, so a
+            # newer entry has a strictly larger value.
+            existing = self._gallery_cache.get(patient_id)
+            if existing is None or existing[0] <= load_started_at:
+                self._gallery_cache[patient_id] = (time.monotonic(), stacked)
+                return stacked
+            # Someone (invalidate cleared+set, or another tick) won
+            # the race. Return our freshly-loaded gallery for THIS
+            # call's use but don't clobber the cache. The next tick
+            # gets the newer cached value.
+            return stacked
 
-    def invalidate_gallery(self, patient_id: UUID) -> None:
+    async def invalidate_gallery(self, patient_id: UUID) -> None:
         """Drop the cached gallery for a patient. Called from the
         harvester when it appends a new row so the next tick picks it
-        up immediately rather than waiting for TTL."""
-        self._gallery_cache.pop(patient_id, None)
+        up immediately rather than waiting for TTL.
+
+        Takes the cache lock so a concurrent `_get_gallery` post-load
+        store can detect the invalidation and skip the stale write."""
+        async with self._cache_lock:
+            self._gallery_cache.pop(patient_id, None)

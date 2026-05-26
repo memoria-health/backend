@@ -70,16 +70,27 @@ async def maybe_promote_analysis(
     if patient is None:
         raise ValueError(f"[event_promotion] patient {patient_id} not found")
 
-    # Identity gate: if Re-ID confirmed the patient is in this clip,
-    # promote. If the patient was NOT confirmed but the gallery is
-    # populated, suppress all promotions for this tick — someone other
-    # than the patient is in frame, and we don't want to alert the
-    # caregiver about the cleaning lady's pacing.
+    # Identity gate. Three states, and only one suppresses:
     #
-    # If no enrollment exists yet, the identity gate is bypassed and
-    # everything fires identity-agnostic. This protects day-zero.
+    #   (a) Re-ID did not run (timeout / crash / feature disabled) →
+    #       identity_reid_ran=False → bypass the gate, promote
+    #       identity-agnostic (today's behavior). This is the
+    #       load-bearing safety invariant: a Re-ID infrastructure
+    #       failure must NEVER silence detector promotion. We'd
+    #       rather over-alert than miss a fall.
+    #
+    #   (b) Re-ID ran, patient_in_clip=True → promote normally.
+    #
+    #   (c) Re-ID ran, patient_in_clip=False, AND a ready enrollment
+    #       exists → SUPPRESS. The patient is confidently not in this
+    #       clip; we don't want to alert the caregiver about
+    #       household-member behavior.
+    #
+    #   (d) Re-ID ran, patient_in_clip=False, NO enrollment yet →
+    #       bypass (day-zero before the caregiver has enrolled).
+    identity_reid_ran = bool(detector_fields.get("identity_reid_ran", False))
     identity_patient_in_clip = bool(detector_fields.get("identity_patient_in_clip", False))
-    if not identity_patient_in_clip:
+    if identity_reid_ran and not identity_patient_in_clip:
         gallery_exists = await _patient_has_ready_enrollment(session, patient_id)
         if gallery_exists:
             _log.info(
