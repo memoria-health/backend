@@ -298,38 +298,54 @@ class CameraIngest:
                 identity.face_count,
             )
 
-            # Upstream identity gate. When Re-ID is confident the patient
-            # is NOT in this clip AND an enrollment exists, skip the LLM
-            # call entirely. Saves a per-tick OpenAI call (5-7s + cost)
-            # plus the archival path that follows (no event ever fires
-            # for a non-patient tick, so no clip is uploaded either —
-            # exactly the user's "never see a clip of a non-patient"
-            # contract).
+            # Upstream identity gate. When Re-ID has POSITIVE evidence
+            # that the patient is NOT in this clip (faces detected,
+            # none matched the gallery) AND an enrollment exists, skip
+            # the LLM call entirely. Saves a per-tick OpenAI call
+            # (5-7s + cost) plus the archival path.
             #
-            # Safety contract preserved: `reid_ran=False` (timeout,
-            # crash, or no-enrollment-yet) bypasses this gate, so a
-            # Re-ID infrastructure failure can NEVER silence the
-            # detector pipeline. That's the load-bearing invariant the
-            # existing safety tests already cover.
+            # Crucially, the gate only fires when `face_count > 0`.
+            # `face_count == 0` means Re-ID saw no faces — that's NOT
+            # evidence that the patient is absent. The patient may be
+            # in frame with their face turned away, occluded, foreshort-
+            # ened from a high-mounted camera, or motion-blurred during
+            # a fall. We fall back to identity-agnostic (run the LLM)
+            # in that case, same as we do for `reid_ran=False`.
             #
-            # The `has_ready_enrollment` check is the day-zero clause:
-            # without it, a patient who hasn't enrolled yet would have
-            # every tick skipped because Re-ID always returns "not in
-            # clip" with an empty gallery.
-            if identity.reid_ran and not identity.patient_in_clip:
+            # Safety contract preserved on every axis:
+            #   - reid_ran=False (timeout/crash/no-enrollment) → bypass
+            #   - face_count=0 (no faces seen) → bypass
+            #   - face_count>0, patient_in_clip=False → suppress
+            #   - patient_in_clip=True → run with patient marked
+            #
+            # The `has_ready_enrollment` check is the day-zero clause.
+            # Without it, a patient who hasn't enrolled would have
+            # every tick skipped because Re-ID always says "not in
+            # clip" against an empty gallery.
+            if (
+                identity.reid_ran
+                and not identity.patient_in_clip
+                and identity.face_count > 0
+            ):
                 if await has_ready_enrollment(session, self.patient_id):
                     state_after = await apply_tick_update(
                         session,
                         camera_id=self.camera_id,
-                        people_present=False,
+                        # We saw faces but none matched. The state
+                        # machine should treat this as "people present"
+                        # (someone IS here, just not the patient), so a
+                        # household-member walking by doesn't trip the
+                        # closed-state countdown.
+                        people_present=True,
                         motion_in_clip=motion_in_clip,
                     )
                     synthetic_fields = {
-                        "people_present": False,
+                        "people_present": True,
                         "skipped_reason": "identity_not_patient",
                         "identity_reid_ran": True,
                         "identity_patient_in_clip": False,
                         "identity_confidence": round(identity.confidence, 4),
+                        "identity_face_count": identity.face_count,
                     }
                     await add_analysis(
                         session,
@@ -337,8 +353,8 @@ class CameraIngest:
                         provider="skipped",
                         description="(non-patient in frame — LLM skipped)",
                         detector_fields=synthetic_fields,
-                        people_present=False,
-                        people_count=0,
+                        people_present=True,
+                        people_count=identity.face_count,
                         motion_in_clip=motion_in_clip,
                         state_after=state_after.state,
                         captured_at=captured_at,
@@ -392,6 +408,7 @@ class CameraIngest:
             result.detector_fields["identity_reid_ran"] = identity.reid_ran
             result.detector_fields["identity_patient_in_clip"] = identity.patient_in_clip
             result.detector_fields["identity_confidence"] = round(identity.confidence, 4)
+            result.detector_fields["identity_face_count"] = identity.face_count
 
             # State machine + analyses + event promotion. Same session,
             # one commit at the end.

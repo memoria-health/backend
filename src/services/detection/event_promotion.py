@@ -27,7 +27,6 @@ from src.db.camera import Camera
 from src.db.detector import Detector
 from src.db.event import Event
 from src.db.patient import Patient
-from src.repos.face_embedding_repo import has_ready_enrollment
 
 _log = logging.getLogger(__name__)
 
@@ -70,35 +69,19 @@ async def maybe_promote_analysis(
     if patient is None:
         raise ValueError(f"[event_promotion] patient {patient_id} not found")
 
-    # Identity gate. Three states, and only one suppresses:
+    # Identity gating happens UPSTREAM in `camera_ingest._run_tick`:
+    # when Re-ID has positive evidence the patient is not in this clip
+    # (face_count > 0 and patient_in_clip=False with an enrollment),
+    # the LLM call is skipped entirely and we never reach this code
+    # path. That's the only filter — no defense-in-depth duplicate
+    # here, so the two paths can't fall out of sync. The identity_*
+    # fields are still written into detector_fields for the dashboard
+    # to render.
     #
-    #   (a) Re-ID did not run (timeout / crash / feature disabled) →
-    #       identity_reid_ran=False → bypass the gate, promote
-    #       identity-agnostic (today's behavior). This is the
-    #       load-bearing safety invariant: a Re-ID infrastructure
-    #       failure must NEVER silence detector promotion. We'd
-    #       rather over-alert than miss a fall.
-    #
-    #   (b) Re-ID ran, patient_in_clip=True → promote normally.
-    #
-    #   (c) Re-ID ran, patient_in_clip=False, AND a ready enrollment
-    #       exists → SUPPRESS. The patient is confidently not in this
-    #       clip; we don't want to alert the caregiver about
-    #       household-member behavior.
-    #
-    #   (d) Re-ID ran, patient_in_clip=False, NO enrollment yet →
-    #       bypass (day-zero before the caregiver has enrolled).
-    identity_reid_ran = bool(detector_fields.get("identity_reid_ran", False))
-    identity_patient_in_clip = bool(detector_fields.get("identity_patient_in_clip", False))
-    if identity_reid_ran and not identity_patient_in_clip:
-        gallery_exists = await has_ready_enrollment(session, patient_id)
-        if gallery_exists:
-            _log.info(
-                "event_promotion.identity_gated patient=%s camera=%s "
-                "suppressing all detector promotions for this tick",
-                patient_id, camera_id,
-            )
-            return PromotionResult(fired=[], skipped_for_dedup=[])
+    # If `maybe_promote_analysis` is called, it means: either the
+    # patient is confirmed in the clip, or Re-ID couldn't confirm
+    # they aren't (no faces detected, timeout, no enrollment). In
+    # both cases we promote any detector findings normally.
 
     # Load this patient's detectors so we can map identifier → (id, category, source).
     stmt = select(Detector).where(Detector.patient_id == patient_id)

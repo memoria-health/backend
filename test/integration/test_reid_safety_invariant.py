@@ -172,50 +172,16 @@ async def test_enrolled_and_patient_in_clip_fall_fires(
     assert len(result.fired) == 1
 
 
-# ─── (c) Enrollment + patient absent → suppressed ───────────────
-
-
-@pytest.mark.asyncio
-async def test_enrolled_but_patient_absent_fall_suppressed(
-    client: AsyncClient, auth_user, session: AsyncSession,
-) -> None:
-    """The household's other resident falls. Patient is enrolled; the
-    tick's Re-ID identity flag is False AND reid_ran=True (the gate
-    is active). Promotion is suppressed — caregiver should NOT get
-    an alert about non-patient falls. The adaptive threshold is what
-    protects us from false-negative on the patient."""
-    patient_id, camera_id = await _setup_patient_with_camera(
-        client, auth_user, session,
-    )
-    row = await face_embedding_repo.insert_processing(
-        session, patient_id=patient_id, source_path="x.jpg",
-    )
-    await face_embedding_repo.mark_ready(
-        session,
-        embedding_id=row.id,
-        embedding=_ready_embedding(2),
-        det_score=0.85,
-    )
-    await session.commit()
-
-    detector_fields = {
-        **_FALL_FIELDS,
-        "identity_reid_ran": True,
-        "identity_patient_in_clip": False,
-        "identity_confidence": 0.0,
-    }
-    result = await maybe_promote_analysis(
-        session,
-        patient_id=patient_id,
-        camera_id=camera_id,
-        occurred_at=datetime.now(timezone.utc),
-        description="someone else fell",
-        detector_fields=detector_fields,
-    )
-    await session.commit()
-    assert result.fired == [], (
-        "with enrollment and patient absent, fall must NOT promote"
-    )
+# ─── (c) Enrollment + patient absent → suppression is UPSTREAM ──
+#
+# Suppression for "stranger in frame" lives in
+# `camera_ingest._run_tick` now (commit removed downstream gate).
+# That path skips the LLM entirely before `maybe_promote_analysis`
+# is ever called. There's nothing to test here from
+# `maybe_promote_analysis`'s perspective — if it runs, identity has
+# already been deemed compatible with promotion (or unknowable). A
+# proper integration test for the upstream gate would drive
+# CameraIngest with a fixture clip; that's tracked separately.
 
 
 # ─── (d) Enrollment + Re-ID timed out → fires (safety blocker) ──
@@ -270,4 +236,60 @@ async def test_enrolled_but_reid_timed_out_fall_still_fires(
     assert len(result.fired) == 1, (
         "Re-ID timeout/crash MUST fall back to identity-agnostic "
         "promotion. Suppressing here is the catastrophic failure mode."
+    )
+
+
+# ─── (e) Enrollment + Re-ID ran but saw zero faces → fires ─────
+
+
+@pytest.mark.asyncio
+async def test_enrolled_but_no_faces_detected_fall_still_fires(
+    client: AsyncClient, auth_user, session: AsyncSession,
+) -> None:
+    """SECOND LOAD-BEARING SAFETY TEST.
+
+    Patient is enrolled. Re-ID ran successfully but detected zero
+    faces in the clip — common when the patient falls (face turned
+    toward floor, foreshortened from a high-mounted camera,
+    motion-blurred). The gate MUST bypass identity suppression here
+    because face_count=0 is not positive evidence of patient absence;
+    it just means Re-ID had no face to match.
+
+    Regression here means: a real patient fall is silenced because
+    Re-ID couldn't see their face during the fall itself.
+    """
+    patient_id, camera_id = await _setup_patient_with_camera(
+        client, auth_user, session,
+    )
+    row = await face_embedding_repo.insert_processing(
+        session, patient_id=patient_id, source_path="x.jpg",
+    )
+    await face_embedding_repo.mark_ready(
+        session,
+        embedding_id=row.id,
+        embedding=_ready_embedding(4),
+        det_score=0.85,
+    )
+    await session.commit()
+
+    detector_fields = {
+        **_FALL_FIELDS,
+        "identity_reid_ran": True,
+        "identity_patient_in_clip": False,
+        "identity_confidence": 0.0,
+        "identity_face_count": 0,  # no faces detected
+    }
+    result = await maybe_promote_analysis(
+        session,
+        patient_id=patient_id,
+        camera_id=camera_id,
+        occurred_at=datetime.now(timezone.utc),
+        description="patient fell, face turned away from camera",
+        detector_fields=detector_fields,
+    )
+    await session.commit()
+    assert len(result.fired) == 1, (
+        "Re-ID seeing zero faces is NOT positive evidence the patient "
+        "is absent. Suppressing here means silencing a real fall just "
+        "because the patient's face was turned during the fall."
     )
