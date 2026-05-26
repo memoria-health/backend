@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 
 from src.services.detection.motion_cache import MotionCache
 from src.services.detection.room_worker import RoomWorker
+from src.services.reid.inference import ReIDInference
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -60,6 +61,12 @@ class DetectorWorker:
         self._motion_cache = MotionCache(
             ttl_seconds=settings.livekit_motion_state_ttl_seconds,
         )
+        # Single Re-ID inference instance shared across every RoomWorker.
+        # The InsightFace model is lazy-singleton'd at module level so a
+        # second instance here would be wasted; we share the instance to
+        # also share the gallery cache and avoid duplicate DB reads when
+        # multiple cameras of the same patient tick concurrently.
+        self._reid = ReIDInference(sessionmaker=sessionmaker, settings=settings)
         self._rooms: dict[str, RoomWorker] = {}
         self._lock = asyncio.Lock()
         self._started = False
@@ -115,6 +122,7 @@ class DetectorWorker:
                 settings=self._settings,
                 sessionmaker=self._sessionmaker,
                 motion_cache=self._motion_cache,
+                reid=self._reid,
             )
             self._rooms[room_name] = worker
         # Connect outside the lock — `Room.connect` does network I/O

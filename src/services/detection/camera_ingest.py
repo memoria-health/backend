@@ -46,6 +46,7 @@ from src.services.detection.providers.openai import openai_provider
 from src.services.detection.providers.types import ProviderResult
 from src.services.detection.registry import get_enabled_detectors_for_camera
 from src.services.detection.state_machine import apply_tick_update
+from src.services.reid.inference import ReIDInference
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -70,12 +71,14 @@ class CameraIngest:
         sessionmaker: "async_sessionmaker",
         motion_cache: MotionCache,
         settings: "Settings",
+        reid: ReIDInference,
     ) -> None:
         self.camera_id = camera_id
         self.patient_id = patient_id
         self._sessionmaker = sessionmaker
         self._motion_cache = motion_cache
         self._settings = settings
+        self._reid = reid
         self.frame_buffer = FrameBuffer(
             window_seconds=settings.livekit_worker_window_seconds,
             target_fps=settings.livekit_worker_target_fps,
@@ -272,6 +275,27 @@ class CameraIngest:
                 log.warning("%s mp4_remux failed: %s", self._log_tag, exc)
                 return
 
+            # Re-ID identity check. Runs before the LLM call so the
+            # patient_in_clip flag can flow into the prompt addendum.
+            # Wrapped in try/except — Re-ID failures must NEVER break
+            # the tick. Empty result = identity-agnostic (today's
+            # behavior); the LLM still scores every detector.
+            try:
+                identity = await self._reid.label_clip(
+                    mp4_bytes=mp4_bytes, patient_id=self.patient_id,
+                )
+            except Exception:
+                log.exception("%s reid.label_clip crashed", self._log_tag)
+                from src.services.reid.inference import IdentityResult
+                identity = IdentityResult.empty()
+            log.info(
+                "%s reid patient_in_clip=%s confidence=%.3f face_count=%d",
+                self._log_tag,
+                identity.patient_in_clip,
+                identity.confidence,
+                identity.face_count,
+            )
+
             # Provider fallback: OpenAI → Gemini. OpenAI's gpt-5.4-nano
             # is the cheaper of the two on a per-tick basis (the OpenAI
             # path also samples frames at lower fps + 480px width, vs
@@ -286,6 +310,7 @@ class CameraIngest:
                 result = await openai_provider(
                     mp4=mp4_bytes, detectors=detectors,
                     log_tag=self._log_tag, settings=self._settings,
+                    patient_in_clip=identity.patient_in_clip,
                 )
             except Exception as oa_err:
                 log.warning("%s openai failed, trying gemini: %s", self._log_tag, oa_err)
@@ -294,6 +319,7 @@ class CameraIngest:
                     result = await gemini_provider(
                         mp4=mp4_bytes, detectors=detectors,
                         log_tag=self._log_tag, settings=self._settings,
+                        patient_in_clip=identity.patient_in_clip,
                     )
                 except Exception as gem_err:
                     log.error(
@@ -301,6 +327,13 @@ class CameraIngest:
                         self._log_tag, oa_err, gem_err,
                     )
                     return
+
+            # Stash identity_map in detector_fields so the analyses
+            # row carries it for the dashboard / event_promotion path.
+            # The dashboard can filter "patient agitation" vs anyone-
+            # else's-agitation by reading identity_confidence here.
+            result.detector_fields["identity_patient_in_clip"] = identity.patient_in_clip
+            result.detector_fields["identity_confidence"] = round(identity.confidence, 4)
 
             # State machine + analyses + event promotion. Same session,
             # one commit at the end.

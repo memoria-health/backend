@@ -14,7 +14,11 @@ from collections.abc import Sequence
 from openai import AsyncOpenAI
 
 from src.services.detection.frame_extraction import extract_frames
-from src.services.detection.prompt import DetectorSpec, build_prompt_and_schema
+from src.services.detection.prompt import (
+    DetectorSpec,
+    build_identity_addendum,
+    build_prompt_and_schema,
+)
 from src.services.detection.providers._parse import parse_and_validate
 from src.services.detection.providers.types import ProviderResult
 from src.settings import Settings
@@ -26,12 +30,14 @@ async def openai_provider(
     detectors: Sequence[DetectorSpec],
     log_tag: str,
     settings: Settings,
+    patient_in_clip: bool = False,
 ) -> ProviderResult:
     if not settings.openai_api_key:
         raise RuntimeError("NEMARA_OPENAI_API_KEY not configured")
 
     fps = settings.openai_frames_fps
     built = build_prompt_and_schema(detectors)
+    identity_addendum = build_identity_addendum(patient_in_clip)
 
     frames = await extract_frames(mp4, fps=fps, max_width=480)
 
@@ -61,6 +67,7 @@ async def openai_provider(
                             f"video frames sampled at {fps} fps from a 15-second "
                             f"clip (frame 1 is earliest, frame {len(frames)} is "
                             f"most recent). Reason over them as a temporal sequence."
+                            f"{identity_addendum}"
                         ),
                     },
                     *image_parts,

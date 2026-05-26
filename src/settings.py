@@ -151,6 +151,12 @@ class Settings(BaseSettings):
     # tier (~280 MB); `buffalo_sc` is the lighter option (~40 MB) for
     # memory-constrained deploys. Override via env if Railway OOMs.
     reid_insightface_model: str = Field(default="buffalo_l")
+    # Per-tick frame sampling for the inference path. 1 fps × 15s = 15
+    # frames is plenty to catch a face glimpse without spending the
+    # 75-frames-at-5fps budget the LLM uses. 480 px wide matches the
+    # OpenAI provider's frame size, so the ffmpeg pass is reusable.
+    reid_inference_sample_fps: int = Field(ge=1, le=15, default=1)
+    reid_inference_sample_width: int = Field(ge=240, le=1920, default=480)
 
     # ── APNs (Phase 4) ──────────────────────────────────────────
     # Apple Developer credentials for HTTP/2 push. team_id +
