@@ -27,6 +27,7 @@ from src.db.camera import Camera
 from src.db.detector import Detector
 from src.db.event import Event
 from src.db.patient import Patient
+from src.db.patient_face_embedding import PatientFaceEmbedding
 
 _log = logging.getLogger(__name__)
 
@@ -68,6 +69,25 @@ async def maybe_promote_analysis(
     patient = await session.get(Patient, patient_id)
     if patient is None:
         raise ValueError(f"[event_promotion] patient {patient_id} not found")
+
+    # Identity gate: if Re-ID confirmed the patient is in this clip,
+    # promote. If the patient was NOT confirmed but the gallery is
+    # populated, suppress all promotions for this tick — someone other
+    # than the patient is in frame, and we don't want to alert the
+    # caregiver about the cleaning lady's pacing.
+    #
+    # If no enrollment exists yet, the identity gate is bypassed and
+    # everything fires identity-agnostic. This protects day-zero.
+    identity_patient_in_clip = bool(detector_fields.get("identity_patient_in_clip", False))
+    if not identity_patient_in_clip:
+        gallery_exists = await _patient_has_ready_enrollment(session, patient_id)
+        if gallery_exists:
+            _log.info(
+                "event_promotion.identity_gated patient=%s camera=%s "
+                "suppressing all detector promotions for this tick",
+                patient_id, camera_id,
+            )
+            return PromotionResult(fired=[], skipped_for_dedup=[])
 
     # Load this patient's detectors so we can map identifier → (id, category, source).
     stmt = select(Detector).where(Detector.patient_id == patient_id)
@@ -140,6 +160,26 @@ async def maybe_promote_analysis(
 
 def _is_truthy_bool(v: Any) -> bool:
     return isinstance(v, bool) and v is True
+
+
+async def _patient_has_ready_enrollment(
+    session: AsyncSession,
+    patient_id: UUID,
+) -> bool:
+    """True iff the patient has at least one ready face embedding.
+    Used by the identity gate to decide whether to fall back to
+    today's identity-agnostic behavior (no enrollment) or actively
+    suppress non-patient promotions.
+    """
+    stmt = (
+        select(PatientFaceEmbedding.id)
+        .where(
+            PatientFaceEmbedding.patient_id == patient_id,
+            PatientFaceEmbedding.status == "ready",
+        )
+        .limit(1)
+    )
+    return (await session.execute(stmt)).scalar_one_or_none() is not None
 
 
 async def _within_dedup_window(

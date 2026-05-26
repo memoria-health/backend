@@ -40,6 +40,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from src.repos import face_embedding_repo
 from src.services.detection import frame_extraction
 from src.services.reid import embeddings as reid_embeddings
+from src.services.reid import harvester
 from src.settings import Settings
 
 log = logging.getLogger(__name__)
@@ -175,6 +176,7 @@ class ReIDInference:
 
         best_score: float = -1.0
         best_frame_idx: int | None = None
+        best_hit = None
         face_count = 0
         any_match = False
 
@@ -198,7 +200,26 @@ class ReIDInference:
             if match.score >= threshold and match.score > best_score:
                 best_score = match.score
                 best_frame_idx = idx
+                best_hit = hit
                 any_match = True
+
+        # Adaptive learning: if the best match cleared the harvest
+        # threshold (0.80 default, much higher than the lock threshold),
+        # append the embedding to the gallery. This closes the
+        # selfie-to-wall-cam domain gap over a week of operation. The
+        # cache invalidation makes the new row visible on the very
+        # next tick instead of waiting for the TTL.
+        if best_hit is not None:
+            harvested = await harvester.maybe_harvest_embedding(
+                patient_id=patient_id,
+                embedding=best_hit.embedding,
+                det_score=best_hit.det_score,
+                match_score=best_score,
+                sessionmaker=self._sessionmaker,
+                settings=self._settings,
+            )
+            if harvested:
+                self.invalidate_gallery(patient_id)
 
         elapsed_ms = (time.monotonic() - started) * 1000.0
         result = IdentityResult(
