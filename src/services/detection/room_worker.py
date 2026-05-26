@@ -92,6 +92,17 @@ class RoomWorker:
         # (= the LiveKit participant identity). Allows fast lookup from
         # data-packet handlers without a DB roundtrip per packet.
         self._ingests_by_identity: dict[str, CameraIngest] = {}
+        # Serializes the get-then-spawn in `_handle_track_subscribed`.
+        # Video and audio arrive as TWO separate track_subscribed
+        # events, both routed through `asyncio.create_task`, so they
+        # run concurrently. Without this lock, both see an empty
+        # `_ingests_by_identity` for the same identity, both spawn a
+        # CameraIngest, both bind their track to their own ingest, and
+        # both tick independently → two `public.analyses` rows per
+        # 10-second window (one with only video buffered, one with
+        # only audio buffered). The lock turns the get-then-spawn into
+        # a single atomic critical section per identity.
+        self._spawn_lock = asyncio.Lock()
         # Per-identity in-flight video consumer tasks. Stopped on
         # participant_disconnected so we don't leak.
         self._video_tasks_by_identity: dict[str, asyncio.Task[None]] = {}
@@ -290,19 +301,26 @@ class RoomWorker:
 
         # Resolve the LiveKit identity to a real cameras row exactly
         # once per camera. The result populates `_ingests_by_identity`,
-        # and the lock prevents a video+audio race from creating two.
-        ingest = self._ingests_by_identity.get(identity)
-        if ingest is None:
-            ingest = await self._spawn_ingest_for_identity(identity)
+        # and `_spawn_lock` prevents the video+audio race from creating
+        # two CameraIngest objects (one per track kind) for the same
+        # publisher. The lock is per-RoomWorker, not per-identity, so a
+        # camera-A audio event briefly blocks a camera-B video event in
+        # the same room — fine in practice (the await inside is one DB
+        # roundtrip).
+        async with self._spawn_lock:
+            ingest = self._ingests_by_identity.get(identity)
             if ingest is None:
-                # Identity isn't a paired camera in our DB — log and
-                # walk away. This shouldn't happen if pairing is
-                # working, but it's the right defensive posture.
-                log.warning(
-                    "room_worker.unknown_identity room=%s identity=%s",
-                    self.room_name, identity,
-                )
-                return
+                ingest = await self._spawn_ingest_for_identity(identity)
+                if ingest is None:
+                    # Identity isn't a paired camera in our DB — log
+                    # and walk away. This shouldn't happen if pairing
+                    # is working, but it's the right defensive
+                    # posture.
+                    log.warning(
+                        "room_worker.unknown_identity room=%s identity=%s",
+                        self.room_name, identity,
+                    )
+                    return
 
         if track.kind == rtc.TrackKind.KIND_VIDEO:
             # Start consuming if we don't already have a task for this

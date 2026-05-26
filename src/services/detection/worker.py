@@ -37,6 +37,12 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# Upper bound on how long a RoomWorker.stop() can hold the DetectorWorker
+# lock during `ensure_room_left_if_empty`. 10s is generous for a clean
+# LiveKit disconnect (typically <500ms) but short enough that a hung
+# disconnect doesn't park subsequent join/leave operations forever.
+_STOP_TIMEOUT: float = 10.0
+
 
 class DetectorWorker:
     """Single instance per FastAPI process. Wired into the lifespan
@@ -124,29 +130,45 @@ class DetectorWorker:
                 self._rooms.pop(room_name, None)
 
     async def ensure_room_left_if_empty(self, room_name: str) -> None:
-        """Called from `participant_left` webhooks. The current
-        heuristic: leave only when there are no remaining
-        `cam_<...>` participants in the room. Phase 2 v0 treats every
-        `participant_left` as "check; if no more cameras, leave".
-        Phase 4 may refine this with a settling timer.
+        """Called from `participant_left` webhooks for cam_* identities.
+        Tears the room worker down. The next camera join re-fires the
+        webhook and we rejoin from scratch.
 
-        For v0 we simply always leave on `participant_left` — the next
-        camera that joins re-fires the webhook and we rejoin. Slightly
-        chatty but correctness is trivial.
+        `worker.stop()` runs **inside** `self._lock` so a concurrent
+        `ensure_room_joined` for the same room can't spawn a new
+        RoomWorker (and a new LiveKit connection) while the old one is
+        still mid-disconnect. Before this was outside the lock, every
+        cam-leave-then-rejoin race left a zombie detector_worker
+        participant in the LiveKit room — they accumulated over
+        Railway redeploys and started producing duplicate
+        `public.analyses` rows once their respective track subscribers
+        each got their own CameraIngest.
+
+        The stop is bounded by `_STOP_TIMEOUT` so a hung LiveKit
+        disconnect can't park the lock forever. On timeout we drop the
+        reference and log loudly; the LiveKit server eventually times
+        out the orphaned participant on its own (~5min).
         """
         if not self._started:
             return
         async with self._lock:
             worker = self._rooms.pop(room_name, None)
-        if worker is None:
-            return
-        try:
-            await worker.stop()
-        except Exception:
-            log.exception(
-                "detector_worker.ensure_left failed room=%s",
-                room_name,
-            )
+            if worker is None:
+                return
+            try:
+                await asyncio.wait_for(worker.stop(), timeout=_STOP_TIMEOUT)
+            except asyncio.TimeoutError:
+                log.warning(
+                    "detector_worker.ensure_left stop() timed out "
+                    "after %ss room=%s — dropping reference, LiveKit "
+                    "participant will time out server-side",
+                    _STOP_TIMEOUT, room_name,
+                )
+            except Exception:
+                log.exception(
+                    "detector_worker.ensure_left failed room=%s",
+                    room_name,
+                )
 
     # ── diagnostics ────────────────────────────────────────────────
 
