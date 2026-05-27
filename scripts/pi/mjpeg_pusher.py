@@ -100,13 +100,18 @@ async def _capture_frames(
 
     from PIL import Image
 
-    def _encode_jpeg(rgb_in, quality_in: int) -> bytes:
-        """Run in a worker thread; encodes a single RGB888 array to
-        JPEG bytes. Defined at module-scope-equivalent (a closure
-        over no loop variables) so each tick gets a clean call frame.
+    def _encode_jpeg(buf_in, quality_in: int) -> bytes:
+        """Run in a worker thread; encodes a captured buffer to JPEG
+        bytes. Despite picamera2's "RGB888" format label, the buffer
+        is actually laid out as BGR in memory (libcamera convention
+        on little-endian platforms; picamera2's examples use cv2
+        which expects BGR so this works for them). Pillow's "RGB"
+        mode would treat the buffer as RGB, swapping R and B and
+        producing an all-blue image of red objects. Reverse the last
+        axis (channels) so what Pillow encodes is genuinely R, G, B.
         """
         out = io.BytesIO()
-        Image.fromarray(rgb_in, "RGB").save(
+        Image.fromarray(buf_in[..., ::-1], "RGB").save(
             out, format="JPEG", quality=quality_in,
         )
         return out.getvalue()
@@ -116,11 +121,11 @@ async def _capture_frames(
 
     while not stop.is_set():
         tick_start = loop.time()
-        # capture_array returns an RGB888 numpy array. JPEG-encode
-        # via Pillow; matches the format picamera2's MJPEGEncoder
-        # would emit but giving us control over the quality knob.
-        rgb = await asyncio.to_thread(cam.capture_array)
-        jpeg_bytes = await asyncio.to_thread(_encode_jpeg, rgb, quality)
+        # capture_array returns a BGR888 numpy array under picamera2's
+        # misleading "RGB888" format label; see _encode_jpeg for the
+        # channel-swap rationale.
+        buf = await asyncio.to_thread(cam.capture_array)
+        jpeg_bytes = await asyncio.to_thread(_encode_jpeg, buf, quality)
         yield jpeg_bytes
 
         # Pace to the target fps. Skip if we already ran long.
