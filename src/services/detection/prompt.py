@@ -118,6 +118,40 @@ def build_prompt_and_schema(detectors: Sequence[DetectorSpec]) -> BuiltPrompt:
     )
 
 
+def build_identity_addendum(patient_in_clip: bool) -> str:
+    """Return the prompt addendum to append when Re-ID has identified
+    the patient in the current clip. Empty string otherwise.
+
+    Two states (per the plan's "two prompt states" design):
+
+      - patient_in_clip=True  -> tell the LLM about the green box AND
+                                 to focus on the patient
+      - patient_in_clip=False -> no addendum; today's behavior (score
+                                 any visible person, including for
+                                 safety detectors)
+
+    The OpenAI path actually draws the green rectangle on every frame
+    via `frame_annotate.annotate_jpeg`. Gemini accepts the raw MP4
+    and the text guidance carries it — the box-on-frames pass would
+    require a decode/re-encode loop we haven't committed to yet.
+    """
+    if not patient_in_clip:
+        return ""
+    return (
+        "\n\n"
+        "Re-ID has identified the patient in this clip with high "
+        "confidence. The patient is marked with a thin green "
+        "rectangle drawn around their face on every frame where the "
+        "rectangle is visible. Focus detector outcomes on the person "
+        "inside the green rectangle. Other people may be present but "
+        "should not be the subject of behavioral findings unless they "
+        "directly interact with the patient. Safety findings (fall, "
+        "agitation, distress) should still be reported for the "
+        "patient even if they happen while the patient is partially "
+        "out of frame."
+    )
+
+
 def detector_spec_from_row(row: Any) -> DetectorSpec:
     """Adapt an ORM `Detector` row to a `DetectorSpec`. Skips rows
     without an `identifier` (legacy / not-yet-migrated rows).

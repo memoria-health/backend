@@ -95,6 +95,20 @@ async def maybe_promote_analysis(
     if patient is None:
         raise ValueError(f"[event_promotion] patient {patient_id} not found")
 
+    # Identity gating happens UPSTREAM in `camera_ingest._run_tick`:
+    # when Re-ID has positive evidence the patient is not in this clip
+    # (face_count > 0 and patient_in_clip=False with an enrollment),
+    # the LLM call is skipped entirely and we never reach this code
+    # path. That's the only filter — no defense-in-depth duplicate
+    # here, so the two paths can't fall out of sync. The identity_*
+    # fields are still written into detector_fields for the dashboard
+    # to render.
+    #
+    # If `maybe_promote_analysis` is called, it means: either the
+    # patient is confirmed in the clip, or Re-ID couldn't confirm
+    # they aren't (no faces detected, timeout, no enrollment). In
+    # both cases we promote any detector findings normally.
+
     # Load this patient's detectors so we can map identifier → (id, category, source).
     stmt = select(Detector).where(Detector.patient_id == patient_id)
     detectors_by_id: dict[str, Detector] = {}

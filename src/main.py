@@ -22,6 +22,30 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 
+# Silence verbose third-party loggers that flood every tick.
+#
+# - boxmot's `boxmot.utils.__init__` calls `configure_logging()` at
+#   import time, which installs a RichHandler on the "boxmot" logger
+#   with propagate=False and a hardcoded INFO level. We need to
+#   import that submodule explicitly — `import boxmot` alone doesn't
+#   pull in boxmot.utils, so configure_logging would only fire later
+#   (when the tracker first instantiates) and clobber any override
+#   we set here.
+# - ultralytics also chatters at INFO about model loading.
+#
+# After both have done their import-time logger setup, we strip
+# RichHandler and set propagate=True so anything WARNING+ flows
+# through our standard root config.
+import boxmot.utils  # noqa: F401, E402
+import ultralytics  # noqa: F401, E402
+
+for _noisy in ("boxmot", "ultralytics"):
+    _lg = logging.getLogger(_noisy)
+    _lg.setLevel(logging.WARNING)
+    for _h in list(_lg.handlers):
+        _lg.removeHandler(_h)
+    _lg.propagate = True
+
 # Register every ORM model in SQLAlchemy metadata at startup so foreign
 # keys resolve when the first INSERT/SELECT runs. Imported for side
 # effects only.
@@ -30,6 +54,7 @@ from src.api.caregivers import router as caregivers_router
 from src.api.detectors import router as detectors_router
 from src.api.devices import router as devices_router
 from src.api.events import router as events_router
+from src.api.face_embeddings import router as face_embeddings_router
 from src.api.health import router as health_router
 from src.api.livekit import router as livekit_router
 from src.api.livekit_webhooks import router as livekit_webhooks_router
@@ -45,6 +70,7 @@ from src.db import caregiver_device as _caregiver_device  # noqa: F401
 from src.db import detector as _detector  # noqa: F401
 from src.db import event as _event  # noqa: F401
 from src.db import patient as _patient  # noqa: F401
+from src.db import patient_face_embedding as _patient_face_embedding  # noqa: F401
 from src.db import pi_discovery as _pi_discovery  # noqa: F401
 from src.db.session import get_engine, get_sessionmaker
 from src.services import push
@@ -97,6 +123,8 @@ def create_app() -> FastAPI:
     app.include_router(livekit_webhooks_router)
     # Phase 3 caregiver Talk mode.
     app.include_router(talk_router)
+    # Re-ID face enrollment + status.
+    app.include_router(face_embeddings_router)
     return app
 
 

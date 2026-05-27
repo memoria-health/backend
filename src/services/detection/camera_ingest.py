@@ -46,6 +46,8 @@ from src.services.detection.providers.openai import openai_provider
 from src.services.detection.providers.types import ProviderResult
 from src.services.detection.registry import get_enabled_detectors_for_camera
 from src.services.detection.state_machine import apply_tick_update
+from src.repos.face_embedding_repo import has_ready_enrollment
+from src.services.reid.inference import IdentityResult, ReIDInference
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -70,12 +72,14 @@ class CameraIngest:
         sessionmaker: "async_sessionmaker",
         motion_cache: MotionCache,
         settings: "Settings",
+        reid: ReIDInference,
     ) -> None:
         self.camera_id = camera_id
         self.patient_id = patient_id
         self._sessionmaker = sessionmaker
         self._motion_cache = motion_cache
         self._settings = settings
+        self._reid = reid
         self.frame_buffer = FrameBuffer(
             window_seconds=settings.livekit_worker_window_seconds,
             target_fps=settings.livekit_worker_target_fps,
@@ -272,10 +276,100 @@ class CameraIngest:
                 log.warning("%s mp4_remux failed: %s", self._log_tag, exc)
                 return
 
-            # Provider fallback: Gemini → OpenAI. Gemini-3.5-flash
+            # Re-ID identity check. Runs before the LLM call so the
+            # patient_in_clip flag can flow into the prompt addendum.
+            # Wrapped in try/except, Re-ID failures must NEVER break
+            # the tick. `IdentityResult.empty()` has reid_ran=False
+            # which makes event_promotion bypass the identity gate
+            # entirely (identity-agnostic / today's behavior).
+            try:
+                identity = await self._reid.label_clip(
+                    mp4_bytes=mp4_bytes, patient_id=self.patient_id,
+                )
+            except Exception:
+                log.exception("%s reid.label_clip crashed", self._log_tag)
+                identity = IdentityResult.empty()
+            log.info(
+                "%s reid reid_ran=%s patient_in_clip=%s confidence=%.3f face_count=%d",
+                self._log_tag,
+                identity.reid_ran,
+                identity.patient_in_clip,
+                identity.confidence,
+                identity.face_count,
+            )
+
+            # Upstream identity gate. When Re-ID has POSITIVE evidence
+            # that the patient is NOT in this clip (faces detected,
+            # none matched the gallery) AND an enrollment exists, skip
+            # the LLM call entirely. Saves a per-tick provider call
+            # (5-7s + cost) plus the archival path.
+            #
+            # Crucially, the gate only fires when `face_count > 0`.
+            # `face_count == 0` means Re-ID saw no faces, which is NOT
+            # evidence that the patient is absent. The patient may be
+            # in frame with their face turned away, occluded, foreshort-
+            # ened from a high-mounted camera, or motion-blurred during
+            # a fall. We fall back to identity-agnostic (run the LLM)
+            # in that case, same as we do for `reid_ran=False`.
+            #
+            # Safety contract preserved on every axis:
+            #   reid_ran=False (timeout/crash/no-enrollment) -> bypass
+            #   face_count=0 (no faces seen) -> bypass
+            #   face_count>0, patient_in_clip=False -> suppress
+            #   patient_in_clip=True -> run with patient marked
+            #
+            # The `has_ready_enrollment` check is the day-zero clause.
+            # Without it, a patient who hasn't enrolled would have
+            # every tick skipped because Re-ID always says "not in
+            # clip" against an empty gallery.
+            if (
+                identity.reid_ran
+                and not identity.patient_in_clip
+                and identity.face_count > 0
+            ):
+                if await has_ready_enrollment(session, self.patient_id):
+                    state_after = await apply_tick_update(
+                        session,
+                        camera_id=self.camera_id,
+                        # We saw faces but none matched. The state
+                        # machine should treat this as "people present"
+                        # (someone IS here, just not the patient), so a
+                        # household-member walking by doesn't trip the
+                        # closed-state countdown.
+                        people_present=True,
+                        motion_in_clip=motion_in_clip,
+                    )
+                    synthetic_fields = {
+                        "people_present": True,
+                        "skipped_reason": "identity_not_patient",
+                        "identity_reid_ran": True,
+                        "identity_patient_in_clip": False,
+                        "identity_confidence": round(identity.confidence, 4),
+                        "identity_face_count": identity.face_count,
+                    }
+                    await add_analysis(
+                        session,
+                        camera_id=self.camera_id,
+                        provider="skipped",
+                        description="(non-patient in frame, LLM skipped)",
+                        detector_fields=synthetic_fields,
+                        people_present=True,
+                        people_count=identity.face_count,
+                        motion_in_clip=motion_in_clip,
+                        state_after=state_after.state,
+                        captured_at=captured_at,
+                    )
+                    await session.commit()
+                    log.info(
+                        "%s SKIP identity-gated, faces=%d confidence=%.3f",
+                        self._log_tag, identity.face_count, identity.confidence,
+                    )
+                    return
+
+            # Provider fallback: Gemini -> OpenAI. Gemini-3.5-flash
             # processes the MP4 as actual video (native temporal
             # reasoning + higher per-frame fidelity) which is
-            # materially better at the safety-critical detectors —
+            # materially better at the safety-critical detectors:
             # wandering (did the body cross a doorway through a door
             # swing?) and fall (sudden downward motion at a specific
             # instant). gpt-5.4-nano on 75 low-detail jpegs handles
@@ -283,8 +377,8 @@ class CameraIngest:
             # was producing false negatives on threshold-crossing
             # events. Cost is ~2-3x higher per tick on Gemini, paid
             # back by not missing real safety incidents. Keep OpenAI
-            # in the fallback slot for when Gemini errors / rate-
-            # limits. Both providers accept the same MP4 bytes —
+            # in the fallback slot for when Gemini errors or rate-
+            # limits. Both providers accept the same MP4 bytes;
             # `openai_provider` extracts frames internally via
             # `extract_frames`.
             used_provider: str
@@ -294,6 +388,8 @@ class CameraIngest:
                 result = await gemini_provider(
                     mp4=mp4_bytes, detectors=detectors,
                     log_tag=self._log_tag, settings=self._settings,
+                    patient_in_clip=identity.patient_in_clip,
+                    patient_bbox=identity.patient_bbox,
                 )
             except Exception as gem_err:
                 log.warning("%s gemini failed, trying openai: %s", self._log_tag, gem_err)
@@ -302,6 +398,11 @@ class CameraIngest:
                     result = await openai_provider(
                         mp4=mp4_bytes, detectors=detectors,
                         log_tag=self._log_tag, settings=self._settings,
+                        patient_in_clip=identity.patient_in_clip,
+                        patient_bbox=identity.patient_bbox,
+                        pre_extracted_frames=identity.extracted_frames,
+                        per_frame_bboxes=identity.per_frame_bboxes,
+                        sample_fps=identity.sample_fps,
                     )
                 except Exception as oa_err:
                     log.error(
@@ -309,6 +410,16 @@ class CameraIngest:
                         self._log_tag, gem_err, oa_err,
                     )
                     return
+
+            # Stash identity in detector_fields so the analyses row
+            # carries it for the dashboard / event_promotion path.
+            # The `identity_reid_ran` flag is the gate signal that
+            # tells event_promotion whether to apply identity
+            # suppression at all (False = bypass, identity-agnostic).
+            result.detector_fields["identity_reid_ran"] = identity.reid_ran
+            result.detector_fields["identity_patient_in_clip"] = identity.patient_in_clip
+            result.detector_fields["identity_confidence"] = round(identity.confidence, 4)
+            result.detector_fields["identity_face_count"] = identity.face_count
 
             # State machine + analyses + event promotion. Same session,
             # one commit at the end.
@@ -359,11 +470,19 @@ class CameraIngest:
                 # fired event so the same camera can have two events
                 # fire at the same tick (rare but possible — fall +
                 # agitation) without one stomping the other's wait.
+                # The last frame in the pre snapshot anchors the post
+                # snapshot's start. Without this, the archive task's
+                # "wait then take last 15s" leaves a 5-10s hole equal
+                # to the LLM think time between pre's end and post's
+                # start.
+                pre_end_captured_at = window[-1].captured_at
                 for fired_event in promotion.fired:
                     asyncio.create_task(
                         clip_archival.archive_event(
                             event_id=fired_event.id,
+                            patient_id=self.patient_id,
                             pre_event_mp4=mp4_bytes,
+                            pre_end_captured_at=pre_end_captured_at,
                             frame_buffer=self.frame_buffer,
                             audio_buffer=self.audio_buffer,
                             sessionmaker=self._sessionmaker,

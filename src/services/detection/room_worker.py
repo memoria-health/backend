@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
     from src.services.detection.motion_cache import MotionCache
+    from src.services.reid.inference import ReIDInference
     from src.settings import Settings
 
 log = logging.getLogger(__name__)
@@ -82,11 +83,13 @@ class RoomWorker:
         settings: "Settings",
         sessionmaker: "async_sessionmaker",
         motion_cache: "MotionCache",
+        reid: "ReIDInference",
     ) -> None:
         self.room_name = room_name
         self._settings = settings
         self._sessionmaker = sessionmaker
         self._motion_cache = motion_cache
+        self._reid = reid
         self._room: rtc.Room | None = None
         # Active ingest pipelines, keyed by the camera's livekit_identity
         # (= the LiveKit participant identity). Allows fast lookup from
@@ -529,6 +532,7 @@ class RoomWorker:
             sessionmaker=self._sessionmaker,
             motion_cache=self._motion_cache,
             settings=self._settings,
+            reid=self._reid,
         )
         await ingest.start()
         self._ingests_by_identity[identity] = ingest

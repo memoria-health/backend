@@ -2,7 +2,7 @@
 name = "nemara-backend"
 version = "0.0.1"
 description = "Nemara caregiver-app backend (FastAPI + Supabase)"
-requires-python = ">=3.13"
+requires-python = ">=3.12,<3.14"
 readme = "README.md"
 dependencies = [
     "fastapi>=0.115",
@@ -48,10 +48,41 @@ dependencies = [
     # lightweight choice (~3 MB) over OpenCV (~80 MB) since the only
     # operation we need from it is JPEG decode.
     "pillow>=11.0",
-    # numpy is already a transitive dep but make it explicit because
-    # the motion detector (services/ingest/pi/motion_detector.py) and
-    # the JPEG-to-I420 path both import it directly.
-    "numpy>=2.0",
+    # ── Re-ID pipeline (face identification) ─────────────────────────
+    # InsightFace bundles SCRFD (face detector) + ArcFace (face
+    # embedding) under a single FaceAnalysis API. The `buffalo_l`
+    # model pack is ~280MB and pre-downloaded at Dockerfile build
+    # time so the first tick after deploy doesn't pay the cold-
+    # download cost.
+    "insightface>=0.7.3",
+    "onnxruntime>=1.16",
+    # onnx 1.19 references `ml_dtypes.float4_e2m1fn` which only exists
+    # in ml_dtypes>=0.5; but torch / tensorflow / jax in the wider
+    # graph hold ml_dtypes at 0.4.x. Pinning onnx<1.19 keeps the
+    # resolver happy. Revisit once the ML-stack graph upgrades
+    # ml_dtypes.
+    "onnx<1.19",
+    # OpenCV is required by InsightFace for image decode + alignment.
+    # The `headless` variant skips GUI deps (no X11 in the container).
+    "opencv-python-headless>=4.9",
+    # ── Body Re-ID stack (mirrors nemara-reid-experiment) ────────────
+    # ultralytics ships YOLO11n (~6MB weights) for person detection.
+    # boxmot wraps BoT-SORT + OSNet body-appearance Re-ID (~10MB weights
+    # for osnet_x0_25_msmt17). Both pull torch as a hard dep, which is
+    # what dominates the image size (~500MB for CPU-only torch). We
+    # accept this so the production pipeline matches the experiment
+    # exactly: body tracks carry the patient identity through frames
+    # where the face is occluded, pointed away, or motion-blurred (e.g.,
+    # the exact moment of a fall).
+    "ultralytics>=8.3",
+    "boxmot>=11.0",
+    "torch>=2.0",
+    # numpy is a transitive dep of several others; pin explicitly
+    # because both the Re-ID code and the Pi motion detector / JPEG-to-
+    # I420 path import it directly. Upper bound matches the boxmot
+    # constraint from the experiment's pyproject; the Pi-side numpy
+    # usage is basic array ops so 1.26.x works fine.
+    "numpy>=1.26,<2.0",
 ]
 
 [project.scripts]
@@ -75,7 +106,7 @@ packages = ["src", "scripts"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py313"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "RUF"]
