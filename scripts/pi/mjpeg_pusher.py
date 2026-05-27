@@ -22,7 +22,9 @@ Configuration via env vars (loaded by systemd unit from
   NEMARA_CAMERA_WIDTH        optional, default 1280
   NEMARA_CAMERA_HEIGHT       optional, default 720
   NEMARA_CAMERA_FPS          optional, default 15
-  NEMARA_CAMERA_QUALITY      optional JPEG quality 1..100, default 80
+  NEMARA_CAMERA_BITRATE_BPS  MJPEGEncoder target bitrate, default 4000000
+                             (4 Mbps; rough guide for 720p: 4M clean,
+                             6M sharp, 8M visually lossless)
   NEMARA_PUSH_RECONNECT_S    optional backoff base seconds, default 2.0
   NEMARA_LOG_LEVEL           optional, default INFO
 
@@ -129,7 +131,9 @@ class _JpegRing(io.BufferedIOBase):
             return frame
 
 
-def _build_camera_and_encoder(width: int, height: int, fps: int, quality: int):
+def _build_camera_and_encoder(
+    width: int, height: int, fps: int, bitrate_bps: int,
+):
     """Configure picamera2 with the hardware JpegEncoder feeding a
     `_JpegRing`. The hardware encoder uses the SoC's ISP for the
     JPEG step, dropping per-frame CPU cost from "saturate the core"
@@ -166,7 +170,12 @@ def _build_camera_and_encoder(width: int, height: int, fps: int, quality: int):
             controls={"FrameRate": float(fps)},
         )
         cam.configure(cfg)
-        encoder = MJPEGEncoder()
+        # MJPEGEncoder controls quality via target bitrate (no `q`
+        # arg). Rough guide for 720p: 4 Mbps = clean, 6 Mbps = sharp,
+        # 8 Mbps+ = visually lossless. Bandwidth is the trade-off;
+        # WiFi on a Zero W comfortably handles 8 Mbps in good
+        # conditions.
+        encoder = MJPEGEncoder(bitrate=bitrate_bps)
         ring = _JpegRing()
         output = FileOutput(ring)
     except Exception:
@@ -258,7 +267,7 @@ async def push_once(
     width: int,
     height: int,
     fps: int,
-    quality: int,
+    bitrate_bps: int,
 ) -> None:
     """Open one push connection and stream frames until the camera
     or the server closes it. Returns on clean exit (server closed,
@@ -266,7 +275,7 @@ async def push_once(
     off and reconnect.
     """
     cam, encoder, output, ring = _build_camera_and_encoder(
-        width, height, fps, quality,
+        width, height, fps, bitrate_bps,
     )
     stop = asyncio.Event()
     cam.start_recording(encoder, output)
@@ -327,12 +336,14 @@ async def main_loop() -> None:
     width = int(os.environ.get("NEMARA_CAMERA_WIDTH", "1280"))
     height = int(os.environ.get("NEMARA_CAMERA_HEIGHT", "720"))
     fps = int(os.environ.get("NEMARA_CAMERA_FPS", "15"))
-    quality = int(os.environ.get("NEMARA_CAMERA_QUALITY", "80"))
+    # Target bitrate for MJPEGEncoder. Default 4 Mbps gives clean
+    # 720p; raise for sharper image at higher bandwidth cost.
+    bitrate_bps = int(os.environ.get("NEMARA_CAMERA_BITRATE_BPS", "4000000"))
     base_backoff_s = float(os.environ.get("NEMARA_PUSH_RECONNECT_S", "2.0"))
 
     log.info(
-        "starting pusher url=%s res=%dx%d fps=%d quality=%d",
-        ingest_url, width, height, fps, quality,
+        "starting pusher url=%s res=%dx%d fps=%d bitrate_mbps=%.1f",
+        ingest_url, width, height, fps, bitrate_bps / 1_000_000,
     )
 
     backoff = base_backoff_s
@@ -342,7 +353,7 @@ async def main_loop() -> None:
                 ingest_url=ingest_url,
                 ingest_token=ingest_token,
                 width=width, height=height,
-                fps=fps, quality=quality,
+                fps=fps, bitrate_bps=bitrate_bps,
             )
             # Clean exit: server closed gracefully. Reset backoff
             # and reconnect immediately.
