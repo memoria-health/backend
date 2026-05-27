@@ -132,19 +132,32 @@ def _build_camera_and_encoder(width: int, height: int, fps: int, quality: int):
     from picamera2.outputs import FileOutput
 
     cam = Picamera2()
-    # Hardware JPEG path uses YUV420 internally; the encoder converts
-    # for us. Explicit FrameDurationLimits pins the sensor to the
-    # requested fps so the source rate matches what the encoder
-    # produces (avoids the encoder dropping or padding frames).
-    fdl = int(1_000_000 / max(1, fps))
-    cfg = cam.create_video_configuration(
-        main={"size": (width, height)},
-        controls={"FrameDurationLimits": (fdl, fdl)},
-    )
-    cam.configure(cfg)
-    encoder = JpegEncoder(q=quality)
-    ring = _JpegRing()
-    output = FileOutput(ring)
+    # CRITICAL: if anything below this line raises, we must close the
+    # Picamera2 instance, or the camera device stays bound to this
+    # process and subsequent retries fail with `Device or resource
+    # busy` until the whole pusher process exits. The outer try/
+    # finally in push_once only runs if this function returns.
+    try:
+        # Hardware JPEG path uses YUV420 internally; the encoder
+        # converts for us. Explicit FrameDurationLimits pins the
+        # sensor to the requested fps so the source rate matches what
+        # the encoder produces (avoids the encoder dropping or padding
+        # frames).
+        fdl = int(1_000_000 / max(1, fps))
+        cfg = cam.create_video_configuration(
+            main={"size": (width, height)},
+            controls={"FrameDurationLimits": (fdl, fdl)},
+        )
+        cam.configure(cfg)
+        encoder = JpegEncoder(q=quality)
+        ring = _JpegRing()
+        output = FileOutput(ring)
+    except Exception:
+        try:
+            cam.close()
+        except Exception:
+            pass
+        raise
     return cam, encoder, output, ring
 
 
