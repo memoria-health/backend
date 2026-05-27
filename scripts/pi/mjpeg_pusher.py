@@ -140,7 +140,7 @@ def _build_camera_and_encoder(width: int, height: int, fps: int, quality: int):
     `cam.stop_recording()`.
     """
     from picamera2 import Picamera2
-    from picamera2.encoders import JpegEncoder
+    from picamera2.encoders import MJPEGEncoder
     from picamera2.outputs import FileOutput
 
     cam = Picamera2()
@@ -150,18 +150,23 @@ def _build_camera_and_encoder(width: int, height: int, fps: int, quality: int):
     # busy` until the whole pusher process exits. The outer try/
     # finally in push_once only runs if this function returns.
     try:
-        # Hardware JPEG path uses YUV420 internally; the encoder
-        # converts for us. Explicit FrameDurationLimits pins the
-        # sensor to the requested fps so the source rate matches what
-        # the encoder produces (avoids the encoder dropping or padding
-        # frames).
-        fdl = int(1_000_000 / max(1, fps))
+        # MJPEGEncoder uses the SoC's V4L2 hardware encoder
+        # (single-digit CPU%). picamera2 also has `JpegEncoder` whose
+        # name suggests hardware too, but is actually software
+        # libjpeg-turbo on the CPU and cannot sustain 15 fps at 720p
+        # on a Zero W. We hit ~3 fps with JpegEncoder before this
+        # swap; MJPEGEncoder gets back to the 15 fps the old serve-
+        # mode script achieved.
+        #
+        # `FrameRate` control pins the sensor to the requested fps
+        # (matches the old stream.py's working config). The encoder
+        # then emits at the sensor rate.
         cfg = cam.create_video_configuration(
             main={"size": (width, height)},
-            controls={"FrameDurationLimits": (fdl, fdl)},
+            controls={"FrameRate": float(fps)},
         )
         cam.configure(cfg)
-        encoder = JpegEncoder(q=quality)
+        encoder = MJPEGEncoder()
         ring = _JpegRing()
         output = FileOutput(ring)
     except Exception:
