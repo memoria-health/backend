@@ -185,6 +185,35 @@ create table public.cameras (
   -- See NemaraCam/.../DesiredStateMonitor.swift.
   desired_state       text not null default 'connected'
     check (desired_state in ('connected', 'disconnected')),
+  -- ── Camera source type (iPhone vs Pi ingest path) ───────────────
+  -- 'iphone': wall phone running the NemaraCam app. Publishes
+  --   directly to LiveKit, motion detection runs on-device, audio
+  --   co-streamed via LiveKit. This is the only source type the
+  --   pairing flow supports for v0.
+  -- 'pi': Raspberry Pi running the MJPEG-over-HTTP streaming
+  --   daemon. The backend's pi_ingest worker process pulls frames,
+  --   runs motion detection backend-side, and re-publishes to
+  --   LiveKit as a cam_* participant so the rest of the system
+  --   (caregiver viewer, detector tick, clip archival) treats the
+  --   Pi camera identically to an iPhone camera. See
+  --   src/services/ingest/pi/ for the worker.
+  -- Default 'iphone' makes this backwards-compatible with existing
+  -- rows; no data migration required.
+  source_type         text not null default 'iphone'
+    check (source_type in ('iphone', 'pi')),
+  -- Required when source_type='pi'. The HTTP MJPEG endpoint the
+  -- pi_ingest worker connects to (e.g. http://10.0.0.44:8000/stream.mjpg).
+  -- NULL is enforced for source_type='iphone' to keep the schema
+  -- self-consistent. Length cap of 2048 matches the Pydantic
+  -- boundary so a row that survives a write can always be read.
+  pi_stream_url       text,
+  constraint cameras_pi_stream_url_required
+    check (
+      (source_type = 'pi' and pi_stream_url is not null)
+      or (source_type = 'iphone' and pi_stream_url is null)
+    ),
+  constraint cameras_pi_stream_url_length
+    check (pi_stream_url is null or length(pi_stream_url) <= 2048),
   unique (patient_id, display_id)
 );
 

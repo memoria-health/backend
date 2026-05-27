@@ -137,10 +137,18 @@ async def create_pairing_code(
         close_threshold=6,
         battery_percent=None,
         # Default to connected so a freshly-paired phone starts
-        # streaming immediately. Server default would cover this too —
+        # streaming immediately. Server default would cover this too,
         # set it explicitly so the row's full state is grep-able from
         # this construction site.
         desired_state="connected",
+        # The pairing flow only creates iPhone cameras. Pi cameras
+        # come in through /v1/cameras/pi-provision (Phase 4) which
+        # constructs its own Camera row. Setting source_type and
+        # pi_stream_url explicitly here keeps the row's full state
+        # grep-able and surfaces source_type drift if a future change
+        # alters the Python-side default.
+        source_type="iphone",
+        pi_stream_url=None,
     )
     session.add(cam)
     await session.flush()  # Ensure the camera row is visible to the assignment query below.

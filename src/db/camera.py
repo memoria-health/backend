@@ -92,3 +92,22 @@ class Camera(Base):
     desired_state: Mapped[str] = mapped_column(
         String(16), server_default=text("'connected'"), default="connected",
     )
+
+    # ── Source type (iPhone vs Pi) ───────────────────────────────────
+    # Discriminates the ingest path. 'iphone' rows are paired via the
+    # existing /v1/cameras/pair flow and publish directly to LiveKit.
+    # 'pi' rows are provisioned via /v1/cameras/pi-provision (Phase 4),
+    # carry a `pi_stream_url`, and have their LiveKit publishing
+    # handled by the backend's pi_ingest worker process. From the
+    # detection pipeline's perspective both look identical.
+    source_type: Mapped[str] = mapped_column(
+        String(16), server_default=text("'iphone'"), default="iphone",
+    )
+
+    # ── Pi MJPEG endpoint ────────────────────────────────────────────
+    # Required when source_type='pi', forbidden when source_type='iphone'.
+    # The CHECK constraint at the DB layer enforces this invariant;
+    # Pydantic validation enforces it at the API boundary. Length cap
+    # matches the Pydantic boundary (2048 chars) so a raw-SQL write of
+    # a longer URL can never produce a row the API cannot read.
+    pi_stream_url: Mapped[str | None] = mapped_column(String(2048), default=None)

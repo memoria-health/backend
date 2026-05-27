@@ -8,15 +8,26 @@ from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 Room = Annotated[str, Field(min_length=1, max_length=80)]
 IconName = Annotated[str, Field(min_length=1, max_length=80)]
 
 # Mirrors the DB CHECK constraint on cameras.desired_state. Pydantic
 # Literal raises ValidationError if the DB ever returns something
-# outside this set — fail-loud on schema drift between DB + code.
+# outside this set, fail-loud on schema drift between DB + code.
 DesiredState = Literal["connected", "disconnected"]
+
+# Mirrors the DB CHECK constraint on cameras.source_type. 'iphone' is
+# the existing NemaraCam wall-phone path. 'pi' is the Raspberry Pi
+# ingest path handled by services/ingest/pi/.
+SourceType = Literal["iphone", "pi"]
+
+# A Pi stream URL must be an HTTP(S) URL. We do not parse / validate
+# routing here; the worker process will discover unreachable URLs
+# at connect time. Length cap protects against accidentally storing
+# a multi-MB blob.
+PiStreamUrl = Annotated[str, Field(min_length=8, max_length=2048)]
 
 
 class CameraResponse(BaseModel):
@@ -35,11 +46,20 @@ class CameraResponse(BaseModel):
     # row goes into analyses). Web hides disabled cameras from the
     # live grid + analyses feed.
     disabled: bool
-    # Stronger than `disabled` — when 'disconnected', the wall phone
+    # Stronger than `disabled`, when 'disconnected', the wall phone
     # itself leaves the LiveKit room. Reconnect takes ~1-2s after
     # flipping back to 'connected'. See cameras.desired_state in
     # supabase/schema.sql for the underlying CHECK constraint.
     desired_state: DesiredState
+    # 'iphone' (NemaraCam wall phone) or 'pi' (Raspberry Pi ingest).
+    # The caregiver app uses this to hide source-incompatible UI
+    # affordances; e.g. Talk mode is iPhone-only until Pi gets a
+    # speaker (Phase 6).
+    source_type: SourceType
+    # The MJPEG-over-HTTP endpoint for Pi cameras. Present only when
+    # source_type='pi'. Forbidden when source_type='iphone' (enforced
+    # at the DB layer too via CHECK constraint).
+    pi_stream_url: PiStreamUrl | None = None
     # `cam_<8 hex>` once the pairing handshake completes; None on rows
     # that hold an open pairing code but haven't been claimed by a
     # wall phone yet. Exposed to the caregiver app so the Live tab
@@ -48,6 +68,21 @@ class CameraResponse(BaseModel):
     livekit_identity: str | None
     last_seen_at: datetime | None
     created_at: datetime
+
+    @model_validator(mode="after")
+    def _validate_source_pi_url_consistency(self) -> "CameraResponse":
+        """Mirror the DB CHECK constraint at the Pydantic boundary so
+        schema drift fails loudly here too.
+        """
+        if self.source_type == "pi" and self.pi_stream_url is None:
+            raise ValueError(
+                "source_type='pi' requires a non-null pi_stream_url"
+            )
+        if self.source_type == "iphone" and self.pi_stream_url is not None:
+            raise ValueError(
+                "source_type='iphone' must not carry a pi_stream_url"
+            )
+        return self
 
 
 class UpdateCameraRequest(BaseModel):
