@@ -1,0 +1,17 @@
+[Unit]
+Description=Nemara camera announce daemon
+After=network-online.target NetworkManager.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+EnvironmentFile=/etc/nemara/announce.env
+ExecStart=/usr/bin/python3 /opt/nemara/announce_daemon.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
