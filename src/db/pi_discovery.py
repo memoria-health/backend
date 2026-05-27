@@ -42,3 +42,12 @@ class PiDiscovery(Base):
     claimed_camera_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("cameras.id", ondelete="SET NULL"), default=None,
     )
+    # One-shot plaintext ingest bearer token for the Pi to pick up on
+    # its next announce response. Set by the provision endpoint in the
+    # same transaction that mints the camera row's
+    # ingest_token_hash. Nulled the first time the announce handler
+    # reads it (one-shot delivery). If the Pi misses the response,
+    # caregiver re-provisions to mint a fresh pair.
+    pending_ingest_token: Mapped[str | None] = mapped_column(
+        String(128), default=None,
+    )

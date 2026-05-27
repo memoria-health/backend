@@ -306,7 +306,10 @@ async def test_provision_with_discovery_id_copies_urls(
     client: AsyncClient, auth_user, session: AsyncSession,
 ) -> None:
     """Provisioning from a discovery copies BOTH current_url and
-    current_audio_url to the cameras row.
+    current_audio_url onto the cameras row (still happens for
+    backwards compat / diagnostics even though they're vestigial).
+    Also: the discovery is marked claimed and gets a one-shot
+    pending_ingest_token for the next announce to consume.
     """
     headers, pid = await _setup_patient(client, auth_user)
     announce_r = await client.post(
@@ -326,21 +329,38 @@ async def test_provision_with_discovery_id_copies_urls(
     )
     assert provision_r.status_code == 201
     cam = provision_r.json()
-    assert cam["pi_stream_url"] == "http://10.0.0.88:8000/stream.mjpg"
-    assert cam["pi_audio_url"] == "http://10.0.0.88:8001/audio.pcm"
-
-    # Verify the discovery is marked claimed and linked to this camera.
+    # Push-refactor: pi_stream_url / pi_audio_url no longer surface
+    # in the provision response. The URLs do still land on the row.
+    assert "pi_stream_url" not in cam
+    assert "pi_audio_url" not in cam
+    camera_id = cam["camera_id"]
     row = (
         await session.execute(
             text(
-                "SELECT claimed_at, claimed_camera_id "
+                "SELECT pi_stream_url, pi_audio_url FROM cameras "
+                "WHERE id = :id"
+            ),
+            {"id": camera_id},
+        )
+    ).one()
+    assert row.pi_stream_url == "http://10.0.0.88:8000/stream.mjpg"
+    assert row.pi_audio_url == "http://10.0.0.88:8001/audio.pcm"
+
+    # Verify the discovery is marked claimed, linked, and has a
+    # pending_ingest_token stashed for next-announce delivery.
+    drow = (
+        await session.execute(
+            text(
+                "SELECT claimed_at, claimed_camera_id, pending_ingest_token "
                 "FROM pi_discoveries WHERE id = :id"
             ),
             {"id": discovery_id},
         )
     ).one()
-    assert row.claimed_at is not None
-    assert str(row.claimed_camera_id) == cam["camera_id"]
+    assert drow.claimed_at is not None
+    assert str(drow.claimed_camera_id) == camera_id
+    assert drow.pending_ingest_token is not None
+    assert len(drow.pending_ingest_token) >= 40
 
 
 @pytest.mark.asyncio

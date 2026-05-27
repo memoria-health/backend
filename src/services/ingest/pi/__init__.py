@@ -1,28 +1,34 @@
-"""Pi camera ingest service.
+"""Pi camera ingest service (push-mode).
 
-A Raspberry Pi running a tiny MJPEG-over-HTTP daemon streams JPEG
-frames continuously. This package consumes that stream, performs
-motion detection, and republishes the video to LiveKit as a regular
-camera participant. From the existing detection pipeline's
-perspective, a Pi camera is indistinguishable from an iPhone camera
-joining the LiveKit room.
+A Raspberry Pi running a small picamera2 client opens a long-lived
+HTTPS POST to `/v1/cameras/me/frames` and streams `multipart/x-mixed-
+replace` JPEG frames over the request body. The push endpoint
+(src/api/cameras_ingest.py) authenticates the connection, parses
+the multipart body, runs motion detection, and republishes to
+LiveKit as a regular `cam_*` participant. From the existing
+detection pipeline's perspective, a Pi camera is indistinguishable
+from an iPhone camera joining the LiveKit room.
 
-Module layout (built incrementally):
+Module layout:
 
-    mjpeg_reader.py     -- async MJPEG stream parser (Phase 1)
+    auth.py             -- ingest bearer-token mint + verify helpers
+    mjpeg_reader.py     -- multipart MJPEG parser (used by both the
+                           push endpoint parsing the request body
+                           and the legacy pull path)
     motion_detector.py  -- Python port of the iOS SAD-tile algorithm
-                           that runs on the same frames before they
-                           are re-encoded for LiveKit (Phase 2)
+                           that runs on each frame before LiveKit
+                           re-encode
+    jpeg_decoder.py     -- JPEG -> Y plane + I420 buffer for LiveKit
+    audio_reader.py     -- PCM-over-HTTP audio reader (pull mode,
+                           vestigial; push-mode audio is a follow-up
+                           endpoint)
     relay_publisher.py  -- LiveKit publisher: connects, publishes a
                            video track frame-by-frame, fires motion
-                           heartbeat data packets (Phase 5)
-    manager.py          -- PiIngestManager: reads `cameras` rows with
-                           `source_type='pi'` at startup, spawns one
-                           relay coroutine per row, manages reconnects
-                           (Phase 5)
+                           heartbeat data packets. Exposes
+                           `run_from_iterator(frames)` so the push
+                           endpoint can drive it directly from the
+                           request body.
 
-The orchestration (manager.py) is run by a standalone worker
-entrypoint in `src/workers/pi_ingest_worker.py` so a publisher crash
-or WebRTC hang does not affect the FastAPI process serving the
-caregiver app.
+There is no longer a separate worker process: the push endpoint
+runs inside the FastAPI app, one connection per Pi at a time.
 """

@@ -55,13 +55,15 @@ async def test_pi_provision_creates_row_with_full_shape(
     assert r.status_code == 201, r.text
     resp = r.json()
 
-    # Response body: caller gets back what it needs to confirm the
-    # camera is wired before the worker brings it online.
+    # Response body shape after the push refactor: vestigial URL
+    # fields no longer surfaced; the Pi receives its ingest token
+    # via the next /v1/cameras/pi-announce response, not here.
     assert resp["patient_id"] == pid
-    assert resp["pi_stream_url"] == "http://10.0.0.44:8000/stream.mjpg"
     assert resp["livekit_room"] == f"patient_{pid}"
     assert resp["livekit_identity"].startswith("cam_")
     assert len(resp["livekit_identity"]) == len("cam_") + 8  # short hex
+    assert "pi_stream_url" not in resp
+    assert "ingest_token" not in resp
     camera_id = resp["camera_id"]
 
     # DB shape: every field that matters for the iPhone path is also
@@ -71,6 +73,7 @@ async def test_pi_provision_creates_row_with_full_shape(
             text(
                 "SELECT patient_id, display_id, room, icon_name, online, "
                 "source_type, pi_stream_url, pi_audio_url, "
+                "ingest_token_hash, ingest_token_created_at, "
                 "livekit_identity, livekit_room, "
                 "state, no_people_count, close_threshold, disabled, "
                 "desired_state, pairing_code, api_key_hash "
@@ -83,12 +86,18 @@ async def test_pi_provision_creates_row_with_full_shape(
     assert row.display_id == 1  # first camera for this patient
     assert row.room == "Living Room"
     assert row.icon_name == "tv"
-    assert row.online is False  # worker flips this when it confirms the stream
+    assert row.online is False  # the push endpoint flips this on first frame
     assert row.source_type == "pi"
+    # Vestigial: pi_stream_url accepted for backwards compat with the
+    # Mode B direct-URL provision path used by these test fixtures.
     assert row.pi_stream_url == "http://10.0.0.44:8000/stream.mjpg"
-    # Default provisioning request had no pi_audio_url, so the row
-    # is video-only. The relay will skip the audio task entirely.
     assert row.pi_audio_url is None
+    # New push-mode contract: ingest_token_hash MUST be set (DB CHECK
+    # constraint cameras_ingest_token_required enforces this), and
+    # it must be the 64-char SHA-256 hex digest shape.
+    assert row.ingest_token_hash is not None
+    assert len(row.ingest_token_hash) == 64
+    assert row.ingest_token_created_at is not None
     assert row.livekit_identity == resp["livekit_identity"]
     assert row.livekit_room == resp["livekit_room"]
     assert row.state == "open"
@@ -96,9 +105,8 @@ async def test_pi_provision_creates_row_with_full_shape(
     assert row.close_threshold == 6
     assert row.disabled is False
     assert row.desired_state == "connected"
-    # Pi rows skip the pairing-code dance: there is no device-side
-    # bearer token. The pi_ingest worker authenticates to LiveKit
-    # using server credentials.
+    # Pi rows skip the pairing-code dance: the device-side bearer is
+    # ingest_token_hash (verified above), not api_key_hash.
     assert row.pairing_code is None
     assert row.api_key_hash is None
 
@@ -252,7 +260,10 @@ async def test_pi_provision_with_audio_url_creates_audio_enabled_row(
     )
     assert r.status_code == 201, r.text
     resp = r.json()
-    assert resp["pi_audio_url"] == "http://10.0.0.55:8001/audio.pcm"
+    # Push-refactor: pi_audio_url no longer surfaces in the response
+    # body. The URL is still persisted on the row for backwards
+    # compat / diagnostics.
+    assert "pi_audio_url" not in resp
 
     row = (
         await session.execute(

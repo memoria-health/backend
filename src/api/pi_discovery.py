@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, status
 
-from src.api.deps import CaregiverAuth, SessionDep
+from src.api.deps import CaregiverAuth, SessionDep, SettingsDep
 from src.repos import pi_discovery_repo
 from src.schemas.pi_discovery import (
     DiscoveredPi,
@@ -48,6 +48,7 @@ _DISCOVERY_WINDOW_SECONDS: int = 5 * 60
 async def announce_pi(
     body: PiAnnounceRequest,
     session: SessionDep,
+    settings: SettingsDep,
 ) -> PiAnnounceResponse:
     """Upsert a discovery row keyed by hardware_id.
 
@@ -55,6 +56,13 @@ async def announce_pi(
     Pi has no credentials before pairing. The hardware_id (MAC
     address) is the de-dupe key; re-announcing just refreshes
     last_seen_at and current_url.
+
+    If a caregiver has already provisioned this Pi, the response
+    carries the ingest URL + plaintext bearer token so the Pi can
+    switch from the announce loop to the push-frames loop. The
+    token is delivered exactly once (consume_pending_ingest_token
+    nulls it after read); a Pi that misses the response forces a
+    re-provision to mint a fresh token.
     """
     discovery = await pi_discovery_repo.upsert_announcement(
         session,
@@ -63,10 +71,22 @@ async def announce_pi(
         current_url=body.current_url,
         current_audio_url=body.current_audio_url,
     )
+    pending = await pi_discovery_repo.consume_pending_ingest_token(
+        session, hardware_id=body.hardware_id,
+    )
+    paired = discovery.claimed_at is not None
+    ingest_token: str | None = None
+    ingest_url: str | None = None
+    if pending is not None:
+        _camera_id, ingest_token = pending
+        ingest_url = f"{settings.public_base_url}/v1/cameras/me/frames"
     await session.commit()
     return PiAnnounceResponse(
         discovery_id=discovery.id,
         last_seen_at=discovery.last_seen_at,
+        paired=paired,
+        ingest_url=ingest_url,
+        ingest_token=ingest_token,
     )
 
 

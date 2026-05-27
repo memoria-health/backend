@@ -41,30 +41,38 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo ">>> Installing system packages"
 apt-get update
-# network-manager: nmcli for both AP mode and home-WiFi joining
-# python3-httpx:   used by the announce daemon (HTTP client)
+# network-manager:    nmcli for both AP mode and home-WiFi joining
+# python3-httpx:      used by both announce daemon and push streamer
+# python3-picamera2:  used by the push streamer to capture frames
+# python3-pil:        Pillow, used by the push streamer for JPEG encode
 apt-get install -y --no-install-recommends \
-  network-manager python3-httpx
+  network-manager python3-httpx python3-picamera2 python3-pil
 
 echo ">>> Deploying daemon scripts to /opt/nemara"
 install -d /opt/nemara
 install -m 0755 "$SCRIPT_DIR/announce_daemon.py"     /opt/nemara/announce_daemon.py
 install -m 0755 "$SCRIPT_DIR/wifi_ap_provision.py"   /opt/nemara/wifi_ap_provision.py
+install -m 0755 "$SCRIPT_DIR/mjpeg_pusher.py"        /opt/nemara/mjpeg_pusher.py
 
 echo ">>> Writing /etc/nemara/announce.env"
 install -d /etc/nemara
 cat > /etc/nemara/announce.env <<EOF
 NEMARA_BACKEND_URL=$BACKEND_URL
-# `{ip}` is replaced with this device's current WiFi IP on every
-# announcement (so a new DHCP lease pushes the new URL).
-NEMARA_CAMERA_STREAM_URL=http://{ip}:8000/stream.mjpg
-# Uncomment when a USB mic is attached and an audio daemon serves PCM:
-# NEMARA_CAMERA_AUDIO_URL=http://{ip}:8001/audio.pcm
 NEMARA_ANNOUNCE_INTERVAL_S=60
 NEMARA_WIFI_IFACE=wlan0
 NEMARA_LOG_LEVEL=INFO
 EOF
 chmod 0644 /etc/nemara/announce.env
+
+echo ">>> Writing /etc/nemara/camera-stream.env (per-camera tuning)"
+cat > /etc/nemara/camera-stream.env <<EOF
+NEMARA_CAMERA_WIDTH=1280
+NEMARA_CAMERA_HEIGHT=720
+NEMARA_CAMERA_FPS=15
+NEMARA_CAMERA_QUALITY=80
+NEMARA_LOG_LEVEL=INFO
+EOF
+chmod 0644 /etc/nemara/camera-stream.env
 
 echo ">>> Writing /etc/nemara/wifi-ap.env"
 cat > /etc/nemara/wifi-ap.env <<EOF
@@ -79,8 +87,9 @@ EOF
 chmod 0644 /etc/nemara/wifi-ap.env
 
 echo ">>> Installing systemd units"
-install -m 0644 "$SCRIPT_DIR/nemara-announce.service" /etc/systemd/system/
-install -m 0644 "$SCRIPT_DIR/nemara-wifi-ap.service"  /etc/systemd/system/
+install -m 0644 "$SCRIPT_DIR/nemara-announce.service"      /etc/systemd/system/
+install -m 0644 "$SCRIPT_DIR/nemara-wifi-ap.service"       /etc/systemd/system/
+install -m 0644 "$SCRIPT_DIR/nemara-camera-stream.service" /etc/systemd/system/
 # Remove the old BLE provisioning unit from any prior install of
 # this script. Failure here is fine (the unit may never have been
 # installed).
@@ -89,6 +98,11 @@ rm -f /etc/systemd/system/nemara-ble-provision.service /opt/nemara/ble_provision
 systemctl daemon-reload
 systemctl enable nemara-announce.service
 systemctl enable nemara-wifi-ap.service
+# The camera-stream unit is enabled but won't start until
+# /etc/nemara/ingest.env exists (ConditionPathExists). The announce
+# daemon writes that file the moment the backend hands us a fresh
+# token, then triggers `systemctl restart` on this unit.
+systemctl enable nemara-camera-stream.service
 
 echo ""
 echo ">>> Installed. On next boot:"

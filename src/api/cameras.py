@@ -19,6 +19,7 @@ from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import func, select
 
 from src.api.deps import CameraAuth, CaregiverAuth, SessionDep, SettingsDep
+from src.services.ingest.pi.auth import mint_ingest_token
 from src.db.camera import Camera
 from src.repos import (
     camera_detector_repo,
@@ -240,18 +241,21 @@ async def provision_pi_camera(
         pi_stream_url = body.pi_stream_url
         pi_audio_url = body.pi_audio_url
 
-    # Reject duplicate provisioning: a Pi URL is uniquely tied to one
-    # physical device; if it is already registered, the caregiver
-    # should delete the existing row rather than create a duplicate.
-    existing_url_stmt = (
-        select(Camera.id).where(Camera.pi_stream_url == pi_stream_url).limit(1)
-    )
-    existing_url = (await session.execute(existing_url_stmt)).scalar_one_or_none()
-    if existing_url is not None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="pi_stream_url_already_registered",
+    # Reject duplicate provisioning: a discovery is uniquely tied to
+    # one physical Pi (via hardware MAC); if it has been claimed
+    # before, the caregiver should delete the existing camera row
+    # before re-pairing. For direct-URL mode (vestigial) we fall back
+    # to the URL check for backwards compat with test fixtures.
+    if discovery_id_to_claim is None and pi_stream_url is not None:
+        existing_url_stmt = (
+            select(Camera.id).where(Camera.pi_stream_url == pi_stream_url).limit(1)
         )
+        existing_url = (await session.execute(existing_url_stmt)).scalar_one_or_none()
+        if existing_url is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="pi_stream_url_already_registered",
+            )
 
     # Next display_id for this patient, same as the iPhone path.
     max_display_stmt = select(func.coalesce(func.max(Camera.display_id), 0)).where(
@@ -265,6 +269,14 @@ async def provision_pi_camera(
     livekit_identity = f"cam_{short}"
     livekit_room = f"patient_{patient_id}"
 
+    # Mint the Pi's ingest bearer token. The hash lands on the camera
+    # row (used by the push endpoint to authenticate); the plaintext
+    # gets stashed on the discovery row (read once by the Pi on its
+    # next announce, then nulled). For Mode B (no discovery), there
+    # is no per-Pi channel to deliver the plaintext, so we surface it
+    # in the provision response as the only place it can land.
+    ingest_token_plaintext, ingest_token_hash = mint_ingest_token()
+
     cam = Camera(
         id=camera_id,
         patient_id=patient_id,
@@ -274,9 +286,9 @@ async def provision_pi_camera(
         online=False,
         last_seen_at=None,
         created_at=now,
-        # Pi rows skip the pairing-code / api_key dance: there is no
-        # device-side bearer token. The pi_ingest worker authenticates
-        # to LiveKit using server credentials.
+        # Pi rows skip the pairing-code / api_key dance used by the
+        # iPhone path. Instead, the Pi authenticates with the
+        # ingest_token_hash bearer token below when pushing frames.
         pairing_code=None,
         pairing_expires_at=None,
         api_key_hash=None,
@@ -291,6 +303,8 @@ async def provision_pi_camera(
         source_type="pi",
         pi_stream_url=pi_stream_url,
         pi_audio_url=pi_audio_url,
+        ingest_token_hash=ingest_token_hash,
+        ingest_token_created_at=now,
     )
     session.add(cam)
     await session.flush()
@@ -301,18 +315,21 @@ async def provision_pi_camera(
         session, camera_id, patient_id,
     )
     # Mark the discovery claimed (if we got here via discovery mode)
-    # so it disappears from the next /discovered listing.
+    # so it disappears from the next /discovered listing, AND stash
+    # the plaintext ingest token on the discovery row so the Pi can
+    # pick it up on its next announce.
     if discovery_id_to_claim is not None:
         await pi_discovery_repo.claim(
-            session, discovery_id=discovery_id_to_claim, camera_id=camera_id,
+            session,
+            discovery_id=discovery_id_to_claim,
+            camera_id=camera_id,
+            pending_ingest_token=ingest_token_plaintext,
         )
     await session.commit()
 
     return PiProvisionResponse(
         camera_id=camera_id,
         patient_id=patient_id,
-        pi_stream_url=pi_stream_url,
-        pi_audio_url=pi_audio_url,
         livekit_identity=livekit_identity,
         livekit_room=livekit_room,
     )

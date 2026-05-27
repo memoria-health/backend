@@ -22,6 +22,15 @@ class Settings(BaseSettings):
     env: Literal["local", "test", "staging", "prod"] = "local"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
+    # ── Public base URL ─────────────────────────────────────────
+    # Public URL the backend is reachable at from Pi cameras out in
+    # customers' homes. The announce response embeds this into the
+    # ingest_url it returns to a freshly-paired Pi so the Pi knows
+    # where to POST its frame stream. In local dev set this to the
+    # LAN IP+port (e.g. http://10.0.0.245:8002); in production set it
+    # to the public HTTPS URL of the deployed backend.
+    public_base_url: str = Field(min_length=1, default="http://localhost:8002")
+
     # ── Database ────────────────────────────────────────────────
     db_url: str = Field(min_length=1)
     db_pool_size: int = Field(ge=1, le=100, default=10)

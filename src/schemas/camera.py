@@ -82,21 +82,12 @@ class CameraResponse(BaseModel):
 
     @model_validator(mode="after")
     def _validate_source_pi_url_consistency(self) -> "CameraResponse":
-        """Mirror the DB CHECK constraints at the Pydantic boundary so
-        schema drift fails loudly here too.
+        """Vestigial URL columns: pi_stream_url and pi_audio_url no
+        longer carry source-type-XOR semantics after the push refactor
+        (Pi POSTs frames outbound; backend never pulls). The columns
+        remain nullable for backwards compat but the API does not
+        enforce a presence rule on them.
         """
-        if self.source_type == "pi" and self.pi_stream_url is None:
-            raise ValueError(
-                "source_type='pi' requires a non-null pi_stream_url"
-            )
-        if self.source_type == "iphone" and self.pi_stream_url is not None:
-            raise ValueError(
-                "source_type='iphone' must not carry a pi_stream_url"
-            )
-        if self.source_type == "iphone" and self.pi_audio_url is not None:
-            raise ValueError(
-                "source_type='iphone' must not carry a pi_audio_url"
-            )
         return self
 
 
@@ -201,9 +192,13 @@ class PiProvisionRequest(BaseModel):
 
     room: Room
     icon_name: IconName = "tv"
-    # Mode A (recommended): pair from a discovery.
+    # Mode A (recommended): pair from a discovery. The Pi's hardware ID
+    # and human label come from the discovery record.
     discovery_id: UUID | None = None
-    # Mode B (manual): direct URLs.
+    # Mode B (manual): direct URLs (vestigial, accepted but unused after
+    # the push refactor since the backend no longer pulls from the Pi).
+    # Kept for ops/scripted workflows and to avoid breaking old test
+    # fixtures.
     pi_stream_url: PiStreamUrl | None = None
     pi_audio_url: PiAudioUrl | None = None
 
@@ -219,29 +214,22 @@ class PiProvisionRequest(BaseModel):
             raise ValueError(
                 "Must specify either discovery_id or pi_stream_url"
             )
-        if has_discovery and self.pi_audio_url is not None:
-            # Audio URL on a discovery-based request would be
-            # ignored (the discovery record carries the URLs).
-            # Reject loudly rather than silently dropping.
-            raise ValueError(
-                "pi_audio_url is not allowed with discovery_id; "
-                "the discovery record carries the audio URL"
-            )
         return self
 
 
 class PiProvisionResponse(BaseModel):
-    """Handed back to the caregiver after provisioning. Contains the
-    LiveKit identity + room the backend worker will publish under;
-    these are informational so the caregiver app can confirm the
-    camera is wired before the worker brings it online.
+    """Handed back to the caregiver app after provisioning. Carries the
+    LiveKit identity + room so the app can confirm the camera is wired
+    before the Pi starts pushing frames.
+
+    NOTE: the camera's ingest bearer token is NOT delivered here. The
+    Pi receives it via the next /v1/cameras/pi-announce response (which
+    is the only direct Pi-to-backend channel before pairing completes).
     """
 
     model_config = ConfigDict(frozen=True)
 
     camera_id: UUID
     patient_id: UUID
-    pi_stream_url: PiStreamUrl
-    pi_audio_url: PiAudioUrl | None = None
     livekit_identity: str
     livekit_room: str

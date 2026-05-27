@@ -51,15 +51,29 @@ class PiAnnounceRequest(BaseModel):
 
 
 class PiAnnounceResponse(BaseModel):
-    """Returned to the Pi after a successful announcement. The Pi
-    does not need anything back from us; we echo the assigned
-    discovery_id for debugging and to acknowledge receipt.
+    """Returned to the Pi after a successful announcement.
+
+    `paired` flips to True after a caregiver provisions this
+    discovery; that's the Pi's signal to switch from the announce-
+    loop (poll for pairing) to the push-frames loop (stream MJPEG
+    out to /v1/cameras/me/frames).
+
+    `ingest_url` and `ingest_token` are delivered ONCE, on the
+    announce immediately following provisioning. The backend nulls
+    `pi_discoveries.pending_ingest_token` in the same transaction so
+    a second read returns `ingest_token=None`. The Pi is expected to
+    write the token to /etc/nemara/ingest.env on receipt; if the
+    response is lost in transit the caregiver re-provisions
+    (which mints a fresh token).
     """
 
     model_config = ConfigDict(frozen=True)
 
     discovery_id: UUID
     last_seen_at: datetime
+    paired: bool = False
+    ingest_url: str | None = None
+    ingest_token: str | None = None
 
 
 class DiscoveredPi(BaseModel):

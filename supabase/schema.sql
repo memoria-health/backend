@@ -201,34 +201,35 @@ create table public.cameras (
   -- rows; no data migration required.
   source_type         text not null default 'iphone'
     check (source_type in ('iphone', 'pi')),
-  -- Required when source_type='pi'. The HTTP MJPEG endpoint the
-  -- pi_ingest worker connects to (e.g. http://10.0.0.44:8000/stream.mjpg).
-  -- NULL is enforced for source_type='iphone' to keep the schema
-  -- self-consistent. Length cap of 2048 matches the Pydantic
-  -- boundary so a row that survives a write can always be read.
+  -- Vestigial: was the URL the backend pulled MJPEG from when Pis
+  -- served their stream. Push refactor (Pi POSTs frames outbound)
+  -- made it unused but column is kept nullable so historical /
+  -- diagnostic queries still work. NOT referenced by the relay path.
   pi_stream_url       text,
-  -- Optional PCM-over-HTTP audio endpoint for Pi cameras with a USB
-  -- microphone attached. NULL for Pi cameras without a mic
-  -- (video-only) and for iPhone cameras (audio rides the same
-  -- LiveKit publisher as video). When non-null, the pi_ingest
-  -- worker publishes a LiveKit audio track alongside the video
-  -- track, restoring full feature parity with the iPhone path
-  -- (including caregiver Talk-mode listen-direction). 16 kHz mono
-  -- 16-bit PCM, served as chunked HTTP from the Pi.
+  -- Vestigial: was the URL the backend pulled PCM audio from in the
+  -- pull-mode design. Same status as pi_stream_url after the push
+  -- refactor; nullable, unused by the relay path.
   pi_audio_url        text,
-  constraint cameras_pi_stream_url_required
-    check (
-      (source_type = 'pi' and pi_stream_url is not null)
-      or (source_type = 'iphone' and pi_stream_url is null)
-    ),
+  -- Bearer token (hashed) that the Pi presents on POST /v1/cameras/me/frames
+  -- when pushing its MJPEG stream up. Generated at provision time,
+  -- returned ONCE in plaintext to the Pi via the announce response,
+  -- and stored only as a SHA-256 hex digest server-side. Required for
+  -- source_type='pi' (Pis are the only callers of the push ingest
+  -- endpoint), NULL for source_type='iphone' (iPhones publish to
+  -- LiveKit directly with their own per-session tokens).
+  ingest_token_hash       text,
+  ingest_token_created_at timestamptz,
   constraint cameras_pi_stream_url_length
     check (pi_stream_url is null or length(pi_stream_url) <= 2048),
-  -- Audio URL is only valid for Pi cameras (iPhone audio rides on
-  -- LiveKit). Length cap parallels pi_stream_url.
-  constraint cameras_pi_audio_url_source
-    check (pi_audio_url is null or source_type = 'pi'),
   constraint cameras_pi_audio_url_length
     check (pi_audio_url is null or length(pi_audio_url) <= 2048),
+  constraint cameras_ingest_token_required
+    check (
+      (source_type = 'pi' and ingest_token_hash is not null)
+      or (source_type = 'iphone' and ingest_token_hash is null)
+    ),
+  constraint cameras_ingest_token_hash_length
+    check (ingest_token_hash is null or length(ingest_token_hash) = 64),
   unique (patient_id, display_id)
 );
 
@@ -285,11 +286,17 @@ create table public.pi_discoveries (
   -- DB intervention.
   claimed_at        timestamptz,
   claimed_camera_id uuid references public.cameras(id) on delete set null,
+  -- One-shot plaintext ingest bearer token for the Pi to pick up on
+  -- its next announce response. See src/db/pi_discovery.py for the
+  -- lifecycle rule (set on provision, nulled on first read).
+  pending_ingest_token text,
   -- Length caps mirror cameras.pi_stream_url for consistency.
   constraint pi_discoveries_url_length
     check (length(current_url) <= 2048),
   constraint pi_discoveries_audio_url_length
     check (current_audio_url is null or length(current_audio_url) <= 2048),
+  constraint pi_discoveries_pending_token_length
+    check (pending_ingest_token is null or length(pending_ingest_token) <= 128),
   unique (hardware_id)
 );
 

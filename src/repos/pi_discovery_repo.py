@@ -105,16 +105,61 @@ async def find_by_id(
 
 
 async def claim(
-    session: AsyncSession, *, discovery_id: UUID, camera_id: UUID,
+    session: AsyncSession,
+    *,
+    discovery_id: UUID,
+    camera_id: UUID,
+    pending_ingest_token: str,
 ) -> None:
-    """Mark a discovery as claimed and link it to the new cameras
-    row. Caller has already verified the discovery exists and is
-    unclaimed.
+    """Mark a discovery as claimed, link it to the new cameras row,
+    and stash the plaintext ingest token for one-shot delivery on
+    the Pi's next announce. Caller has already verified the
+    discovery exists and is unclaimed.
     """
     now = datetime.now(UTC)
     await session.execute(
         update(PiDiscovery)
         .where(PiDiscovery.id == discovery_id)
-        .values(claimed_at=now, claimed_camera_id=camera_id)
+        .values(
+            claimed_at=now,
+            claimed_camera_id=camera_id,
+            pending_ingest_token=pending_ingest_token,
+        )
     )
     await session.flush()
+
+
+async def consume_pending_ingest_token(
+    session: AsyncSession, *, hardware_id: str,
+) -> tuple[UUID, str] | None:
+    """Atomically read-and-null the pending_ingest_token for the
+    discovery row matching `hardware_id`. Returns
+    `(claimed_camera_id, plaintext_token)` if a token was waiting,
+    or None if there was no waiting token. Used by the announce
+    handler to deliver the token exactly once.
+
+    Implementation: SELECT ... FOR UPDATE locks the row, then UPDATE
+    nulls the token. Both run inside the caller's transaction. A
+    concurrent announce from the same Pi blocks on the row lock,
+    then sees the nulled token and returns None. So the token is
+    delivered to exactly one HTTP response.
+    """
+    select_stmt = (
+        select(PiDiscovery.claimed_camera_id, PiDiscovery.pending_ingest_token)
+        .where(PiDiscovery.hardware_id == hardware_id)
+        .where(PiDiscovery.pending_ingest_token.is_not(None))
+        .with_for_update()
+    )
+    row = (await session.execute(select_stmt)).one_or_none()
+    if row is None:
+        return None
+    claimed_camera_id, plaintext = row
+    if claimed_camera_id is None or plaintext is None:
+        return None
+    await session.execute(
+        update(PiDiscovery)
+        .where(PiDiscovery.hardware_id == hardware_id)
+        .values(pending_ingest_token=None)
+    )
+    await session.flush()
+    return claimed_camera_id, plaintext

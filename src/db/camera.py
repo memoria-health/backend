@@ -104,19 +104,27 @@ class Camera(Base):
         String(16), server_default=text("'iphone'"), default="iphone",
     )
 
-    # ── Pi MJPEG endpoint ────────────────────────────────────────────
-    # Required when source_type='pi', forbidden when source_type='iphone'.
-    # The CHECK constraint at the DB layer enforces this invariant;
-    # Pydantic validation enforces it at the API boundary. Length cap
-    # matches the Pydantic boundary (2048 chars) so a raw-SQL write of
-    # a longer URL can never produce a row the API cannot read.
+    # ── Pi MJPEG endpoint (vestigial) ────────────────────────────────
+    # Was the URL the backend pulled MJPEG from in the pull-mode design.
+    # Push refactor (Pi POSTs frames outbound to /v1/cameras/me/frames)
+    # made this column unused; kept nullable for backwards compat and
+    # for diagnostic queries. NOT referenced by the relay path.
     pi_stream_url: Mapped[str | None] = mapped_column(String(2048), default=None)
 
-    # ── Pi PCM audio endpoint ────────────────────────────────────────
-    # Optional. Set when a Pi camera has a USB microphone attached.
-    # NULL means the camera is video-only (no LiveKit audio track is
-    # published, agitation/speech detectors degrade gracefully). The
-    # DB-side CHECK constraint forbids this from being set on iPhone
-    # rows since iPhone audio rides on the same LiveKit publisher as
-    # video.
+    # ── Pi PCM audio endpoint (vestigial) ────────────────────────────
+    # Same status as pi_stream_url after the push refactor. Kept
+    # nullable, unused by the ingest path.
     pi_audio_url: Mapped[str | None] = mapped_column(String(2048), default=None)
+
+    # ── Ingest bearer token (push auth) ──────────────────────────────
+    # Hashed bearer token the Pi presents on
+    # POST /v1/cameras/me/frames. Generated at provision time, the
+    # plaintext value is returned ONCE in the next announce response,
+    # never stored or logged server-side outside this hash. SHA-256
+    # hex digest (64 chars). Required for source_type='pi', forbidden
+    # for source_type='iphone' (iPhones use their own per-session
+    # LiveKit access tokens minted via /v1/livekit/token).
+    ingest_token_hash: Mapped[str | None] = mapped_column(String(64), default=None)
+    ingest_token_created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None,
+    )

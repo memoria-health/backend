@@ -41,7 +41,7 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Protocol
@@ -111,7 +111,11 @@ class RelayConfig:
     camera_id: UUID
     camera_identity: str  # cam_<8 hex>, matches cameras.livekit_identity
     room_name: str  # patient_<patient_id>, matches cameras.livekit_room
-    pi_stream_url: str
+    # Pull-mode only: the URL the backend used to pull MJPEG from.
+    # Empty string for push-mode connections; the request body of
+    # POST /v1/cameras/me/frames provides the frames directly. Kept on
+    # the dataclass so the pull entrypoint (`run()`) still type-checks.
+    pi_stream_url: str = ""
     # Optional audio endpoint. When None, the relay publishes only a
     # video track. When set, an audio LiveKit track is published in
     # parallel; audio-stream failures degrade to video-only without
@@ -179,117 +183,130 @@ class RelayPublisher:
         self._motion_detector = MotionDetector(config.motion_config)
 
     async def run(self) -> None:
-        """Run the relay until the stream ends or the task is
-        cancelled. On clean stream end, returns. On error, raises
-        for the manager to handle.
+        """Pull-mode entrypoint: opens the Pi's MJPEG URL and runs
+        the publish loop on the resulting frame iterator. Kept for
+        backwards compatibility with the (now-disabled) reconciliation
+        worker. The push path uses `run_from_iterator` directly,
+        feeding it the request body of POST /v1/cameras/me/frames.
         """
         log.info(
-            "pi_relay.start camera=%s url=%s",
+            "pi_relay.start.pull camera=%s url=%s",
             self._config.camera_identity, self._config.pi_stream_url,
         )
-
         async with read_mjpeg(
             self._config.pi_stream_url,
             connect_timeout=self._config.mjpeg_connect_timeout_s,
             read_timeout=self._config.mjpeg_read_timeout_s,
         ) as frames:
-            # Pull the first frame BEFORE connecting to LiveKit so we
-            # know the resolution to size the VideoSource with.
-            first_frame_bytes = await self._read_first_frame(frames)
-            first = decode_jpeg(first_frame_bytes)
+            await self.run_from_iterator(frames)
 
-            token = self._mint_publisher_token()
-            room = self._room_factory()
-            disconnected = asyncio.Event()
+    async def run_from_iterator(
+        self, frames: AsyncIterator[bytes],
+    ) -> None:
+        """Run the relay against an arbitrary async iterator of JPEG
+        bytes. The push endpoint passes the multipart-parsed request
+        body here; the pull path passes the read_mjpeg() iterator.
 
-            @room.on("disconnected")
-            def _on_disconnected(reason: object = None) -> None:
-                log.warning(
-                    "pi_relay.disconnected camera=%s reason=%s",
-                    self._config.camera_identity, reason,
-                )
-                disconnected.set()
+        Returns on clean iterator exhaustion (Pi disconnected cleanly).
+        Raises MjpegStreamError on persistent decode failure so the
+        caller can tear down the connection.
+        """
+        # Pull the first frame BEFORE connecting to LiveKit so we
+        # know the resolution to size the VideoSource with.
+        first_frame_bytes = await self._read_first_frame(frames)
+        first = decode_jpeg(first_frame_bytes)
 
-            await room.connect(self._settings.livekit_url, token)
-            log.info(
-                "pi_relay.connected camera=%s room=%s",
-                self._config.camera_identity, self._config.room_name,
+        token = self._mint_publisher_token()
+        room = self._room_factory()
+        disconnected = asyncio.Event()
+
+        @room.on("disconnected")
+        def _on_disconnected(reason: object = None) -> None:
+            log.warning(
+                "pi_relay.disconnected camera=%s reason=%s",
+                self._config.camera_identity, reason,
+            )
+            disconnected.set()
+
+        await room.connect(self._settings.livekit_url, token)
+        log.info(
+            "pi_relay.connected camera=%s room=%s",
+            self._config.camera_identity, self._config.room_name,
+        )
+
+        source = self._video_source_factory(first.width, first.height)
+        track = rtc.LocalVideoTrack.create_video_track("video", source)
+        publish_options = rtc.TrackPublishOptions(
+            source=rtc.TrackSource.SOURCE_CAMERA,
+            video_encoding=rtc.VideoEncoding(
+                max_bitrate=self._config.max_video_bitrate_bps,
+            ),
+            simulcast=False,
+        )
+        await room.local_participant.publish_track(track, publish_options)
+
+        # Push the first frame we already decoded.
+        self._on_decoded_frame(source, first)
+
+        heartbeat_task = asyncio.create_task(
+            self._motion_heartbeat_loop(room, disconnected),
+            name=f"pi_relay_heartbeat_{self._config.camera_identity}",
+        )
+
+        # Optional audio: only meaningful in the pull-from-URL design
+        # (the URL is in RelayConfig). In push mode this stays None;
+        # audio support over push lands in a follow-up endpoint
+        # (POST /v1/cameras/me/audio) when needed.
+        audio_task: asyncio.Task[None] | None = None
+        if self._config.pi_audio_url is not None:
+            audio_task = asyncio.create_task(
+                self._audio_publish_loop(room, disconnected),
+                name=f"pi_relay_audio_{self._config.camera_identity}",
             )
 
-            source = self._video_source_factory(first.width, first.height)
-            track = rtc.LocalVideoTrack.create_video_track("video", source)
-            publish_options = rtc.TrackPublishOptions(
-                source=rtc.TrackSource.SOURCE_CAMERA,
-                video_encoding=rtc.VideoEncoding(
-                    max_bitrate=self._config.max_video_bitrate_bps,
-                ),
-                simulcast=False,
-            )
-            await room.local_participant.publish_track(track, publish_options)
-
-            # Push the first frame we already decoded.
-            self._on_decoded_frame(source, first)
-
-            heartbeat_task = asyncio.create_task(
-                self._motion_heartbeat_loop(room, disconnected),
-                name=f"pi_relay_heartbeat_{self._config.camera_identity}",
-            )
-
-            # Optional audio: when the camera row has a pi_audio_url
-            # configured, spawn an audio task that pulls PCM from the
-            # Pi and publishes it as a parallel LiveKit audio track.
-            # The audio task is supervised independently so an audio
-            # failure does not take down video.
-            audio_task: asyncio.Task[None] | None = None
-            if self._config.pi_audio_url is not None:
-                audio_task = asyncio.create_task(
-                    self._audio_publish_loop(room, disconnected),
-                    name=f"pi_relay_audio_{self._config.camera_identity}",
-                )
-
-            consecutive_decode_errors: int = 0
-            try:
-                async for jpeg_bytes in frames:
-                    if disconnected.is_set():
-                        break
-                    try:
-                        decoded = decode_jpeg(jpeg_bytes)
-                    except JpegDecodeError as exc:
-                        # One bad frame is recoverable; the next frame
-                        # will arrive in ~67 ms. Logging at DEBUG so a
-                        # noisy WiFi link does not spam INFO logs.
-                        log.debug(
-                            "pi_relay.bad_frame camera=%s err=%s",
-                            self._config.camera_identity, exc,
-                        )
-                        consecutive_decode_errors += 1
-                        if (
-                            consecutive_decode_errors
-                            > self._config.max_consecutive_decode_errors
-                        ):
-                            # Tear down so the manager reconnects.
-                            # Without this, a Pi sending only bad
-                            # JPEGs would freeze the LiveKit video
-                            # while heartbeats kept the room alive
-                            # and the detection pipeline ticked on
-                            # stale frames.
-                            raise MjpegStreamError(
-                                f"{consecutive_decode_errors} consecutive "
-                                f"JPEG decode failures on stream "
-                                f"{self._config.pi_stream_url}"
-                            ) from exc
-                        continue
-                    consecutive_decode_errors = 0
-                    self._on_decoded_frame(source, decoded)
-            finally:
-                heartbeat_task.cancel()
+        consecutive_decode_errors: int = 0
+        try:
+            async for jpeg_bytes in frames:
+                if disconnected.is_set():
+                    break
+                try:
+                    decoded = decode_jpeg(jpeg_bytes)
+                except JpegDecodeError as exc:
+                    # One bad frame is recoverable; the next frame
+                    # will arrive in ~67 ms. Logging at DEBUG so a
+                    # noisy WiFi link does not spam INFO logs.
+                    log.debug(
+                        "pi_relay.bad_frame camera=%s err=%s",
+                        self._config.camera_identity, exc,
+                    )
+                    consecutive_decode_errors += 1
+                    if (
+                        consecutive_decode_errors
+                        > self._config.max_consecutive_decode_errors
+                    ):
+                        # Tear down so the caller (push handler /
+                        # pull manager) reconnects. Without this, a Pi
+                        # sending only bad JPEGs would freeze the
+                        # LiveKit video while heartbeats kept the room
+                        # alive and the detection pipeline ticked on
+                        # stale frames.
+                        raise MjpegStreamError(
+                            f"{consecutive_decode_errors} consecutive "
+                            f"JPEG decode failures on camera "
+                            f"{self._config.camera_identity}"
+                        ) from exc
+                    continue
+                consecutive_decode_errors = 0
+                self._on_decoded_frame(source, decoded)
+        finally:
+            heartbeat_task.cancel()
+            with _suppress(asyncio.CancelledError):
+                await heartbeat_task
+            if audio_task is not None:
+                audio_task.cancel()
                 with _suppress(asyncio.CancelledError):
-                    await heartbeat_task
-                if audio_task is not None:
-                    audio_task.cancel()
-                    with _suppress(asyncio.CancelledError):
-                        await audio_task
-                await room.disconnect()
+                    await audio_task
+            await room.disconnect()
 
         log.info("pi_relay.stop camera=%s", self._config.camera_identity)
 

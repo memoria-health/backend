@@ -74,35 +74,43 @@ def test_pi_camera_accepts_https_url() -> None:
 # ─── invariant violations ────────────────────────────────────────
 
 
-def test_pi_source_without_url_is_rejected() -> None:
+def test_pi_source_without_url_is_accepted() -> None:
+    """After the push refactor, pi_stream_url is vestigial and Pi
+    rows do not need to carry it. Null is valid.
+    """
     kw = {**_valid_pi_kwargs(), "pi_stream_url": None}
-    with pytest.raises(ValidationError, match="requires a non-null pi_stream_url"):
-        CameraResponse(**kw)
+    cam = CameraResponse(**kw)
+    assert cam.source_type == "pi"
+    assert cam.pi_stream_url is None
 
 
-def test_iphone_source_with_url_is_rejected() -> None:
-    """An iPhone row carrying a pi_stream_url is a sign of schema
-    drift; reject loudly.
+def test_iphone_source_with_url_is_accepted() -> None:
+    """The pi_stream_url / pi_audio_url columns are vestigial after
+    the push refactor; the Pydantic boundary no longer enforces the
+    source-type XOR that used to live in the validator. A spurious
+    URL on an iPhone row is harmless because nothing reads it.
     """
     kw = {
         **_valid_iphone_kwargs(),
         "pi_stream_url": "http://10.0.0.44:8000/stream.mjpg",
     }
-    with pytest.raises(ValidationError, match="must not carry a pi_stream_url"):
-        CameraResponse(**kw)
+    cam = CameraResponse(**kw)
+    assert cam.source_type == "iphone"
+    assert cam.pi_stream_url == "http://10.0.0.44:8000/stream.mjpg"
 
 
-def test_iphone_source_with_audio_url_is_rejected() -> None:
-    """An iPhone row must not carry pi_audio_url; iPhone audio rides
-    on the same LiveKit publisher as video. Mirrors the DB CHECK
-    constraint cameras_pi_audio_url_source.
+def test_iphone_source_with_audio_url_is_accepted() -> None:
+    """Same rationale as the pi_stream_url test above: vestigial
+    columns are no longer XOR-validated. Spurious audio URL on an
+    iPhone row is ignored downstream.
     """
     kw = {
         **_valid_iphone_kwargs(),
         "pi_audio_url": "http://10.0.0.44:8001/audio.pcm",
     }
-    with pytest.raises(ValidationError, match="must not carry a pi_audio_url"):
-        CameraResponse(**kw)
+    cam = CameraResponse(**kw)
+    assert cam.source_type == "iphone"
+    assert cam.pi_audio_url == "http://10.0.0.44:8001/audio.pcm"
 
 
 def test_pi_source_can_carry_audio_url() -> None:

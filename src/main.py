@@ -50,6 +50,7 @@ for _noisy in ("boxmot", "ultralytics"):
 # keys resolve when the first INSERT/SELECT runs. Imported for side
 # effects only.
 from src.api.cameras import router as cameras_router
+from src.api.cameras_ingest import router as cameras_ingest_router
 from src.api.caregivers import router as caregivers_router
 from src.api.detectors import router as detectors_router
 from src.api.devices import router as devices_router
@@ -112,6 +113,7 @@ def create_app() -> FastAPI:
     app.include_router(detectors_router)
     app.include_router(events_router)
     app.include_router(cameras_router)
+    app.include_router(cameras_ingest_router)
     # APNs device-token registration.
     app.include_router(devices_router)
     # Pairing flow + LiveKit token minting.
