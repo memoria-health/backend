@@ -247,15 +247,24 @@ async def push_once(
                 return
             log.info("push closed cleanly status=%d", resp.status_code)
     finally:
+        # picamera2's start_recording / stop_recording pair owns the
+        # camera lifecycle: stop_recording calls stop() + releases
+        # the encoder internally. Calling cam.stop() again leaves
+        # libcamera in a `Configured` state instead of releasing
+        # back to `Available`, and the next acquire() then fails with
+        # "Device or resource busy". Just close() after
+        # stop_recording. Wrap each step so a failure in one doesn't
+        # leak the next.
         stop.set()
         ring.close()
         try:
             cam.stop_recording()
-        finally:
-            try:
-                cam.stop()
-            finally:
-                cam.close()
+        except Exception:
+            log.exception("stop_recording failed during cleanup")
+        try:
+            cam.close()
+        except Exception:
+            log.exception("close failed during cleanup")
 
 
 async def main_loop() -> None:
