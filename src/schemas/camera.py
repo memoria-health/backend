@@ -35,6 +35,10 @@ class CameraResponse(BaseModel):
     # row goes into analyses). Web hides disabled cameras from the
     # live grid + analyses feed.
     disabled: bool
+    # LLM-only pause: when true, the tick skips the Gemini call but
+    # video keeps streaming and the tile stays visible in the live
+    # grid. Lighter than `disabled` (which hides the tile entirely).
+    ai_paused: bool
     # Stronger than `disabled` — when 'disconnected', the wall phone
     # itself leaves the LiveKit room. Reconnect takes ~1-2s after
     # flipping back to 'connected'. See cameras.desired_state in
@@ -61,6 +65,8 @@ class UpdateCameraRequest(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     disabled: bool | None = None
+    # LLM-only pause. Video keeps streaming; AI tick is skipped.
+    ai_paused: bool | None = None
     # Flip this from the dashboard's 3-dot menu. Phone polls
     # /v1/cameras/me/desired-state every 1s and reconciles by leaving
     # or rejoining the LiveKit room.

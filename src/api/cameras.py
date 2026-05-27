@@ -311,9 +311,12 @@ async def update_camera(
 ) -> CameraResponse:
     """Partial-update a caregiver-owned camera.
 
-    Two mutable fields, both user-facing toggles:
-      - `disabled`: pauses LLM ticks. LiveKit stays connected.
-        Instant on/off, no battery savings.
+    Three mutable fields, all user-facing toggles:
+      - `disabled`: pauses LLM ticks AND hides the tile from the live
+        grid. LiveKit stays connected. Instant on/off.
+      - `ai_paused`: pauses LLM ticks only; tile + video stay visible.
+        Lighter than `disabled` — for watching without paying for
+        Gemini calls.
       - `desired_state`: 'disconnected' makes the wall phone leave
         the LiveKit room entirely. Phone polls
         /v1/cameras/me/desired-state every 1s; reconnect latency
@@ -324,6 +327,7 @@ async def update_camera(
         camera_id,
         caregiver_id=auth.id,
         disabled=body.disabled,
+        ai_paused=body.ai_paused,
         desired_state=body.desired_state,
     )
     if cam is None:

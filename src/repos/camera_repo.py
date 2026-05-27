@@ -63,6 +63,7 @@ async def update_partial(
     *,
     caregiver_id: UUID,
     disabled: bool | None = None,
+    ai_paused: bool | None = None,
     desired_state: str | None = None,
 ) -> Camera | None:
     """Partial-update a caregiver-owned camera. Returns the refreshed
@@ -83,6 +84,8 @@ async def update_partial(
         return None
     if disabled is not None:
         cam.disabled = disabled
+    if ai_paused is not None:
+        cam.ai_paused = ai_paused
     if desired_state is not None:
         cam.desired_state = desired_state
     await session.flush()

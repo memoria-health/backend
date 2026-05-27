@@ -175,6 +175,13 @@ create table public.cameras (
   -- `cameras_paused` is true). Caregiver-web hides disabled cameras
   -- from the live grid + analyses feed.
   disabled            boolean not null default false,
+  -- ── AI paused (LLM-only pause, video keeps streaming) ────────────
+  -- Lighter than `disabled`: the tick still short-circuits before
+  -- the LLM call (synthetic "skipped" row with skipped_reason='ai_paused')
+  -- but the tile STAYS VISIBLE in the live grid and video keeps
+  -- streaming. Lets the caregiver watch a room without paying for
+  -- Gemini calls.
+  ai_paused           boolean not null default false,
   -- ── Desired connection state (privacy / battery / cost) ─────────
   -- Stronger than `disabled`: when 'disconnected', the wall phone
   -- itself LEAVES the LiveKit room. No video bytes are encoded,

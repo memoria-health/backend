@@ -160,7 +160,7 @@ class CameraIngest:
             log.info(
                 "%s START detectors=%s motion=%s prior_state=%s "
                 "buffered_frames=%d buffered_audio_chunks=%d "
-                "disabled=%s paused=%s",
+                "disabled=%s ai_paused=%s paused=%s",
                 self._log_tag,
                 [d.identifier for d in detectors],
                 motion_in_clip,
@@ -168,23 +168,30 @@ class CameraIngest:
                 len(self.frame_buffer),
                 len(self.audio_buffer),
                 cam.disabled,
+                cam.ai_paused,
                 patient.cameras_paused,
             )
 
-            # User-facing "off" short-circuit. Either the per-camera
-            # disable flag OR the patient-wide pause flag suppresses the
-            # LLM call. We still write a synthetic "skipped" row so the
-            # debug feed shows ticks happening (and the state machine
-            # stays consistent — counters keep advancing). The LiveKit
-            # connection + frame buffer stay alive in case the user
-            # re-enables mid-tick.
-            if cam.disabled or patient.cameras_paused:
-                reason = "camera_disabled" if cam.disabled else "monitoring_paused"
-                description = (
-                    "(disabled — LLM skipped)"
-                    if cam.disabled
-                    else "(monitoring paused — LLM skipped)"
-                )
+            # User-facing "off" short-circuit. Any of the three flags
+            # suppresses the LLM call:
+            #   - cam.disabled         → user hid + paused via Hide button
+            #   - cam.ai_paused        → user paused AI only (video still flows)
+            #   - patient.cameras_paused → patient-wide monitoring off
+            # We still write a synthetic "skipped" row so the debug feed
+            # shows ticks happening (and the state machine stays
+            # consistent — counters keep advancing). The LiveKit
+            # connection + frame buffer stay alive in all three cases so
+            # re-enabling is instant.
+            if cam.disabled or cam.ai_paused or patient.cameras_paused:
+                if cam.disabled:
+                    reason = "camera_disabled"
+                    description = "(disabled — LLM skipped)"
+                elif cam.ai_paused:
+                    reason = "ai_paused"
+                    description = "(AI paused — LLM skipped)"
+                else:
+                    reason = "monitoring_paused"
+                    description = "(monitoring paused — LLM skipped)"
                 state_after = await apply_tick_update(
                     session,
                     camera_id=self.camera_id,

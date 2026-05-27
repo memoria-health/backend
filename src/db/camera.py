@@ -80,6 +80,16 @@ class Camera(Base):
         Boolean, server_default=text("false"), default=False,
     )
 
+    # ── AI paused (LLM-only, video still streams) ────────────────
+    # Lighter than `disabled`: when true, the tick still short-circuits
+    # before the LLM call (synthetic "skipped" row with
+    # skipped_reason='ai_paused') but the live tile STAYS VISIBLE in
+    # the grid and video keeps streaming. Lets the caregiver watch a
+    # room without spending on Gemini calls.
+    ai_paused: Mapped[bool] = mapped_column(
+        Boolean, server_default=text("false"), default=False,
+    )
+
     # ── Desired connection state (privacy / battery / cost) ─────────
     # Stronger than `disabled`: when 'disconnected', the wall phone
     # itself LEAVES the LiveKit room. No video bytes are encoded,
