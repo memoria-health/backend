@@ -12,6 +12,16 @@
 #
 # The single positional argument is the backend URL the announce
 # daemon will POST to. It is written into /etc/nemara/announce.env.
+#
+# What this installs:
+#   wifi_ap_provision.py    First-boot WiFi setup via an open AP
+#                           + captive portal. Runs once on a fresh
+#                           Pi with no saved WiFi, then short-
+#                           circuits forever after a successful
+#                           provision (marker file).
+#   announce_daemon.py      Heartbeat to the backend so the caregiver
+#                           app's "Add a camera" picker can see this
+#                           device.
 
 set -euo pipefail
 
@@ -31,22 +41,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo ">>> Installing system packages"
 apt-get update
-# bluez:           BLE peripheral support via D-Bus
-# python3-pip:     to install bless
-# network-manager: nmcli for WiFi credential handoff
+# network-manager: nmcli for both AP mode and home-WiFi joining
+# python3-httpx:   used by the announce daemon (HTTP client)
 apt-get install -y --no-install-recommends \
-  bluez network-manager python3-pip python3-httpx
-
-echo ">>> Installing Python deps for BLE (system-wide pip with PEP 668 override)"
-# PEP 668 marks Pi OS Python as externally managed; we need the
-# --break-system-packages flag since we are installing into the
-# system interpreter that systemd will run as.
-pip install --break-system-packages bless
+  network-manager python3-httpx
 
 echo ">>> Deploying daemon scripts to /opt/nemara"
 install -d /opt/nemara
-install -m 0755 "$SCRIPT_DIR/announce_daemon.py" /opt/nemara/announce_daemon.py
-install -m 0755 "$SCRIPT_DIR/ble_provision.py"   /opt/nemara/ble_provision.py
+install -m 0755 "$SCRIPT_DIR/announce_daemon.py"     /opt/nemara/announce_daemon.py
+install -m 0755 "$SCRIPT_DIR/wifi_ap_provision.py"   /opt/nemara/wifi_ap_provision.py
 
 echo ">>> Writing /etc/nemara/announce.env"
 install -d /etc/nemara
@@ -63,31 +66,47 @@ NEMARA_LOG_LEVEL=INFO
 EOF
 chmod 0644 /etc/nemara/announce.env
 
-echo ">>> Writing /etc/nemara/ble.env"
-cat > /etc/nemara/ble.env <<EOF
+echo ">>> Writing /etc/nemara/wifi-ap.env"
+cat > /etc/nemara/wifi-ap.env <<EOF
 NEMARA_WIFI_IFACE=wlan0
-NEMARA_BLE_LABEL_PREFIX=Nemara Camera
+NEMARA_AP_LABEL_PREFIX=Nemara-Setup
+NEMARA_AP_CHANNEL=6
+NEMARA_AP_BIND_ADDR=192.168.4.1
+NEMARA_AP_HTTP_PORT=80
 NEMARA_PROVISIONED_FILE=/var/lib/nemara/provisioned
 NEMARA_LOG_LEVEL=INFO
 EOF
-chmod 0644 /etc/nemara/ble.env
+chmod 0644 /etc/nemara/wifi-ap.env
 
 echo ">>> Installing systemd units"
-install -m 0644 "$SCRIPT_DIR/nemara-announce.service"      /etc/systemd/system/
-install -m 0644 "$SCRIPT_DIR/nemara-ble-provision.service" /etc/systemd/system/
+install -m 0644 "$SCRIPT_DIR/nemara-announce.service" /etc/systemd/system/
+install -m 0644 "$SCRIPT_DIR/nemara-wifi-ap.service"  /etc/systemd/system/
+# Remove the old BLE provisioning unit from any prior install of
+# this script. Failure here is fine (the unit may never have been
+# installed).
+systemctl disable --now nemara-ble-provision.service 2>/dev/null || true
+rm -f /etc/systemd/system/nemara-ble-provision.service /opt/nemara/ble_provision.py /etc/nemara/ble.env
 systemctl daemon-reload
 systemctl enable nemara-announce.service
-systemctl enable nemara-ble-provision.service
+systemctl enable nemara-wifi-ap.service
 
 echo ""
-echo ">>> Installed. Both daemons will start on next boot."
-echo "    nemara-ble-provision: advertises BLE until WiFi is configured"
-echo "    nemara-announce:     POSTs to $BACKEND_URL once on WiFi"
+echo ">>> Installed. On next boot:"
+echo "    nemara-wifi-ap   advertises an open WiFi AP named"
+echo "                     'Nemara-Setup-XXXXXX' (with a captive"
+echo "                     portal at http://192.168.4.1) UNTIL"
+echo "                     the customer enters home WiFi creds."
+echo "    nemara-announce  POSTs to $BACKEND_URL once on home WiFi."
 echo ""
 echo ">>> To start now without rebooting:"
-echo "    sudo systemctl start nemara-ble-provision.service"
+echo "    sudo systemctl start nemara-wifi-ap.service"
 echo "    sudo systemctl start nemara-announce.service"
 echo ""
 echo ">>> To watch logs:"
-echo "    journalctl -u nemara-ble-provision.service -f"
+echo "    journalctl -u nemara-wifi-ap.service -f"
 echo "    journalctl -u nemara-announce.service -f"
+echo ""
+echo ">>> To re-trigger setup mode (wipe saved WiFi + marker):"
+echo "    sudo rm /var/lib/nemara/provisioned"
+echo "    sudo nmcli connection delete <home-wifi-ssid>"
+echo "    sudo systemctl restart nemara-wifi-ap.service"

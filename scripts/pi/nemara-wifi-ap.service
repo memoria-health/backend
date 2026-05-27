@@ -1,0 +1,27 @@
+[Unit]
+Description=Nemara camera WiFi AP-mode provisioning daemon
+# Run AFTER NetworkManager is up, since we use nmcli to bring the
+# AP up and down. On a freshly-imaged Pi with no saved WiFi, NM
+# starts but has no connections to activate; this daemon then
+# creates the temporary "Nemara-Setup-XXXXXX" AP. Once the
+# customer submits home WiFi credentials and the daemon touches the
+# marker file, subsequent boots short-circuit immediately.
+After=NetworkManager.service dbus.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+# Must run as root to manage WiFi via nmcli + bind to port 80.
+User=root
+EnvironmentFile=-/etc/nemara/wifi-ap.env
+ExecStart=/usr/bin/python3 /opt/nemara/wifi_ap_provision.py
+# Restart on failure (e.g. nmcli transient hiccup) but NOT on
+# successful exit; the daemon exits cleanly after provisioning
+# completes and should not auto-restart at that point.
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
