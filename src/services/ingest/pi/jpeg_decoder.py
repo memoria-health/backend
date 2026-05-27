@@ -85,6 +85,15 @@ def decode_jpeg(jpeg_bytes: bytes) -> DecodedFrame:
     except OSError as exc:
         # Pillow raises OSError for truncated / corrupt JPEGs.
         raise JpegDecodeError(f"Corrupt JPEG: {exc}") from exc
+    except ModuleNotFoundError as exc:
+        # ultralytics monkey-patches PIL.Image.open in the same
+        # process (pulled in transitively by boxmot for body Re-ID).
+        # On UnidentifiedImageError the patched opener tries to lazy-
+        # install pi_heif and re-raise it; that surfaces as
+        # ModuleNotFoundError instead of UnidentifiedImageError. Treat
+        # it the same as Not-a-JPEG since we only ever feed this
+        # decoder JPEG bytes from the Pi MJPEG stream.
+        raise JpegDecodeError(f"Not a JPEG (ultralytics patch): {exc}") from exc
 
     width, height = ycbcr.size
 
