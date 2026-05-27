@@ -41,6 +41,17 @@ dependencies = [
     # endpoint, and Phase 4's clip-archival path benefits from
     # connection multiplexing against Supabase Storage as well.
     "h2>=4.1",
+    # ── Phase 5: Pi camera ingest ────────────────────────────────────
+    # Pillow decodes JPEG bytes from the Raspberry Pi's MJPEG stream
+    # into RGB arrays. The relay re-encodes those frames as I420 for
+    # LiveKit using pure NumPy color-conversion. Pillow is the
+    # lightweight choice (~3 MB) over OpenCV (~80 MB) since the only
+    # operation we need from it is JPEG decode.
+    "pillow>=11.0",
+    # numpy is already a transitive dep but make it explicit because
+    # the motion detector (services/ingest/pi/motion_detector.py) and
+    # the JPEG-to-I420 path both import it directly.
+    "numpy>=2.0",
 ]
 
 [project.scripts]
