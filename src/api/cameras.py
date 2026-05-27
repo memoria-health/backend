@@ -259,6 +259,7 @@ async def provision_pi_camera(
         desired_state="connected",
         source_type="pi",
         pi_stream_url=body.pi_stream_url,
+        pi_audio_url=body.pi_audio_url,
     )
     session.add(cam)
     await session.flush()
@@ -274,6 +275,7 @@ async def provision_pi_camera(
         camera_id=camera_id,
         patient_id=patient_id,
         pi_stream_url=body.pi_stream_url,
+        pi_audio_url=body.pi_audio_url,
         livekit_identity=livekit_identity,
         livekit_room=livekit_room,
     )

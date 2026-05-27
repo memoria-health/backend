@@ -111,3 +111,12 @@ class Camera(Base):
     # matches the Pydantic boundary (2048 chars) so a raw-SQL write of
     # a longer URL can never produce a row the API cannot read.
     pi_stream_url: Mapped[str | None] = mapped_column(String(2048), default=None)
+
+    # ── Pi PCM audio endpoint ────────────────────────────────────────
+    # Optional. Set when a Pi camera has a USB microphone attached.
+    # NULL means the camera is video-only (no LiveKit audio track is
+    # published, agitation/speech detectors degrade gracefully). The
+    # DB-side CHECK constraint forbids this from being set on iPhone
+    # rows since iPhone audio rides on the same LiveKit publisher as
+    # video.
+    pi_audio_url: Mapped[str | None] = mapped_column(String(2048), default=None)

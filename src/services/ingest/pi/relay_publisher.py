@@ -50,6 +50,13 @@ from uuid import UUID
 from livekit import rtc
 from livekit.api import AccessToken, VideoGrants
 
+from src.services.ingest.pi.audio_reader import CHANNELS as AUDIO_CHANNELS
+from src.services.ingest.pi.audio_reader import FRAME_SAMPLES as AUDIO_FRAME_SAMPLES
+from src.services.ingest.pi.audio_reader import SAMPLE_RATE_HZ as AUDIO_SAMPLE_RATE_HZ
+from src.services.ingest.pi.audio_reader import (
+    AudioStreamError,
+    read_pcm_audio,
+)
 from src.services.ingest.pi.jpeg_decoder import (
     DecodedFrame,
     JpegDecodeError,
@@ -105,6 +112,11 @@ class RelayConfig:
     camera_identity: str  # cam_<8 hex>, matches cameras.livekit_identity
     room_name: str  # patient_<patient_id>, matches cameras.livekit_room
     pi_stream_url: str
+    # Optional audio endpoint. When None, the relay publishes only a
+    # video track. When set, an audio LiveKit track is published in
+    # parallel; audio-stream failures degrade to video-only without
+    # taking down the video relay.
+    pi_audio_url: str | None = None
     motion_config: MotionConfig = field(default_factory=MotionConfig)
     motion_heartbeat_seconds: float = DEFAULT_MOTION_HEARTBEAT_SECONDS
     token_ttl_seconds: int = DEFAULT_TOKEN_TTL_SECONDS
@@ -223,6 +235,18 @@ class RelayPublisher:
                 name=f"pi_relay_heartbeat_{self._config.camera_identity}",
             )
 
+            # Optional audio: when the camera row has a pi_audio_url
+            # configured, spawn an audio task that pulls PCM from the
+            # Pi and publishes it as a parallel LiveKit audio track.
+            # The audio task is supervised independently so an audio
+            # failure does not take down video.
+            audio_task: asyncio.Task[None] | None = None
+            if self._config.pi_audio_url is not None:
+                audio_task = asyncio.create_task(
+                    self._audio_publish_loop(room, disconnected),
+                    name=f"pi_relay_audio_{self._config.camera_identity}",
+                )
+
             consecutive_decode_errors: int = 0
             try:
                 async for jpeg_bytes in frames:
@@ -261,6 +285,10 @@ class RelayPublisher:
                 heartbeat_task.cancel()
                 with _suppress(asyncio.CancelledError):
                     await heartbeat_task
+                if audio_task is not None:
+                    audio_task.cancel()
+                    with _suppress(asyncio.CancelledError):
+                        await audio_task
                 await room.disconnect()
 
         log.info("pi_relay.stop camera=%s", self._config.camera_identity)
@@ -298,6 +326,64 @@ class RelayPublisher:
             # Rising edge: latch in_motion=True. The heartbeat loop
             # will publish this as soon as its cadence permits.
             self._in_motion = True
+
+    async def _audio_publish_loop(
+        self, room: rtc.Room, disconnected: asyncio.Event
+    ) -> None:
+        """Pull PCM frames from the Pi's audio URL and publish them
+        as a LiveKit audio track.
+
+        Lifecycle is independent of the video loop: an audio stream
+        failure (TCP reset, read timeout, wrong content type) logs a
+        warning and returns silently. The video relay keeps running
+        with the camera as video-only. This degradation matches the
+        contract that pi_audio_url is optional.
+
+        The audio track is published lazily on the first successful
+        connect so a Pi that is up for video but down for audio does
+        not advertise a stale audio track to subscribers.
+        """
+        assert self._config.pi_audio_url is not None
+        try:
+            async with read_pcm_audio(self._config.pi_audio_url) as frames:
+                source = rtc.AudioSource(AUDIO_SAMPLE_RATE_HZ, AUDIO_CHANNELS)
+                track = rtc.LocalAudioTrack.create_audio_track("audio", source)
+                publish_options = rtc.TrackPublishOptions(
+                    source=rtc.TrackSource.SOURCE_MICROPHONE,
+                )
+                await room.local_participant.publish_track(track, publish_options)
+                log.info(
+                    "pi_relay.audio_connected camera=%s",
+                    self._config.camera_identity,
+                )
+
+                async for pcm_frame in frames:
+                    if disconnected.is_set():
+                        return
+                    audio_frame = rtc.AudioFrame.create(
+                        sample_rate=AUDIO_SAMPLE_RATE_HZ,
+                        num_channels=AUDIO_CHANNELS,
+                        samples_per_channel=AUDIO_FRAME_SAMPLES,
+                    )
+                    # Copy PCM bytes into the LiveKit frame buffer.
+                    # The frame's `data` is a writable bytearray
+                    # exposed by the SDK; slicing keeps the assignment
+                    # to exactly `samples_per_channel * 2` bytes.
+                    audio_frame.data[: len(pcm_frame)] = pcm_frame
+                    await source.capture_frame(audio_frame)
+        except AudioStreamError as exc:
+            log.warning(
+                "pi_relay.audio_stream_failed camera=%s err=%r, "
+                "video continues without audio",
+                self._config.camera_identity, exc,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.warning(
+                "pi_relay.audio_unexpected_failure camera=%s",
+                self._config.camera_identity, exc_info=True,
+            )
 
     async def _motion_heartbeat_loop(
         self, room: rtc.Room, disconnected: asyncio.Event

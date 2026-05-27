@@ -188,6 +188,7 @@ class PiIngestManager:
             camera_identity=row.livekit_identity or f"cam_{row.id.hex[:8]}",
             room_name=row.livekit_room or f"patient_{row.patient_id}",
             pi_stream_url=row.pi_stream_url,
+            pi_audio_url=row.pi_audio_url,
         )
         task = asyncio.create_task(
             self._run_relay_with_backoff(config),

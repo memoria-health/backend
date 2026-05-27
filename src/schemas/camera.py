@@ -29,6 +29,11 @@ SourceType = Literal["iphone", "pi"]
 # a multi-MB blob.
 PiStreamUrl = Annotated[str, Field(min_length=8, max_length=2048)]
 
+# A Pi audio URL has the same shape and constraints. We split the
+# type alias for clarity at field declarations even though it is
+# identical to PiStreamUrl.
+PiAudioUrl = Annotated[str, Field(min_length=8, max_length=2048)]
+
 
 class CameraResponse(BaseModel):
     """Full camera row."""
@@ -60,6 +65,12 @@ class CameraResponse(BaseModel):
     # source_type='pi'. Forbidden when source_type='iphone' (enforced
     # at the DB layer too via CHECK constraint).
     pi_stream_url: PiStreamUrl | None = None
+    # Optional PCM-over-HTTP audio endpoint for Pi cameras with a USB
+    # microphone. NULL when the camera is video-only (no LiveKit
+    # audio track is published, the agitation/speech detectors
+    # downstream degrade gracefully). Forbidden on iPhone cameras
+    # (their audio rides on the same LiveKit publisher as video).
+    pi_audio_url: PiAudioUrl | None = None
     # `cam_<8 hex>` once the pairing handshake completes; None on rows
     # that hold an open pairing code but haven't been claimed by a
     # wall phone yet. Exposed to the caregiver app so the Live tab
@@ -71,7 +82,7 @@ class CameraResponse(BaseModel):
 
     @model_validator(mode="after")
     def _validate_source_pi_url_consistency(self) -> "CameraResponse":
-        """Mirror the DB CHECK constraint at the Pydantic boundary so
+        """Mirror the DB CHECK constraints at the Pydantic boundary so
         schema drift fails loudly here too.
         """
         if self.source_type == "pi" and self.pi_stream_url is None:
@@ -81,6 +92,10 @@ class CameraResponse(BaseModel):
         if self.source_type == "iphone" and self.pi_stream_url is not None:
             raise ValueError(
                 "source_type='iphone' must not carry a pi_stream_url"
+            )
+        if self.source_type == "iphone" and self.pi_audio_url is not None:
+            raise ValueError(
+                "source_type='iphone' must not carry a pi_audio_url"
             )
         return self
 
@@ -166,6 +181,9 @@ class PiProvisionRequest(BaseModel):
     own credentials, so no api_key needs to be handed to the Pi
     device itself. The caregiver provides the MJPEG URL that points
     at the running Pi daemon (e.g. http://10.0.0.44:8000/stream.mjpg).
+
+    `pi_audio_url` is optional: pass it when the Pi has a USB mic
+    attached and is also serving PCM audio. Omit for a video-only Pi.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -173,6 +191,7 @@ class PiProvisionRequest(BaseModel):
     room: Room
     icon_name: IconName = "tv"
     pi_stream_url: PiStreamUrl
+    pi_audio_url: PiAudioUrl | None = None
 
 
 class PiProvisionResponse(BaseModel):
@@ -187,5 +206,6 @@ class PiProvisionResponse(BaseModel):
     camera_id: UUID
     patient_id: UUID
     pi_stream_url: PiStreamUrl
+    pi_audio_url: PiAudioUrl | None = None
     livekit_identity: str
     livekit_room: str

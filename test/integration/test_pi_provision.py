@@ -70,7 +70,8 @@ async def test_pi_provision_creates_row_with_full_shape(
         await session.execute(
             text(
                 "SELECT patient_id, display_id, room, icon_name, online, "
-                "source_type, pi_stream_url, livekit_identity, livekit_room, "
+                "source_type, pi_stream_url, pi_audio_url, "
+                "livekit_identity, livekit_room, "
                 "state, no_people_count, close_threshold, disabled, "
                 "desired_state, pairing_code, api_key_hash "
                 "FROM cameras WHERE id = :id"
@@ -85,6 +86,9 @@ async def test_pi_provision_creates_row_with_full_shape(
     assert row.online is False  # worker flips this when it confirms the stream
     assert row.source_type == "pi"
     assert row.pi_stream_url == "http://10.0.0.44:8000/stream.mjpg"
+    # Default provisioning request had no pi_audio_url, so the row
+    # is video-only. The relay will skip the audio task entirely.
+    assert row.pi_audio_url is None
     assert row.livekit_identity == resp["livekit_identity"]
     assert row.livekit_room == resp["livekit_room"]
     assert row.state == "open"
@@ -226,6 +230,42 @@ async def test_pi_provision_unauthenticated_returns_401(client: AsyncClient) -> 
         json={"room": "Living Room", "pi_stream_url": "http://x:8/s.mjpg"},
     )
     assert r.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_pi_provision_with_audio_url_creates_audio_enabled_row(
+    client: AsyncClient, auth_user, session: AsyncSession,
+) -> None:
+    """When the caregiver provides pi_audio_url, the row is stored
+    with audio enabled. The relay will publish a parallel audio
+    track for this camera.
+    """
+    headers, pid = await _setup_patient(client, auth_user)
+    r = await client.post(
+        f"/v1/patients/{pid}/cameras/pi-provision",
+        headers=headers,
+        json={
+            "room": "Bedroom",
+            "pi_stream_url": "http://10.0.0.55:8000/stream.mjpg",
+            "pi_audio_url": "http://10.0.0.55:8001/audio.pcm",
+        },
+    )
+    assert r.status_code == 201, r.text
+    resp = r.json()
+    assert resp["pi_audio_url"] == "http://10.0.0.55:8001/audio.pcm"
+
+    row = (
+        await session.execute(
+            text(
+                "SELECT source_type, pi_stream_url, pi_audio_url "
+                "FROM cameras WHERE id = :id"
+            ),
+            {"id": resp["camera_id"]},
+        )
+    ).one()
+    assert row.source_type == "pi"
+    assert row.pi_stream_url == "http://10.0.0.55:8000/stream.mjpg"
+    assert row.pi_audio_url == "http://10.0.0.55:8001/audio.pcm"
 
 
 @pytest.mark.asyncio

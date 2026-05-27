@@ -92,6 +92,34 @@ def test_iphone_source_with_url_is_rejected() -> None:
         CameraResponse(**kw)
 
 
+def test_iphone_source_with_audio_url_is_rejected() -> None:
+    """An iPhone row must not carry pi_audio_url; iPhone audio rides
+    on the same LiveKit publisher as video. Mirrors the DB CHECK
+    constraint cameras_pi_audio_url_source.
+    """
+    kw = {
+        **_valid_iphone_kwargs(),
+        "pi_audio_url": "http://10.0.0.44:8001/audio.pcm",
+    }
+    with pytest.raises(ValidationError, match="must not carry a pi_audio_url"):
+        CameraResponse(**kw)
+
+
+def test_pi_source_can_carry_audio_url() -> None:
+    """A Pi camera with a USB mic gets a pi_audio_url. Optional
+    field; pi_stream_url is still required."""
+    kw = {**_valid_pi_kwargs(), "pi_audio_url": "http://10.0.0.44:8001/audio.pcm"}
+    cam = CameraResponse(**kw)
+    assert cam.pi_audio_url == "http://10.0.0.44:8001/audio.pcm"
+
+
+def test_pi_source_without_audio_url_is_valid() -> None:
+    """Video-only Pi camera. Most common case for v1."""
+    kw = {**_valid_pi_kwargs()}  # audio omitted
+    cam = CameraResponse(**kw)
+    assert cam.pi_audio_url is None
+
+
 def test_invalid_source_type_value_is_rejected() -> None:
     kw = {**_valid_iphone_kwargs(), "source_type": "android"}
     with pytest.raises(ValidationError):

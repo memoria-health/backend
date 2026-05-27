@@ -207,6 +207,15 @@ create table public.cameras (
   -- self-consistent. Length cap of 2048 matches the Pydantic
   -- boundary so a row that survives a write can always be read.
   pi_stream_url       text,
+  -- Optional PCM-over-HTTP audio endpoint for Pi cameras with a USB
+  -- microphone attached. NULL for Pi cameras without a mic
+  -- (video-only) and for iPhone cameras (audio rides the same
+  -- LiveKit publisher as video). When non-null, the pi_ingest
+  -- worker publishes a LiveKit audio track alongside the video
+  -- track, restoring full feature parity with the iPhone path
+  -- (including caregiver Talk-mode listen-direction). 16 kHz mono
+  -- 16-bit PCM, served as chunked HTTP from the Pi.
+  pi_audio_url        text,
   constraint cameras_pi_stream_url_required
     check (
       (source_type = 'pi' and pi_stream_url is not null)
@@ -214,6 +223,12 @@ create table public.cameras (
     ),
   constraint cameras_pi_stream_url_length
     check (pi_stream_url is null or length(pi_stream_url) <= 2048),
+  -- Audio URL is only valid for Pi cameras (iPhone audio rides on
+  -- LiveKit). Length cap parallels pi_stream_url.
+  constraint cameras_pi_audio_url_source
+    check (pi_audio_url is null or source_type = 'pi'),
+  constraint cameras_pi_audio_url_length
+    check (pi_audio_url is null or length(pi_audio_url) <= 2048),
   unique (patient_id, display_id)
 );
 
