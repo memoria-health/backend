@@ -48,6 +48,21 @@ apt-get update
 apt-get install -y --no-install-recommends \
   network-manager python3-httpx python3-picamera2 python3-pil
 
+echo ">>> Ensuring camera dtoverlay is enabled"
+# IMX219 (Camera Module 2 / Arducam IMX219) needs the dtoverlay
+# explicitly enabled in /boot/firmware/config.txt. Pi OS Lite does NOT
+# auto-detect MIPI camera modules at boot; without this line,
+# libcamera reports zero cameras and picamera2 raises IndexError.
+# Idempotent: only appends if not already present.
+CONFIG_TXT="/boot/firmware/config.txt"
+if [[ -f "$CONFIG_TXT" ]] && ! grep -q "^dtoverlay=imx219" "$CONFIG_TXT"; then
+  echo "dtoverlay=imx219" >> "$CONFIG_TXT"
+  echo "    added dtoverlay=imx219 (reboot required to take effect)"
+  NEED_REBOOT=1
+else
+  echo "    dtoverlay already configured"
+fi
+
 echo ">>> Deploying daemon scripts to /opt/nemara"
 install -d /opt/nemara
 install -m 0755 "$SCRIPT_DIR/announce_daemon.py"     /opt/nemara/announce_daemon.py
@@ -105,6 +120,11 @@ systemctl enable nemara-wifi-ap.service
 systemctl enable nemara-camera-stream.service
 
 echo ""
+if [[ "${NEED_REBOOT:-0}" == "1" ]]; then
+  echo ">>> REBOOT REQUIRED for the camera dtoverlay change to take effect:"
+  echo "    sudo reboot"
+  echo ""
+fi
 echo ">>> Installed. On next boot:"
 echo "    nemara-wifi-ap   advertises an open WiFi AP named"
 echo "                     'Nemara-Setup-XXXXXX' (with a captive"
