@@ -143,15 +143,49 @@ class CameraDetectorsResponse(BaseModel):
 
 
 class SetCameraDetectorsRequest(BaseModel):
-    """PUT /v1/cameras/{id}/detectors body — replace the camera's
+    """PUT /v1/cameras/{id}/detectors body, replace the camera's
     assignment set with exactly `detector_ids`.
 
     Every ID must belong to the same patient as the camera; otherwise
     the request is rejected (no cross-patient leakage). Empty list is
-    valid — it means the camera runs no per-tick detectors (only the
+    valid, it means the camera runs no per-tick detectors (only the
     implicit `people_present`).
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     detector_ids: list[UUID]
+
+
+class PiProvisionRequest(BaseModel):
+    """Body of POST /v1/patients/{patient_id}/cameras/pi-provision.
+
+    Creates a Pi camera row in one shot. Unlike the iPhone pairing
+    flow, there is no two-step exchange: the Pi has no UI to enter a
+    code, and the backend worker authenticates to LiveKit using its
+    own credentials, so no api_key needs to be handed to the Pi
+    device itself. The caregiver provides the MJPEG URL that points
+    at the running Pi daemon (e.g. http://10.0.0.44:8000/stream.mjpg).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    room: Room
+    icon_name: IconName = "tv"
+    pi_stream_url: PiStreamUrl
+
+
+class PiProvisionResponse(BaseModel):
+    """Handed back to the caregiver after provisioning. Contains the
+    LiveKit identity + room the backend worker will publish under;
+    these are informational so the caregiver app can confirm the
+    camera is wired before the worker brings it online.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    camera_id: UUID
+    patient_id: UUID
+    pi_stream_url: PiStreamUrl
+    livekit_identity: str
+    livekit_room: str

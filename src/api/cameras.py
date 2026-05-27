@@ -25,6 +25,8 @@ from src.schemas.camera import (
     CameraDetectorsResponse,
     CameraResponse,
     DesiredStateResponse,
+    PiProvisionRequest,
+    PiProvisionResponse,
     SetCameraDetectorsRequest,
     UpdateCameraRequest,
     UpdateMyDesiredStateRequest,
@@ -166,6 +168,114 @@ async def create_pairing_code(
         pairing_code=code,
         expires_at=expires_at,
         camera_id=camera_id,
+    )
+
+
+@router.post(
+    "/patients/{patient_id}/cameras/pi-provision",
+    response_model=PiProvisionResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def provision_pi_camera(
+    patient_id: UUID,
+    body: PiProvisionRequest,
+    auth: CaregiverAuth,
+    session: SessionDep,
+) -> PiProvisionResponse:
+    """Create a Raspberry Pi camera row in one shot.
+
+    Unlike the iPhone path, the Pi camera has no UI to display a
+    pairing code and no device-side bearer token. The backend's
+    pi_ingest worker (Phase 5) connects to LiveKit using the
+    server's own LiveKit credentials, so the Pi device itself does
+    not need authentication; the pi_stream_url is the entire
+    contract between worker and Pi.
+
+    Sets source_type='pi' and pi_stream_url=body.pi_stream_url. Same
+    LiveKit identity / room convention as iPhone cameras so the
+    detection pipeline (RoomWorker, CameraIngest) treats Pi cameras
+    identically once they appear in the room.
+
+    The Pi camera row appears with `online=false` and `state='open'`.
+    The pi_ingest worker flips `online=true` after its first
+    successful frame pull.
+    """
+    # Caregiver must own the patient. RLS would also catch this but
+    # an explicit 404 is the right wire shape for "this patient isn't
+    # yours" (matching the iPhone pairing-code endpoint above).
+    patient = await patient_repo.find_by_id(session, patient_id, caregiver_id=auth.id)
+    if patient is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="patient_not_found",
+        )
+
+    # Reject duplicate provisioning: a Pi URL is uniquely tied to one
+    # physical device; if it is already registered, the caregiver
+    # should delete the existing row rather than create a duplicate.
+    existing_url_stmt = (
+        select(Camera.id).where(Camera.pi_stream_url == body.pi_stream_url).limit(1)
+    )
+    existing_url = (await session.execute(existing_url_stmt)).scalar_one_or_none()
+    if existing_url is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="pi_stream_url_already_registered",
+        )
+
+    # Next display_id for this patient, same as the iPhone path.
+    max_display_stmt = select(func.coalesce(func.max(Camera.display_id), 0)).where(
+        Camera.patient_id == patient_id
+    )
+    next_display_id = (await session.execute(max_display_stmt)).scalar_one() + 1
+
+    now = datetime.now(timezone.utc)
+    camera_id = uuid4()
+    short = camera_id.hex[:8]
+    livekit_identity = f"cam_{short}"
+    livekit_room = f"patient_{patient_id}"
+
+    cam = Camera(
+        id=camera_id,
+        patient_id=patient_id,
+        display_id=next_display_id,
+        room=body.room,
+        icon_name=body.icon_name,
+        online=False,
+        last_seen_at=None,
+        created_at=now,
+        # Pi rows skip the pairing-code / api_key dance: there is no
+        # device-side bearer token. The pi_ingest worker authenticates
+        # to LiveKit using server credentials.
+        pairing_code=None,
+        pairing_expires_at=None,
+        api_key_hash=None,
+        livekit_identity=livekit_identity,
+        livekit_room=livekit_room,
+        state="open",
+        no_people_count=0,
+        state_changed_at=now,
+        close_threshold=6,
+        battery_percent=None,
+        desired_state="connected",
+        source_type="pi",
+        pi_stream_url=body.pi_stream_url,
+    )
+    session.add(cam)
+    await session.flush()
+    # Auto-assign preset detectors, same convention as the iPhone path
+    # so a freshly-provisioned Pi camera is detector-equivalent to an
+    # iPhone camera in the same room.
+    await camera_detector_repo.assign_preset_detectors_of_patient_to_camera(
+        session, camera_id, patient_id,
+    )
+    await session.commit()
+
+    return PiProvisionResponse(
+        camera_id=camera_id,
+        patient_id=patient_id,
+        pi_stream_url=body.pi_stream_url,
+        livekit_identity=livekit_identity,
+        livekit_room=livekit_room,
     )
 
 
