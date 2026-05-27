@@ -65,78 +65,110 @@ _BOUNDARY = b"frame"
 _MAX_BACKOFF_S = 30.0
 
 
-def _build_camera(width: int, height: int) -> Picamera2:
-    """Configure picamera2 for an MJPEG capture loop at the requested
-    resolution. Returns the started camera; caller must `.stop()` /
-    `.close()` it. Raises if libcamera/picamera2 are not installed.
+class _JpegRing:
+    """Thread-safe single-slot buffer that holds the most-recent JPEG
+    frame produced by picamera2's hardware JpegEncoder.
+
+    picamera2 calls `write(buf)` from the encoder thread for each
+    encoded frame. The async push loop calls `get()` from the asyncio
+    thread when it is ready to send a frame. The single-slot design
+    drops older frames if the consumer is slower than the producer
+    (real-time streaming, not buffered playback). This is exactly the
+    behavior we want for a live camera: never queue up stale frames.
+    """
+
+    def __init__(self) -> None:
+        import threading
+
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._latest: bytes | None = None
+        self._closed = False
+
+    def write(self, buf: bytes) -> int:
+        """File-like sink for picamera2's FileOutput. Called on the
+        encoder thread.
+        """
+        with self._cond:
+            self._latest = bytes(buf)
+            self._cond.notify_all()
+        return len(buf)
+
+    def flush(self) -> None:  # FileOutput contract
+        pass
+
+    def close(self) -> None:
+        with self._cond:
+            self._closed = True
+            self._cond.notify_all()
+
+    def get(self, timeout_s: float = 2.0) -> bytes | None:
+        """Block (with timeout) until a frame is available; return it
+        and clear the slot so the next call waits for a fresh frame.
+        Returns None on timeout or after close().
+        """
+        with self._cond:
+            if self._latest is None and not self._closed:
+                self._cond.wait(timeout=timeout_s)
+            if self._closed:
+                return None
+            frame = self._latest
+            self._latest = None
+            return frame
+
+
+def _build_camera_and_encoder(width: int, height: int, fps: int, quality: int):
+    """Configure picamera2 with the hardware JpegEncoder feeding a
+    `_JpegRing`. The hardware encoder uses the SoC's ISP for the
+    JPEG step, dropping per-frame CPU cost from "saturate the core"
+    (Pillow) to "single-digit percent" (hardware).
+
+    Returns `(camera, encoder, output, ring)`. Caller starts +
+    stops via `cam.start_recording(encoder, output)` /
+    `cam.stop_recording()`.
     """
     from picamera2 import Picamera2
+    from picamera2.encoders import JpegEncoder
+    from picamera2.outputs import FileOutput
 
     cam = Picamera2()
+    # Hardware JPEG path uses YUV420 internally; the encoder converts
+    # for us. Explicit FrameDurationLimits pins the sensor to the
+    # requested fps so the source rate matches what the encoder
+    # produces (avoids the encoder dropping or padding frames).
+    fdl = int(1_000_000 / max(1, fps))
     cfg = cam.create_video_configuration(
-        main={"size": (width, height), "format": "RGB888"},
+        main={"size": (width, height)},
+        controls={"FrameDurationLimits": (fdl, fdl)},
     )
     cam.configure(cfg)
-    cam.start()
-    return cam
+    encoder = JpegEncoder(q=quality)
+    ring = _JpegRing()
+    output = FileOutput(ring)
+    return cam, encoder, output, ring
 
 
 async def _capture_frames(
-    cam: Picamera2,
+    ring: "_JpegRing",
     *,
-    fps: int,
-    quality: int,
     stop: asyncio.Event,
 ) -> AsyncIterator[bytes]:
-    """Yield JPEG bytes from `cam` at the requested fps. Stops when
-    `stop` is set.
+    """Pull most-recent JPEG frames from the encoder ring. The
+    hardware encoder runs at the camera's fps; this loop only yields
+    when a fresh frame is in the slot. If the consumer falls behind
+    (slow network upload), frames are dropped silently inside the
+    ring rather than queued.
 
-    The capture runs in a worker thread so the asyncio event loop
-    keeps servicing the HTTPS push. JPEG encoding happens in the
-    same thread (Pillow); CPU cost is the dominant cost on a Zero W
-    so we cap fps to keep the loop sustainable.
+    Each ring.get() runs in a worker thread because it blocks on a
+    threading.Condition; doing it inline would block the event loop.
     """
-    import io
-
-    from PIL import Image
-
-    def _encode_jpeg(buf_in, quality_in: int) -> bytes:
-        """Run in a worker thread; encodes a captured buffer to JPEG
-        bytes. Despite picamera2's "RGB888" format label, the buffer
-        is actually laid out as BGR in memory (libcamera convention
-        on little-endian platforms; picamera2's examples use cv2
-        which expects BGR so this works for them). Pillow's "RGB"
-        mode would treat the buffer as RGB, swapping R and B and
-        producing an all-blue image of red objects. Reverse the last
-        axis (channels) so what Pillow encodes is genuinely R, G, B.
-        """
-        out = io.BytesIO()
-        Image.fromarray(buf_in[..., ::-1], "RGB").save(
-            out, format="JPEG", quality=quality_in,
-        )
-        return out.getvalue()
-
-    interval_s = 1.0 / max(1, fps)
-    loop = asyncio.get_event_loop()
-
     while not stop.is_set():
-        tick_start = loop.time()
-        # capture_array returns a BGR888 numpy array under picamera2's
-        # misleading "RGB888" format label; see _encode_jpeg for the
-        # channel-swap rationale.
-        buf = await asyncio.to_thread(cam.capture_array)
-        jpeg_bytes = await asyncio.to_thread(_encode_jpeg, buf, quality)
-        yield jpeg_bytes
-
-        # Pace to the target fps. Skip if we already ran long.
-        elapsed = loop.time() - tick_start
-        slack = interval_s - elapsed
-        if slack > 0:
-            try:
-                await asyncio.wait_for(stop.wait(), timeout=slack)
-                # stop was set during the sleep; exit on next iter
-            except TimeoutError:
-                pass
+        frame = await asyncio.to_thread(ring.get, 2.0)
+        if frame is None:
+            # Timeout or ring closed. Loop back; outer stop check
+            # will exit cleanly on shutdown.
+            continue
+        yield frame
 
 
 async def _stream_body(
@@ -179,10 +211,13 @@ async def push_once(
     Pi shutdown); raises on transport error so the caller can back
     off and reconnect.
     """
-    cam = _build_camera(width, height)
+    cam, encoder, output, ring = _build_camera_and_encoder(
+        width, height, fps, quality,
+    )
     stop = asyncio.Event()
+    cam.start_recording(encoder, output)
     try:
-        frames = _capture_frames(cam, fps=fps, quality=quality, stop=stop)
+        frames = _capture_frames(ring, stop=stop)
         body = _stream_body(frames)
         headers = {
             "Authorization": f"Bearer {ingest_token}",
@@ -213,10 +248,14 @@ async def push_once(
             log.info("push closed cleanly status=%d", resp.status_code)
     finally:
         stop.set()
+        ring.close()
         try:
-            cam.stop()
+            cam.stop_recording()
         finally:
-            cam.close()
+            try:
+                cam.stop()
+            finally:
+                cam.close()
 
 
 async def main_loop() -> None:
