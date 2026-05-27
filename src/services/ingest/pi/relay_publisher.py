@@ -87,6 +87,14 @@ MOTION_STATE_TOPIC: str = "motion_state"
 # 2.5 Mbps. Set on the track publish options.
 DEFAULT_MAX_VIDEO_BITRATE_BPS: int = 2_500_000
 
+# Required-field cap on the publish-side framerate. The LiveKit
+# Python SDK's protobuf for `publish_track.options.video_encoding`
+# requires `max_framerate` to be non-zero or it refuses to serialize
+# (caught the first push end-to-end on a Pi). 30 fps is the iPhone
+# convention and is well above the Pi Zero W's 15 fps source, so it
+# is non-binding in practice.
+DEFAULT_MAX_VIDEO_FRAMERATE: float = 30.0
+
 # Token TTL for the publisher. Long enough that we never refresh
 # mid-connection, short enough that a stolen token is not useful for
 # long. The supervisor mints a fresh token on every reconnect.
@@ -125,6 +133,7 @@ class RelayConfig:
     motion_heartbeat_seconds: float = DEFAULT_MOTION_HEARTBEAT_SECONDS
     token_ttl_seconds: int = DEFAULT_TOKEN_TTL_SECONDS
     max_video_bitrate_bps: int = DEFAULT_MAX_VIDEO_BITRATE_BPS
+    max_video_framerate: float = DEFAULT_MAX_VIDEO_FRAMERATE
     max_consecutive_decode_errors: int = DEFAULT_MAX_CONSECUTIVE_DECODE_ERRORS
     # Bounds on the MJPEG reader, surfaced here so the manager can
     # tune them per-camera (e.g. tighter timeouts on local LAN).
@@ -240,6 +249,7 @@ class RelayPublisher:
             source=rtc.TrackSource.SOURCE_CAMERA,
             video_encoding=rtc.VideoEncoding(
                 max_bitrate=self._config.max_video_bitrate_bps,
+                max_framerate=self._config.max_video_framerate,
             ),
             simulcast=False,
         )
