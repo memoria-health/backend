@@ -160,18 +160,82 @@ def scan_nearby_networks(iface: str) -> list[str]:
     return seen
 
 
+# Per-step nmcli timeout. Each individual nmcli invocation should
+# complete in seconds; anything longer is a hung D-Bus call (the
+# class of failure that wedged us repeatedly). 30 s is generous but
+# bounded so the supervisor loop can back off and retry.
+_NMCLI_TIMEOUT_S: int = 30
+
+
+def _nmcli(args: list[str], *, check: bool, label: str) -> subprocess.CompletedProcess:
+    """Wrapped nmcli call with hard timeout + structured logging.
+
+    Each call logs the command, exit code, and (when non-zero or
+    `check=True`) stdout/stderr. This is the debug path that surfaces
+    *why* AP setup fails without us having to attach to the device.
+    """
+    log.info("nmcli.run [%s]: %s", label, " ".join(args))
+    try:
+        result = subprocess.run(
+            args,
+            capture_output=True, text=True,
+            timeout=_NMCLI_TIMEOUT_S,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        log.error(
+            "nmcli.timeout [%s] after %ds: %s",
+            label, _NMCLI_TIMEOUT_S, " ".join(args),
+        )
+        raise RuntimeError(f"nmcli {label} hung past {_NMCLI_TIMEOUT_S}s") from exc
+
+    if result.returncode != 0:
+        log.warning(
+            "nmcli.nonzero [%s] rc=%d stdout=%r stderr=%r",
+            label, result.returncode,
+            result.stdout.strip()[:300], result.stderr.strip()[:300],
+        )
+        if check:
+            raise RuntimeError(
+                f"nmcli {label} failed rc={result.returncode}: "
+                f"{result.stderr.strip()[:300]}"
+            )
+    else:
+        log.info("nmcli.ok [%s] rc=0", label)
+    return result
+
+
 def start_ap(cfg: Config) -> None:
     """Bring up the WiFi access point via NetworkManager.
 
     We delete any old `Nemara-Setup` connection first so a previous
     aborted run does not leave a stale profile blocking the create.
+    Each step logs verbosely so the journal shows exactly where we
+    fail when this doesn't work.
     """
-    log.info("starting AP ssid=%r channel=%s", cfg.ap_ssid, cfg.ap_channel)
-    subprocess.run(
-        ["nmcli", "connection", "delete", cfg.ap_ssid],
-        capture_output=True, check=False,
+    log.info(
+        "start_ap.begin ssid=%r iface=%s channel=%s bind=%s",
+        cfg.ap_ssid, cfg.wifi_iface, cfg.ap_channel, cfg.bind_addr,
     )
-    subprocess.run(
+
+    # Pre-flight: confirm NM is responsive at all (this also catches
+    # the case where NM hasn't finished starting yet).
+    _nmcli(
+        ["nmcli", "-t", "-f", "STATE", "general"],
+        check=True, label="nm-state",
+    )
+
+    # Pre-flight: confirm the wifi interface exists and isn't blocked.
+    _nmcli(
+        ["nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "device"],
+        check=True, label="device-status",
+    )
+
+    _nmcli(
+        ["nmcli", "connection", "delete", cfg.ap_ssid],
+        check=False, label="delete-stale-ap",
+    )
+    _nmcli(
         [
             "nmcli", "connection", "add",
             "type", "wifi",
@@ -185,21 +249,22 @@ def start_ap(cfg: Config) -> None:
             "wifi.band", "bg",
             "wifi.channel", cfg.ap_channel,
         ],
-        check=True, capture_output=True,
+        check=True, label="add-ap-connection",
     )
     # Set an open network (no PSK); customers should not be typing a
     # PSK to access a temporary setup network.
-    subprocess.run(
+    _nmcli(
         [
             "nmcli", "connection", "modify", cfg.ap_ssid,
             "wifi-sec.key-mgmt", "none",
         ],
-        check=True, capture_output=True,
+        check=True, label="modify-no-key-mgmt",
     )
-    subprocess.run(
+    _nmcli(
         ["nmcli", "connection", "up", cfg.ap_ssid],
-        check=True, capture_output=True,
+        check=True, label="up-ap-connection",
     )
+    log.info("start_ap.complete ssid=%r is now broadcasting", cfg.ap_ssid)
 
 
 def stop_ap(cfg: Config) -> None:

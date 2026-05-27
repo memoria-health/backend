@@ -68,6 +68,17 @@ install -d /opt/nemara
 install -m 0755 "$SCRIPT_DIR/announce_daemon.py"     /opt/nemara/announce_daemon.py
 install -m 0755 "$SCRIPT_DIR/wifi_ap_provision.py"   /opt/nemara/wifi_ap_provision.py
 install -m 0755 "$SCRIPT_DIR/mjpeg_pusher.py"        /opt/nemara/mjpeg_pusher.py
+install -m 0755 "$SCRIPT_DIR/wifi_wipe_safe.sh"      /opt/nemara/wifi_wipe_safe.sh
+install -m 0755 "$SCRIPT_DIR/wifi_recovery.sh"       /opt/nemara/wifi_recovery.sh
+
+echo ">>> Enabling persistent journal so previous-boot logs survive a reboot"
+# Default Pi OS keeps journal in /run (volatile, wiped on reboot).
+# Creating /var/log/journal makes journald switch to persistent
+# storage on next start. Essential for AP-mode debug: when the AP
+# attempt fails and the Pi recovers back to home WiFi via a reboot,
+# we can `journalctl --boot=-1 -u nemara-wifi-ap.service` to see why.
+install -d -m 2755 /var/log/journal
+systemd-tmpfiles --create --prefix /var/log/journal >/dev/null 2>&1 || true
 
 echo ">>> Writing /etc/nemara/announce.env"
 install -d /etc/nemara
@@ -105,6 +116,8 @@ echo ">>> Installing systemd units"
 install -m 0644 "$SCRIPT_DIR/nemara-announce.service"      /etc/systemd/system/
 install -m 0644 "$SCRIPT_DIR/nemara-wifi-ap.service"       /etc/systemd/system/
 install -m 0644 "$SCRIPT_DIR/nemara-camera-stream.service" /etc/systemd/system/
+install -m 0644 "$SCRIPT_DIR/nemara-wifi-recovery.service" /etc/systemd/system/
+install -m 0644 "$SCRIPT_DIR/nemara-wifi-recovery.timer"   /etc/systemd/system/
 # Remove the old BLE provisioning unit from any prior install of
 # this script. Failure here is fine (the unit may never have been
 # installed).
