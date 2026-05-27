@@ -382,6 +382,9 @@ class CameraIngest:
                     log_tag=self._log_tag, settings=self._settings,
                     patient_in_clip=identity.patient_in_clip,
                     patient_bbox=identity.patient_bbox,
+                    pre_extracted_frames=identity.extracted_frames,
+                    per_frame_bboxes=identity.per_frame_bboxes,
+                    sample_fps=identity.sample_fps,
                 )
             except Exception as oa_err:
                 log.warning("%s openai failed, trying gemini: %s", self._log_tag, oa_err)
@@ -459,12 +462,19 @@ class CameraIngest:
                 # fired event so the same camera can have two events
                 # fire at the same tick (rare but possible — fall +
                 # agitation) without one stomping the other's wait.
+                # The last frame in the pre snapshot anchors the post
+                # snapshot's start. Without this, the archive task's
+                # "wait then take last 15s" leaves a 5-10s hole equal
+                # to the LLM think time between pre's end and post's
+                # start.
+                pre_end_captured_at = window[-1].captured_at
                 for fired_event in promotion.fired:
                     asyncio.create_task(
                         clip_archival.archive_event(
                             event_id=fired_event.id,
                             patient_id=self.patient_id,
                             pre_event_mp4=mp4_bytes,
+                            pre_end_captured_at=pre_end_captured_at,
                             frame_buffer=self.frame_buffer,
                             audio_buffer=self.audio_buffer,
                             sessionmaker=self._sessionmaker,

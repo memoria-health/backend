@@ -110,23 +110,40 @@ class BodyReIDPipeline:
         self._best_face_embedding: Optional[np.ndarray] = None
         self._best_face_det_score = 0.0
 
+    def reset_tracker(self) -> None:
+        """Rebuild BoT-SORT and clear the per-track state machine.
+        Keeps the gallery + face/body models in place. Use this when
+        the input stream has a known discontinuity (e.g., the concat
+        boundary between the pre-event and post-event halves of an
+        archived clip) so the post-discontinuity frames get their
+        own clean lock instead of inheriting stale tracks."""
+        self._tracker = PersonTracker(frame_rate=max(1, self._cfg.sample_fps))
+        self._tracks = {}
+
     def process_frame(self, frame_bgr: np.ndarray, frame_idx: int) -> FrameResult:
         """Push one frame through detect → track → maybe-face-check →
-        state machine. Returns the most recent locked PATIENT bbox
-        for THIS frame (None if no track is currently PATIENT or no
-        person was detected at the patient track's location)."""
+        state machine. Returns the locked PATIENT bbox AT THE CURRENT
+        FRAME's position (None if no PATIENT track was reported by
+        BoT-SORT this frame). Mirrors the experiment's overlay flow —
+        we only emit a bbox tied to a track present in the current
+        update, never a stale last_seen position from frames ago."""
         cfg = self._cfg
         dets = self._detector.detect(frame_bgr)
         tracked = self._tracker.update(dets, frame_bgr)
 
         frame_result = FrameResult()
 
+        # Collect tids reported by BoT-SORT this frame so the resolve
+        # step below only considers CURRENTLY-active tracks (not stale
+        # entries in self._tracks left over from past frames).
+        seen_this_frame: dict[int, tuple[float, float, float, float]] = {}
         for row in tracked:
             x1, y1, x2, y2, tid_f, _conf, _cls, _det_ind = row.tolist()
             tid = int(tid_f)
             state = self._tracks.setdefault(tid, _TrackState(track_id=tid))
             bbox = (float(x1), float(y1), float(x2), float(y2))
             state.last_seen_bbox = bbox
+            seen_this_frame[tid] = bbox
 
             if (
                 state.label == LABEL_UNKNOWN
@@ -136,10 +153,14 @@ class BodyReIDPipeline:
                 state.face_checks += 1
                 self._face_check(state, frame_bgr, bbox, frame_idx, frame_result)
 
-        # Resolve a PATIENT bbox for this frame, if any.
-        for state in self._tracks.values():
-            if state.label == LABEL_PATIENT and state.last_seen_bbox is not None:
-                frame_result.patient_bbox = state.last_seen_bbox
+        # Emit a PATIENT bbox only for a track active this frame.
+        # If BoT-SORT lost the patient track (motion / occlusion),
+        # the bbox is None for this frame rather than a frozen
+        # position from earlier in the clip.
+        for tid, bbox in seen_this_frame.items():
+            state = self._tracks.get(tid)
+            if state is not None and state.label == LABEL_PATIENT:
+                frame_result.patient_bbox = bbox
                 break
 
         return frame_result

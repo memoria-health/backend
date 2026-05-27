@@ -52,6 +52,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from src.repos import face_embedding_repo
 from src.services.detection import frame_extraction
+from src.services.detection.frame_extraction import ExtractedFrame
 from src.services.reid import embeddings as reid_embeddings
 from src.services.reid import harvester
 from src.services.reid.body_pipeline import BodyReIDPipeline, PipelineConfig
@@ -100,6 +101,27 @@ class IdentityResult:
     face_count: int
     patient_bbox: tuple[float, float, float, float] | None = None
 
+    # Frames the Re-ID pipeline already decoded + sampled. The LLM
+    # provider reuses these instead of running its own ffmpeg
+    # extract_frames pass (the OpenAI fps/width settings match Re-ID's
+    # sampling: 5 fps, 480px). None when Re-ID didn't run (disabled,
+    # no enrollment, timeout, error).
+    extracted_frames: list[ExtractedFrame] | None = None
+
+    # One body bbox per entry in `extracted_frames`, in the same pixel
+    # space. `None` for frames where no PATIENT track was locked at
+    # that instant (e.g., the lock hasn't happened yet, or the track
+    # was lost on this frame). The provider uses these to draw a
+    # frame-accurate green rectangle that follows the patient — the
+    # caregiver-facing archive uses the same per-frame approach via
+    # `clip_annotate`, so the LLM sees what the caregiver sees.
+    per_frame_bboxes: list[tuple[float, float, float, float] | None] | None = None
+
+    # Sampling rate of `extracted_frames`. The provider uses this for
+    # the "sampled at N fps" line in its prompt so the LLM's temporal
+    # reasoning matches the actual frame cadence.
+    sample_fps: int | None = None
+
     # Legacy alias so existing call sites that reference `face_bbox`
     # keep compiling. The semantic shifted from "face bbox" to "body
     # bbox" when we ported the experiment's YOLO + BoT-SORT pipeline.
@@ -116,6 +138,9 @@ class IdentityResult:
             best_frame_index=None,
             face_count=0,
             patient_bbox=None,
+            extracted_frames=None,
+            per_frame_bboxes=None,
+            sample_fps=None,
         )
 
 
@@ -254,6 +279,11 @@ class ReIDInference:
             ),
         )
 
+        # One bbox slot per input frame, aligned by index. Slots stay
+        # None when the frame decode fails or no PATIENT track is
+        # currently locked. The provider consumes this list directly
+        # so the annotation it draws matches the frames it sends.
+        per_frame_bboxes: list[tuple[float, float, float, float] | None] = []
         for frame_idx, frame in enumerate(frames):
             try:
                 jpeg = base64.b64decode(frame.data_base64)
@@ -261,10 +291,13 @@ class ReIDInference:
                 img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
             except Exception:
                 log.exception("reid.frame_decode_failed frame=%d", frame_idx)
+                per_frame_bboxes.append(None)
                 continue
             if img is None:
+                per_frame_bboxes.append(None)
                 continue
-            pipeline.process_frame(img, frame_idx)
+            result = pipeline.process_frame(img, frame_idx)
+            per_frame_bboxes.append(result.patient_bbox)
 
         # Adaptive learning: hand the best face embedding we saw back
         # to the async caller, which will run the harvester + cache
@@ -290,6 +323,9 @@ class ReIDInference:
             best_frame_index=pipeline.best_frame_idx,
             face_count=pipeline.face_count,
             patient_bbox=pipeline.latest_patient_bbox,
+            extracted_frames=list(frames),
+            per_frame_bboxes=per_frame_bboxes,
+            sample_fps=sample_fps,
         )
         log.info(
             "reid.label_clip patient=%s frames=%d face_count=%d "

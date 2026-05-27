@@ -72,6 +72,7 @@ async def annotate_clip_for_display(
     patient_id: UUID,
     sessionmaker: "async_sessionmaker",
     settings: "Settings",
+    reset_at_seconds: float | None = None,
 ) -> bytes:
     """Return a new MP4 with a green rectangle tracking the patient's
     body throughout the clip. Audio is preserved.
@@ -111,7 +112,7 @@ async def annotate_clip_for_display(
 
     try:
         return await asyncio.to_thread(
-            _annotate_clip_sync, mp4_bytes, gallery, cfg,
+            _annotate_clip_sync, mp4_bytes, gallery, cfg, reset_at_seconds,
         )
     except Exception:
         log.exception("clip_annotate: failed patient=%s, returning raw clip", patient_id)
@@ -143,6 +144,7 @@ def _annotate_clip_sync(
     mp4_bytes: bytes,
     gallery: np.ndarray,
     cfg: _AnnotateConfig,
+    reset_at_seconds: float | None = None,
 ) -> bytes:
     """Decode → per-frame inference + draw → re-encode. Runs in a
     thread so we don't block the event loop."""
@@ -199,7 +201,19 @@ def _annotate_clip_sync(
             ),
         )
 
+        # Translate the optional pre/post boundary from seconds to the
+        # JPEG index at which we rebuild the BoT-SORT tracker. At the
+        # 15s cut the patient often jumps to a very different position
+        # (e.g., on the ground after a fall) — a fresh tracker gives
+        # the post half its own clean lock instead of inheriting (or
+        # failing to inherit) the pre-half's stale track state.
+        reset_at_frame: int | None = None
+        if reset_at_seconds is not None and reset_at_seconds > 0:
+            reset_at_frame = max(1, int(round(reset_at_seconds * fps)))
+
         for frame_idx, jpeg_path in enumerate(jpegs):
+            if reset_at_frame is not None and frame_idx == reset_at_frame:
+                pipeline.reset_tracker()
             img = cv2.imread(jpeg_path)
             if img is None:
                 continue
@@ -320,20 +334,45 @@ def _ffmpeg_assemble(
     had no audio (silent buffer fallback), the output is video-only
     and ffmpeg doesn't error.
     """
+    # `-vf format=yuv420p` forces an explicit colorspace conversion
+    # away from JPEG-range (yuvj420p). Without it, libx264 inherits
+    # full-range from the source JPEGs and writes `yuvj420p` even when
+    # we ask for `yuv420p`; iOS AVPlayer rejects yuvj420p MP4s
+    # silently, so the caregiver app sees an unplayable file. The
+    # `-color_range tv` tag matches the standard range we just
+    # converted to.
+    #
+    # Audio is re-encoded (not copied). The source's AAC frames are
+    # timestamped against the original concat'd MP4, whose video had
+    # slightly drifted fps from the rolling buffer. Our re-encoded
+    # video lands on a different (also slightly drifted) fps from
+    # `_probe_fps`, so `-c:a copy` would put audio packets at PTS
+    # that don't match the new video PTS — caregiver sees audio that
+    # progressively lags video. Re-encoding regenerates audio PTS
+    # against the new video timing. `-fps_mode cfr` + `-shortest`
+    # pin the output to constant frame rate and the shortest stream,
+    # so concat-boundary glitches don't bleed past the end of either
+    # track.
     proc = subprocess.run(
         [
             "ffmpeg", "-y",
             "-hide_banner", "-loglevel", "error",
+            "-fflags", "+genpts",
             "-framerate", str(fps),
             "-i", os.path.join(frames_dir, "%06d.jpg"),
             "-i", audio_source_path,
             "-map", "0:v:0",
             "-map", "1:a:0?",
+            "-vf", "format=yuv420p",
+            "-fps_mode", "cfr",
             "-c:v", "libx264",
-            "-preset", "slow",
+            "-preset", "medium",
             "-crf", "18",
             "-pix_fmt", "yuv420p",
-            "-c:a", "copy",
+            "-color_range", "tv",
+            "-c:a", "aac",
+            "-b:a", "64k",
+            "-shortest",
             "-movflags", "+faststart",
             out_path,
         ],

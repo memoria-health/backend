@@ -26,6 +26,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from typing import Any
@@ -210,6 +211,7 @@ async def test_archive_event_uploads_and_flips_has_clip(
         event_id=event_id,
         patient_id=patient_id,
         pre_event_mp4=pre_mp4,
+        pre_end_captured_at=time.monotonic(),
         frame_buffer=frame_buffer,
         audio_buffer=audio_buffer,
         sessionmaker=sm,
@@ -263,6 +265,7 @@ async def test_archive_event_noops_when_post_frames_missing(
         event_id=event_id,
         patient_id=patient_id,
         pre_event_mp4=pre_mp4,
+        pre_end_captured_at=time.monotonic(),
         frame_buffer=frame_buffer,
         audio_buffer=audio_buffer,
         sessionmaker=sm,
@@ -335,6 +338,7 @@ async def test_archive_event_swallows_upload_failure(
         event_id=event_id,
         patient_id=patient_id,
         pre_event_mp4=pre_mp4,
+        pre_end_captured_at=time.monotonic(),
         frame_buffer=frame_buffer,
         audio_buffer=audio_buffer,
         sessionmaker=sm,
