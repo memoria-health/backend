@@ -190,6 +190,12 @@ class RelayPublisher:
         # write is a single attribute assignment of an immutable bool.
         self._in_motion: bool = False
         self._motion_detector = MotionDetector(config.motion_config)
+        # Throughput meter: count frames published, log fps every
+        # `_fps_log_interval_s` seconds. Diagnostic only; cost is one
+        # increment + one wall-clock check per frame.
+        self._frames_since_log: int = 0
+        self._last_fps_log_t: float = self._clock()
+        self._fps_log_interval_s: float = 5.0
 
     async def run(self) -> None:
         """Pull-mode entrypoint: opens the Pi's MJPEG URL and runs
@@ -347,6 +353,23 @@ class RelayPublisher:
             decoded.i420,
         )
         source.capture_frame(frame)
+
+        # Throughput telemetry: log fps every _fps_log_interval_s so
+        # we can diagnose Pi-side encode rate, network drops, or
+        # backend backpressure separately from any other symptom.
+        self._frames_since_log += 1
+        now = self._clock()
+        elapsed = now - self._last_fps_log_t
+        if elapsed >= self._fps_log_interval_s:
+            log.info(
+                "pi_relay.fps camera=%s frames=%d elapsed_s=%.2f fps=%.2f",
+                self._config.camera_identity,
+                self._frames_since_log,
+                elapsed,
+                self._frames_since_log / elapsed,
+            )
+            self._frames_since_log = 0
+            self._last_fps_log_t = now
 
         result = self._motion_detector.process(decoded.y_plane)
         if result.in_motion:

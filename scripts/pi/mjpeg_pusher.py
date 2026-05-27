@@ -186,13 +186,37 @@ async def _capture_frames(
 
     Each ring.get() runs in a worker thread because it blocks on a
     threading.Condition; doing it inline would block the event loop.
+
+    Logs throughput (frames/sec + average JPEG size) every 5s so we
+    can see if the bottleneck is the encoder rate, the network, or
+    the backend's consumer side independently.
     """
+    loop = asyncio.get_event_loop()
+    bucket_count = 0
+    bucket_bytes = 0
+    bucket_start = loop.time()
+    log_interval_s = 5.0
     while not stop.is_set():
         frame = await asyncio.to_thread(ring.get, 2.0)
         if frame is None:
             # Timeout or ring closed. Loop back; outer stop check
             # will exit cleanly on shutdown.
             continue
+        bucket_count += 1
+        bucket_bytes += len(frame)
+        now = loop.time()
+        elapsed = now - bucket_start
+        if elapsed >= log_interval_s:
+            avg_size_kb = (bucket_bytes / bucket_count) / 1024.0
+            log.info(
+                "fps source=%.2f avg_jpeg_kb=%.1f bytes_per_s_kb=%.1f",
+                bucket_count / elapsed,
+                avg_size_kb,
+                (bucket_bytes / elapsed) / 1024.0,
+            )
+            bucket_count = 0
+            bucket_bytes = 0
+            bucket_start = now
         yield frame
 
 
