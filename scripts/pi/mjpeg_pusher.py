@@ -39,9 +39,11 @@ Failure model:
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import os
 import sys
+import threading
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING
 
@@ -65,9 +67,16 @@ _BOUNDARY = b"frame"
 _MAX_BACKOFF_S = 30.0
 
 
-class _JpegRing:
+class _JpegRing(io.BufferedIOBase):
     """Thread-safe single-slot buffer that holds the most-recent JPEG
     frame produced by picamera2's hardware JpegEncoder.
+
+    picamera2's `FileOutput.fileoutput` setter does
+    `isinstance(file, io.BufferedIOBase)`, so this MUST inherit from
+    that class (a plain class with the same methods raises
+    `Must pass io.BufferedIOBase`). Only `write` is actually called
+    by FileOutput; the rest of the ABC is satisfied by the default
+    raise-UnsupportedOperation implementations.
 
     picamera2 calls `write(buf)` from the encoder thread for each
     encoded frame. The async push loop calls `get()` from the asyncio
@@ -78,14 +87,16 @@ class _JpegRing:
     """
 
     def __init__(self) -> None:
-        import threading
-
+        super().__init__()
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
         self._latest: bytes | None = None
         self._closed = False
 
-    def write(self, buf: bytes) -> int:
+    def writable(self) -> bool:
+        return True
+
+    def write(self, buf: bytes) -> int:  # type: ignore[override]
         """File-like sink for picamera2's FileOutput. Called on the
         encoder thread.
         """
@@ -97,10 +108,11 @@ class _JpegRing:
     def flush(self) -> None:  # FileOutput contract
         pass
 
-    def close(self) -> None:
+    def close(self) -> None:  # type: ignore[override]
         with self._cond:
             self._closed = True
             self._cond.notify_all()
+        super().close()
 
     def get(self, timeout_s: float = 2.0) -> bytes | None:
         """Block (with timeout) until a frame is available; return it
