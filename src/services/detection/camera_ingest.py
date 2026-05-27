@@ -192,12 +192,18 @@ class CameraIngest:
                 else:
                     reason = "monitoring_paused"
                     description = "(monitoring paused — LLM skipped)"
-                state_after = await apply_tick_update(
-                    session,
-                    camera_id=self.camera_id,
-                    people_present=False,
-                    motion_in_clip=False,
-                )
+                # DO NOT advance the state machine here. We have no real
+                # observation — we're explicitly skipping the LLM. The
+                # previous version called apply_tick_update with
+                # (people_present=False, motion_in_clip=False), which is
+                # a fabrication, not a measurement. Over ~6 paused ticks
+                # (~90s) that drove the state machine to "closed," and
+                # the very next tick after resume would short-circuit
+                # again on the closed-state check ("camera_closed") —
+                # the user observed this as "I clicked resume but it's
+                # still skipping." camera_repo.update_partial also
+                # resets state to "open" on resume as a belt-and-
+                # suspenders against any drift that snuck in.
                 await add_analysis(
                     session,
                     camera_id=self.camera_id,
@@ -210,16 +216,16 @@ class CameraIngest:
                     people_present=False,
                     people_count=0,
                     motion_in_clip=False,
-                    state_after=state_after.state,
+                    state_after=cam.state,
                     captured_at=captured_at,
                 )
                 await session.commit()
                 log.info(
-                    "%s SKIP user-off (%s) — state=%s/%s",
+                    "%s SKIP user-off (%s) — state preserved at %s/%s",
                     self._log_tag,
                     reason,
-                    state_after.state,
-                    state_after.no_people_count,
+                    cam.state,
+                    cam.no_people_count,
                 )
                 return
 

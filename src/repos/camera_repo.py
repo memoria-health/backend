@@ -6,6 +6,7 @@ later plan.
 """
 
 from collections.abc import Sequence
+from datetime import datetime, timezone
 from uuid import UUID
 
 from sqlalchemy import delete, select
@@ -82,11 +83,31 @@ async def update_partial(
     cam = await find_by_id(session, camera_id, caregiver_id=caregiver_id)
     if cam is None:
         return None
+
+    # Detect "resume" transitions BEFORE we mutate the flags. Either
+    # disabled true→false (un-hide) or ai_paused true→false (resume AI)
+    # is a user-initiated wake-up: they want AI to start running again
+    # immediately, not "wait for motion to wake the closed-state
+    # machine." Without this, even a brief pause that happened to span
+    # ~6 ticks would leave state="closed" — and the closed-state check
+    # in camera_ingest._run_tick would short-circuit the very next tick
+    # on the resumed camera as "camera_closed."
+    resuming = (
+        (disabled is False and cam.disabled)
+        or (ai_paused is False and cam.ai_paused)
+    )
+
     if disabled is not None:
         cam.disabled = disabled
     if ai_paused is not None:
         cam.ai_paused = ai_paused
     if desired_state is not None:
         cam.desired_state = desired_state
+
+    if resuming:
+        cam.state = "open"
+        cam.no_people_count = 0
+        cam.state_changed_at = datetime.now(timezone.utc)
+
     await session.flush()
     return cam
