@@ -180,9 +180,11 @@ _WANDERING_PROMPT_FRAGMENT = (
 )
 
 _AGITATION_PROMPT_FRAGMENT = (
-    "agitation_detected: boolean. True if a person displays sustained restless body language over the clip — pacing back and forth, fidgeting with clothing/objects in a repetitive nervous way, repeatedly standing/sitting, wringing hands, sharp jerky gestures, or other movement patterns suggesting distress/anxiety. The behavior must be SUSTAINED across multiple seconds of the clip — a single moment of motion is not agitation. Set FALSE if the person is moving normally (walking through, doing a task with purpose, sitting still, sleeping), or if no person is visible.\n"
-    "agitation_confidence: number 0–1. 0 = clearly calm/normal/no person. 0.3–0.6 = some restless motion but ambiguous (could be normal activity). 0.7+ = clear sustained agitation.\n"
-    "agitation_reasoning: 1 short sentence explaining your judgment (e.g. 'person paced from doorway to window four times across the clip', 'person sat reading throughout — calm', 'no person visible')."
+    "agitation_detected: boolean. True if a person displays sustained restless body language over the clip — pacing back and forth, fidgeting with clothing/objects in a repetitive nervous way, repeatedly standing/sitting, wringing hands, sharp jerky gestures, or other movement patterns suggesting distress/anxiety. The behavior must be SUSTAINED across multiple seconds of the clip — a single moment of motion is not agitation. "
+    "Audio is supporting evidence only: agitated vocalizations (shouting, sustained crying, distressed or repetitive verbalizations, loud groans) can corroborate a visual judgment of agitation, but audio alone is NEVER sufficient to set this TRUE — there must also be visible restless body language in the clip. If the audio sounds distressed but the person is visually calm, off-camera, or not visible at all, set FALSE. "
+    "Set FALSE if the person is moving normally (walking through, doing a task with purpose, sitting still, sleeping), or if no person is visible.\n"
+    "agitation_confidence: number 0–1. 0 = clearly calm/normal/no person. 0.3–0.6 = some restless motion but ambiguous (could be normal activity). 0.7+ = clear sustained agitation; raise within this band when distressed audio also corroborates the visual signal.\n"
+    "agitation_reasoning: 1 short sentence explaining your judgment, noting briefly whether audio reinforced or contradicted the visual (e.g. 'person paced from doorway to window four times across the clip, audio also muttering anxiously', 'person sat reading throughout — calm, no audio cues', 'audible shouting but no person visible — not agitation', 'no person visible')."
 )
 
 _MEDICATION_PROMPT_FRAGMENT = (
