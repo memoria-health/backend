@@ -1,11 +1,11 @@
 [Unit]
-Description=Nemara camera WiFi AP-mode provisioning daemon
+Description=Nemara camera WiFi AP-mode provisioning supervisor
 # Run AFTER NetworkManager is up, since we use nmcli to bring the
-# AP up and down. On a freshly-imaged Pi with no saved WiFi, NM
-# starts but has no connections to activate; this daemon then
-# creates the temporary "Nemara-Setup-XXXXXX" AP. Once the
-# customer submits home WiFi credentials and the daemon touches the
-# marker file, subsequent boots short-circuit immediately.
+# AP up and down. The daemon is a long-running supervisor (post
+# bugfix): it periodically re-checks the provisioned state and
+# brings the AP back up whenever the marker file disappears, so a
+# customer-initiated factory reset (rm /var/lib/nemara/provisioned)
+# rearms the AP within ~30 s without a reboot.
 After=NetworkManager.service dbus.service
 Wants=NetworkManager.service
 
@@ -15,10 +15,11 @@ Type=simple
 User=root
 EnvironmentFile=-/etc/nemara/wifi-ap.env
 ExecStart=/usr/bin/python3 /opt/nemara/wifi_ap_provision.py
-# Restart on failure (e.g. nmcli transient hiccup) but NOT on
-# successful exit; the daemon exits cleanly after provisioning
-# completes and should not auto-restart at that point.
-Restart=on-failure
+# Always restart: the supervisor is meant to run for the lifetime of
+# the device. Even on clean exit (which only happens via SIGINT in
+# practice now that the loop is permanent), systemd brings it back
+# so a manual `systemctl stop` is the only way to keep it down.
+Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal

@@ -442,34 +442,78 @@ def serve(cfg: Config) -> None:
     stop_ap(cfg)
 
 
+# How long to sleep between re-checks of the provisioned state when
+# the Pi is paired and idle. Short enough that a customer who clears
+# the marker (factory-reset path) gets the AP back within a minute
+# without rebooting; long enough that the supervisor uses negligible
+# CPU.
+_IDLE_RECHECK_INTERVAL_S: int = 30
+
+
 def main() -> None:
+    """Supervisor loop: bring up the AP whenever the Pi is unpaired,
+    and keep checking once paired so a customer-initiated factory
+    reset (removing the marker file) auto-rearms the AP without a
+    reboot.
+
+    Behavior:
+      - Unpaired (no marker, no saved WiFi): run `serve(cfg)` which
+        brings up the AP, serves the captive portal, joins the home
+        WiFi on submit, touches the marker, returns.
+      - Paired (marker present or saved WiFi): sleep
+        `_IDLE_RECHECK_INTERVAL_S` and re-check. Next iteration sees
+        the same state and sleeps again. If the marker disappears,
+        next iteration falls into the unpaired branch and AP comes
+        back up.
+      - Fatal exception inside serve(): log, sleep
+        `_IDLE_RECHECK_INTERVAL_S` (so we do not hot-loop on a
+        persistent failure), continue.
+    """
     logging.basicConfig(
         level=os.environ.get("NEMARA_LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     cfg = load_config()
-    if already_provisioned(cfg.marker_path):
-        log.info(
-            "WiFi already configured (marker=%s); skipping AP",
-            cfg.marker_path.exists(),
-        )
-        return
-    try:
-        serve(cfg)
-    except KeyboardInterrupt:
-        log.info("stopped by signal")
+    log.info(
+        "supervisor.start marker=%s recheck=%ds",
+        cfg.marker_path, _IDLE_RECHECK_INTERVAL_S,
+    )
+    while True:
         try:
-            stop_ap(cfg)
+            if already_provisioned(cfg.marker_path):
+                # Paired and configured. Sleep and re-check; this is
+                # the steady-state branch for the lifetime of the
+                # device after first provisioning.
+                time.sleep(_IDLE_RECHECK_INTERVAL_S)
+                continue
+            # Unpaired: run the one-shot AP + captive portal flow.
+            # Returns on successful provision (marker written) or
+            # timeout. Either way the next loop iteration re-checks.
+            log.info(
+                "unpaired (marker=%s, no saved WiFi); starting AP",
+                cfg.marker_path.exists(),
+            )
+            serve(cfg)
+        except KeyboardInterrupt:
+            log.info("stopped by signal")
+            try:
+                stop_ap(cfg)
+            except Exception:
+                pass
+            sys.exit(0)
         except Exception:
-            pass
-        sys.exit(0)
-    except Exception:
-        log.exception("provisioning daemon failed")
-        try:
-            stop_ap(cfg)
-        except Exception:
-            pass
-        sys.exit(1)
+            # A persistent failure (nmcli stuck, radio offline) should
+            # not hot-loop. Tear down whatever the AP got partway
+            # through, sleep, then retry. systemd's Restart=on-failure
+            # would also catch this, but the supervisor loop keeps
+            # state in-process across retries so a long backoff doesn't
+            # require systemd churn.
+            log.exception("provisioning iteration failed; backing off")
+            try:
+                stop_ap(cfg)
+            except Exception:
+                pass
+            time.sleep(_IDLE_RECHECK_INTERVAL_S)
 
 
 if __name__ == "__main__":
