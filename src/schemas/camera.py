@@ -179,19 +179,55 @@ class PiProvisionRequest(BaseModel):
     flow, there is no two-step exchange: the Pi has no UI to enter a
     code, and the backend worker authenticates to LiveKit using its
     own credentials, so no api_key needs to be handed to the Pi
-    device itself. The caregiver provides the MJPEG URL that points
-    at the running Pi daemon (e.g. http://10.0.0.44:8000/stream.mjpg).
+    device itself.
 
-    `pi_audio_url` is optional: pass it when the Pi has a USB mic
-    attached and is also serving PCM audio. Omit for a video-only Pi.
+    Two mutually-exclusive modes to specify the camera's MJPEG URL:
+
+      - `discovery_id`: pick a discovered Pi from the announce table
+        (the normal customer flow; the caregiver app gets the id
+        from GET /v1/cameras/discovered). The URL fields on the row
+        come from the discovery record and the discovery is marked
+        claimed.
+      - `pi_stream_url` (+ optional `pi_audio_url`): for ops /
+        scripted provisioning when the caregiver already knows the
+        URL and no announce record exists. Kept so the existing
+        admin and test workflows still work.
+
+    Exactly one of the two modes must be set; both or neither raises
+    a 422.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     room: Room
     icon_name: IconName = "tv"
-    pi_stream_url: PiStreamUrl
+    # Mode A (recommended): pair from a discovery.
+    discovery_id: UUID | None = None
+    # Mode B (manual): direct URLs.
+    pi_stream_url: PiStreamUrl | None = None
     pi_audio_url: PiAudioUrl | None = None
+
+    @model_validator(mode="after")
+    def _validate_mode(self) -> "PiProvisionRequest":
+        has_discovery = self.discovery_id is not None
+        has_direct_url = self.pi_stream_url is not None
+        if has_discovery and has_direct_url:
+            raise ValueError(
+                "Specify either discovery_id or pi_stream_url, not both"
+            )
+        if not has_discovery and not has_direct_url:
+            raise ValueError(
+                "Must specify either discovery_id or pi_stream_url"
+            )
+        if has_discovery and self.pi_audio_url is not None:
+            # Audio URL on a discovery-based request would be
+            # ignored (the discovery record carries the URLs).
+            # Reject loudly rather than silently dropping.
+            raise ValueError(
+                "pi_audio_url is not allowed with discovery_id; "
+                "the discovery record carries the audio URL"
+            )
+        return self
 
 
 class PiProvisionResponse(BaseModel):

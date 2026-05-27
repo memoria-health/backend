@@ -241,6 +241,67 @@ create unique index cameras_pairing_code_uniq
   where pairing_code is not null;
 
 
+-- ── pi_discoveries ───────────────────────────────────────────────
+-- Holds "I am a Nemara camera at <url>" announcements from Pi
+-- devices that have joined home WiFi but have not yet been paired
+-- to a patient. Pairing happens when a caregiver picks a discovery
+-- from the "Add a camera" screen, which triggers
+-- POST /v1/cameras/pi-provision {discovery_id} and inserts a row
+-- in `cameras` referencing this discovery.
+--
+-- One row per device, keyed by hardware_id (stable MAC address).
+-- A device that re-announces just updates `current_url` and
+-- `last_seen_at`. The caregiver-facing list endpoint filters to
+-- recently-seen unclaimed rows so stale devices fall off
+-- automatically.
+--
+-- Security note: there is intentionally NO authentication on the
+-- announce path. The Pi has no credentials before pairing. This is
+-- acceptable for v1 because BLE-based provisioning (Phase 4.5b)
+-- requires physical proximity to set up the device, and our
+-- customer scale is low enough that cross-customer announcement
+-- collisions are extremely unlikely. v2 will add a per-device
+-- secret negotiated over BLE that the announcement carries.
+create table public.pi_discoveries (
+  id                uuid primary key default gen_random_uuid(),
+  -- Stable hardware identifier (the WiFi NIC's MAC address). Used
+  -- both as the de-dupe key (one record per device) and as the
+  -- public-facing "ID" the caregiver picks from in the UI.
+  hardware_id       text not null,
+  -- Human-readable label the Pi sends (e.g. "Nemara Camera A4B7C2"
+  -- with the last 6 of MAC). Surfaces in the caregiver's pick list
+  -- so they can match a discovered record to the physical device.
+  device_label      text not null,
+  -- Current MJPEG endpoint. Updated on every re-announce; a Pi that
+  -- gets a new DHCP lease pushes a new URL within ~60 s.
+  current_url       text not null,
+  -- Optional audio endpoint, same shape contract as cameras.pi_audio_url.
+  current_audio_url text,
+  first_seen_at     timestamptz not null default now(),
+  last_seen_at      timestamptz not null default now(),
+  -- When a caregiver pairs this discovery to a camera row, both
+  -- fields are populated. `claimed_camera_id` is the FK; nulled on
+  -- camera delete so the discovery can be re-paired without manual
+  -- DB intervention.
+  claimed_at        timestamptz,
+  claimed_camera_id uuid references public.cameras(id) on delete set null,
+  -- Length caps mirror cameras.pi_stream_url for consistency.
+  constraint pi_discoveries_url_length
+    check (length(current_url) <= 2048),
+  constraint pi_discoveries_audio_url_length
+    check (current_audio_url is null or length(current_audio_url) <= 2048),
+  unique (hardware_id)
+);
+
+create index pi_discoveries_last_seen_idx
+  on public.pi_discoveries(last_seen_at);
+-- Index the "unclaimed list" query path: GET /v1/cameras/discovered
+-- filters `WHERE claimed_at IS NULL AND last_seen_at > now() - 5 min`.
+create index pi_discoveries_unclaimed_idx
+  on public.pi_discoveries(last_seen_at)
+  where claimed_at is null;
+
+
 -- ── detectors ────────────────────────────────────────────────────
 -- Mix of preset (created by the seed-on-patient-creation service) and
 -- custom (created by the caregiver via POST /v1/patients/{id}/detectors).

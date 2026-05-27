@@ -20,7 +20,12 @@ from sqlalchemy import func, select
 
 from src.api.deps import CameraAuth, CaregiverAuth, SessionDep, SettingsDep
 from src.db.camera import Camera
-from src.repos import camera_detector_repo, camera_repo, patient_repo
+from src.repos import (
+    camera_detector_repo,
+    camera_repo,
+    patient_repo,
+    pi_discovery_repo,
+)
 from src.schemas.camera import (
     CameraDetectorsResponse,
     CameraResponse,
@@ -182,23 +187,25 @@ async def provision_pi_camera(
     auth: CaregiverAuth,
     session: SessionDep,
 ) -> PiProvisionResponse:
-    """Create a Raspberry Pi camera row in one shot.
+    """Create a Pi camera row.
 
-    Unlike the iPhone path, the Pi camera has no UI to display a
-    pairing code and no device-side bearer token. The backend's
-    pi_ingest worker (Phase 5) connects to LiveKit using the
-    server's own LiveKit credentials, so the Pi device itself does
-    not need authentication; the pi_stream_url is the entire
-    contract between worker and Pi.
+    Two ways to specify which Pi this row points at:
 
-    Sets source_type='pi' and pi_stream_url=body.pi_stream_url. Same
-    LiveKit identity / room convention as iPhone cameras so the
-    detection pipeline (RoomWorker, CameraIngest) treats Pi cameras
-    identically once they appear in the room.
+      - discovery_id: pick from the announce list (normal customer
+        flow). Backend resolves the URL from the discovery record
+        and marks it claimed.
+      - pi_stream_url (+ optional pi_audio_url): direct URL for
+        scripted provisioning or admin use.
 
-    The Pi camera row appears with `online=false` and `state='open'`.
-    The pi_ingest worker flips `online=true` after its first
-    successful frame pull.
+    The Pydantic validator on PiProvisionRequest enforces that
+    exactly one of the two modes is set.
+
+    Sets source_type='pi'. Same LiveKit identity / room convention
+    as iPhone cameras so the detection pipeline (RoomWorker,
+    CameraIngest) treats Pi cameras identically once they appear
+    in the room. The row appears with `online=false` and
+    `state='open'`. The pi_ingest worker flips `online=true` after
+    its first successful frame pull.
     """
     # Caregiver must own the patient. RLS would also catch this but
     # an explicit 404 is the right wire shape for "this patient isn't
@@ -209,11 +216,35 @@ async def provision_pi_camera(
             status_code=status.HTTP_404_NOT_FOUND, detail="patient_not_found",
         )
 
+    # Resolve the URLs from whichever mode the caller used. The
+    # Pydantic validator guarantees exactly one is set.
+    discovery_id_to_claim: UUID | None = None
+    if body.discovery_id is not None:
+        discovery = await pi_discovery_repo.find_by_id(session, body.discovery_id)
+        if discovery is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="discovery_not_found",
+            )
+        if discovery.claimed_at is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="discovery_already_claimed",
+            )
+        pi_stream_url = discovery.current_url
+        pi_audio_url = discovery.current_audio_url
+        discovery_id_to_claim = discovery.id
+    else:
+        # Direct-URL mode. The validator guarantees pi_stream_url is set.
+        assert body.pi_stream_url is not None
+        pi_stream_url = body.pi_stream_url
+        pi_audio_url = body.pi_audio_url
+
     # Reject duplicate provisioning: a Pi URL is uniquely tied to one
     # physical device; if it is already registered, the caregiver
     # should delete the existing row rather than create a duplicate.
     existing_url_stmt = (
-        select(Camera.id).where(Camera.pi_stream_url == body.pi_stream_url).limit(1)
+        select(Camera.id).where(Camera.pi_stream_url == pi_stream_url).limit(1)
     )
     existing_url = (await session.execute(existing_url_stmt)).scalar_one_or_none()
     if existing_url is not None:
@@ -258,8 +289,8 @@ async def provision_pi_camera(
         battery_percent=None,
         desired_state="connected",
         source_type="pi",
-        pi_stream_url=body.pi_stream_url,
-        pi_audio_url=body.pi_audio_url,
+        pi_stream_url=pi_stream_url,
+        pi_audio_url=pi_audio_url,
     )
     session.add(cam)
     await session.flush()
@@ -269,13 +300,19 @@ async def provision_pi_camera(
     await camera_detector_repo.assign_preset_detectors_of_patient_to_camera(
         session, camera_id, patient_id,
     )
+    # Mark the discovery claimed (if we got here via discovery mode)
+    # so it disappears from the next /discovered listing.
+    if discovery_id_to_claim is not None:
+        await pi_discovery_repo.claim(
+            session, discovery_id=discovery_id_to_claim, camera_id=camera_id,
+        )
     await session.commit()
 
     return PiProvisionResponse(
         camera_id=camera_id,
         patient_id=patient_id,
-        pi_stream_url=body.pi_stream_url,
-        pi_audio_url=body.pi_audio_url,
+        pi_stream_url=pi_stream_url,
+        pi_audio_url=pi_audio_url,
         livekit_identity=livekit_identity,
         livekit_room=livekit_room,
     )

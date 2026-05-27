@@ -35,6 +35,7 @@ from src.api.livekit import router as livekit_router
 from src.api.livekit_webhooks import router as livekit_webhooks_router
 from src.api.pairing import router as pairing_router
 from src.api.patients import router as patients_router
+from src.api.pi_discovery import router as pi_discovery_router
 from src.api.talk import router as talk_router
 from src.db import analysis as _analysis  # noqa: F401
 from src.db import camera as _camera  # noqa: F401
@@ -44,6 +45,7 @@ from src.db import caregiver_device as _caregiver_device  # noqa: F401
 from src.db import detector as _detector  # noqa: F401
 from src.db import event as _event  # noqa: F401
 from src.db import patient as _patient  # noqa: F401
+from src.db import pi_discovery as _pi_discovery  # noqa: F401
 from src.db.session import get_engine, get_sessionmaker
 from src.services import push
 from src.services.detection.worker import DetectorWorker
@@ -89,6 +91,8 @@ def create_app() -> FastAPI:
     # Pairing flow + LiveKit token minting.
     app.include_router(pairing_router)
     app.include_router(livekit_router)
+    # Pi-device announce + caregiver-facing discovered list.
+    app.include_router(pi_discovery_router)
     # Phase 2: webhook receiver feeding the in-process detector worker.
     app.include_router(livekit_webhooks_router)
     # Phase 3 caregiver Talk mode.
