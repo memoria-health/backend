@@ -46,5 +46,5 @@ class Patient(Base):
         Boolean, server_default=text("false"), default=False,
     )
     email_alert_recipients: Mapped[list[str]] = mapped_column(
-        JSONB, server_default=text("'[]'::jsonb"), default=list,
+        JSONB, server_default=text("'[]'::jsonb"), default_factory=list,
     )
