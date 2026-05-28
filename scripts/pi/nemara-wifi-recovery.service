@@ -1,0 +1,15 @@
+[Unit]
+Description=Nemara WiFi recovery (auto-restore after failed AP provisioning)
+# Only run after NetworkManager is up; we read/write /etc/netplan
+# files that NM picks up on reboot.
+After=NetworkManager.service
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/opt/nemara/wifi_recovery.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

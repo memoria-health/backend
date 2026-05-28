@@ -22,19 +22,46 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 
+# Silence verbose third-party loggers that flood every tick.
+#
+# - boxmot's `boxmot.utils.__init__` calls `configure_logging()` at
+#   import time, which installs a RichHandler on the "boxmot" logger
+#   with propagate=False and a hardcoded INFO level. We need to
+#   import that submodule explicitly — `import boxmot` alone doesn't
+#   pull in boxmot.utils, so configure_logging would only fire later
+#   (when the tracker first instantiates) and clobber any override
+#   we set here.
+# - ultralytics also chatters at INFO about model loading.
+#
+# After both have done their import-time logger setup, we strip
+# RichHandler and set propagate=True so anything WARNING+ flows
+# through our standard root config.
+import boxmot.utils  # noqa: F401, E402
+import ultralytics  # noqa: F401, E402
+
+for _noisy in ("boxmot", "ultralytics"):
+    _lg = logging.getLogger(_noisy)
+    _lg.setLevel(logging.WARNING)
+    for _h in list(_lg.handlers):
+        _lg.removeHandler(_h)
+    _lg.propagate = True
+
 # Register every ORM model in SQLAlchemy metadata at startup so foreign
 # keys resolve when the first INSERT/SELECT runs. Imported for side
 # effects only.
 from src.api.cameras import router as cameras_router
+from src.api.cameras_ingest import router as cameras_ingest_router
 from src.api.caregivers import router as caregivers_router
 from src.api.detectors import router as detectors_router
 from src.api.devices import router as devices_router
 from src.api.events import router as events_router
+from src.api.face_embeddings import router as face_embeddings_router
 from src.api.health import router as health_router
 from src.api.livekit import router as livekit_router
 from src.api.livekit_webhooks import router as livekit_webhooks_router
 from src.api.pairing import router as pairing_router
 from src.api.patients import router as patients_router
+from src.api.pi_discovery import router as pi_discovery_router
 from src.api.talk import router as talk_router
 from src.db import analysis as _analysis  # noqa: F401
 from src.db import camera as _camera  # noqa: F401
@@ -44,6 +71,8 @@ from src.db import caregiver_device as _caregiver_device  # noqa: F401
 from src.db import detector as _detector  # noqa: F401
 from src.db import event as _event  # noqa: F401
 from src.db import patient as _patient  # noqa: F401
+from src.db import patient_face_embedding as _patient_face_embedding  # noqa: F401
+from src.db import pi_discovery as _pi_discovery  # noqa: F401
 from src.db.session import get_engine, get_sessionmaker
 from src.services import push
 from src.services.detection.worker import DetectorWorker
@@ -84,15 +113,20 @@ def create_app() -> FastAPI:
     app.include_router(detectors_router)
     app.include_router(events_router)
     app.include_router(cameras_router)
+    app.include_router(cameras_ingest_router)
     # APNs device-token registration.
     app.include_router(devices_router)
     # Pairing flow + LiveKit token minting.
     app.include_router(pairing_router)
     app.include_router(livekit_router)
+    # Pi-device announce + caregiver-facing discovered list.
+    app.include_router(pi_discovery_router)
     # Phase 2: webhook receiver feeding the in-process detector worker.
     app.include_router(livekit_webhooks_router)
     # Phase 3 caregiver Talk mode.
     app.include_router(talk_router)
+    # Re-ID face enrollment + status.
+    app.include_router(face_embeddings_router)
     return app
 
 

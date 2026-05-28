@@ -16,6 +16,7 @@ from google.genai import types as genai_types
 from src.services.detection.prompt import (
     BASE_PROMPT,
     DetectorSpec,
+    build_identity_addendum,
     build_prompt_and_schema,
 )
 from src.services.detection.providers._parse import parse_and_validate
@@ -60,7 +61,18 @@ async def gemini_provider(
     detectors: Sequence[DetectorSpec],
     log_tag: str,
     settings: Settings,
+    patient_in_clip: bool = False,
+    patient_bbox: tuple[float, float, float, float] | None = None,
 ) -> ProviderResult:
+    # `patient_bbox` is accepted for signature parity with
+    # `openai_provider`. Gemini's input is the raw MP4 (no per-frame
+    # rewrite path here), so visual annotation isn't applied — the
+    # text addendum from `build_identity_addendum(patient_in_clip)`
+    # carries the identification cue. If we ever observe Gemini
+    # misattributing detector outcomes in multi-person scenes, the
+    # path is to decode → annotate → re-encode the MP4 here
+    # (expensive, ~1-2s extra).
+    _ = patient_bbox
     if not settings.gemini_api_key:
         raise RuntimeError("NEMARA_GEMINI_API_KEY not configured")
 
@@ -81,7 +93,8 @@ async def gemini_provider(
             )
 
     built = build_prompt_and_schema(detectors)
-    full_prompt = f"{built.prompt}\n\n{_SPEECH_PROMPT_FRAGMENT}"
+    identity_addendum = build_identity_addendum(patient_in_clip)
+    full_prompt = f"{built.prompt}\n\n{_SPEECH_PROMPT_FRAGMENT}{identity_addendum}"
     properties = {**built.schema_properties, **_SPEECH_FIELDS}
     required = built.schema_required + ["speech_heard", "speech_transcript"]
 

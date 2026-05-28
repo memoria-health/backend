@@ -34,3 +34,9 @@ htmlcov/
 
 # runtime log from local dev
 .prod-server.log
+
+# Local-only ML model weights (5+ MB binaries, fetched on first
+# detector run, not part of source). Keep gitignored even on a
+# private repo so clones stay small.
+yolo11n.pt
+*.pt
