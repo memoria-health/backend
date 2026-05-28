@@ -22,6 +22,15 @@ class Settings(BaseSettings):
     env: Literal["local", "test", "staging", "prod"] = "local"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
+    # ── Public base URL ─────────────────────────────────────────
+    # Public URL the backend is reachable at from Pi cameras out in
+    # customers' homes. The announce response embeds this into the
+    # ingest_url it returns to a freshly-paired Pi so the Pi knows
+    # where to POST its frame stream. In local dev set this to the
+    # LAN IP+port (e.g. http://10.0.0.245:8002); in production set it
+    # to the public HTTPS URL of the deployed backend.
+    public_base_url: str = Field(min_length=1, default="http://localhost:8002")
+
     # ── Database ────────────────────────────────────────────────
     db_url: str = Field(min_length=1)
     db_pool_size: int = Field(ge=1, le=100, default=10)
@@ -106,6 +115,93 @@ class Settings(BaseSettings):
     # is comfortable for "tap event → watch clip" and short enough
     # that a shared URL goes stale fast.
     storage_signed_url_default_ttl_seconds: int = Field(ge=30, le=3600, default=600)
+
+    # ── Re-ID (Phase 1+) ────────────────────────────────────────
+    # Feature flag: when False, the enrollment API still accepts
+    # photos but the inference pipeline does NOT consult the gallery
+    # at tick time. Lets us roll the schema + API out without flipping
+    # the detector behavior until we're ready.
+    reid_enabled: bool = Field(default=False)
+    # Hard timeout for the per-tick Re-ID call. If exceeded, the tick
+    # proceeds with no identity_map and detectors fire identity-agnostic
+    # (same as today). Larger than the current ~36s offline-CPU pace so
+    # GPU-on-Railway can land well under, with CPU as a fallback for
+    # local dev.
+    # Hard timeout for the per-tick Re-ID pipeline. Body Re-ID
+    # (YOLO + BoT-SORT + face checks on a ~75-frame tick) lands
+    # around 6-10s on CPU; 15s gives reasonable headroom without
+    # letting a stuck tick block the next one indefinitely (tick
+    # interval is 10s but the loop is fire-and-forget).
+    reid_timeout_seconds: float = Field(gt=0, le=60, default=15.0)
+    # Base cosine threshold for face matches. The adaptive curve in
+    # `services/reid/embeddings.py:effective_match_threshold` scales
+    # this up for clear faces (~0.50) and down for unclear ones
+    # (~0.24 floor); the value here is the "wall-cam normal" point.
+    reid_match_threshold_base: float = Field(gt=0, lt=1, default=0.40)
+    # Minimum SCRFD det_score for an enrollment selfie to be accepted.
+    # Lower than the experiment's 0.6 because we now use adaptive
+    # thresholds at match time — we want to accept a wider band of
+    # selfie quality so the gallery has variety.
+    reid_enrollment_min_det_score: float = Field(ge=0, le=1, default=0.4)
+    # TTL on the per-patient gallery cache. The gallery is read once
+    # at tick time and cached so repeat ticks for the same patient
+    # don't hammer Postgres. 60s is long enough that a fresh
+    # enrollment becomes visible within a minute, short enough that
+    # harvested rows show up promptly too.
+    reid_gallery_cache_ttl_seconds: int = Field(ge=1, le=600, default=60)
+    # Cosine score required to harvest a face crop back into the
+    # gallery as `source='harvested'`. Much higher than the lock
+    # threshold so only highly-confident matches enrich the gallery.
+    reid_harvest_enabled: bool = Field(default=True)
+    reid_harvest_threshold: float = Field(gt=0, le=1, default=0.80)
+    # Per-patient gallery cap. When inserting a harvested row would
+    # exceed this, the oldest harvested row is evicted (selfies are
+    # never evicted).
+    reid_gallery_cap: int = Field(ge=20, le=1000, default=200)
+    # Per-enrollment upload bounds. iOS captures 10-15 selfies; we
+    # cap at 20 so a buggy client can't flood the gallery in one shot.
+    reid_max_photos_per_enrollment: int = Field(ge=1, le=50, default=20)
+    # InsightFace model bundle. `buffalo_l` is the production accuracy
+    # tier (~280 MB); `buffalo_sc` is the lighter option (~40 MB) for
+    # memory-constrained deploys. Override via env if Railway OOMs.
+    reid_insightface_model: str = Field(default="buffalo_l")
+    # Per-tick frame sampling for the inference path. 1 fps × 15s = 15
+    # frames is plenty to catch a face glimpse without spending the
+    # 75-frames-at-5fps budget the LLM uses. 480 px wide matches the
+    # OpenAI provider's frame size, so the ffmpeg pass is reusable.
+    # 5 fps gives BoT-SORT enough temporal continuity to keep track
+    # IDs stable as the patient moves. 15s tick × 5 fps = 75 frames
+    # per tick, processed sequentially through YOLO + tracker.
+    reid_inference_sample_fps: int = Field(ge=1, le=15, default=5)
+    reid_inference_sample_width: int = Field(ge=240, le=1920, default=480)
+    # ── Body Re-ID pipeline (mirrors the experiment) ───────────────
+    # YOLO confidence threshold for the person detector. Default
+    # matches the experiment's PersonDetector(confidence=0.4).
+    reid_yolo_confidence: float = Field(gt=0, le=1, default=0.4)
+    # Per-track face check cadence: every N frames per UNKNOWN track,
+    # run SCRFD inside the person bbox. 5 frames @ 5 fps = 1s
+    # between checks, same as the experiment.
+    reid_face_check_interval: int = Field(ge=1, le=60, default=5)
+    # Consecutive above-threshold face matches required to lock a
+    # track as PATIENT. 2 means a single false-positive embedding
+    # cannot lock the wrong identity.
+    reid_hits_to_lock: int = Field(ge=1, le=10, default=2)
+    # SCRFD detection confidence floor for a face check to count.
+    # Faces below this are ignored (motion blur, partial occlusion).
+    reid_face_min_det_score: float = Field(ge=0, le=1, default=0.5)
+    # Face checks (with no patient match) before a track locks as
+    # OTHER. Higher = slower OTHER locks but fewer wrong-OTHER calls
+    # if the patient was briefly face-occluded early in the tick.
+    reid_face_checks_for_other: int = Field(ge=1, le=20, default=5)
+    # Per-frame Re-ID annotation of archived event clips. Display-only
+    # post-processing; the detector pipeline never reads these. When
+    # enabled, every event clip uploaded to Supabase Storage has a
+    # thin green box tracking the patient body bbox on every native
+    # frame so caregivers always see who triggered the alert. Adds
+    # ~25-35s to the archive path (already async/fire-and-forget) —
+    # the trade-off for matching nemara-reid-experiment's visual
+    # quality.
+    reid_clip_annotation_enabled: bool = Field(default=True)
 
     # ── APNs (Phase 4) ──────────────────────────────────────────
     # Apple Developer credentials for HTTP/2 push. team_id +

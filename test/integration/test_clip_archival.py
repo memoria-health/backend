@@ -26,6 +26,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from typing import Any
@@ -101,7 +102,7 @@ def _install_fake_httpx(monkeypatch) -> dict[str, Any]:
 # ── seeding ───────────────────────────────────────────────────────────
 
 
-async def _seed_event(session: AsyncSession, auth_user_factory) -> UUID:
+async def _seed_event(session: AsyncSession, auth_user_factory) -> tuple[UUID, UUID]:
     uid, email = await auth_user_factory()
     now = datetime.now(timezone.utc)
     session.add(
@@ -134,7 +135,7 @@ async def _seed_event(session: AsyncSession, auth_user_factory) -> UUID:
         )
     )
     await session.commit()
-    return event_id
+    return event_id, patient_id
 
 
 def _i420_blob(width: int, height: int) -> bytes:
@@ -160,17 +161,25 @@ async def _build_pre_event_mp4() -> bytes:
 
 @pytest_asyncio.fixture
 async def filled_buffers() -> AsyncIterator[tuple[FrameBuffer, AudioBuffer]]:
-    """A pre-populated post-event frame + audio buffer. The archival
-    code calls `snapshot_last_seconds(15)` against `time.monotonic()`,
-    so we push frames with captured_at very close to `now`."""
+    """A pre-populated post-event frame + audio buffer.
+
+    archive_event() sleeps for clip_post_event_wait_seconds and then
+    calls snapshot_last_seconds(clip_post_event_wait_seconds) against
+    time.monotonic(). In production the room-worker is continuously
+    pushing fresh frames during that sleep, so the snapshot always
+    finds recent ones. In the test we have no such background pusher,
+    so we future-date the fixture's captured_at values to outlive any
+    setup delay between fixture build and archive_event call (ffmpeg
+    pre-mp4 build can take a few hundred ms).
+    """
     import time
-    now = time.monotonic()
+    base = time.monotonic() + 2.0
     frames = FrameBuffer(window_seconds=15.0, target_fps=5)
     audio = AudioBuffer(window_seconds=15.0)
     for i in range(15):
         frames.push(
             width=320, height=240, data=_i420_blob(320, 240),
-            captured_at=now - 2.0 + i / 5,
+            captured_at=base + i / 5,
         )
     yield frames, audio
 
@@ -185,7 +194,7 @@ async def test_archive_event_uploads_and_flips_has_clip(
 ):
     sm = get_sessionmaker()
     async with sm() as s:
-        event_id = await _seed_event(s, auth_user_factory)
+        event_id, patient_id = await _seed_event(s, auth_user_factory)
 
     fake_httpx = _install_fake_httpx(monkeypatch)
     frame_buffer, audio_buffer = filled_buffers
@@ -200,7 +209,9 @@ async def test_archive_event_uploads_and_flips_has_clip(
 
     await archive_event(
         event_id=event_id,
+        patient_id=patient_id,
         pre_event_mp4=pre_mp4,
+        pre_end_captured_at=time.monotonic(),
         frame_buffer=frame_buffer,
         audio_buffer=audio_buffer,
         sessionmaker=sm,
@@ -238,7 +249,7 @@ async def test_archive_event_noops_when_post_frames_missing(
     stays without a clip — caregiver still sees the alert text."""
     sm = get_sessionmaker()
     async with sm() as s:
-        event_id = await _seed_event(s, auth_user_factory)
+        event_id, patient_id = await _seed_event(s, auth_user_factory)
 
     fake_httpx = _install_fake_httpx(monkeypatch)
     # Empty buffers (no frames pushed).
@@ -252,7 +263,9 @@ async def test_archive_event_noops_when_post_frames_missing(
 
     await archive_event(
         event_id=event_id,
+        patient_id=patient_id,
         pre_event_mp4=pre_mp4,
+        pre_end_captured_at=time.monotonic(),
         frame_buffer=frame_buffer,
         audio_buffer=audio_buffer,
         sessionmaker=sm,
@@ -306,7 +319,7 @@ async def test_archive_event_swallows_upload_failure(
     a fire-and-forget task; we log and move on."""
     sm = get_sessionmaker()
     async with sm() as s:
-        event_id = await _seed_event(s, auth_user_factory)
+        event_id, patient_id = await _seed_event(s, auth_user_factory)
 
     fake_httpx = _install_fake_httpx(monkeypatch)
     frame_buffer, audio_buffer = filled_buffers
@@ -323,7 +336,9 @@ async def test_archive_event_swallows_upload_failure(
     # Must not raise.
     await archive_event(
         event_id=event_id,
+        patient_id=patient_id,
         pre_event_mp4=pre_mp4,
+        pre_end_captured_at=time.monotonic(),
         frame_buffer=frame_buffer,
         audio_buffer=audio_buffer,
         sessionmaker=sm,

@@ -192,6 +192,51 @@ create table public.cameras (
   -- See NemaraCam/.../DesiredStateMonitor.swift.
   desired_state       text not null default 'connected'
     check (desired_state in ('connected', 'disconnected')),
+  -- ── Camera source type (iPhone vs Pi ingest path) ───────────────
+  -- 'iphone': wall phone running the NemaraCam app. Publishes
+  --   directly to LiveKit, motion detection runs on-device, audio
+  --   co-streamed via LiveKit. This is the only source type the
+  --   pairing flow supports for v0.
+  -- 'pi': Raspberry Pi running the MJPEG-over-HTTP streaming
+  --   daemon. The backend's pi_ingest worker process pulls frames,
+  --   runs motion detection backend-side, and re-publishes to
+  --   LiveKit as a cam_* participant so the rest of the system
+  --   (caregiver viewer, detector tick, clip archival) treats the
+  --   Pi camera identically to an iPhone camera. See
+  --   src/services/ingest/pi/ for the worker.
+  -- Default 'iphone' makes this backwards-compatible with existing
+  -- rows; no data migration required.
+  source_type         text not null default 'iphone'
+    check (source_type in ('iphone', 'pi')),
+  -- Vestigial: was the URL the backend pulled MJPEG from when Pis
+  -- served their stream. Push refactor (Pi POSTs frames outbound)
+  -- made it unused but column is kept nullable so historical /
+  -- diagnostic queries still work. NOT referenced by the relay path.
+  pi_stream_url       text,
+  -- Vestigial: was the URL the backend pulled PCM audio from in the
+  -- pull-mode design. Same status as pi_stream_url after the push
+  -- refactor; nullable, unused by the relay path.
+  pi_audio_url        text,
+  -- Bearer token (hashed) that the Pi presents on POST /v1/cameras/me/frames
+  -- when pushing its MJPEG stream up. Generated at provision time,
+  -- returned ONCE in plaintext to the Pi via the announce response,
+  -- and stored only as a SHA-256 hex digest server-side. Required for
+  -- source_type='pi' (Pis are the only callers of the push ingest
+  -- endpoint), NULL for source_type='iphone' (iPhones publish to
+  -- LiveKit directly with their own per-session tokens).
+  ingest_token_hash       text,
+  ingest_token_created_at timestamptz,
+  constraint cameras_pi_stream_url_length
+    check (pi_stream_url is null or length(pi_stream_url) <= 2048),
+  constraint cameras_pi_audio_url_length
+    check (pi_audio_url is null or length(pi_audio_url) <= 2048),
+  constraint cameras_ingest_token_required
+    check (
+      (source_type = 'pi' and ingest_token_hash is not null)
+      or (source_type = 'iphone' and ingest_token_hash is null)
+    ),
+  constraint cameras_ingest_token_hash_length
+    check (ingest_token_hash is null or length(ingest_token_hash) = 64),
   unique (patient_id, display_id)
 );
 
@@ -202,6 +247,73 @@ create index cameras_patient_id_idx on public.cameras(patient_id);
 create unique index cameras_pairing_code_uniq
   on public.cameras(pairing_code)
   where pairing_code is not null;
+
+
+-- ── pi_discoveries ───────────────────────────────────────────────
+-- Holds "I am a Nemara camera at <url>" announcements from Pi
+-- devices that have joined home WiFi but have not yet been paired
+-- to a patient. Pairing happens when a caregiver picks a discovery
+-- from the "Add a camera" screen, which triggers
+-- POST /v1/cameras/pi-provision {discovery_id} and inserts a row
+-- in `cameras` referencing this discovery.
+--
+-- One row per device, keyed by hardware_id (stable MAC address).
+-- A device that re-announces just updates `current_url` and
+-- `last_seen_at`. The caregiver-facing list endpoint filters to
+-- recently-seen unclaimed rows so stale devices fall off
+-- automatically.
+--
+-- Security note: there is intentionally NO authentication on the
+-- announce path. The Pi has no credentials before pairing. This is
+-- acceptable for v1 because BLE-based provisioning (Phase 4.5b)
+-- requires physical proximity to set up the device, and our
+-- customer scale is low enough that cross-customer announcement
+-- collisions are extremely unlikely. v2 will add a per-device
+-- secret negotiated over BLE that the announcement carries.
+create table public.pi_discoveries (
+  id                uuid primary key default gen_random_uuid(),
+  -- Stable hardware identifier (the WiFi NIC's MAC address). Used
+  -- both as the de-dupe key (one record per device) and as the
+  -- public-facing "ID" the caregiver picks from in the UI.
+  hardware_id       text not null,
+  -- Human-readable label the Pi sends (e.g. "Nemara Camera A4B7C2"
+  -- with the last 6 of MAC). Surfaces in the caregiver's pick list
+  -- so they can match a discovered record to the physical device.
+  device_label      text not null,
+  -- Current MJPEG endpoint. Updated on every re-announce; a Pi that
+  -- gets a new DHCP lease pushes a new URL within ~60 s.
+  current_url       text not null,
+  -- Optional audio endpoint, same shape contract as cameras.pi_audio_url.
+  current_audio_url text,
+  first_seen_at     timestamptz not null default now(),
+  last_seen_at      timestamptz not null default now(),
+  -- When a caregiver pairs this discovery to a camera row, both
+  -- fields are populated. `claimed_camera_id` is the FK; nulled on
+  -- camera delete so the discovery can be re-paired without manual
+  -- DB intervention.
+  claimed_at        timestamptz,
+  claimed_camera_id uuid references public.cameras(id) on delete set null,
+  -- One-shot plaintext ingest bearer token for the Pi to pick up on
+  -- its next announce response. See src/db/pi_discovery.py for the
+  -- lifecycle rule (set on provision, nulled on first read).
+  pending_ingest_token text,
+  -- Length caps mirror cameras.pi_stream_url for consistency.
+  constraint pi_discoveries_url_length
+    check (length(current_url) <= 2048),
+  constraint pi_discoveries_audio_url_length
+    check (current_audio_url is null or length(current_audio_url) <= 2048),
+  constraint pi_discoveries_pending_token_length
+    check (pending_ingest_token is null or length(pending_ingest_token) <= 128),
+  unique (hardware_id)
+);
+
+create index pi_discoveries_last_seen_idx
+  on public.pi_discoveries(last_seen_at);
+-- Index the "unclaimed list" query path: GET /v1/cameras/discovered
+-- filters `WHERE claimed_at IS NULL AND last_seen_at > now() - 5 min`.
+create index pi_discoveries_unclaimed_idx
+  on public.pi_discoveries(last_seen_at)
+  where claimed_at is null;
 
 
 -- ── detectors ────────────────────────────────────────────────────
@@ -283,6 +395,54 @@ create table public.cameras_detectors (
 
 create index cameras_detectors_camera_id_idx   on public.cameras_detectors(camera_id);
 create index cameras_detectors_detector_id_idx on public.cameras_detectors(detector_id);
+
+
+-- ── patient_face_embeddings (Re-ID gallery) ─────────────────────────
+-- One row per face embedding used for patient identification at tick time.
+-- Two kinds of rows, distinguished by `source`:
+--
+--   'selfie'    Uploaded by the caregiver from the iOS onboarding flow
+--               (10-15 angle-prompted captures). One row per uploaded
+--               photo that passed SCRFD's face detection threshold.
+--               `source_path` is the Supabase Storage object key.
+--
+--   'harvested' Inserted automatically when Re-ID locks a track with
+--               very high confidence (cosine >= 0.80). Closes the
+--               selfie-to-wall-cam domain gap over time. `source_path`
+--               is NULL — we don't keep the source frame, just the
+--               aligned ArcFace embedding.
+--
+-- Status field exists because selfie processing is async (background
+-- task downloads + runs SCRFD + ArcFace). Harvested rows are written
+-- inline with status='ready'.
+create table public.patient_face_embeddings (
+  id              uuid primary key default gen_random_uuid(),
+  patient_id      uuid not null references public.patients(id) on delete cascade,
+  -- 512-dim float32 ArcFace embedding, L2-normalized. Stored as bytea
+  -- (~2KB per row); small enough to scan in-Python without pgvector.
+  embedding       bytea not null,
+  -- SCRFD detection confidence at the moment the embedding was extracted.
+  -- Surfaced for diagnostics; not used as a gate at match time (the
+  -- adaptive threshold uses it internally instead).
+  det_score       real not null,
+  source          text not null check (source in ('selfie', 'harvested')),
+  source_path     text,                              -- Storage object key; selfies only
+  status          text not null default 'ready'
+                  check (status in ('processing', 'ready', 'failed')),
+  failure_reason  text,
+  created_at      timestamptz not null default now()
+);
+
+-- Hot-path index: gallery lookups always filter to ready rows for one patient.
+create index patient_face_embeddings_patient_ready_idx
+  on public.patient_face_embeddings(patient_id)
+  where status = 'ready';
+
+-- Used by the FIFO-evict-harvested logic when the per-patient gallery
+-- cap is exceeded. Partial index keeps it tight (selfies never evict).
+create index patient_face_embeddings_patient_harvested_idx
+  on public.patient_face_embeddings(patient_id, created_at)
+  where source = 'harvested' and status = 'ready';
 
 
 -- ── events ───────────────────────────────────────────────────────
@@ -442,6 +602,17 @@ create policy cameras_detectors_owner on public.cameras_detectors
 
 alter table public.events enable row level security;
 create policy events_owner on public.events
+  for all using (
+    patient_id in (select id from public.patients where caregiver_id = auth.uid())
+  ) with check (
+    patient_id in (select id from public.patients where caregiver_id = auth.uid())
+  );
+
+-- patient_face_embeddings: scoped through the embedding's patient → caregiver.
+-- Mirrors the events_owner pattern: rows visible only to the caregiver who owns
+-- the patient.
+alter table public.patient_face_embeddings enable row level security;
+create policy patient_face_embeddings_owner on public.patient_face_embeddings
   for all using (
     patient_id in (select id from public.patients where caregiver_id = auth.uid())
   ) with check (

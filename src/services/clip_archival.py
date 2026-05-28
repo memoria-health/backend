@@ -39,11 +39,13 @@ import asyncio
 import logging
 import os
 import tempfile
+import time
 from typing import TYPE_CHECKING
 from uuid import UUID
 
 from src.db.event import Event
 from src.services import storage
+from src.services.clip_annotate import annotate_clip_for_display
 from src.services.detection.mp4_remux import Mp4RemuxError, frames_to_mp4
 
 if TYPE_CHECKING:
@@ -64,15 +66,18 @@ class ConcatError(RuntimeError):
 async def archive_event(
     *,
     event_id: UUID,
+    patient_id: UUID,
     pre_event_mp4: bytes,
+    pre_end_captured_at: float,
     frame_buffer: "FrameBuffer",
     audio_buffer: "AudioBuffer",
     sessionmaker: "async_sessionmaker",
     settings: "Settings",
 ) -> None:
     """Capture the post-event window, concat with the pre-event MP4
-    handed in, upload the result to Supabase Storage, and flip
-    `has_clip=true` on the events row.
+    handed in, burn a green bbox tracking the patient through the
+    ±15s window, upload the result, and flip `has_clip=true` on the
+    events row.
 
     Errors are caught and logged. The events row stays without a clip
     rather than the whole detector pipeline crashing — caregivers
@@ -81,11 +86,24 @@ async def archive_event(
     `pre_event_mp4` is what `_run_tick` already built and handed to
     the LLM. Reusing the bytes saves an ffmpeg encode and guarantees
     pre/post have identical codec params for `-c copy` concat.
+
+    `pre_end_captured_at` is the `time.monotonic()` timestamp of the
+    last frame in the pre-event snapshot. The archive task uses it
+    to clock-align the post-event snapshot — without it, the LLM's
+    5-10s of think time leaves a hole in wall-clock coverage between
+    pre's last frame and post's first frame, which surfaces as a
+    visible scene jump at the concat boundary.
+
+    `patient_id` drives the Re-ID gallery lookup at annotation time.
+    Annotation is best-effort: if it fails, the un-annotated clip is
+    uploaded so caregivers never lose a clip to display-layer issues.
     """
     try:
         await _archive_one(
             event_id=event_id,
+            patient_id=patient_id,
             pre_event_mp4=pre_event_mp4,
+            pre_end_captured_at=pre_end_captured_at,
             frame_buffer=frame_buffer,
             audio_buffer=audio_buffer,
             sessionmaker=sessionmaker,
@@ -98,20 +116,31 @@ async def archive_event(
 async def _archive_one(
     *,
     event_id: UUID,
+    patient_id: UUID,
     pre_event_mp4: bytes,
+    pre_end_captured_at: float,
     frame_buffer: "FrameBuffer",
     audio_buffer: "AudioBuffer",
     sessionmaker: "async_sessionmaker",
     settings: "Settings",
 ) -> None:
-    # Sleep first so the post-event buffer fills out. The frame and
-    # audio consumers in room_worker.py keep pushing into the buffers
-    # independently of the tick loop, so by the time we wake the
-    # buffers contain a fresh window covering T..T+wait.
-    await asyncio.sleep(settings.clip_post_event_wait_seconds)
+    # Sleep until wall-clock has advanced enough that the buffer
+    # contains `clip_post_event_wait_seconds` of frames AFTER the
+    # pre snapshot's last frame. This eliminates the LLM-think-time
+    # gap between pre and post — both video and audio snapshots
+    # below use `pre_end_captured_at` as the cutoff anchor, so the
+    # concat is temporally seamless.
+    wait_seconds = settings.clip_post_event_wait_seconds
+    target_wall_time = pre_end_captured_at + wait_seconds
+    remaining = target_wall_time - time.monotonic()
+    if remaining > 0:
+        await asyncio.sleep(remaining)
 
+    # `now=target_wall_time` makes the snapshot cutoff exactly
+    # `pre_end_captured_at` (i.e., the next frame after pre ended),
+    # regardless of how long the asyncio runtime actually slept for.
     post_frames = frame_buffer.snapshot_last_seconds(
-        settings.clip_post_event_wait_seconds,
+        wait_seconds, now=target_wall_time,
     )
     if not post_frames:
         log.warning(
@@ -120,7 +149,7 @@ async def _archive_one(
         )
         return
     post_pcm = audio_buffer.snapshot_last_seconds(
-        settings.clip_post_event_wait_seconds,
+        wait_seconds, now=target_wall_time,
     )
 
     try:
@@ -137,8 +166,22 @@ async def _archive_one(
 
     combined_mp4 = await concat_mp4s(pre_event_mp4, post_event_mp4)
 
+    # Single encode keeps timestamps monotonic so iOS AVPlayer accepts
+    # the file. The reset-at-boundary hint tells the annotator to
+    # rebuild its BoT-SORT tracker at the 15s cut so the post half
+    # re-identifies the patient independently — otherwise the
+    # patient's motion across the boundary breaks BoT-SORT's
+    # IoU/Kalman matching and the post half never re-locks.
+    annotated_mp4 = await annotate_clip_for_display(
+        combined_mp4,
+        patient_id=patient_id,
+        sessionmaker=sessionmaker,
+        settings=settings,
+        reset_at_seconds=float(settings.clip_post_event_wait_seconds),
+    )
+
     final_key = await storage.upload_clip(
-        event_id=event_id, mp4_bytes=combined_mp4, settings=settings,
+        event_id=event_id, mp4_bytes=annotated_mp4, settings=settings,
     )
 
     async with sessionmaker() as session:
@@ -156,7 +199,7 @@ async def _archive_one(
 
     log.info(
         "clip_archival.done event_id=%s key=%s bytes=%d",
-        event_id, final_key, len(combined_mp4),
+        event_id, final_key, len(annotated_mp4),
     )
 
 

@@ -1,0 +1,14 @@
+[Unit]
+Description=Fires 5 min after boot to check if WiFi-wipe AP provisioning completed; restores backup if not
+
+[Timer]
+# 5 minutes is the customer-flow budget: AP comes up (~30s), customer
+# joins (~30s), captive portal (~1 min), home WiFi join (~30s). Keeps
+# slack for slow networks and dropped connections.
+OnBootSec=5min
+# Fire exactly once per boot; don't re-trigger.
+Persistent=false
+RandomizedDelaySec=0
+
+[Install]
+WantedBy=timers.target
