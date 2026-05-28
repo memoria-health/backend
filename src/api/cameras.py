@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from src.api.deps import CameraAuth, CaregiverAuth, SessionDep, SettingsDep
 from src.db.camera import Camera
@@ -38,7 +38,25 @@ router = APIRouter(prefix="/v1", tags=["camera"])
 
 
 def _to_response(c: Camera) -> CameraResponse:
-    return CameraResponse.model_validate(c, from_attributes=True)
+    # `paired` is derived from `api_key_hash` (which we never expose
+    # to clients). The ORM row has no `paired` attribute, so we can't
+    # use plain `model_validate(c, from_attributes=True)` — that would
+    # raise for the missing field. Build the dict explicitly instead.
+    return CameraResponse(
+        id=c.id,
+        patient_id=c.patient_id,
+        display_id=c.display_id,
+        room=c.room,
+        icon_name=c.icon_name,
+        online=c.online,
+        disabled=c.disabled,
+        ai_paused=c.ai_paused,
+        desired_state=c.desired_state,  # type: ignore[arg-type]
+        livekit_identity=c.livekit_identity,
+        last_seen_at=c.last_seen_at,
+        created_at=c.created_at,
+        paired=c.api_key_hash is not None,
+    )
 
 
 @router.get(
@@ -82,6 +100,49 @@ async def create_pairing_code(
     if patient is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="patient_not_found",
+        )
+
+    requested = body.room.strip()
+
+    # Sweep orphan pairing rows for this patient + room name before
+    # checking duplicates. An "orphan" is a row with no api_key_hash:
+    # `create_pairing_code` was called but `/v1/cameras/pair` never
+    # completed it. Two ways orphans get created:
+    #
+    #   1. User taps "Generate code" in iOS, sees the code, then
+    #      dismisses the sheet without entering it on NemaraCam.
+    #   2. iOS double-fires `createPairingCode` on a single user
+    #      action (SwiftUI `.task` re-runs when the parent view
+    #      re-renders mid-flight — typically after the realtime
+    #      INSERT for the row just created lands and refreshes the
+    #      camera list). First call creates the row, second collides.
+    #
+    # Either way the right behavior is: a fresh pairing attempt
+    # supersedes any incomplete previous attempt for the same name.
+    # The old pairing_code is invalidated, but no one entered it
+    # anyway. Real (api_key_hash IS NOT NULL) cameras still block.
+    await session.execute(
+        delete(Camera)
+        .where(Camera.patient_id == patient_id)
+        .where(func.lower(Camera.room) == requested.lower())
+        .where(Camera.api_key_hash.is_(None))
+    )
+
+    # Reject ACTUAL duplicates — fully paired cameras with the same
+    # room name. App-level check; no DB unique constraint on
+    # (patient_id, room) yet, since adding one would need a migration
+    # + cleanup of any historical duplicates. Case-insensitive.
+    duplicate_stmt = (
+        select(Camera.id)
+        .where(Camera.patient_id == patient_id)
+        .where(func.lower(Camera.room) == requested.lower())
+        .limit(1)
+    )
+    existing_dup = (await session.execute(duplicate_stmt)).scalar_one_or_none()
+    if existing_dup is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="camera_room_duplicate",
         )
 
     # Next display_id for this patient (1-based, dense).
@@ -136,11 +197,16 @@ async def create_pairing_code(
         state_changed_at=now,
         close_threshold=6,
         battery_percent=None,
-        # Default to connected so a freshly-paired phone starts
-        # streaming immediately. Server default would cover this too —
-        # set it explicitly so the row's full state is grep-able from
-        # this construction site.
-        desired_state="connected",
+        # Default to DISCONNECTED on creation. A freshly-paired wall
+        # phone hasn't actually joined LiveKit yet — the human still
+        # has to tap Start on NemaraCam (or Connect from the caregiver
+        # UI). Defaulting to `connected` made the caregiver-side tile
+        # show a "Disconnect" button immediately, which lied: there
+        # was nothing to disconnect from. Once Start is tapped on the
+        # wall phone, its own `patchDesiredState("connected")` flips
+        # this to "connected" and the caregiver UIs flip their button
+        # label to "Disconnect" — matching reality.
+        desired_state="disconnected",
     )
     session.add(cam)
     await session.flush()  # Ensure the camera row is visible to the assignment query below.
@@ -178,6 +244,82 @@ async def delete_camera(
             detail="camera_not_found",
         )
     await session.commit()
+
+
+@router.post(
+    "/cameras/{camera_id}/pairing-code",
+    response_model=CreatePairingCodeResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def regenerate_pairing_code(
+    camera_id: UUID,
+    auth: CaregiverAuth,
+    session: SessionDep,
+    settings: SettingsDep,
+) -> CreatePairingCodeResponse:
+    """Re-mint a 6-digit pairing code for an UNPAIRED camera row.
+
+    Companion to `create_pairing_code`. Used by the caregiver UI's
+    "Show pairing code" button on the camera detail page so a user
+    who dismissed the pairing sheet (or whose code expired) can
+    resume pairing without deleting + recreating the camera row.
+
+    Behavior:
+      - 404 if the camera doesn't exist or isn't owned by this
+        caregiver's patient (via `find_by_id` caregiver-scope).
+      - 409 if the camera is already paired (api_key_hash set) —
+        there's nothing to re-mint a code for. The detail-page button
+        is hidden in that state too; this is the belt-and-braces.
+      - Otherwise: generate a fresh 6-digit code, refresh
+        `pairing_expires_at` to now + TTL, return both. Any previously
+        emitted code becomes invalid (it was, in practice, abandoned).
+    """
+    cam = await camera_repo.find_by_id(session, camera_id, caregiver_id=auth.id)
+    if cam is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="camera_not_found",
+        )
+    if cam.api_key_hash is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="camera_already_paired",
+        )
+
+    # Mint a fresh code (same retry-on-collision loop as
+    # create_pairing_code). Exclude ourselves from the collision check
+    # so re-minting on an already-active row isn't a false-positive
+    # collision against its own currently-held code.
+    code: str | None = None
+    for _ in range(5):
+        candidate = str(secrets.randbelow(900_000) + 100_000)
+        existing = (
+            await session.execute(
+                select(Camera.id)
+                .where(Camera.pairing_code == candidate)
+                .where(Camera.id != camera_id)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            code = candidate
+            break
+    if code is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="could_not_generate_pairing_code",
+        )
+
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(seconds=settings.pairing_code_ttl_seconds)
+    cam.pairing_code = code
+    cam.pairing_expires_at = expires_at
+    await session.commit()
+
+    return CreatePairingCodeResponse(
+        pairing_code=code,
+        expires_at=expires_at,
+        camera_id=camera_id,
+    )
 
 
 @router.get(
@@ -336,4 +478,7 @@ async def update_camera(
             detail="camera_not_found",
         )
     await session.commit()
-    return CameraResponse.model_validate(cam, from_attributes=True)
+    # Use the helper that derives `paired` from api_key_hash — bare
+    # model_validate would fail since the ORM row has no `paired`
+    # attribute (it's a Pydantic-only computed field).
+    return _to_response(cam)

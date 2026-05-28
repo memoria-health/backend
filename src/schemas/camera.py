@@ -52,6 +52,13 @@ class CameraResponse(BaseModel):
     livekit_identity: str | None
     last_seen_at: datetime | None
     created_at: datetime
+    # True once the wall phone has called /v1/cameras/pair and we've
+    # set the api_key_hash. False = "row exists with an open pairing
+    # code, no wall phone has claimed it yet." Caregiver clients use
+    # this to show a "PAIRING" badge, surface a "Show pairing code"
+    # button on the detail page, and skip the LiveKit tile subscription
+    # (there's no published track until pairing completes).
+    paired: bool
 
 
 class UpdateCameraRequest(BaseModel):
