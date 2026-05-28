@@ -87,6 +87,22 @@ class RoomWorker:
         self._settings = settings
         self._sessionmaker = sessionmaker
         self._motion_cache = motion_cache
+        self._reid = reid
+        # Optional callback used by the idle monitor to ask the
+        # parent DetectorWorker to remove this room. See
+        # _IDLE_TEARDOWN_WINDOW_S for the trigger condition.
+        # Unidirectional (parent to child capability injection); no
+        # circular references introduced.
+        self._on_idle_timeout = on_idle_timeout
+        # Idempotency flag for the idle teardown signal so we fire
+        # the callback at most once even if the monitor races with
+        # an eviction in progress.
+        self._idle_signalled: bool = False
+        # Tracks whether this room has ever seen a `cam_*` ingest
+        # spawn. If yes, not eligible for idle teardown (the room
+        # is in normal use; a transient empty window is just a
+        # camera reconnecting). If never, it's eligible.
+        self._has_ever_seen_ingest: bool = False
         self._room: rtc.Room | None = None
         # Active ingest pipelines, keyed by the camera's livekit_identity
         # (= the LiveKit participant identity). Allows fast lookup from
@@ -529,6 +545,14 @@ class RoomWorker:
             sessionmaker=self._sessionmaker,
             motion_cache=self._motion_cache,
             settings=self._settings,
+            reid=self._reid,
+            # Hand the ingest a back-channel so it can ask to be removed
+            # if its `cameras` row vanishes (admin DELETE without a
+            # paired participant_left, partition-then-replay races).
+            # remove_ingest is idempotent and lock-free of any RoomWorker
+            # mutex, see remove_ingest docstring.
+            livekit_identity=identity,
+            on_self_destruct=self.remove_ingest,
         )
         await ingest.start()
         self._ingests_by_identity[identity] = ingest
