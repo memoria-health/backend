@@ -24,9 +24,16 @@ from src.repos import camera_detector_repo, detector_repo, patient_repo
 from src.schemas.detector import (
     CreateDetectorRequest,
     DetectorResponse,
+    DetectorShape,
+    InferDetectorRequest,
+    InferDetectorResponse,
+    ScheduleConfig,
     UpdateDetectorRequest,
 )
-from src.services.detector_compiler import compile_custom_detector
+from src.services.detector_compiler import (
+    compile_custom_detector,
+    infer_detector_config,
+)
 from src.settings import Settings
 
 log = logging.getLogger(__name__)
@@ -49,6 +56,41 @@ async def list_detectors(
 ) -> list[DetectorResponse]:
     rows = await detector_repo.list_for_patient(session, patient_id, caregiver_id=auth.id)
     return [_to_response(d) for d in rows]
+
+
+@router.post("/detectors/infer", response_model=InferDetectorResponse)
+async def infer_detector(
+    auth: CaregiverAuth,
+    body: InferDetectorRequest,
+    settings: SettingsDep,
+) -> InferDetectorResponse:
+    """Classify + structure a plain-English detector request for the
+    create review screen. Synchronous (the user is waiting on "Generate"),
+    ~2-4s. Returns shape / category / icon / sensitivity and, for
+    absence detectors, the schedule window — with nulls where the model
+    couldn't infer, so the UI highlights them for the user to fill.
+
+    Auth-only (no patient scope) — inference touches no patient data,
+    just the caregiver's text.
+    """
+    try:
+        inferred = await infer_detector_config(
+            name=body.name, prompt=body.prompt, settings=settings,
+        )
+    except RuntimeError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="detector_inference_unavailable",
+        ) from e
+    return InferDetectorResponse(
+        shape=inferred.shape,            # type: ignore[arg-type]
+        category=inferred.category,      # type: ignore[arg-type]
+        icon_name=inferred.icon_name,
+        sensitivity=inferred.sensitivity,  # type: ignore[arg-type]
+        schedule_config=(
+            ScheduleConfig(**inferred.schedule) if inferred.schedule else None
+        ),
+    )
 
 
 @router.post(
@@ -119,6 +161,10 @@ async def create_detector(
         schema_json=None,
         always_on=False,
         is_builtin=False,
+        # Null for reactive; the evaluation window for `scheduled`.
+        schedule_config=(
+            body.schedule_config.model_dump() if body.schedule_config else None
+        ),
     )
     await detector_repo.insert(session, det)
 
@@ -150,6 +196,7 @@ async def create_detector(
             name=body.name,
             description=body.description,
             user_text=body.custom_prompt,
+            scheduled=body.shape == DetectorShape.scheduled,
             settings=settings,
         )
     )
@@ -163,6 +210,7 @@ async def _compile_and_update_detector(
     name: str,
     description: str,
     user_text: str,
+    scheduled: bool,
     settings: Settings,
 ) -> None:
     """Background task: run Gemini compile + UPDATE the detector row.
@@ -176,7 +224,7 @@ async def _compile_and_update_detector(
     try:
         compiled = await compile_custom_detector(
             name=name, description=description,
-            user_text=user_text, settings=settings,
+            user_text=user_text, scheduled=scheduled, settings=settings,
         )
     except Exception as e:
         log.error(

@@ -132,6 +132,19 @@ class Settings(BaseSettings):
     # contiguous. Test overrides bump it down to ~0.1 to avoid waiting.
     clip_post_event_wait_seconds: float = Field(gt=0, le=120, default=15.0)
 
+    # ── Scheduled ("absence") detector runtime ──────────────────
+    # How often the scheduler loop wakes to check for scheduled
+    # detectors past their deadline. 60s is plenty — deadlines are
+    # minute-granular and the single-fire guard makes re-checks cheap.
+    scheduler_tick_seconds: int = Field(ge=15, le=300, default=60)
+
+    # ── Email alerts (Resend) ───────────────────────────────────
+    # When resend_api_key is empty the email sender no-ops (logs a
+    # warning) so dev + tests run without the integration. email_from
+    # must be a Resend-verified domain for real sends.
+    resend_api_key: str = Field(default="")
+    email_from: str = Field(default="onboarding@resend.dev")
+
 
 def get_settings() -> Settings:
     return Settings()

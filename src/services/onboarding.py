@@ -40,6 +40,8 @@ def to_response(cg: Caregiver) -> CaregiverResponse:
         phone=cg.phone,
         created_at=cg.created_at,
         updated_at=cg.updated_at,
+        onboarded_web=cg.onboarded_web,
+        timezone=cg.timezone,
     )
 
 

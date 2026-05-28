@@ -143,6 +143,12 @@ async def maybe_promote_analysis(
             continue
         if not det.is_on:
             continue
+        # Scheduled ("absence") detectors run per-tick (their
+        # `<id>_detected` lands in analyses, which the scheduler reads),
+        # but they must NOT fire reactively — they fire only via the
+        # ScheduledDetectorRunner at their deadline, on ABSENCE.
+        if det.shape == "scheduled":
+            continue
         if not _is_truthy_bool(detector_fields.get(f"{ident}_detected")):
             continue
         if await _within_dedup_window(

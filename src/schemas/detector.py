@@ -24,7 +24,8 @@ class DetectorSource(str, Enum):
 
 class DetectorShape(str, Enum):
     point_in_time = "point_in_time"
-    state = "state"
+    state = "state"          # legacy preset (agitation); no longer offered in UI
+    scheduled = "scheduled"  # absence detector — fires if signal absent in window
 
 
 class DetectorSensitivity(str, Enum):
@@ -32,6 +33,26 @@ class DetectorSensitivity(str, Enum):
     standard = "standard"
     high = "high"
     off = "off"
+
+
+class ScheduleCadence(str, Enum):
+    daily = "daily"
+    weekly = "weekly"
+
+
+class ScheduleConfig(BaseModel):
+    """Window an `scheduled` detector evaluates. All fields optional so
+    the LLM can return a partial inference (blanks the user fills in on
+    the review screen). Times are local "HH:MM" 24h strings;
+    days_of_week is 0=Mon..6=Sun (weekly only)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    cadence: ScheduleCadence | None = None
+    days_of_week: list[int] | None = None
+    window_start: str | None = None
+    window_end: str | None = None
+    deadline: str | None = None
 
 
 Name = Annotated[str, Field(min_length=1, max_length=120)]
@@ -67,6 +88,8 @@ class DetectorResponse(BaseModel):
     # custom-detector reasoning fields in analyses.detector_fields
     # back to a human-readable name.
     identifier: str | None = None
+    # Null for reactive detectors; the evaluation window for `scheduled`.
+    schedule_config: ScheduleConfig | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -74,24 +97,53 @@ class DetectorResponse(BaseModel):
 class CreateDetectorRequest(BaseModel):
     """Body of POST /v1/patients/{id}/detectors.
 
-    Server forces `source = custom` — preset detectors come only from
-    the auto-seed on patient create. `custom_prompt` is required (it's
-    what makes a custom detector custom); the v0 backend stores the
-    string verbatim and a later plan compiles it into a runtime config
-    via an LLM call.
+    Server forces `source = custom`. `custom_prompt` is the caregiver's
+    plain-English description (required). The other fields are normally
+    LLM-inferred (via /infer) then confirmed on the review screen, but
+    the client sends the final values here.
+
+    `where_scope` / `when_scope` are legacy free-text scope hints no
+    longer shown in the UI — they default server-side. `shape` defaults
+    to point_in_time (reactive); the client sends `scheduled` +
+    `schedule_config` for absence detectors.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     name: Name
-    icon_name: IconName
-    description: Description
-    category: DetectorCategory
-    shape: DetectorShape
-    where_scope: Scope
-    when_scope: Scope
     custom_prompt: Prompt
+    description: Description = "Custom detector"
+    category: DetectorCategory = DetectorCategory.safety
+    shape: DetectorShape = DetectorShape.point_in_time
+    icon_name: IconName = "eye"
+    where_scope: Scope = "ALL ROOMS"
+    when_scope: Scope = "ALWAYS"
     sensitivity: DetectorSensitivity = DetectorSensitivity.standard
+    schedule_config: ScheduleConfig | None = None
+
+
+class InferDetectorRequest(BaseModel):
+    """Body of POST /v1/detectors/infer — the plain-English ask the LLM
+    classifies + structures for the review screen."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: Name | None = None
+    prompt: Prompt
+
+
+class InferDetectorResponse(BaseModel):
+    """LLM-inferred fields for the create review screen. Anything the
+    model can't confidently determine comes back null/empty so the UI
+    can highlight it for the user to fill."""
+
+    model_config = ConfigDict(frozen=True)
+
+    shape: DetectorShape
+    category: DetectorCategory
+    icon_name: IconName
+    sensitivity: DetectorSensitivity
+    schedule_config: ScheduleConfig | None = None
 
 
 class UpdateDetectorRequest(BaseModel):

@@ -5,11 +5,11 @@ Python `str` here — boundary validation runs at the Pydantic schema
 layer; the DB-level enum types catch anything that gets past.
 """
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, String
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -52,3 +52,17 @@ class Detector(Base):
     schema_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
     always_on: Mapped[bool] = mapped_column(Boolean, default=False)
     is_builtin: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    # ── Scheduled ("absence") detectors ─────────────────────────────
+    # Null for reactive (point_in_time / state) detectors. When shape
+    # == 'scheduled', holds the window the runtime scheduler evaluates:
+    #   { cadence: 'daily'|'weekly', days_of_week: [0..6],
+    #     window_start: 'HH:MM', window_end: 'HH:MM', deadline: 'HH:MM' }
+    # The per-tick detection (identifier/prompt_fragment/schema_json) is
+    # unchanged — the schedule just inverts + windows when it fires.
+    schedule_config: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+
+    # Single-fire guard for the scheduler — the last date this scheduled
+    # detector was evaluated (whether or not it fired). Internal; not
+    # exposed in DetectorResponse. NULL = never evaluated.
+    last_scheduled_eval_date: Mapped[date | None] = mapped_column(Date, default=None)

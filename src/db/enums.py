@@ -22,7 +22,7 @@ DetectorSourceEnum = ENUM(
     name="detector_source", create_type=False,
 )
 DetectorShapeEnum = ENUM(
-    "point_in_time", "state",
+    "point_in_time", "state", "scheduled",
     name="detector_shape", create_type=False,
 )
 DetectorSensitivityEnum = ENUM(

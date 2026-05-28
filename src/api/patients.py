@@ -15,18 +15,19 @@ from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, File, HTTPException, UploadFile, status
+from pydantic import BaseModel
 
 from src.api.deps import CaregiverAuth, SessionDep, SettingsDep
 from src.db.patient import Patient
 from src.errors import StorageError
-from src.repos import patient_repo
+from src.repos import caregiver_repo, patient_repo
 from src.schemas.patient import (
     CreatePatientRequest,
     PatientResponse,
     PhotoURLResponse,
     UpdatePatientRequest,
 )
-from src.services import onboarding, storage
+from src.services import email, onboarding, storage
 
 router = APIRouter(prefix="/v1/patients", tags=["patient"])
 
@@ -152,6 +153,41 @@ async def patch_patient(
         )
     await session.commit()
     return _to_response(p)
+
+
+class TestEmailResponse(BaseModel):
+    """Result of POST /v1/patients/{id}/test-email — a human-readable
+    status the settings tab surfaces in a toast."""
+
+    status: str
+
+
+@router.post("/{patient_id}/test-email", response_model=TestEmailResponse)
+async def post_patient_test_email(
+    patient_id: UUID,
+    auth: CaregiverAuth,
+    session: SessionDep,
+    settings: SettingsDep,
+) -> TestEmailResponse:
+    """Send a test alert for this patient to its configured recipients
+    (owning caregiver's account email + per-patient extras). Sends
+    regardless of `email_alerts_enabled` — it's an explicit user
+    action from the settings tab, not an automated alert.
+    """
+    patient = await patient_repo.find_by_id(session, patient_id, caregiver_id=auth.id)
+    if patient is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="patient_not_found",
+        )
+    caregiver = await caregiver_repo.find_by_id(session, auth.id)
+    if caregiver is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="caregiver_not_found",
+        )
+    msg = await email.send_test_email(
+        patient=patient, caregiver=caregiver, settings=settings,
+    )
+    return TestEmailResponse(status=msg)
 
 
 @router.delete(

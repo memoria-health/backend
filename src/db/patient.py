@@ -9,7 +9,8 @@ check constraints catch anything that gets past Pydantic.
 from datetime import date, datetime
 from uuid import UUID
 
-from sqlalchemy import Date, DateTime, ForeignKey, Integer, String
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, String, text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.db.base import Base
@@ -36,3 +37,14 @@ class Patient(Base):
     last_event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     battery_percent: Mapped[int | None] = mapped_column(Integer, default=None)
     photo_storage_key: Mapped[str | None] = mapped_column(String, default=None)
+
+    # Per-patient email alerts. Each patient can route alerts to a
+    # different set of family/aides. `email_alerts_enabled` is the
+    # master switch; when on, alerts go to the owning caregiver's
+    # account email PLUS every address in `email_alert_recipients`.
+    email_alerts_enabled: Mapped[bool] = mapped_column(
+        Boolean, server_default=text("false"), default=False,
+    )
+    email_alert_recipients: Mapped[list[str]] = mapped_column(
+        JSONB, server_default=text("'[]'::jsonb"), default=list,
+    )

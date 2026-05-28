@@ -45,8 +45,9 @@ from src.db import detector as _detector  # noqa: F401
 from src.db import event as _event  # noqa: F401
 from src.db import patient as _patient  # noqa: F401
 from src.db.session import get_engine, get_sessionmaker
-from src.services import push
+from src.services import email, push
 from src.services.detection.worker import DetectorWorker
+from src.services.scheduling.scheduler import ScheduledDetectorRunner
 from src.settings import get_settings
 
 
@@ -64,11 +65,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.detector_worker = worker
     await worker.start()
+    # Scheduled ("absence") detector runtime — standalone background
+    # loop, independent of the webhook-driven DetectorWorker.
+    scheduler = ScheduledDetectorRunner(
+        settings=get_settings(), sessionmaker=get_sessionmaker(),
+    )
+    app.state.scheduler = scheduler
+    await scheduler.start()
     try:
         yield
     finally:
+        await scheduler.stop()
         await worker.stop()
         await push.close()
+        await email.close()
         await engine.dispose()
 
 

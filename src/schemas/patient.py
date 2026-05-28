@@ -34,6 +34,7 @@ Name80 = Annotated[str, Field(min_length=1, max_length=80)]
 Address = Annotated[str, Field(min_length=1, max_length=500)]
 Gender = Annotated[str, Field(min_length=1, max_length=40)]
 BatteryPct = Annotated[int, Field(ge=0, le=100)]
+Email = Annotated[str, Field(min_length=3, max_length=255)]
 
 
 class PatientResponse(BaseModel):
@@ -57,6 +58,11 @@ class PatientResponse(BaseModel):
     photo_storage_key: str | None
     created_at: datetime
     updated_at: datetime
+    # Per-patient email alerts. enabled = master switch; recipients =
+    # ADDITIONAL addresses beyond the owning caregiver's account email
+    # (which always receives alerts for this patient when enabled).
+    email_alerts_enabled: bool
+    email_alert_recipients: list[Email]
 
 
 class PhotoURLResponse(BaseModel):
@@ -116,3 +122,7 @@ class UpdatePatientRequest(BaseModel):
     relation: Relation | None = None
     home_address: Address | None = None
     cameras_paused: bool | None = None
+    # Per-patient email alert settings. Omitting leaves unchanged;
+    # sending `email_alert_recipients` replaces the whole list.
+    email_alerts_enabled: bool | None = None
+    email_alert_recipients: list[Email] | None = None

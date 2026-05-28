@@ -27,6 +27,13 @@ class CaregiverResponse(BaseModel):
     phone: Phone | None
     created_at: datetime
     updated_at: datetime
+    # Web onboarding walkthrough — false until the user dismisses or
+    # completes the dashboard modal. The web client reads this on load
+    # and PATCHes it true via PATCH /v1/me.
+    onboarded_web: bool
+    # IANA timezone scheduled detectors evaluate in. Auto-set from the
+    # web client's browser timezone.
+    timezone: str
 
 
 class CreateCaregiverRequest(BaseModel):
@@ -55,3 +62,9 @@ class UpdateCaregiverRequest(BaseModel):
 
     display_name: DisplayName | None = None
     phone: Phone | None = None
+    # Web client PATCHes this true when the user finishes/skips the
+    # onboarding walkthrough. Only ever set to true from the client.
+    onboarded_web: bool | None = None
+    # IANA timezone (e.g. "America/New_York"). Auto-set by the web
+    # client from the browser's resolved timezone.
+    timezone: str | None = Field(default=None, max_length=64)
