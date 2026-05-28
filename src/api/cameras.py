@@ -11,12 +11,16 @@ Cameras are CREATED in two steps by the pairing flow:
      → cameras row gets api_key_hash, pairing_code cleared.
 """
 
+import asyncio
+import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Request, status
 from sqlalchemy import func, select
+
+log = logging.getLogger(__name__)
 
 from src.api.deps import CameraAuth, CaregiverAuth, SessionDep, SettingsDep
 from src.services.ingest.pi.auth import mint_ingest_token
@@ -344,6 +348,7 @@ async def delete_camera(
     camera_id: UUID,
     auth: CaregiverAuth,
     session: SessionDep,
+    request: Request,
 ) -> None:
     deleted = await camera_repo.delete_by_id(session, camera_id, caregiver_id=auth.id)
     if not deleted:
@@ -352,6 +357,36 @@ async def delete_camera(
             detail="camera_not_found",
         )
     await session.commit()
+    # Best-effort in-process worker shutdown. If the camera was actively
+    # streaming, this stops the detector tick loop within ~1s rather
+    # than waiting for the CameraIngest self-destruct (P1) to fire on
+    # its own ~30s later. Either path produces the same end state — no
+    # zombie worker — but doing it here gives the caregiver instant
+    # feedback ("deleted" = no more analyses for this camera).
+    #
+    # Failure handling per the user's choice ("force the DELETE, log a
+    # warning"): we've ALREADY committed the DB delete, so even if the
+    # worker stop fails or times out we return 204. The P1 self-destruct
+    # acts as the safety net.
+    worker = getattr(request.app.state, "detector_worker", None)
+    if worker is not None:
+        try:
+            await asyncio.wait_for(
+                worker.stop_worker_for_camera(camera_id, timeout=4.0),
+                timeout=5.0,
+            )
+        except asyncio.TimeoutError:
+            log.warning(
+                "delete_camera worker_stop_timeout camera=%s — "
+                "P1 self-destruct will reap the zombie within ~30s",
+                camera_id,
+            )
+        except Exception:
+            log.exception(
+                "delete_camera worker_stop_failed camera=%s — "
+                "P1 self-destruct will reap the zombie within ~30s",
+                camera_id,
+            )
 
 
 @router.get(

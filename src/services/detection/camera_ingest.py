@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 from uuid import UUID
@@ -44,7 +45,10 @@ from src.services.detection.mp4_remux import Mp4RemuxError, frames_to_mp4
 from src.services.detection.providers.gemini import gemini_provider
 from src.services.detection.providers.openai import openai_provider
 from src.services.detection.providers.types import ProviderResult
-from src.services.detection.registry import get_enabled_detectors_for_camera
+from src.services.detection.registry import (
+    CameraVanishedError,
+    get_enabled_detectors_for_camera,
+)
 from src.services.detection.state_machine import apply_tick_update
 from src.repos.face_embedding_repo import has_ready_enrollment
 from src.services.reid.inference import IdentityResult, ReIDInference
@@ -55,6 +59,26 @@ if TYPE_CHECKING:
     from src.settings import Settings
 
 log = logging.getLogger(__name__)
+
+# After this many consecutive vanished-row ticks, the ingest signals
+# its parent RoomWorker to remove it (the camera was deleted from the
+# DB while the worker was still running). At 10s tick cadence that's
+# ~30s — fast enough to not waste resources, slow enough to absorb a
+# legitimate DELETE/replay race without false self-destruct.
+_SELF_DESTRUCT_THRESHOLD: int = 3
+
+# Bound on how long stop() will wait for in-flight tick bodies to
+# finish before force-cancelling. Re-id-gated ticks (fast path) finish
+# in ~3s; Gemini-running ticks take up to ~28s and we'd rather
+# force-cancel them than block a DELETE API response — those would
+# otherwise write an analysis row to a now-deleted camera (FK
+# violation, silently swallowed).
+_STOP_INFLIGHT_TIMEOUT: float = 2.0
+
+# Bound on how long the self-destruct callback (RoomWorker.remove_ingest)
+# can run before we give up on it. Generous because remove_ingest itself
+# awaits CameraIngest.stop() which has its own 2s in-flight bound.
+_SELF_DESTRUCT_CALLBACK_TIMEOUT: float = 10.0
 
 
 class CameraIngest:
@@ -73,6 +97,8 @@ class CameraIngest:
         motion_cache: MotionCache,
         settings: "Settings",
         reid: ReIDInference,
+        livekit_identity: str | None = None,
+        on_self_destruct: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self.camera_id = camera_id
         self.patient_id = patient_id
@@ -80,6 +106,8 @@ class CameraIngest:
         self._motion_cache = motion_cache
         self._settings = settings
         self._reid = reid
+        self._livekit_identity = livekit_identity
+        self._on_self_destruct = on_self_destruct
         self.frame_buffer = FrameBuffer(
             window_seconds=settings.livekit_worker_window_seconds,
             target_fps=settings.livekit_worker_target_fps,
@@ -89,6 +117,17 @@ class CameraIngest:
         )
         self._lock = asyncio.Lock()
         self._tick_task: asyncio.Task[None] | None = None
+        # In-flight tick bodies spawned by _tick_loop. stop() awaits these
+        # with a 2s bound so the most recent tick(s) have a chance to
+        # finish cleanly before we force-cancel — otherwise their
+        # analyses writes would FK-violate after the row CASCADE-deletes.
+        self._inflight_ticks: set[asyncio.Task[None]] = set()
+        # Self-destruct state: count consecutive vanished-row failures
+        # and fire the parent callback exactly once when the threshold
+        # is hit. Asyncio is cooperative single-threaded so int increments
+        # are atomic between awaits.
+        self._camera_missing_streak: int = 0
+        self._self_destructed: bool = False
         self._log_tag = f"worker cam={camera_id}"
 
     async def start(self) -> None:
@@ -97,14 +136,47 @@ class CameraIngest:
         self._tick_task = asyncio.create_task(self._tick_loop())
 
     async def stop(self) -> None:
-        if self._tick_task is None:
-            return
-        self._tick_task.cancel()
-        try:
-            await self._tick_task
-        except asyncio.CancelledError:
-            pass
-        self._tick_task = None
+        # Cancel the loop FIRST so no new ticks get spawned while we wait
+        # on the in-flight ones. Idempotent — second stop() is a no-op
+        # because _tick_task is None after the first call.
+        if self._tick_task is not None:
+            self._tick_task.cancel()
+            try:
+                await self._tick_task
+            except asyncio.CancelledError:
+                pass
+            self._tick_task = None
+        # Drain in-flight tick bodies regardless of loop state. This
+        # block runs even when stop() is called without a prior start()
+        # (some tests do this) so any tasks added directly to the set
+        # are still cleaned up.
+        #
+        # Re-id-gated ticks (~3s) usually finish before timeout;
+        # Gemini-running ticks (up to ~28s) get force-cancelled — which
+        # is exactly right, since their analysis writes would FK-violate
+        # against a row that's about to be CASCADE-deleted.
+        if self._inflight_ticks:
+            # Snapshot to avoid mutation during iteration (done-callbacks
+            # remove tasks from the set as they complete).
+            in_flight = list(self._inflight_ticks)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*in_flight, return_exceptions=True),
+                    timeout=_STOP_INFLIGHT_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                log.warning(
+                    "%s stop: %d in-flight tick(s) still running after %.1fs — "
+                    "force-cancelling",
+                    self._log_tag, sum(1 for t in in_flight if not t.done()),
+                    _STOP_INFLIGHT_TIMEOUT,
+                )
+                for task in in_flight:
+                    if not task.done():
+                        task.cancel()
+                # Drain the cancellations so we don't leak warnings about
+                # un-awaited tasks at process shutdown.
+                await asyncio.gather(*in_flight, return_exceptions=True)
         self._motion_cache.drop(self.camera_id)
 
     async def _tick_loop(self) -> None:
@@ -125,20 +197,109 @@ class CameraIngest:
         try:
             while True:
                 await asyncio.sleep(tick_seconds)
-                asyncio.create_task(
+                task = asyncio.create_task(
                     self._run_tick_safely(),
                     name=f"tick-{self.camera_id}",
                 )
+                # Track so stop() can wait on or cancel in-flight ticks.
+                # The done callback runs synchronously when the task
+                # finishes (or is cancelled) and discards the reference,
+                # so the set stays bounded.
+                self._inflight_ticks.add(task)
+                task.add_done_callback(self._inflight_ticks.discard)
         except asyncio.CancelledError:
             raise
 
     async def _run_tick_safely(self) -> None:
         try:
             await self._run_tick()
+        except CameraVanishedError:
+            # The cameras row is gone. Two possibilities:
+            #  (1) admin DELETE just landed (transient — next tick may
+            #      succeed if it was a different row),
+            #  (2) the camera is permanently gone and we should
+            #      self-destruct so we stop wasting Re-ID/LLM cycles.
+            # We can't distinguish these in a single tick, so we count
+            # consecutive misses; after _SELF_DESTRUCT_THRESHOLD in a
+            # row, fire the callback. ANY non-vanished tick resets the
+            # streak (handled in the success path below).
+            self._camera_missing_streak += 1
+            log.warning(
+                "%s tick failed: camera row missing (streak=%d/%d)",
+                self._log_tag, self._camera_missing_streak,
+                _SELF_DESTRUCT_THRESHOLD,
+            )
+            if self._camera_missing_streak >= _SELF_DESTRUCT_THRESHOLD:
+                # Fire and forget — the trigger itself is idempotent
+                # and bounded. Scheduling as a task means the current
+                # tick body returns cleanly first, so the loop and the
+                # done-callback bookkeeping aren't disturbed.
+                asyncio.create_task(
+                    self._trigger_self_destruct(),
+                    name=f"self-destruct-{self.camera_id}",
+                )
+            return
         except Exception as exc:
             # Tick failures must NEVER kill the loop. Log
             # and move on; next tick will get another shot.
             log.exception("%s tick failed: %s", self._log_tag, exc)
+            return
+        # Successful tick path: reset the vanished-row streak. Transient
+        # blips (e.g. a single tick raised CameraVanishedError because
+        # of a brief read-after-write race) don't accumulate.
+        if self._camera_missing_streak > 0:
+            log.info(
+                "%s tick succeeded after %d vanished-row failure(s) — streak reset",
+                self._log_tag, self._camera_missing_streak,
+            )
+            self._camera_missing_streak = 0
+
+    async def _trigger_self_destruct(self) -> None:
+        """Signal the parent RoomWorker to remove us. Idempotent —
+        guarded by `_self_destructed` so we fire the callback at most
+        once even if multiple ticks fail concurrently after the
+        threshold is hit. Bounded by _SELF_DESTRUCT_CALLBACK_TIMEOUT so
+        a buggy parent callback can't park this task forever.
+        """
+        if self._self_destructed:
+            return
+        self._self_destructed = True
+        if self._on_self_destruct is None or self._livekit_identity is None:
+            # No parent to signal (e.g. a unit test constructed us
+            # without a RoomWorker). Log loudly so the situation is
+            # visible — the ingest can't reap itself.
+            log.error(
+                "%s self-destruct threshold reached but no callback "
+                "registered (livekit_identity=%s); ingest will keep "
+                "ticking and logging vanished-row failures",
+                self._log_tag, self._livekit_identity,
+            )
+            return
+        log.error(
+            "%s self-destruct: vanished-row streak hit %d, signalling "
+            "RoomWorker to remove ingest (identity=%s)",
+            self._log_tag, self._camera_missing_streak,
+            self._livekit_identity,
+        )
+        try:
+            await asyncio.wait_for(
+                self._on_self_destruct(self._livekit_identity),
+                timeout=_SELF_DESTRUCT_CALLBACK_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            log.error(
+                "%s self-destruct: callback timed out after %.1fs — "
+                "ingest is now orphaned from parent's dict; the next "
+                "supervisor reconnect will reap it",
+                self._log_tag, _SELF_DESTRUCT_CALLBACK_TIMEOUT,
+            )
+        except Exception:
+            log.exception(
+                "%s self-destruct: callback raised — ingest is now "
+                "orphaned from parent's dict; the next supervisor "
+                "reconnect will reap it",
+                self._log_tag,
+            )
 
     async def _run_tick(self) -> None:
         """One tick — mirrors `src/api/clips.py:ingest_clip` body."""
@@ -154,8 +315,13 @@ class CameraIngest:
             # "cameras_paused" toggle (global monitoring off).
             cam = await session.get(Camera, self.camera_id)
             if cam is None:
-                log.warning("%s camera row vanished mid-flight", self._log_tag)
-                return
+                # Raise so _run_tick_safely's vanished-row counter ticks.
+                # Routes the same self-destruct path as the registry-
+                # level miss above — single source of truth for "row is
+                # gone, eventually reap me".
+                raise CameraVanishedError(
+                    f"[camera_ingest] camera {self.camera_id} vanished mid-tick"
+                )
             patient = await session.get(Patient, self.patient_id)
             if patient is None:
                 log.warning("%s patient row vanished mid-flight", self._log_tag)

@@ -33,6 +33,15 @@ from src.db.detector import Detector
 from src.services.detection.prompt import DetectorSpec, detector_spec_from_row
 
 
+class CameraVanishedError(ValueError):
+    """The detector tick referenced a `cameras` row that no longer
+    exists. Subclass of ValueError so any existing broad `except
+    ValueError` keeps working. CameraIngest._run_tick_safely uses the
+    isinstance check to count consecutive vanished-row failures and
+    fire its self-destruct callback after N in a row.
+    """
+
+
 async def get_enabled_detectors_for_camera(
     session: AsyncSession, camera_id: UUID,
 ) -> Sequence[DetectorSpec]:
@@ -50,7 +59,7 @@ async def get_enabled_detectors_for_camera(
     """
     cam = await session.get(Camera, camera_id)
     if cam is None:
-        raise ValueError(
+        raise CameraVanishedError(
             f"[registry] camera {camera_id} does not exist; cannot resolve detectors"
         )
 

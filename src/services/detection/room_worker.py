@@ -24,6 +24,7 @@ import json
 import logging
 import secrets
 import time
+from collections.abc import Awaitable, Callable
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
@@ -72,6 +73,28 @@ _CONSUMER_RETRY_BACKOFF_INITIAL = 1.0
 _CONSUMER_RETRY_BACKOFF_MAX = 16.0
 _CONSUMER_MAX_RETRIES = 5
 
+# Idle-room auto-teardown window. After this many seconds connected
+# to a room with zero `cam_*` ingests, the RoomWorker asks its
+# parent DetectorWorker to remove it. Prevents the
+# startup-reconciliation overshoot case: P3 joins every active
+# patient_* room, but a room with no actual camera publishing has
+# nothing for us to subscribe to, so `track_subscribed` never fires,
+# `_ingests_by_identity` stays empty, and (without this) we'd sit
+# connected to LiveKit forever burning an identity slot.
+#
+# Window choice: 120s is comfortably longer than the wall phone's
+# pairing flow + initial publish handshake (~30s), so we don't
+# accidentally evict a room whose camera is briefly between
+# reconnects. Short enough that a truly orphaned room is cleaned up
+# within a couple of minutes — well within human-noticeable
+# observability windows.
+_IDLE_TEARDOWN_WINDOW_S: float = 120.0
+
+# How often the idle monitor checks. 30s is granular enough that
+# the worst-case eviction lag is window + 30s = 150s, but coarse
+# enough that the monitor itself costs nearly nothing.
+_IDLE_MONITOR_TICK_S: float = 30.0
+
 
 class RoomWorker:
     """One worker, one LiveKit room, N cameras."""
@@ -84,12 +107,28 @@ class RoomWorker:
         sessionmaker: "async_sessionmaker",
         motion_cache: "MotionCache",
         reid: "ReIDInference",
+        on_idle_timeout: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self.room_name = room_name
         self._settings = settings
         self._sessionmaker = sessionmaker
         self._motion_cache = motion_cache
         self._reid = reid
+        # Optional callback used by the idle monitor to ask the
+        # parent DetectorWorker to remove this room. See
+        # _IDLE_TEARDOWN_WINDOW_S for the trigger condition.
+        # Unidirectional (parent → child capability injection); no
+        # circular references introduced.
+        self._on_idle_timeout = on_idle_timeout
+        # Idempotency flag for the idle teardown signal so we fire
+        # the callback at most once even if the monitor races with
+        # an eviction in progress.
+        self._idle_signalled: bool = False
+        # Tracks whether this room has ever seen a `cam_*` ingest
+        # spawn. If yes → not eligible for idle teardown (the room
+        # is in normal use; a transient empty window is just a
+        # camera reconnecting). If never → it's eligible.
+        self._has_ever_seen_ingest: bool = False
         self._room: rtc.Room | None = None
         # Active ingest pipelines, keyed by the camera's livekit_identity
         # (= the LiveKit participant identity). Allows fast lookup from
@@ -142,15 +181,37 @@ class RoomWorker:
         """
         if self._supervisor_task is not None:
             return
+        self._created_at = time.monotonic()
         self._supervisor_task = asyncio.create_task(
             self._maintain_connection(),
             name=f"room-supervisor-{self.room_name}",
         )
+        # Spawn the idle monitor only if the parent registered a
+        # callback for it (None = the legacy / test path that doesn't
+        # want auto-teardown).
+        self._idle_monitor_task: asyncio.Task[None] | None = None
+        if self._on_idle_timeout is not None:
+            self._idle_monitor_task = asyncio.create_task(
+                self._monitor_idle(),
+                name=f"room-idle-monitor-{self.room_name}",
+            )
 
     async def stop(self) -> None:
         if self._stopped:
             return
         self._stopped = True
+        # Cancel both background tasks before tearing down LiveKit
+        # state. Order: idle monitor first (it might be about to fire
+        # a callback that we're already overriding by stopping
+        # ourselves), then supervisor (it owns the LiveKit
+        # connection). Either task being None is fine.
+        if getattr(self, "_idle_monitor_task", None) is not None:
+            self._idle_monitor_task.cancel()
+            try:
+                await self._idle_monitor_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._idle_monitor_task = None
         if self._supervisor_task is not None:
             self._supervisor_task.cancel()
             try:
@@ -160,6 +221,67 @@ class RoomWorker:
             self._supervisor_task = None
         await self._teardown_active_session()
         log.info("room_worker.stop room=%s", self.room_name)
+
+    async def _monitor_idle(self) -> None:
+        """Periodic check: if this RoomWorker has been alive for
+        longer than `_IDLE_TEARDOWN_WINDOW_S` AND has never seen a
+        `cam_*` ingest spawn, signal the parent to remove us via
+        `_on_idle_timeout`.
+
+        Why "never seen" instead of "currently empty": a room with
+        an active camera that briefly reconnects can go through
+        empty dict windows without being orphaned. The reconciliation
+        overshoot case (P3 joined a patient_* room with no cam
+        publishing) NEVER sees a single ingest, which is the
+        unambiguous signal.
+
+        Failures (callback raises, callback hangs) are caught and
+        logged. The signal is fire-once; we never retry.
+        """
+        try:
+            while not self._stopped:
+                await asyncio.sleep(_IDLE_MONITOR_TICK_S)
+                if self._stopped:
+                    return
+                if self._idle_signalled:
+                    return
+                if self._has_ever_seen_ingest:
+                    # Active room — monitor's job is done permanently.
+                    return
+                age = time.monotonic() - self._created_at
+                if age < _IDLE_TEARDOWN_WINDOW_S:
+                    continue
+                # We've been around long enough with zero ingests —
+                # this room is orphaned. Fire the eviction callback.
+                self._idle_signalled = True
+                log.info(
+                    "room_worker.idle_timeout room=%s age=%.1fs — "
+                    "signalling parent to remove",
+                    self.room_name, age,
+                )
+                if self._on_idle_timeout is None:
+                    return
+                try:
+                    await asyncio.wait_for(
+                        self._on_idle_timeout(self.room_name),
+                        timeout=15.0,
+                    )
+                except asyncio.TimeoutError:
+                    log.error(
+                        "room_worker.idle_timeout callback timed out "
+                        "after 15s room=%s — ghost worker remains until "
+                        "next backend restart or LiveKit session timeout",
+                        self.room_name,
+                    )
+                except Exception:
+                    log.exception(
+                        "room_worker.idle_timeout callback raised "
+                        "room=%s — ghost worker remains",
+                        self.room_name,
+                    )
+                return
+        except asyncio.CancelledError:
+            raise
 
     # ── connection supervisor ──────────────────────────────────────
 
@@ -533,10 +655,85 @@ class RoomWorker:
             motion_cache=self._motion_cache,
             settings=self._settings,
             reid=self._reid,
+            # Hand the ingest a back-channel so it can ask to be removed
+            # if its `cameras` row vanishes (admin DELETE without a
+            # paired participant_left, partition-then-replay races).
+            # remove_ingest is idempotent and lock-free of any RoomWorker
+            # mutex — see remove_ingest docstring.
+            livekit_identity=identity,
+            on_self_destruct=self.remove_ingest,
         )
         await ingest.start()
         self._ingests_by_identity[identity] = ingest
+        # Latch the "this room has been productive" flag so the idle
+        # monitor (if registered) treats us as in-use forever after,
+        # not just while the ingest dict is currently non-empty. A
+        # camera that briefly drops + rejoins should NOT trigger idle
+        # teardown.
+        self._has_ever_seen_ingest = True
         return ingest
+
+    async def remove_ingest(self, identity: str) -> None:
+        """Idempotent removal of a CameraIngest by its LiveKit identity.
+        Called by:
+          - `CameraIngest._trigger_self_destruct` after N consecutive
+            vanished-row ticks (the camera was deleted from the DB).
+          - `DetectorWorker.stop_worker_for_camera` from the camera
+            DELETE API handler (explicit teardown on user action).
+
+        Symmetric with `_handle_participant_left` (the LiveKit
+        participant-leave path) except we don't get a `participant`
+        object — only the identity string. Pops from
+        `_ingests_by_identity`, cancels the video + audio consumer
+        tasks, awaits `ingest.stop()` with a 5s bound so a hung
+        consumer can't park this call forever.
+        """
+        ingest = self._ingests_by_identity.pop(identity, None)
+        if ingest is None:
+            # Idempotent: already removed (e.g. participant_left arrived
+            # between self-destruct trigger and this call). Common during
+            # an admin DELETE + Pi power-off race.
+            log.debug(
+                "room_worker.remove_ingest room=%s identity=%s — no-op (not present)",
+                self.room_name, identity,
+            )
+            return
+        # Cancel the video + audio consumer tasks that are pushing frames
+        # into this ingest's buffers. Without cancelling them we'd leak
+        # the asyncio tasks and they'd keep trying to write to the now-
+        # stopped ingest's buffers (harmless but noisy).
+        for task_map in (self._video_tasks_by_identity, self._audio_tasks_by_identity):
+            task = task_map.pop(identity, None)
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        # Bound the ingest stop. ingest.stop() has its own 2s bound on
+        # in-flight tick bodies, so total upper bound here is ~7s;
+        # 5s + 2s ≈ generous slack to a hung Gemini call before we
+        # force-cancel. If even this times out, we log loudly but don't
+        # raise — caller (self-destruct or DELETE handler) treats us as
+        # best-effort.
+        try:
+            await asyncio.wait_for(ingest.stop(), timeout=5.0)
+        except asyncio.TimeoutError:
+            log.warning(
+                "room_worker.remove_ingest room=%s camera=%s identity=%s — "
+                "ingest.stop() timed out after 5s; abandoning",
+                self.room_name, ingest.camera_id, identity,
+            )
+        except Exception:
+            log.exception(
+                "room_worker.remove_ingest room=%s camera=%s identity=%s — "
+                "ingest.stop() raised; abandoning",
+                self.room_name, ingest.camera_id, identity,
+            )
+        log.info(
+            "room_worker.ingest_self_destructed room=%s camera=%s identity=%s",
+            self.room_name, ingest.camera_id, identity,
+        )
 
     def _mint_viewer_token(self) -> str:
         """Subscriber-only token for this worker. canPublish=false,
