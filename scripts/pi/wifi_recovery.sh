@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # wifi_recovery.sh — fired 5 minutes after boot by
 # nemara-wifi-recovery.timer. If the customer hasn't completed
-# provisioning by then (no marker file), restore the netplan WiFi
-# backup and reboot back to home WiFi so we don't lose SSH access
-# permanently while debugging the AP-mode flow.
+# provisioning by then (no marker file), restore the WiFi backups
+# (both NM keyfiles and netplan YAMLs) and reboot back to home WiFi
+# so we don't lose SSH access permanently while debugging the AP-mode
+# flow.
 #
 # If the marker DOES exist (customer succeeded), this is a no-op.
 
@@ -11,6 +12,10 @@ set -euo pipefail
 
 MARKER="/var/lib/nemara/provisioned"
 BACKUP_DIR="/var/lib/nemara/wifi-backup"
+NM_BACKUP="$BACKUP_DIR/nm-system-connections"
+NETPLAN_BACKUP="$BACKUP_DIR/netplan"
+
+NM_DIR="/etc/NetworkManager/system-connections"
 NETPLAN_DIR="/etc/netplan"
 
 if [[ -f "$MARKER" ]]; then
@@ -26,8 +31,16 @@ systemctl disable nemara-wifi-recovery.timer >/dev/null 2>&1 || true
 
 shopt -s nullglob
 restored_any=0
-for yaml in "$BACKUP_DIR"/*.yaml; do
-  cp "$yaml" "$NETPLAN_DIR/"
+
+for kf in "$NM_BACKUP"/*.nmconnection; do
+  cp -p "$kf" "$NM_DIR/"
+  echo "restored $kf to $NM_DIR/" \
+    | systemd-cat -t nemara-wifi-recovery
+  restored_any=1
+done
+
+for yaml in "$NETPLAN_BACKUP"/*.yaml; do
+  cp -p "$yaml" "$NETPLAN_DIR/"
   echo "restored $yaml to $NETPLAN_DIR/" \
     | systemd-cat -t nemara-wifi-recovery
   restored_any=1

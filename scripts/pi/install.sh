@@ -72,13 +72,21 @@ install -m 0755 "$SCRIPT_DIR/wifi_wipe_safe.sh"      /opt/nemara/wifi_wipe_safe.
 install -m 0755 "$SCRIPT_DIR/wifi_recovery.sh"       /opt/nemara/wifi_recovery.sh
 
 echo ">>> Enabling persistent journal so previous-boot logs survive a reboot"
-# Default Pi OS keeps journal in /run (volatile, wiped on reboot).
-# Creating /var/log/journal makes journald switch to persistent
-# storage on next start. Essential for AP-mode debug: when the AP
-# attempt fails and the Pi recovers back to home WiFi via a reboot,
-# we can `journalctl --boot=-1 -u nemara-wifi-ap.service` to see why.
+# Pi OS ships /usr/lib/systemd/journald.conf.d/40-rpi-volatile-storage.conf
+# which forces Storage=volatile, overriding /etc/systemd/journald.conf.
+# We need a higher-numbered drop-in in /etc/ to win the merge.
+# Essential for AP-mode debug: when AP setup fails and the recovery
+# timer reboots us back to home WiFi, we want
+# `journalctl --boot=-1 -u nemara-wifi-ap.service` to show why.
 install -d -m 2755 /var/log/journal
-systemd-tmpfiles --create --prefix /var/log/journal >/dev/null 2>&1 || true
+install -d /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/99-nemara-persistent.conf <<'EOF'
+[Journal]
+Storage=persistent
+SystemMaxUse=64M
+EOF
+chmod 0644 /etc/systemd/journald.conf.d/99-nemara-persistent.conf
+systemctl restart systemd-journald
 
 echo ">>> Writing /etc/nemara/announce.env"
 install -d /etc/nemara
@@ -91,14 +99,37 @@ EOF
 chmod 0644 /etc/nemara/announce.env
 
 echo ">>> Writing /etc/nemara/camera-stream.env (per-camera tuning)"
+# Pinned to 720p15 @ 4 Mbps: matches the iPhone publish ceiling
+# closely, stays comfortably within typical home WiFi uplink, and is
+# the rate the MJPEG hardware encoder was validated against on Pi
+# Zero W (sustains the full 15 fps without dropping). The QUALITY
+# env var is legacy from the libjpeg path and is ignored by the
+# current MJPEGEncoder; left in place so existing installs don't
+# error on a missing var, but BITRATE_BPS is the real knob now.
 cat > /etc/nemara/camera-stream.env <<EOF
 NEMARA_CAMERA_WIDTH=1280
 NEMARA_CAMERA_HEIGHT=720
 NEMARA_CAMERA_FPS=15
+NEMARA_CAMERA_BITRATE_BPS=4000000
 NEMARA_CAMERA_QUALITY=80
 NEMARA_LOG_LEVEL=INFO
 EOF
 chmod 0644 /etc/nemara/camera-stream.env
+
+echo ">>> Installing captive-portal DNS wildcard for NM shared mode"
+# When NetworkManager runs a wifi connection with ipv4.method=shared
+# (our AP), it launches dnsmasq for DHCP + DNS. By default that
+# dnsmasq forwards DNS upstream, but the AP has no upstream, so
+# captive-portal probes (captive.apple.com, connectivitycheck.gstatic.com,
+# etc.) just time out and the phone shows a "no internet" toast
+# instead of popping the portal sheet. This drop-in tells dnsmasq to
+# answer 192.168.4.1 (the Pi) for every name, which makes the probe
+# 302-redirect to our setup page and triggers the captive portal UI.
+install -d /etc/NetworkManager/dnsmasq-shared.d
+cat > /etc/NetworkManager/dnsmasq-shared.d/01-nemara-captive.conf <<EOF
+address=/#/192.168.4.1
+EOF
+chmod 0644 /etc/NetworkManager/dnsmasq-shared.d/01-nemara-captive.conf
 
 echo ">>> Writing /etc/nemara/wifi-ap.env"
 cat > /etc/nemara/wifi-ap.env <<EOF

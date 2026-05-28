@@ -170,12 +170,16 @@ def _build_camera_and_encoder(
             controls={"FrameRate": float(fps)},
         )
         cam.configure(cfg)
-        # MJPEGEncoder controls quality via target bitrate (no `q`
-        # arg). Rough guide for 720p: 4 Mbps = clean, 6 Mbps = sharp,
-        # 8 Mbps+ = visually lossless. Bandwidth is the trade-off;
-        # WiFi on a Zero W comfortably handles 8 Mbps in good
-        # conditions.
-        encoder = MJPEGEncoder(bitrate=bitrate_bps)
+        # MJPEGEncoder() with no args is what the original
+        # nemara-cam-viewer/stream.py used and produced clean
+        # ~50 KB JPEGs at 720p15 (well within Zero W WiFi budget).
+        # DO NOT pass `bitrate=...`. Passing bitrate makes picamera2
+        # translate it to the V4L2 driver's `compression_quality`
+        # control via a low-value path, producing ~16 KB blurry
+        # frames at quality~20. Bare MJPEGEncoder() uses the
+        # picamera2 default mapping which sets compression_quality
+        # to a sensible value (~60-70).
+        encoder = MJPEGEncoder()
         ring = _JpegRing()
         output = FileOutput(ring)
     except Exception:

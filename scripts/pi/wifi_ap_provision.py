@@ -251,15 +251,11 @@ def start_ap(cfg: Config) -> None:
         ],
         check=True, label="add-ap-connection",
     )
-    # Set an open network (no PSK); customers should not be typing a
-    # PSK to access a temporary setup network.
-    _nmcli(
-        [
-            "nmcli", "connection", "modify", cfg.ap_ssid,
-            "wifi-sec.key-mgmt", "none",
-        ],
-        check=True, label="modify-no-key-mgmt",
-    )
+    # NB: we intentionally do NOT set wifi-sec.key-mgmt. In NetworkManager,
+    # `key-mgmt=none` means WEP (legacy open auth, still requires a wep-key0),
+    # which makes `connection up` fail with "Secrets were required". The
+    # absence of any [802-11-wireless-security] section is what gives us a
+    # truly open network. The `add` command above deliberately omits it.
     _nmcli(
         ["nmcli", "connection", "up", cfg.ap_ssid],
         check=True, label="up-ap-connection",
@@ -322,50 +318,262 @@ _SETUP_PAGE_TEMPLATE = """<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Nemara Camera Setup</title>
+<meta name="theme-color" content="#EFE6DA">
+<title>Nemara camera setup</title>
 <style>
-  body {{ font-family: -apple-system, system-ui, sans-serif;
-          max-width: 480px; margin: 32px auto; padding: 0 20px;
-          color: #1a1a1a; background: #fafafa; }}
-  h1 {{ font-size: 22px; margin-bottom: 8px; }}
-  .sub {{ color: #666; margin-bottom: 24px; }}
-  label {{ display: block; margin-top: 16px; font-weight: 600; }}
-  input, select {{ width: 100%; padding: 10px; margin-top: 4px;
-                   font-size: 16px; border: 1px solid #ccc; border-radius: 6px; }}
-  button {{ width: 100%; margin-top: 24px; padding: 12px;
-            font-size: 16px; font-weight: 600;
-            background: #1a1a1a; color: #fff; border: 0;
-            border-radius: 6px; }}
-  .err {{ background: #fee; color: #900; padding: 10px; border-radius: 6px;
-          margin-top: 16px; font-size: 14px; }}
+  :root {{
+    --paper: #EFE6DA;
+    --card: #FBF8F0;
+    --ink: #1C1A14;
+    --ink-soft: #4A4539;
+    --line: #C9C0AB;
+    --terra: #A04331;
+    --terra-soft: #F2DDD3;
+    --terra-deep: #7A2F1F;
+    --action-ink: #FBF8F0;
+  }}
+  * {{ box-sizing: border-box; }}
+  html, body {{ margin: 0; padding: 0; }}
+  body {{
+    font-family: -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+    background: var(--paper);
+    color: var(--ink);
+    min-height: 100vh;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 32px 16px 48px;
+    -webkit-font-smoothing: antialiased;
+  }}
+  .card {{
+    width: 100%;
+    max-width: 420px;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    padding: 28px 24px 24px;
+  }}
+  .eyebrow {{
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--ink-soft);
+    margin: 0 0 10px;
+  }}
+  h1 {{
+    font-family: ui-serif, "Iowan Old Style", "Apple Garamond", Georgia,
+                 "Times New Roman", serif;
+    font-weight: 600;
+    font-size: 28px;
+    line-height: 1.15;
+    margin: 0 0 10px;
+    color: var(--ink);
+  }}
+  p.lede {{
+    font-size: 15px;
+    line-height: 1.45;
+    color: var(--ink-soft);
+    margin: 0 0 24px;
+  }}
+  label {{
+    display: block;
+    margin-top: 18px;
+    margin-bottom: 8px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--ink-soft);
+  }}
+  input, select {{
+    width: 100%;
+    padding: 12px 14px;
+    font-size: 16px;
+    font-family: inherit;
+    color: var(--ink);
+    background: var(--card);
+    border: 1.5px solid var(--line);
+    border-radius: 10px;
+    -webkit-appearance: none;
+    appearance: none;
+    transition: border-color 0.15s;
+  }}
+  select {{
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath fill='%234A4539' d='M6 8L0 0h12z'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 14px center;
+    background-size: 10px;
+    padding-right: 36px;
+  }}
+  input:focus, select:focus {{
+    outline: none;
+    border-color: var(--ink);
+    caret-color: var(--terra);
+  }}
+  button {{
+    width: 100%;
+    margin-top: 28px;
+    padding: 16px 20px;
+    font-size: 16px;
+    font-family: inherit;
+    font-weight: 600;
+    background: var(--ink);
+    color: var(--action-ink);
+    border: 0;
+    border-radius: 10px;
+    cursor: pointer;
+    -webkit-appearance: none;
+    appearance: none;
+  }}
+  button:active {{ background: #000; }}
+  .err {{
+    background: var(--terra-soft);
+    color: var(--terra-deep);
+    padding: 12px 14px;
+    border-radius: 10px;
+    margin-top: 20px;
+    font-size: 14px;
+    line-height: 1.4;
+  }}
 </style>
 </head><body>
-<h1>Set up your Nemara Camera</h1>
-<p class="sub">Pick your home WiFi network and enter the password.
-The camera will join your home WiFi and disappear from this setup
-network within about a minute.</p>
-{error_block}
-<form method="POST" action="/provision">
-  <label for="ssid">Home WiFi network</label>
-  {ssid_input}
-  <label for="psk">Password</label>
-  <input type="password" id="psk" name="psk" autocomplete="off"
-         minlength="8" maxlength="63" required>
-  <button type="submit">Connect</button>
-</form>
+<main class="card">
+  <p class="eyebrow">Nemara &middot; Camera setup</p>
+  <h1>Set up your camera</h1>
+  <p class="lede">Pick your home WiFi and enter the password. Your camera
+  will join your network and this setup network will disappear in about
+  a minute.</p>
+  {error_block}
+  <form method="POST" action="/provision">
+    <label for="ssid">Home WiFi</label>
+    {ssid_input}
+    <label for="psk">Password</label>
+    <input type="password" id="psk" name="psk" autocomplete="off"
+           minlength="8" maxlength="63" required>
+    <button type="submit">Connect</button>
+  </form>
+</main>
 </body></html>"""
 
 
-_SUCCESS_PAGE = """<!doctype html>
-<html><head><meta charset="utf-8"><title>Success</title>
-<style>body{{font-family:-apple-system,system-ui,sans-serif;
-max-width:480px;margin:60px auto;padding:0 20px;text-align:center;}}</style>
+_SUCCESS_PAGE_TEMPLATE = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#EFE6DA">
+<title>Connecting your camera</title>
+<style>
+  :root {{
+    --paper: #EFE6DA;
+    --card: #FBF8F0;
+    --ink: #1C1A14;
+    --ink-soft: #4A4539;
+    --line: #C9C0AB;
+    --terra: #A04331;
+  }}
+  * {{ box-sizing: border-box; }}
+  html, body {{ margin: 0; padding: 0; }}
+  body {{
+    font-family: -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+    background: var(--paper);
+    color: var(--ink);
+    min-height: 100vh;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 48px 16px;
+    -webkit-font-smoothing: antialiased;
+  }}
+  .card {{
+    width: 100%;
+    max-width: 420px;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    padding: 36px 28px 32px;
+    text-align: center;
+  }}
+  .spinner {{
+    width: 44px;
+    height: 44px;
+    margin: 0 auto 24px;
+    border: 3px solid var(--line);
+    border-top-color: var(--terra);
+    border-radius: 50%;
+    animation: spin 0.9s linear infinite;
+  }}
+  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+  .eyebrow {{
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--terra);
+    margin: 0 0 10px;
+  }}
+  h1 {{
+    font-family: ui-serif, "Iowan Old Style", "Apple Garamond", Georgia,
+                 "Times New Roman", serif;
+    font-weight: 600;
+    font-size: 28px;
+    line-height: 1.2;
+    margin: 0 0 14px;
+    color: var(--ink);
+  }}
+  p {{
+    font-size: 15px;
+    line-height: 1.5;
+    color: var(--ink-soft);
+    margin: 0 0 10px;
+  }}
+  .ssid {{
+    font-weight: 600;
+    color: var(--ink);
+  }}
+  .hint {{
+    margin-top: 22px;
+    font-size: 13px;
+    color: var(--ink-soft);
+    opacity: 0.85;
+  }}
+</style>
 </head><body>
-<h1>Connected!</h1>
-<p>Your camera is joining the home WiFi. In about a minute it will
-appear in the Nemara app under the &quot;Add a camera&quot; screen.</p>
-<p>You can now reconnect this phone or laptop to your home WiFi.</p>
+<main class="card">
+  <div class="spinner" aria-hidden="true"></div>
+  <p class="eyebrow">Connecting</p>
+  <h1>Connecting your camera</h1>
+  <p>Your camera is joining <span class="ssid">{ssid}</span>.
+  It will appear in the Nemara app in about a minute.</p>
+  <p class="hint">This tab will close automatically.</p>
+</main>
 </body></html>"""
+
+
+def _render_success_page(ssid: str) -> bytes:
+    return _SUCCESS_PAGE_TEMPLATE.format(ssid=_html_escape(ssid)).encode("utf-8")
+
+
+def _join_then_signal(cfg: "Config", ssid: str, psk: str) -> None:
+    """Run after the success page has been flushed to the client.
+    Sleep briefly so the phone has time to render the page before the
+    radio switches and tears down the AP, then call join_wifi. On
+    success, mark provisioned and signal the daemon to exit cleanly;
+    on failure, log it and let the supervisor restart the AP for a
+    retry (since the customer believes setup is in progress, the
+    fastest way to surface failure is the camera not appearing in
+    the app and them restarting the flow).
+    """
+    time.sleep(_TEARDOWN_DELAY_S)
+    ok, msg = join_wifi(cfg, ssid, psk)
+    if ok:
+        _PROVISION_RESULT["ssid"] = ssid
+        _DONE.set()
+    else:
+        log.error("background join failed for ssid=%r: %s", ssid, msg)
 
 
 def _render_setup_page(networks: list[str], error: str | None = None) -> bytes:
@@ -446,21 +654,28 @@ class _Handler(BaseHTTPRequestHandler):
                 "Password must be between 8 and 63 characters."
             )
 
-        ok, msg = join_wifi(self.cfg, ssid, psk)
-        if not ok:
-            return self._reshow_with_error(f"Connect failed: {msg}")
-
-        _PROVISION_RESULT["ssid"] = ssid
-        body = _SUCCESS_PAGE.encode("utf-8")
+        # Send the "Connecting..." page FIRST, while the phone is still
+        # on the AP and able to receive bytes. We can't wait for
+        # join_wifi to confirm before showing a result page because
+        # join_wifi swaps wlan0 from AP-mode to client-mode, tearing
+        # down the AP and stranding the phone before it can render
+        # anything. So the page reads as pending ("Connecting your
+        # camera...") rather than past-tense success. The real
+        # confirmation is the camera appearing in the Nemara app.
+        body = _render_success_page(ssid)
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
-        # Schedule the daemon to shut down so AP mode tears down
-        # cleanly; defer briefly so the success page renders on the
-        # client before the radio mode switches.
-        threading.Timer(_TEARDOWN_DELAY_S, _DONE.set).start()
+        self.wfile.flush()
+
+        threading.Thread(
+            target=_join_then_signal,
+            args=(self.cfg, ssid, psk),
+            daemon=True,
+        ).start()
 
     def _reshow_with_error(self, error: str) -> None:
         type(self).last_error = error
