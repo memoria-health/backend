@@ -175,8 +175,20 @@ class Settings(BaseSettings):
     reid_inference_sample_fps: int = Field(ge=1, le=15, default=5)
     reid_inference_sample_width: int = Field(ge=240, le=1920, default=480)
     # ── Body Re-ID pipeline (mirrors the experiment) ───────────────
+    # YOLO weights. `yolo11n.pt` (nano, 2.5M params) is fastest but
+    # misses partial / distant / occluded bodies — observed
+    # 2026-05-30 with kitchen-counter helper clips where YOLO returned
+    # 0 detections and Gemini still saw the person. `yolo11s.pt`
+    # (small, ~9M params) has much better recall on those cases at
+    # ~2x inference cost; default raised to `s` after that incident.
+    # `yolo11m.pt` is a further step up if `s` still misses.
+    reid_yolo_model: str = Field(min_length=1, default="yolo11s.pt")
     # YOLO confidence threshold for the person detector. Default
-    # matches the experiment's PersonDetector(confidence=0.4).
+    # matches the experiment's PersonDetector(confidence=0.4). Once
+    # the per-clip detection logs ship we can tune this from observed
+    # confidence distributions on missed bodies. Lowering increases
+    # recall at the cost of more false positives (re-ID filters most
+    # of those, so the trade-off is cheap).
     reid_yolo_confidence: float = Field(gt=0, le=1, default=0.4)
     # Per-track face check cadence: every N frames per UNKNOWN track,
     # run SCRFD inside the person bbox. 5 frames @ 5 fps = 1s
@@ -202,6 +214,44 @@ class Settings(BaseSettings):
     # the trade-off for matching nemara-reid-experiment's visual
     # quality.
     reid_clip_annotation_enabled: bool = Field(default=True)
+
+    # ── Cross-clip body Re-ID gallery (Phase 2) ─────────────────
+    # In-memory, per-patient. See cross_clip_body_gallery.py for the
+    # full design. Defaults aim for "4-hour outfit cycle, conservative
+    # OTHER threshold to avoid false-skipping the patient."
+    reid_body_gallery_ttl_seconds: int = Field(ge=60, default=14400)  # 4h
+    # Asymmetric thresholds: PATIENT is more liberal (false positive
+    # = LLM runs with patient context anyway, mild), OTHER is more
+    # conservative (false positive = LLM skipped on a patient clip,
+    # severe).
+    reid_body_match_patient_threshold: float = Field(ge=0, le=1, default=0.72)
+    reid_body_match_other_threshold: float = Field(ge=0, le=1, default=0.80)
+    # Intra-cluster diversity floor. When harvesting a new embedding
+    # into an existing cluster, skip if it cosine-matches any existing
+    # member above this threshold — keeps each cluster's buffer
+    # diverse (we want N representative views of the same person, not
+    # N near-identical embeddings from consecutive frames).
+    reid_body_dedup_threshold: float = Field(ge=0, le=1, default=0.95)
+    # Cluster-merge threshold. A new harvest joins an existing
+    # same-label cluster if its cosine to that cluster (mean over the
+    # cluster's embeddings) is >= this. Otherwise a new cluster is
+    # seeded — i.e. we believe this is a different person. Must be
+    # HIGHER than match_other_threshold so we only merge when we're
+    # SURE it's the same identity (a wrong merge contaminates the
+    # cluster mean and degrades future matches).
+    reid_body_cluster_merge_threshold: float = Field(ge=0, le=1, default=0.85)
+    # Max embeddings retained per cluster. FIFO eviction past the
+    # cap — keeps the most recent N views. Higher = richer match
+    # signal but more memory and slower per-match cosine sum.
+    reid_body_max_embeddings_per_cluster: int = Field(ge=1, default=8)
+    # Max clusters retained per label per patient. Evict the
+    # least-recently-updated on overflow. PATIENT cluster count
+    # should stay ~1 in practice; OTHER may grow to handle multiple
+    # helpers/family members.
+    reid_body_max_clusters_per_label: int = Field(ge=1, default=20)
+    # Master switch — set False to disable the gallery entirely
+    # (harvest + match become no-ops). Useful for A/B comparison.
+    reid_body_gallery_enabled: bool = Field(default=True)
 
     # ── APNs (Phase 4) ──────────────────────────────────────────
     # Apple Developer credentials for HTTP/2 push. team_id +
@@ -240,6 +290,13 @@ class Settings(BaseSettings):
     # must be a Resend-verified domain for real sends.
     resend_api_key: str = Field(default="")
     email_from: str = Field(default="onboarding@resend.dev")
+    # Recipients for caregiver-submitted Contact Support messages from
+    # the iOS app. Comma-separated in env (pydantic-settings parses).
+    # replyTo is set to the caregiver's account email so hitting reply
+    # in Gmail lands directly in their inbox.
+    support_email_recipients: list[str] = Field(
+        default_factory=lambda: ["aryaman@menora-health.com", "sunny@menora-health.com"]
+    )
 
 
 def get_settings() -> Settings:

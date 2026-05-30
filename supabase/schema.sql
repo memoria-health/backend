@@ -16,8 +16,13 @@ create extension if not exists pgcrypto;       -- gen_random_uuid()
 
 create type detector_category    as enum ('safety', 'routine');
 create type detector_source      as enum ('preset', 'custom');
-create type detector_shape       as enum ('point_in_time', 'state');
-create type detector_sensitivity as enum ('low', 'standard', 'high', 'off');
+-- 'scheduled' is the absence-style detector (e.g. "medication not
+-- taken by 5pm"): the scheduler evaluates a daily/weekly window at a
+-- deadline and fires if the signal was never seen. 'state' stays in
+-- the enum for the agitation preset but is no longer offered in the
+-- create UI; everything reactive is point_in_time.
+create type detector_shape       as enum ('point_in_time', 'state', 'scheduled');
+create type detector_sensitivity as enum ('low', 'standard', 'high');
 create type review_choice        as enum ('correct', 'wrong', 'unsure');
 create type patient_state        as enum ('calm', 'critical', 'offline');
 create type relation_kind        as enum (
@@ -75,6 +80,18 @@ create table public.caregivers (
   display_name text not null,
   email        text not null unique,                  -- mirrored from auth.users.email
   phone        text,                                  -- optional; caregiver-editable
+  -- Per-account flag for the web onboarding walkthrough. False until
+  -- the caregiver dismisses or completes the modal on the web
+  -- dashboard; PATCH /v1/me flips it true. iOS gets its own column
+  -- when we ship the iOS onboarding (deliberately separate so a user
+  -- who learned the web flow still sees the iOS walkthrough on first
+  -- use of the mobile app, and vice versa).
+  onboarded_web boolean not null default false,
+  -- IANA tz name (e.g. "America/New_York"). Scheduled detectors
+  -- evaluate their window in the caregiver's local time. The web
+  -- client auto-detects browser tz and PATCHes /v1/me; this default
+  -- is the fallback for accounts that never loaded the web app.
+  timezone     text not null default 'America/New_York',
   created_at   timestamptz not null default now(),
   updated_at   timestamptz not null default now()
 );
@@ -106,9 +123,15 @@ create table public.patients (
   state           patient_state not null default 'calm',
   status_line     text not null default 'All quiet',
   last_event_at   timestamptz,
-  battery_percent int  check (battery_percent between 0 and 100),
   -- Caregiver-editable.
   cameras_paused  boolean not null default false,
+  -- Per-patient email alert prefs. Push notifications cover the iOS
+  -- app; email_alerts_enabled is the master on/off for THIS patient,
+  -- email_alert_recipients is additional recipients beyond the owning
+  -- caregiver's account email (which always receives this patient's
+  -- alerts when enabled). JSON array of strings.
+  email_alerts_enabled    boolean not null default false,
+  email_alert_recipients  jsonb   not null default '[]'::jsonb,
   -- Bucket-relative key in `patient-photos` (e.g. "{patient_id}.jpg").
   -- NULL until the caregiver uploads an avatar; the roster + header
   -- fall back to initials while NULL. The signed URL is minted at
@@ -340,6 +363,19 @@ create table public.detectors (
   sensitivity     detector_sensitivity not null default 'standard',
   is_on           boolean not null default true,
   custom_prompt   text,                              -- only meaningful when source = 'custom'
+  -- Scheduled-detector config (null for reactive detectors). Shape:
+  --   { "cadence": "daily"|"weekly",
+  --     "days_of_week": [0..6],     -- weekly only; 0=Mon..6=Sun
+  --     "window_start": "HH:MM",     -- local time
+  --     "window_end":   "HH:MM",
+  --     "deadline":     "HH:MM" }    -- when to evaluate + fire
+  -- Read by the scheduler runtime (separate from the per-tick path).
+  schedule_config            jsonb,
+  -- Single-fire guard for the scheduled runtime: the date the
+  -- detector last evaluated its window. The 60s scheduler loop
+  -- skips a detector if today's date matches this; NULL = never
+  -- evaluated.
+  last_scheduled_eval_date   date,
   -- ── Runtime contract (detector pipeline reads these) ────────────
   -- Stable identifier the LLM JSON-schema reference. For presets:
   -- 'people_present' | 'fall' | 'wandering'. For custom detectors:

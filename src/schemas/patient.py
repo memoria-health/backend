@@ -2,8 +2,8 @@
 
 Mirrors `nemara-caregiver-app/NemaraCaregiver/Models/Patient.swift` —
 same fields, same enum values. Server-managed fields (`state`,
-`status_line`, `last_event_at`, `battery_percent`) are not writable
-from the iOS app — see `UpdatePatientRequest`.
+`status_line`, `last_event_at`) are not writable from the iOS app —
+see `UpdatePatientRequest`.
 """
 
 from datetime import date, datetime
@@ -33,7 +33,6 @@ Name200 = Annotated[str, Field(min_length=1, max_length=200)]
 Name80 = Annotated[str, Field(min_length=1, max_length=80)]
 Address = Annotated[str, Field(min_length=1, max_length=500)]
 Gender = Annotated[str, Field(min_length=1, max_length=40)]
-BatteryPct = Annotated[int, Field(ge=0, le=100)]
 Email = Annotated[str, Field(min_length=3, max_length=255)]
 
 
@@ -53,7 +52,6 @@ class PatientResponse(BaseModel):
     state: PatientState
     status_line: str
     last_event_at: datetime | None
-    battery_percent: BatteryPct | None
     cameras_paused: bool
     photo_storage_key: str | None
     created_at: datetime
@@ -81,9 +79,9 @@ class CreatePatientRequest(BaseModel):
     """Body of POST /v1/patients.
 
     Server-managed fields (state / status_line / last_event_at /
-    battery_percent / cameras_paused) cannot be set at creation —
-    they default to "calm / All quiet / nulls / false" and only
-    transition via wall-phone telemetry or the dedicated PATCH endpoint.
+    cameras_paused) cannot be set at creation — they default to
+    "calm / All quiet / null / false" and only transition via
+    wall-phone telemetry or the dedicated PATCH endpoint.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -104,10 +102,10 @@ class UpdatePatientRequest(BaseModel):
         home_address, cameras_paused.
 
     Server-managed (not writable here):
-        state, status_line, last_event_at, battery_percent — these come
-        from wall-phone telemetry. The Pydantic model doesn't expose
-        them, so even a malicious client can't sneak a payload through.
-        `extra="forbid"` rejects unknown keys for the same reason.
+        state, status_line, last_event_at — these come from wall-phone
+        telemetry. The Pydantic model doesn't expose them, so even a
+        malicious client can't sneak a payload through. `extra="forbid"`
+        rejects unknown keys for the same reason.
 
     Use `model_dump(exclude_unset=True)` server-side to distinguish
     "field omitted" from explicit `null`.

@@ -17,10 +17,11 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, File, HTTPException, UploadFile, status
 from pydantic import BaseModel
 
+from src.api import cameras_ingest as pi_ingest_module
 from src.api.deps import CaregiverAuth, SessionDep, SettingsDep
 from src.db.patient import Patient
 from src.errors import StorageError
-from src.repos import caregiver_repo, patient_repo
+from src.repos import camera_repo, caregiver_repo, patient_repo
 from src.schemas.patient import (
     CreatePatientRequest,
     PatientResponse,
@@ -102,7 +103,6 @@ async def create_patient(
         gender=body.gender,
         home_address=body.home_address,
         last_event_at=None,
-        battery_percent=None,
     )
     await patient_repo.insert(session, p)
     await onboarding.seed_detectors_for_patient(session, p.id)
@@ -136,13 +136,29 @@ async def patch_patient(
 
     The Pydantic model only exposes caregiver-writable fields, so even
     a payload that tries to set `state` / `status_line` / `last_event_at`
-    / `battery_percent` is rejected as 422 by `extra="forbid"`. Those
-    columns transition via wall-phone telemetry (not in scope here).
+    is rejected as 422 by `extra="forbid"`. Those columns transition via
+    wall-phone telemetry (not in scope here).
+
+    Toggling `cameras_paused` cascades `desired_state` to every camera
+    for this patient. False to true: all cameras to 'disconnected', so
+    the wall phones leave LiveKit entirely (saves LiveKit minutes and
+    battery, on top of the LLM-tick skip the flag already drove). True
+    to false: all cameras back to 'connected'. Naive: caregiver-explicit
+    per-camera disconnects are overwritten on unpause. Atomic with the
+    patient flip via a single commit at the end.
     """
     fields = body.model_dump(exclude_unset=True)
-    # Enum → string for the ORM string columns.
     if "relation" in fields and fields["relation"] is not None:
         fields["relation"] = fields["relation"].value
+
+    cascade_to: str | None = None
+    if "cameras_paused" in fields:
+        current = await patient_repo.find_by_id(
+            session, patient_id, caregiver_id=auth.id
+        )
+        if current is not None and current.cameras_paused != fields["cameras_paused"]:
+            cascade_to = "disconnected" if fields["cameras_paused"] else "connected"
+
     p = await patient_repo.update_partial(
         session, patient_id, caregiver_id=auth.id, fields=fields
     )
@@ -151,6 +167,23 @@ async def patch_patient(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="patient_not_found",
         )
+
+    if cascade_to is not None:
+        cams = await camera_repo.list_for_patient(
+            session, patient_id, caregiver_id=auth.id
+        )
+        for cam in cams:
+            if cam.desired_state == cascade_to:
+                continue
+            await camera_repo.update_partial(
+                session,
+                cam.id,
+                caregiver_id=auth.id,
+                desired_state=cascade_to,
+            )
+            if cascade_to == "disconnected" and cam.source_type == "pi":
+                await pi_ingest_module.cancel_active_relay(cam.id)
+
     await session.commit()
     return _to_response(p)
 

@@ -8,10 +8,60 @@ provisions a real `auth.users` + `caregivers` row first.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from unittest.mock import AsyncMock, patch
+from uuid import UUID, uuid4
+
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import select
 
+from src.db.camera import Camera
+from src.db.session import get_sessionmaker
 from test.conftest import mint_test_jwt
+
+
+async def _insert_camera(
+    *,
+    patient_id: UUID,
+    display_id: int,
+    room: str,
+    source_type: str = "iphone",
+    desired_state: str = "connected",
+) -> UUID:
+    """Insert a minimum-viable camera row. Caller owns FK validity
+    (patient_id must already exist). Returns the new camera's id."""
+    cam_id = uuid4()
+    sm = get_sessionmaker()
+    async with sm() as s:
+        s.add(
+            Camera(
+                id=cam_id,
+                patient_id=patient_id,
+                display_id=display_id,
+                room=room,
+                icon_name="bed.double",
+                online=False,
+                state="closed",
+                no_people_count=0,
+                close_threshold=2,
+                source_type=source_type,
+                desired_state=desired_state,
+                ingest_token_hash=("a" * 64) if source_type == "pi" else None,
+                created_at=datetime.now(timezone.utc),
+            ),
+        )
+        await s.commit()
+    return cam_id
+
+
+async def _camera_desired_state(camera_id: UUID) -> str:
+    sm = get_sessionmaker()
+    async with sm() as s:
+        result = await s.execute(
+            select(Camera.desired_state).where(Camera.id == camera_id),
+        )
+        return result.scalar_one()
 
 
 async def _provision(client: AsyncClient, auth_user) -> dict[str, str]:
@@ -77,7 +127,6 @@ async def test_create_then_get_then_delete_roundtrip(
     assert p["state"] == "calm"
     assert p["status_line"] == "All quiet"
     assert p["last_event_at"] is None
-    assert p["battery_percent"] is None
     assert p["cameras_paused"] is False
 
     # List
@@ -182,19 +231,6 @@ async def test_patch_rejects_status_line_field(
 
 
 @pytest.mark.asyncio
-async def test_patch_rejects_battery_percent_field(
-    client: AsyncClient, auth_user
-) -> None:
-    headers = await _provision(client, auth_user)
-    pid = (await client.post("/v1/patients", headers=headers, json=_FULL_BODY)).json()["id"]
-
-    r = await client.patch(
-        f"/v1/patients/{pid}", headers=headers, json={"battery_percent": 50},
-    )
-    assert r.status_code == 422
-
-
-@pytest.mark.asyncio
 async def test_patch_404_when_patient_missing(
     client: AsyncClient, auth_user
 ) -> None:
@@ -273,3 +309,179 @@ async def test_create_patient_auto_seeds_four_preset_detectors(
         assert d["sensitivity"] == "standard"
         assert d["is_on"] is True
         assert d["custom_prompt"] is None
+
+
+# ─── cameras_paused cascade ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_patch_cameras_paused_false_to_true_cascades_to_disconnected(
+    client: AsyncClient, auth_user,
+) -> None:
+    """Flipping `cameras_paused` false to true MUST set every camera
+    for the patient to `desired_state='disconnected'` in the same
+    transaction. This is the hard-kill behavior the caregiver expects
+    when toggling Monitoring off: wall phones leave LiveKit entirely,
+    no LiveKit minutes burned while paused."""
+    headers = await _provision(client, auth_user)
+    pid = (await client.post("/v1/patients", headers=headers, json=_FULL_BODY)).json()["id"]
+
+    iphone_id = await _insert_camera(
+        patient_id=UUID(pid), display_id=1, room="Living Room",
+        source_type="iphone", desired_state="connected",
+    )
+    pi_id = await _insert_camera(
+        patient_id=UUID(pid), display_id=2, room="Bedroom",
+        source_type="pi", desired_state="connected",
+    )
+
+    with patch(
+        "src.api.patients.pi_ingest_module.cancel_active_relay",
+        new=AsyncMock(return_value=False),
+    ) as mock_cancel:
+        r = await client.patch(
+            f"/v1/patients/{pid}", headers=headers,
+            json={"cameras_paused": True},
+        )
+
+    assert r.status_code == 200
+    assert r.json()["cameras_paused"] is True
+
+    assert await _camera_desired_state(iphone_id) == "disconnected"
+    assert await _camera_desired_state(pi_id) == "disconnected"
+
+    mock_cancel.assert_awaited_once_with(pi_id)
+
+
+@pytest.mark.asyncio
+async def test_patch_cameras_paused_true_to_false_cascades_to_connected(
+    client: AsyncClient, auth_user,
+) -> None:
+    """Unpausing MUST set every camera back to `desired_state='connected'`.
+    Naive restore: caregiver-explicit per-camera disconnects are
+    overwritten on unpause (by design, no snapshot column)."""
+    headers = await _provision(client, auth_user)
+    pid = (await client.post("/v1/patients", headers=headers, json=_FULL_BODY)).json()["id"]
+
+    iphone_id = await _insert_camera(
+        patient_id=UUID(pid), display_id=1, room="Living Room",
+        source_type="iphone", desired_state="disconnected",
+    )
+    pi_id = await _insert_camera(
+        patient_id=UUID(pid), display_id=2, room="Bedroom",
+        source_type="pi", desired_state="disconnected",
+    )
+
+    await client.patch(
+        f"/v1/patients/{pid}", headers=headers, json={"cameras_paused": True},
+    )
+
+    with patch(
+        "src.api.patients.pi_ingest_module.cancel_active_relay",
+        new=AsyncMock(return_value=False),
+    ) as mock_cancel:
+        r = await client.patch(
+            f"/v1/patients/{pid}", headers=headers,
+            json={"cameras_paused": False},
+        )
+
+    assert r.status_code == 200
+    assert r.json()["cameras_paused"] is False
+
+    assert await _camera_desired_state(iphone_id) == "connected"
+    assert await _camera_desired_state(pi_id) == "connected"
+
+    mock_cancel.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_patch_cameras_paused_same_value_does_not_cascade(
+    client: AsyncClient, auth_user,
+) -> None:
+    """If the body sets `cameras_paused` to the value it already has,
+    no cascade fires and cameras keep their current `desired_state`.
+    Prevents churn from the iOS app PATCHing the full mutable surface
+    on every minor edit."""
+    headers = await _provision(client, auth_user)
+    pid = (await client.post("/v1/patients", headers=headers, json=_FULL_BODY)).json()["id"]
+
+    cam_id = await _insert_camera(
+        patient_id=UUID(pid), display_id=1, room="Living Room",
+        source_type="iphone", desired_state="disconnected",
+    )
+
+    with patch(
+        "src.api.patients.pi_ingest_module.cancel_active_relay",
+        new=AsyncMock(return_value=False),
+    ) as mock_cancel:
+        r = await client.patch(
+            f"/v1/patients/{pid}", headers=headers,
+            json={"cameras_paused": False},
+        )
+
+    assert r.status_code == 200
+    assert await _camera_desired_state(cam_id) == "disconnected"
+    mock_cancel.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_patch_without_cameras_paused_does_not_touch_cameras(
+    client: AsyncClient, auth_user,
+) -> None:
+    """Editing any OTHER field on the patient must not perturb
+    `desired_state` on the cameras. The cascade is gated on
+    `cameras_paused` being in the body."""
+    headers = await _provision(client, auth_user)
+    pid = (await client.post("/v1/patients", headers=headers, json=_FULL_BODY)).json()["id"]
+
+    cam_id = await _insert_camera(
+        patient_id=UUID(pid), display_id=1, room="Living Room",
+        source_type="iphone", desired_state="disconnected",
+    )
+
+    with patch(
+        "src.api.patients.pi_ingest_module.cancel_active_relay",
+        new=AsyncMock(return_value=False),
+    ) as mock_cancel:
+        r = await client.patch(
+            f"/v1/patients/{pid}", headers=headers,
+            json={"preferred_name": "Margie"},
+        )
+
+    assert r.status_code == 200
+    assert await _camera_desired_state(cam_id) == "disconnected"
+    mock_cancel.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_patch_cameras_paused_does_not_cascade_to_other_caregivers_cameras(
+    client: AsyncClient, auth_user_factory,
+) -> None:
+    """Caregiver A pausing their patient's cameras must not touch any
+    camera belonging to caregiver B. `camera_repo.list_for_patient`
+    enforces the caregiver scope; this test pins that contract."""
+    a_uid, a_email = await auth_user_factory()
+    b_uid, b_email = await auth_user_factory()
+    h_a = {"Authorization": f"Bearer {mint_test_jwt(a_uid, a_email)}"}
+    h_b = {"Authorization": f"Bearer {mint_test_jwt(b_uid, b_email)}"}
+
+    await client.post("/v1/me", headers=h_a, json={"display_name": "A"})
+    await client.post("/v1/me", headers=h_b, json={"display_name": "B"})
+
+    a_pid = (await client.post("/v1/patients", headers=h_a, json=_FULL_BODY)).json()["id"]
+    b_pid = (await client.post("/v1/patients", headers=h_b, json=_FULL_BODY)).json()["id"]
+
+    a_cam = await _insert_camera(
+        patient_id=UUID(a_pid), display_id=1, room="A-Bedroom",
+    )
+    b_cam = await _insert_camera(
+        patient_id=UUID(b_pid), display_id=1, room="B-Bedroom",
+    )
+
+    r = await client.patch(
+        f"/v1/patients/{a_pid}", headers=h_a, json={"cameras_paused": True},
+    )
+    assert r.status_code == 200
+
+    assert await _camera_desired_state(a_cam) == "disconnected"
+    assert await _camera_desired_state(b_cam) == "connected"

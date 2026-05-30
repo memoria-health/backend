@@ -35,7 +35,6 @@ class Patient(Base):
     gender: Mapped[str | None] = mapped_column(String(40), default=None)
     home_address: Mapped[str | None] = mapped_column(String(500), default=None)
     last_event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
-    battery_percent: Mapped[int | None] = mapped_column(Integer, default=None)
     photo_storage_key: Mapped[str | None] = mapped_column(String, default=None)
 
     # Per-patient email alerts. Each patient can route alerts to a
@@ -45,6 +44,11 @@ class Patient(Base):
     email_alerts_enabled: Mapped[bool] = mapped_column(
         Boolean, server_default=text("false"), default=False,
     )
+    # `default_factory` (not `default`) is the dataclass-style invokable
+    # default. `default=list` stores the type itself, which the JSONB
+    # bind processor then tries to JSON-encode and fails with
+    # "Object of type type is not JSON serializable". analysis.py
+    # has the same trap noted in a comment; same fix needed here.
     email_alert_recipients: Mapped[list[str]] = mapped_column(
         JSONB, server_default=text("'[]'::jsonb"), default_factory=list,
     )

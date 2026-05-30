@@ -82,18 +82,22 @@ async def _send(
     subject: str,
     html: str,
     settings: Settings,
+    reply_to: str | None = None,
 ) -> None:
     """One Resend POST. Raises on transport error; caller logs."""
     client = await _get_client()
+    payload: dict[str, object] = {
+        "from": settings.email_from,
+        "to": list(to),
+        "subject": subject,
+        "html": html,
+    }
+    if reply_to:
+        payload["reply_to"] = reply_to
     resp = await client.post(
         _RESEND_ENDPOINT,
         headers={"Authorization": f"Bearer {settings.resend_api_key}"},
-        json={
-            "from": settings.email_from,
-            "to": list(to),
-            "subject": subject,
-            "html": html,
-        },
+        json=payload,
     )
     if resp.status_code >= 400:
         # Surface Resend's error body so domain-not-verified etc. is
@@ -182,6 +186,56 @@ async def _dispatch_one(
     log.info(
         "email.sent event=%s caregiver=%s recipients=%d",
         event.id, caregiver.id, len(recipients),
+    )
+
+
+async def send_support_email(
+    *,
+    caregiver: Caregiver,
+    subject: str,
+    message: str,
+    settings: Settings,
+) -> str:
+    """Forward a Contact Support message from the iOS app to the team.
+
+    Recipients come from `settings.support_email_recipients`; replyTo
+    is the caregiver's account email so hitting reply in any mail
+    client routes directly back to them. Returns a human-readable
+    status the API echoes to the client.
+    """
+    if not settings.resend_api_key:
+        return "Email isn't configured on the server yet (no Resend key)."
+    recipients = list(settings.support_email_recipients or [])
+    if not recipients:
+        return "No support recipients are configured."
+    full_subject = f"[Nemara support] {subject.strip() or '(no subject)'}"
+    body_html = _support_html(
+        caregiver_name=caregiver.display_name,
+        caregiver_email=caregiver.email,
+        message=message,
+    )
+    await _send(
+        to=recipients,
+        subject=full_subject,
+        html=body_html,
+        settings=settings,
+        reply_to=caregiver.email,
+    )
+    log.info(
+        "email.support_sent caregiver=%s recipients=%d", caregiver.id, len(recipients),
+    )
+    return "Sent. We'll reply to your account email."
+
+
+def _support_html(*, caregiver_name: str, caregiver_email: str, message: str) -> str:
+    safe = message.replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
+    return (
+        "<div style=\"font-family:-apple-system,Segoe UI,sans-serif;color:#1c1a17\">"
+        f"<p style=\"margin:0 0 12px;color:#6b6357;font-size:13px\">"
+        f"From {caregiver_name} &lt;{caregiver_email}&gt; via the Nemara iOS app."
+        "</p>"
+        f"<div style=\"margin:0;font-size:15px;line-height:1.5\">{safe}</div>"
+        "</div>"
     )
 
 

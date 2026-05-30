@@ -62,6 +62,7 @@ from src.api.livekit_webhooks import router as livekit_webhooks_router
 from src.api.pairing import router as pairing_router
 from src.api.patients import router as patients_router
 from src.api.pi_discovery import router as pi_discovery_router
+from src.api.support import router as support_router
 from src.api.talk import router as talk_router
 from src.db import analysis as _analysis  # noqa: F401
 from src.db import camera as _camera  # noqa: F401
@@ -101,6 +102,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.scheduler = scheduler
     await scheduler.start()
+    # `cameras.online` and `last_seen_at` are now owned by each
+    # `RoomWorker`'s `LiveKitRoomReconciler` (see room_reconciler.py).
+    # The standalone `StaleOnlineSweeper` was removed because REST
+    # polling produces the same staleness signal without a separate
+    # DB sweep.
     try:
         yield
     finally:
@@ -137,6 +143,8 @@ def create_app() -> FastAPI:
     app.include_router(talk_router)
     # Re-ID face enrollment + status.
     app.include_router(face_embeddings_router)
+    # Contact Support (Resend forwarding) from the iOS app's Settings.
+    app.include_router(support_router)
     return app
 
 
