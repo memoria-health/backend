@@ -325,6 +325,10 @@ async def test_reconcile_aclose_failure_does_not_crash(
     assert joined == ["patient_only"]
 
 
+async def _noop_async(self, *args, **kwargs):
+    return None
+
+
 @pytest.mark.asyncio
 async def test_start_timeout_on_reconcile_does_not_crash(
     monkeypatch: pytest.MonkeyPatch,
@@ -352,6 +356,19 @@ async def test_start_timeout_on_reconcile_does_not_crash(
     # we're proving the timeout branch is wired correctly.
     monkeypatch.setattr(
         "src.services.detection.worker._RECONCILE_TIMEOUT", 0.3,
+    )
+    # Bypass the singleton advisory-lock acquisition. The lock asserts
+    # only one DetectorWorker can write `cameras.online` against a
+    # given Postgres at a time. Locally we may have a long-running
+    # backend already holding the lock; that's a real production
+    # safety property but not what this test is exercising.
+    monkeypatch.setattr(
+        "src.services.detection.worker.DetectorWorker._acquire_singleton_lock",
+        _noop_async,
+    )
+    monkeypatch.setattr(
+        "src.services.detection.worker.DetectorWorker._release_singleton_lock",
+        _noop_async,
     )
 
     worker = _make_worker()

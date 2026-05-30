@@ -227,7 +227,13 @@ fi
 NGROK_URL=""
 if $WITH_NGROK; then
   step "Starting ngrok tunnel"
-  nohup ngrok http 8002 --log=stdout > "$DEV_DIR/ngrok.log" 2>&1 &
+  # NGROK_DOMAIN pins the tunnel to a static ngrok-free subdomain so
+  # the URL survives across `make fresh` cycles. Without it, ngrok
+  # rotates to a random URL each session and every iOS scheme, web
+  # .env.local, and LiveKit Cloud webhook config has to be re-pasted.
+  # Override via env var to swap to a different reserved domain.
+  NGROK_DOMAIN="${NGROK_DOMAIN:-unpoeticised-mozell-unavengeable.ngrok-free.dev}"
+  nohup ngrok http --domain="$NGROK_DOMAIN" 8002 --log=stdout > "$DEV_DIR/ngrok.log" 2>&1 &
   echo $! > "$DEV_DIR/ngrok.pid"
   NGROK_PID=$(cat "$DEV_DIR/ngrok.pid")
 

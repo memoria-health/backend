@@ -64,20 +64,21 @@ def parse_and_validate(
             f"— raw: {raw[:500]}"
         )
 
-    if not isinstance(parsed.get("people_present"), bool):
-        raise ValueError(
-            f"{provider} response missing people_present (boolean) — raw: {raw[:500]}"
-        )
-    if isinstance(parsed.get("people_count"), bool) or not isinstance(
-        parsed.get("people_count"), (int, float)
-    ):
-        raise ValueError(
-            f"{provider} response missing people_count (number) — raw: {raw[:500]}"
-        )
+    # `people_present`/`people_count` are no longer required: Re-ID's
+    # body pipeline is the source of truth for presence and the prompt
+    # no longer asks the LLM to answer them. Older providers / cached
+    # responses might still include the fields, so we accept-and-pass-
+    # through with type validation; missing or wrong-typed values
+    # default to (False, 0) and are discarded upstream when Re-ID ran.
+    pp_raw = parsed.get("people_present")
+    pc_raw = parsed.get("people_count")
+    people_present = bool(pp_raw) if isinstance(pp_raw, bool) else False
+    if isinstance(pc_raw, bool) or not isinstance(pc_raw, (int, float)):
+        people_count = 0
+    else:
+        people_count = int(pc_raw)
 
     description = str(parsed["description"]).strip()
-    people_present = bool(parsed["people_present"])
-    people_count = int(parsed["people_count"])
 
     detector_fields: dict[str, Any] = {}
     for key, val in parsed.items():

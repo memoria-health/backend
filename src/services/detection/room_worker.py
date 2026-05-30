@@ -22,7 +22,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import secrets
 import time
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
@@ -34,6 +33,7 @@ from sqlalchemy import select
 
 from src.db.camera import Camera
 from src.services.detection.camera_ingest import CameraIngest
+from src.services.detection.room_reconciler import LiveKitRoomReconciler
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -49,10 +49,36 @@ log = logging.getLogger(__name__)
 # identities — useful for triaging "is the bot actually joined?".
 _WORKER_IDENTITY_PREFIX = "detector_worker_"
 
-# Token TTL for the bot's own viewer JWT. Long enough that we don't
-# need refresh logic in v0; if we ever do, refresh-at-TTL/2 is the
-# pattern.
+# Token TTL for the bot's own viewer JWT. Active rotation (see
+# `_TOKEN_RECYCLE_INTERVAL_S` below) refreshes the token well inside
+# this window — TTL is the safety margin, not the rotation period.
 _WORKER_TOKEN_TTL = timedelta(hours=12)
+
+# Active JWT rotation. Every `_TOKEN_RECYCLE_INTERVAL_S`, force a
+# clean disconnect so the supervisor's reconnect cycle mints a fresh
+# token. Required because the LiveKit Python SDK reuses the
+# connect-time token forever (no refresh callback) — without active
+# rotation, a backend that stays up past TTL eventually gets stuck
+# in a 401 resume loop the first time a transient network blip
+# forces the SDK to re-establish its WebSocket with the stale token
+# (observed 2026-05-29: backend up 36h, JWT expired at +12h, network
+# blip at +52h triggered a 9-attempt 18-minute resume loop, all 401).
+# Recycle at TTL/3 leaves ~8h headroom: if the recycle's reconnect
+# fails, the supervisor's backoff loop retries until success well
+# before the token actually expires.
+_TOKEN_RECYCLE_INTERVAL_S: float = 4 * 60 * 60  # 4 hours
+
+# Reconnect-state watchdog. If the SDK stays in its resume codepath
+# longer than this (`reconnecting` event fired, no matching
+# `reconnected` since), force a clean disconnect so the supervisor
+# can mint a fresh token instead of letting the SDK retry forever
+# with the existing one. Belt-and-braces for the same 401-loop bug
+# the periodic recycle prevents proactively: this catches the case
+# where the network blip happens between recycles. The SDK's normal
+# resume completes in well under 10s; a 90s stuck-resume window is
+# unambiguously broken.
+_RECONNECT_WATCHDOG_TIMEOUT_S: float = 90.0
+_RECONNECT_WATCHDOG_TICK_S: float = 5.0
 
 # Topic the wall phone publishes its motion heartbeats on. Mirrored
 # in `nemara-camera-app/NemaraCam/LiveKit/LiveKitPublisher.swift`.
@@ -107,6 +133,7 @@ class RoomWorker:
         sessionmaker: "async_sessionmaker",
         motion_cache: "MotionCache",
         reid: "ReIDInference",
+        lk_api: "object | None" = None,
         on_idle_timeout: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self.room_name = room_name
@@ -158,16 +185,16 @@ class RoomWorker:
         # by stop(). All room state lives behind this single task; the
         # outer worker just sees it spin until told otherwise.
         self._supervisor_task: asyncio.Task[None] | None = None
-        # Per-instance random suffix on the LiveKit identity. Prevents
-        # the DuplicateIdentity reconnect loop that happens when a
-        # previous backend process was killed ungracefully — LiveKit
-        # Cloud holds the old worker's identity slot for ~20s after the
-        # TCP drops, and a new backend trying to join with the SAME
-        # deterministic identity gets kicked, reconnects, kicks the old
-        # ghost, ad infinitum. With a unique suffix per worker instance
-        # there's no collision: the new worker connects under a fresh
-        # name, the ghost times out in the background, no loop.
-        self._identity_suffix = secrets.token_hex(3)
+        # Periodic REST reconciler. Reads the authoritative participant
+        # list from LiveKit Cloud and writes `cameras.online` based on
+        # the two-signal rule (REST-presence AND fresh frame arrival).
+        # Sole writer of the column post-refactor.
+        self._reconciler = LiveKitRoomReconciler(
+            room_name=room_name,
+            room_worker=self,
+            lk_api=lk_api,  # type: ignore[arg-type]
+            sessionmaker=sessionmaker,
+        )
 
     # ── lifecycle ──────────────────────────────────────────────────
 
@@ -195,16 +222,23 @@ class RoomWorker:
                 self._monitor_idle(),
                 name=f"room-idle-monitor-{self.room_name}",
             )
+        # Periodic REST-based participant reconciler. Replaces the
+        # SDK-dict-walking reconciler we used to run inline here; see
+        # `room_reconciler.py` for the design rationale.
+        await self._reconciler.start()
 
     async def stop(self) -> None:
         if self._stopped:
             return
         self._stopped = True
-        # Cancel both background tasks before tearing down LiveKit
-        # state. Order: idle monitor first (it might be about to fire
-        # a callback that we're already overriding by stopping
-        # ourselves), then supervisor (it owns the LiveKit
-        # connection). Either task being None is fine.
+        # Order matters:
+        #   1. stop the reconciler so it cannot spawn or evict during
+        #      teardown
+        #   2. cancel the idle monitor (it would fire a callback we are
+        #      about to render moot)
+        #   3. cancel the supervisor (owns the LiveKit connection;
+        #      `_teardown_active_session` is its post-cancel cleanup)
+        await self._reconciler.stop()
         if getattr(self, "_idle_monitor_task", None) is not None:
             self._idle_monitor_task.cancel()
             try:
@@ -332,16 +366,58 @@ class RoomWorker:
     async def _connect_and_wait(self) -> str:
         """One connect cycle. Returns the disconnect reason the SDK
         gives us when the room drops; raises on connect-time failures
-        so the supervisor backs off."""
+        so the supervisor backs off.
+
+        Spawns two background tasks for the lifetime of this connect
+        cycle: a periodic recycle (forces a clean reconnect every
+        `_TOKEN_RECYCLE_INTERVAL_S` to rotate the JWT) and a reconnect
+        watchdog (forces a disconnect if the SDK gets stuck in
+        `CONN_RECONNECTING` past `_RECONNECT_WATCHDOG_TIMEOUT_S`).
+        Both fire `room.disconnect()`, which is the same path a
+        natural network drop takes, so the supervisor's reconnect
+        machinery handles all three cases uniformly.
+        """
         token = self._mint_viewer_token()
         room = rtc.Room()
         disconnected = asyncio.Event()
         disconnect_reason: dict[str, str] = {"reason": "unknown"}
+        # Tracks when the SDK last entered the resume path. Set by the
+        # `reconnecting` event, cleared by `reconnected` (or by a
+        # `disconnected` that ends the cycle anyway). Read by the
+        # watchdog. We listen on the purpose-built `reconnecting` /
+        # `reconnected` events (room.py:399-402) rather than parsing
+        # `connection_state_changed` enum transitions — the dedicated
+        # events are emitted directly by the SDK's resume codepath and
+        # don't depend on us mapping enum values correctly.
+        resume_state: dict[str, float | None] = {"reconnecting_since": None}
 
         @room.on("disconnected")
         def _on_disconnected(reason: object = None) -> None:
             disconnect_reason["reason"] = str(reason) if reason is not None else "unknown"
             disconnected.set()
+
+        @room.on("reconnecting")
+        def _on_reconnecting() -> None:
+            # Idempotent: if the SDK fires `reconnecting` twice (resume
+            # retry attempt), keep the FIRST timestamp so the watchdog
+            # threshold measures total stuck time, not just the current
+            # attempt's age.
+            if resume_state["reconnecting_since"] is None:
+                resume_state["reconnecting_since"] = time.monotonic()
+                log.warning(
+                    "room_worker.reconnecting_started room=%s",
+                    self.room_name,
+                )
+
+        @room.on("reconnected")
+        def _on_reconnected() -> None:
+            if resume_state["reconnecting_since"] is not None:
+                elapsed = time.monotonic() - resume_state["reconnecting_since"]
+                resume_state["reconnecting_since"] = None
+                log.info(
+                    "room_worker.reconnecting_recovered room=%s elapsed_s=%.1f",
+                    self.room_name, elapsed,
+                )
 
         self._wire_room_handlers(room)
         await room.connect(self._settings.livekit_url, token)
@@ -351,8 +427,117 @@ class RoomWorker:
             self.room_name, self._settings.livekit_url, self._identity(),
         )
 
-        await disconnected.wait()
-        return disconnect_reason["reason"]
+        # Backfill `track_subscribed` for participants that joined BEFORE
+        # we connected. The LiveKit Python SDK only fires that event
+        # for tracks published AFTER our join; tracks already in the
+        # room at connect time silently land in
+        # `room.remote_participants` without the event. Without this
+        # walk, a backend restart or late join leaves the wall phone
+        # publishing into a room whose detector worker is technically
+        # connected but never spawns a CameraIngest, the idle teardown
+        # then evicts the worker after 120s, and the caregiver UI
+        # sits on "Offline" over a live LiveKit stream. We manually
+        # invoke the same handler the event would have called.
+        for participant in room.remote_participants.values():
+            for publication in participant.track_publications.values():
+                track = publication.track
+                if track is None:
+                    # Not yet subscribed; the natural `track_subscribed`
+                    # event will land in a moment. The handler is
+                    # idempotent (per-identity dict + spawn lock) so a
+                    # later event arriving after this backfill is a
+                    # no-op.
+                    continue
+                log.info(
+                    "room_worker.backfill_existing_track room=%s identity=%s kind=%s",
+                    self.room_name,
+                    self._participant_identity(participant),
+                    track.kind,
+                )
+                asyncio.create_task(
+                    self._handle_track_subscribed(track, publication, participant),
+                )
+
+        recycle_task = asyncio.create_task(
+            self._recycle_loop(room),
+            name=f"room-recycle-{self.room_name}",
+        )
+        watchdog_task = asyncio.create_task(
+            self._reconnect_watchdog_loop(room, resume_state),
+            name=f"room-watchdog-{self.room_name}",
+        )
+        try:
+            await disconnected.wait()
+            return disconnect_reason["reason"]
+        finally:
+            for task in (recycle_task, watchdog_task):
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+    async def _recycle_loop(self, room: rtc.Room) -> None:
+        """Sleep for `_TOKEN_RECYCLE_INTERVAL_S`, then force a clean
+        disconnect so the supervisor mints a fresh JWT on its next
+        cycle. One-shot per connect cycle — if the disconnect
+        succeeds, the surrounding `_connect_and_wait` exits and
+        `_maintain_connection` spins us back up with a new token.
+        """
+        try:
+            await asyncio.sleep(_TOKEN_RECYCLE_INTERVAL_S)
+        except asyncio.CancelledError:
+            raise
+        log.info(
+            "room_worker.token_recycle room=%s — forcing clean reconnect "
+            "to rotate JWT",
+            self.room_name,
+        )
+        try:
+            await room.disconnect()
+        except Exception:
+            log.exception(
+                "room_worker.token_recycle_disconnect_failed room=%s",
+                self.room_name,
+            )
+
+    async def _reconnect_watchdog_loop(
+        self,
+        room: rtc.Room,
+        resume_state: dict[str, float | None],
+    ) -> None:
+        """If the SDK stays in `CONN_RECONNECTING` longer than
+        `_RECONNECT_WATCHDOG_TIMEOUT_S`, force a disconnect so the
+        supervisor can rebuild the connection with a fresh token. The
+        SDK's internal resume retries reuse the original (possibly
+        expired) JWT — without this watchdog, a stuck resume burns
+        ~18 minutes before the SDK gives up on its own.
+        """
+        try:
+            while True:
+                await asyncio.sleep(_RECONNECT_WATCHDOG_TICK_S)
+                since = resume_state["reconnecting_since"]
+                if since is None:
+                    continue
+                elapsed = time.monotonic() - since
+                if elapsed < _RECONNECT_WATCHDOG_TIMEOUT_S:
+                    continue
+                log.warning(
+                    "room_worker.reconnect_watchdog_fired room=%s "
+                    "stuck_reconnecting_for=%.1fs — forcing disconnect so "
+                    "supervisor can mint fresh JWT",
+                    self.room_name, elapsed,
+                )
+                try:
+                    await room.disconnect()
+                except Exception:
+                    log.exception(
+                        "room_worker.watchdog_disconnect_failed room=%s",
+                        self.room_name,
+                    )
+                return
+        except asyncio.CancelledError:
+            raise
 
     async def _teardown_active_session(self) -> None:
         """Cancel consumer tasks, stop ingests, disconnect the room.
@@ -405,6 +590,23 @@ class RoomWorker:
                 self._handle_track_subscribed(track, publication, participant),
             )
 
+        @room.on("participant_connected")
+        def _on_participant_connected(participant: rtc.RemoteParticipant) -> None:
+            # Symmetric to the connect-time backfill in `_connect_and_wait`:
+            # the SDK's `track_subscribed` event is supposed to fire for
+            # every track on a newly-joined participant, but it doesn't
+            # always (observed 2026-05-28 with cam_8e3a9bf9 — Pi published
+            # tracks, SDK internally logged the publication, but
+            # `track_subscribed` never reached our handler, so no
+            # CameraIngest, no ticks, no `online` flip). Walking the new
+            # participant's publications ourselves makes the spawn path
+            # event-loss-resilient. `_handle_track_subscribed` is
+            # idempotent under the per-identity spawn lock, so a
+            # native `track_subscribed` arriving later is a safe no-op.
+            asyncio.create_task(
+                self._backfill_participant_tracks(participant),
+            )
+
         @room.on("participant_disconnected")
         def _on_participant_disconnected(participant: rtc.RemoteParticipant) -> None:
             asyncio.create_task(self._handle_participant_left(participant))
@@ -412,6 +614,35 @@ class RoomWorker:
         @room.on("data_received")
         def _on_data_received(data: rtc.DataPacket) -> None:
             self._handle_data_packet(data)
+
+    async def _backfill_participant_tracks(
+        self, participant: rtc.RemoteParticipant,
+    ) -> None:
+        """Walk every track publication on `participant` and feed each
+        subscribed one through `_handle_track_subscribed`, as if the
+        SDK had fired the event itself. Called from the
+        `participant_connected` event so a missed `track_subscribed`
+        doesn't strand the participant with no CameraIngest.
+
+        Idempotent: the handler's per-identity spawn lock + dict
+        membership check make a later native `track_subscribed`
+        arrival a no-op for the video/audio task tracking too.
+        """
+        identity = self._participant_identity(participant)
+        log.info(
+            "room_worker.participant_connected room=%s identity=%s "
+            "publications=%d (walking for missed track_subscribed)",
+            self.room_name, identity, len(participant.track_publications),
+        )
+        for publication in participant.track_publications.values():
+            track = publication.track
+            if track is None:
+                # Not yet subscribed; the SDK should still fire
+                # track_subscribed once subscription completes. Our
+                # handler is idempotent so the later natural event
+                # won't double-spawn.
+                continue
+            await self._handle_track_subscribed(track, publication, participant)
 
     async def _handle_track_subscribed(
         self,
@@ -491,6 +722,12 @@ class RoomWorker:
                 except (asyncio.CancelledError, Exception):
                     pass
         await ingest.stop()
+        # `cameras.online = false` is NOT written here. The reconciler
+        # observes the same `participant_left` via its REST poll and
+        # writes the column once `miss_threshold` polls have agreed.
+        # Writing here too would race the reconciler and could flap
+        # `online` on a sub-second reconnect (publisher dropped + re-
+        # published within one reconciler interval).
         log.info(
             "room_worker.participant_left room=%s camera=%s identity=%s",
             self.room_name, ingest.camera_id, identity,
@@ -567,12 +804,22 @@ class RoomWorker:
             frame = event.frame
             if frame.type != rtc.VideoBufferType.I420:
                 frame = frame.convert(rtc.VideoBufferType.I420)
+            now_mono = time.monotonic()
             ingest.frame_buffer.push(
                 width=frame.width,
                 height=frame.height,
                 data=bytes(frame.data),
-                captured_at=time.monotonic(),
+                captured_at=now_mono,
             )
+            # Stamp the liveness timestamp. `LiveKitRoomReconciler`
+            # reads this every poll (10s) and treats frames within
+            # `liveness_grace_s` (default 30s) as fresh. When this
+            # stamp stops advancing the reconciler flips `online=false`
+            # after the absent-streak debounce. Decoupled from the
+            # detector tick: even an `ai_paused` or `disabled` camera
+            # gets its `_last_frame_at` advanced here, so `online`
+            # tracks actual stream presence, not detector activity.
+            ingest.record_frame_arrival(now_mono)
 
         await self._consume_with_retry(
             label="video",
@@ -655,13 +902,7 @@ class RoomWorker:
             motion_cache=self._motion_cache,
             settings=self._settings,
             reid=self._reid,
-            # Hand the ingest a back-channel so it can ask to be removed
-            # if its `cameras` row vanishes (admin DELETE without a
-            # paired participant_left, partition-then-replay races).
-            # remove_ingest is idempotent and lock-free of any RoomWorker
-            # mutex, see remove_ingest docstring.
             livekit_identity=identity,
-            on_self_destruct=self.remove_ingest,
         )
         await ingest.start()
         self._ingests_by_identity[identity] = ingest
@@ -755,13 +996,16 @@ class RoomWorker:
         )
 
     def _identity(self) -> str:
-        # `detector_worker_<8 hex of room>_<6 hex random per worker instance>`.
-        # The room-derived prefix keeps LiveKit logs readable ("this
-        # bot belongs to which room"). The random suffix makes the
-        # identity unique per backend process / RoomWorker instance —
-        # see the comment on `self._identity_suffix` in __init__.
+        # `detector_worker_<8 hex of room>` — STABLE per patient. On a
+        # backend redeploy the new pod connects with the same identity
+        # and LiveKit Cloud kicks the dying pod's leftover session
+        # (default duplicate-identity behavior). Previously we appended
+        # a random suffix to avoid a DuplicateIdentity reconnect loop;
+        # with REST-driven reconciliation that loop no longer occurs
+        # because the new pod's reconciler does not wait for the SDK
+        # to deliver a `participant_left` for the old self.
         short = self.room_name.removeprefix("patient_")[:8]
-        return f"{_WORKER_IDENTITY_PREFIX}{short}_{self._identity_suffix}"
+        return f"{_WORKER_IDENTITY_PREFIX}{short}"
 
     @staticmethod
     def _participant_identity(participant: rtc.RemoteParticipant | None) -> str:

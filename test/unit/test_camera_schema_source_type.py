@@ -29,6 +29,8 @@ def _valid_iphone_kwargs() -> dict:
         "icon_name": "tv",
         "online": True,
         "disabled": False,
+        "ai_paused": False,
+        "paired": True,
         "desired_state": "connected",
         "source_type": "iphone",
         "pi_stream_url": None,

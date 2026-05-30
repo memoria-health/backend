@@ -42,6 +42,17 @@ _INVALID_AUTH_RESPONSE = HTTPException(
     headers={"WWW-Authenticate": "Bearer"},
 )
 
+# Distinct from 401: the bearer was well-formed but no `cameras` row
+# has a matching `api_key_hash`. Almost always means the camera was
+# deleted server-side (caregiver removed it, or DB was reset). The
+# wall phone uses this code to decide it's actually been unpaired,
+# vs a transient 401 (which it retries through). See
+# DesiredStateMonitor.swift for the consumer.
+_NO_MATCHING_CAMERA_RESPONSE = HTTPException(
+    status_code=status.HTTP_404_NOT_FOUND,
+    detail="camera_not_found",
+)
+
 
 def get_settings_dep() -> Settings:
     """FastAPI-compatible Settings injector."""
@@ -102,7 +113,17 @@ async def camera_auth(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
 ) -> Camera:
     """Verify the bearer token against `cameras.api_key_hash` and
-    return the matching Camera row. Raises 401 on any failure.
+    return the matching Camera row.
+
+    Two distinct failure modes, with different status codes so the
+    wall phone (NemaraCam) can distinguish "auth blip, retry" from
+    "I've actually been deleted, reset to pairing":
+
+      - 401 invalid_auth: missing/malformed bearer header. The phone
+        treats this as transient and keeps polling.
+      - 404 camera_not_found: bearer well-formed but no row has a
+        matching api_key_hash. The phone treats this as definitive
+        "row was deleted" and clears local credentials.
 
     Phase 0 implementation: linear-scan all rows with a non-null
     `api_key_hash`. Phase 4+ may add a prefix index for O(1) lookup.
@@ -135,7 +156,7 @@ async def camera_auth(
             return cam
 
     log.info("camera_auth.reject reason=no_matching_camera")
-    raise _INVALID_AUTH_RESPONSE
+    raise _NO_MATCHING_CAMERA_RESPONSE
 
 
 CameraAuth = Annotated[Camera, Depends(camera_auth)]

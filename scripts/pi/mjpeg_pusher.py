@@ -264,6 +264,10 @@ async def _stream_body(
     yield b"--" + _BOUNDARY + b"--\r\n"
 
 
+_PUSH_RESULT_CLOSED = "closed"
+_PUSH_RESULT_PAUSED = "paused"
+
+
 async def push_once(
     *,
     ingest_url: str,
@@ -272,11 +276,20 @@ async def push_once(
     height: int,
     fps: int,
     bitrate_bps: int,
-) -> None:
+) -> str:
     """Open one push connection and stream frames until the camera
-    or the server closes it. Returns on clean exit (server closed,
-    Pi shutdown); raises on transport error so the caller can back
-    off and reconnect.
+    or the server closes it.
+
+    Returns one of:
+      - `_PUSH_RESULT_CLOSED`: server hung up normally; the caller
+        should immediately reconnect with the existing backoff.
+      - `_PUSH_RESULT_PAUSED`: server returned 423 indicating the
+        caregiver hit Disconnect, the camera is hidden, or any
+        other "stop pushing" signal. Caller MUST switch to paused
+        mode (poll ingest-status until it flips back to connected)
+        rather than reconnecting at full rate.
+
+    Raises on transport error so the caller can back off and reconnect.
     """
     cam, encoder, output, ring = _build_camera_and_encoder(
         width, height, fps, bitrate_bps,
@@ -307,12 +320,25 @@ async def push_once(
                 # kick us; we wait for the announce daemon to write a
                 # fresh ingest.env.
                 raise SystemExit(2)
+            if resp.status_code == 423:
+                # The caregiver disconnected this camera (or some other
+                # "do not relay" signal). Switch the outer loop to
+                # paused mode so we stop hammering the push endpoint
+                # at 15 Hz; the paused loop polls ingest-status at
+                # ~5 s instead and resumes the moment the server
+                # flips back to connected.
+                log.info(
+                    "server returned 423 paused (body=%s); switching to paused mode",
+                    resp.text[:200],
+                )
+                return _PUSH_RESULT_PAUSED
             if resp.status_code >= 500:
                 log.warning(
                     "server returned %d; will reconnect", resp.status_code,
                 )
-                return
+                return _PUSH_RESULT_CLOSED
             log.info("push closed cleanly status=%d", resp.status_code)
+            return _PUSH_RESULT_CLOSED
     finally:
         # picamera2's start_recording / stop_recording pair owns the
         # camera lifecycle: stop_recording calls stop() + releases
@@ -334,9 +360,129 @@ async def push_once(
             log.exception("close failed during cleanup")
 
 
+def _derive_status_url(ingest_url: str) -> str:
+    """Map the push endpoint URL to its sibling status endpoint.
+
+    `ingest_url` is the full `https://.../v1/cameras/me/frames` value
+    the backend handed us in ingest.env. The status endpoint shares
+    everything except the trailing path segment. Keeping the
+    derivation literal (string replace) avoids a second env var and
+    a second source of truth — install.sh / announce_daemon only
+    have to write the one URL.
+    """
+    if ingest_url.endswith("/frames"):
+        return ingest_url[: -len("/frames")] + "/ingest-status"
+    # Fall back to appending the new segment so we never crash if the
+    # endpoint shape ever shifts; the backend will 404 us into the
+    # main-loop reconnect cycle in that case.
+    return ingest_url.rstrip("/") + "/ingest-status"
+
+
+async def fetch_desired_state(
+    *,
+    status_url: str,
+    ingest_token: str,
+) -> str:
+    """One-shot fetch of the camera's current desired_state via the
+    lightweight ingest-status endpoint.
+
+    Used by main_loop as a pre-flight gate before opening the
+    streaming push. Without this gate the Pi opens a long-running
+    multipart POST whose body httpx is still flushing while the
+    server has already returned 423; httpx surfaces the early stream
+    close as `httpx.ReadError` *before* it can parse the actual
+    423 response, so the Pi never sees the paused signal and loops
+    forever on connect+ReadError instead of switching modes. The
+    cheap GET sidesteps that races by checking the state before we
+    ever start streaming.
+
+    Returns the string the backend returned ('connected' or
+    'disconnected'). Raises on transport / auth / parse errors so
+    main_loop can apply its normal back-off and try again.
+    """
+    headers = {
+        "Authorization": f"Bearer {ingest_token}",
+        "User-Agent": "nemara-camera-pusher/1",
+    }
+    timeout = httpx.Timeout(connect=5.0, read=5.0, write=5.0, pool=5.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.get(status_url, headers=headers)
+        if resp.status_code == 401:
+            log.error(
+                "ingest-status returned 401; exiting for re-provision",
+            )
+            raise SystemExit(2)
+        resp.raise_for_status()
+        data = resp.json()
+        state = data.get("desired_state")
+        if state not in ("connected", "disconnected"):
+            raise ValueError(f"unexpected desired_state: {state!r}")
+        return state
+
+
+async def wait_until_active(
+    *,
+    status_url: str,
+    ingest_token: str,
+    poll_interval_s: float,
+) -> None:
+    """Paused-mode loop. Polls the ingest-status endpoint at a low
+    fixed cadence (default 5 s) and returns the moment the server
+    reports `desired_state == 'connected'`.
+
+    No camera is open here, no frames are encoded, no LiveKit
+    egress. This is the zero-bandwidth idle state the user wants
+    when they hit Disconnect on a Pi camera.
+    """
+    headers = {
+        "Authorization": f"Bearer {ingest_token}",
+        "User-Agent": "nemara-camera-pusher/1",
+    }
+    timeout = httpx.Timeout(connect=5.0, read=5.0, write=5.0, pool=5.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        while True:
+            try:
+                resp = await client.get(status_url, headers=headers)
+            except httpx.HTTPError as exc:
+                log.warning(
+                    "paused-mode poll failed (%s); will retry in %.1fs",
+                    exc, poll_interval_s,
+                )
+                await asyncio.sleep(poll_interval_s)
+                continue
+            if resp.status_code == 401:
+                log.error(
+                    "paused-mode poll got 401; exiting for re-provision",
+                )
+                raise SystemExit(2)
+            if resp.status_code != 200:
+                log.warning(
+                    "paused-mode poll http=%d body=%s; will retry in %.1fs",
+                    resp.status_code, resp.text[:200], poll_interval_s,
+                )
+                await asyncio.sleep(poll_interval_s)
+                continue
+            try:
+                state = resp.json().get("desired_state")
+            except Exception:
+                log.warning(
+                    "paused-mode poll body not JSON: %s; will retry",
+                    resp.text[:200],
+                )
+                await asyncio.sleep(poll_interval_s)
+                continue
+            if state == "connected":
+                log.info("paused-mode poll saw desired_state=connected; resuming")
+                return
+            # Still disconnected — quiet log to avoid spam, then sleep.
+            log.debug("paused-mode poll desired_state=%s; sleeping", state)
+            await asyncio.sleep(poll_interval_s)
+
+
 async def main_loop() -> None:
     ingest_url = os.environ["NEMARA_INGEST_URL"]
     ingest_token = os.environ["NEMARA_INGEST_TOKEN"]
+    status_url = _derive_status_url(ingest_url)
     width = int(os.environ.get("NEMARA_CAMERA_WIDTH", "1280"))
     height = int(os.environ.get("NEMARA_CAMERA_HEIGHT", "720"))
     fps = int(os.environ.get("NEMARA_CAMERA_FPS", "15"))
@@ -344,25 +490,70 @@ async def main_loop() -> None:
     # 720p; raise for sharper image at higher bandwidth cost.
     bitrate_bps = int(os.environ.get("NEMARA_CAMERA_BITRATE_BPS", "4000000"))
     base_backoff_s = float(os.environ.get("NEMARA_PUSH_RECONNECT_S", "2.0"))
+    paused_poll_s = float(os.environ.get("NEMARA_PAUSED_POLL_S", "5.0"))
 
     log.info(
-        "starting pusher url=%s res=%dx%d fps=%d bitrate_mbps=%.1f",
-        ingest_url, width, height, fps, bitrate_bps / 1_000_000,
+        "starting pusher url=%s status_url=%s res=%dx%d fps=%d bitrate_mbps=%.1f",
+        ingest_url, status_url, width, height, fps, bitrate_bps / 1_000_000,
     )
 
     backoff = base_backoff_s
     while True:
+        # Pre-flight gate: read desired_state before opening the
+        # streaming push. The push endpoint also returns 423 when
+        # disconnected, but the Pi can't reliably read that
+        # response — see the docstring on `fetch_desired_state` for
+        # the httpx-on-streaming-POST race that loses the 423.
+        # Doing a cheap GET first lets us route into paused mode
+        # cleanly without paying any frame-encoding cost.
         try:
-            await push_once(
+            state = await fetch_desired_state(
+                status_url=status_url, ingest_token=ingest_token,
+            )
+        except SystemExit:
+            raise
+        except Exception:
+            log.exception(
+                "desired-state pre-flight failed; sleeping %.1fs", backoff,
+            )
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2.0, _MAX_BACKOFF_S)
+            continue
+
+        if state == "disconnected":
+            log.info("desired_state=disconnected; entering paused mode")
+            backoff = base_backoff_s
+            await wait_until_active(
+                status_url=status_url,
+                ingest_token=ingest_token,
+                poll_interval_s=paused_poll_s,
+            )
+            # wait_until_active returned -> desired_state flipped to
+            # connected. Loop back round, re-pre-check, then push.
+            continue
+
+        # state == "connected"
+        try:
+            result = await push_once(
                 ingest_url=ingest_url,
                 ingest_token=ingest_token,
                 width=width, height=height,
                 fps=fps, bitrate_bps=bitrate_bps,
             )
-            # Clean exit: server closed gracefully. Reset backoff
-            # and reconnect immediately.
             backoff = base_backoff_s
-            await asyncio.sleep(0.5)
+            if result == _PUSH_RESULT_PAUSED:
+                # Rare: the streaming POST DID surface 423 cleanly.
+                # Drop straight into paused mode. The pre-flight will
+                # also catch this on the next iteration, but cheaper
+                # to react now.
+                await wait_until_active(
+                    status_url=status_url,
+                    ingest_token=ingest_token,
+                    poll_interval_s=paused_poll_s,
+                )
+            else:
+                # Clean close. Reconnect immediately.
+                await asyncio.sleep(0.5)
         except SystemExit:
             raise
         except Exception:

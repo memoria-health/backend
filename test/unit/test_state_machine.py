@@ -119,7 +119,11 @@ async def test_open_to_closed_when_no_people_count_reaches_threshold(
     assert cam.close_threshold == 6
     assert cam.state_changed_at is not None
     assert initial_state_changed_at is None or cam.state_changed_at > initial_state_changed_at
-    assert cam.last_seen_at is not None
+    # `last_seen_at` is now written exclusively by `LiveKitRoomReconciler`
+    # (see room_reconciler.py) and is intentionally NOT touched by the
+    # state machine. The seed in `_insert_camera` left it NULL, so
+    # post-tick it stays NULL.
+    assert cam.last_seen_at is None
 
 
 @pytest.mark.asyncio
@@ -150,10 +154,15 @@ async def test_closed_to_open_on_people_present(
 
 
 @pytest.mark.asyncio
-async def test_closed_to_open_on_motion_in_clip(
+async def test_closed_with_motion_but_no_people_stays_closed(
     client: AsyncClient, auth_user, session
 ) -> None:
-    """Closed + motion=true (people=false) → open + counter=0."""
+    """Motion alone never opens the camera. When state=closed and the
+    pipeline verdict is people_present=False, the camera stays closed
+    with the counter clamped — even if motion fired (a false-positive
+    wake-up). This is the post-a785c31 contract: the LLM/Re-ID verdict
+    is the sole gate, motion is just the wake-up trigger.
+    """
     pid = await _setup_patient(client, auth_user)
     cid = await _insert_camera(
         session, patient_id=pid, state="closed", no_people_count=6,
@@ -162,15 +171,15 @@ async def test_closed_to_open_on_motion_in_clip(
     res = await apply_tick_update(
         session, camera_id=cid, people_present=False, motion_in_clip=True,
     )
-    assert res.state == "open"
-    assert res.no_people_count == 0
+    assert res.state == "closed"
+    assert res.no_people_count == 6
     assert res.close_threshold == 6
     await session.commit()
 
     cam = await session.get(Camera, cid)
     assert cam is not None
-    assert cam.state == "open"
-    assert cam.no_people_count == 0
+    assert cam.state == "closed"
+    assert cam.no_people_count == 6
     assert cam.close_threshold == 6
 
 

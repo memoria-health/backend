@@ -143,6 +143,50 @@ NEMARA_LOG_LEVEL=INFO
 EOF
 chmod 0644 /etc/nemara/wifi-ap.env
 
+# Pre-bake the Nemara-Setup AP nmconnection so the supervisors start_ap()
+# only has to `nmcli connection up`, NOT `connection add`. On Pi OS Trixie,
+# `nmcli connection add` triggers NM -> netplan-regenerate -> systemctl
+# daemon-reload (~13s) and the chain runs 2-3 times during a single up.
+# Pre-baking eliminates the cascade entirely; AP comes up in ~3s instead
+# of ~50s. Confirmed via 2026-05-28 FAT32 debug dump.
+#
+# The keyfile is static config + dynamic SSID suffix (last 6 of MAC,
+# matching wifi_ap_provision.load_config()). autoconnect=no means NM
+# wont activate it automatically -- only when supervisor calls `up`.
+echo ">>> Pre-baking Nemara-Setup AP nmconnection (eliminates start_ap netplan cascade)"
+WLAN_MAC=$(cat /sys/class/net/wlan0/address 2>/dev/null || echo "00:00:00:00:00:00")
+MAC_SUFFIX=$(echo "$WLAN_MAC" | tr -d ':' | tr '[:lower:]' '[:upper:]' | tail -c 7 | head -c 6)
+AP_SSID="Nemara-Setup-${MAC_SUFFIX}"
+AP_KEYFILE="/etc/NetworkManager/system-connections/${AP_SSID}.nmconnection"
+AP_UUID=$(cat /proc/sys/kernel/random/uuid)
+mkdir -p /etc/NetworkManager/system-connections
+cat > "$AP_KEYFILE" <<EOF
+[connection]
+id=${AP_SSID}
+uuid=${AP_UUID}
+type=wifi
+autoconnect=false
+interface-name=wlan0
+
+[wifi]
+band=bg
+channel=6
+mode=ap
+ssid=${AP_SSID}
+
+[ipv4]
+address1=192.168.4.1/24
+method=shared
+
+[ipv6]
+method=ignore
+EOF
+chmod 0600 "$AP_KEYFILE"
+chown root:root "$AP_KEYFILE"
+echo "    wrote $AP_KEYFILE (ssid=$AP_SSID)"
+# Reload NM so it picks up the new keyfile without a restart.
+nmcli connection reload 2>/dev/null || true
+
 echo ">>> Installing systemd units"
 install -m 0644 "$SCRIPT_DIR/nemara-announce.service"      /etc/systemd/system/
 install -m 0644 "$SCRIPT_DIR/nemara-wifi-ap.service"       /etc/systemd/system/
@@ -162,6 +206,15 @@ systemctl enable nemara-wifi-ap.service
 # daemon writes that file the moment the backend hands us a fresh
 # token, then triggers `systemctl restart` on this unit.
 systemctl enable nemara-camera-stream.service
+
+# Touch the provisioning marker. wifi_ap_provision.py treats the marker
+# as the sole signal for "this Pi has wifi, skip AP mode." Dev-mode
+# installs (no `--for-customer`) keep the marker so the Pi stays on
+# the imager's wifi across reboots. `wifi_wipe_safe.sh` explicitly
+# clears the marker to force the next boot into AP-mode provisioning
+# for a customer handoff.
+mkdir -p /var/lib/nemara
+touch /var/lib/nemara/provisioned
 
 echo ""
 if [[ "${NEED_REBOOT:-0}" == "1" ]]; then

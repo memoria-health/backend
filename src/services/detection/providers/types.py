@@ -1,12 +1,18 @@
 """Provider abstraction — same shape Gemini + OpenAI both satisfy.
 
 Ports `nemara-temp-dashboard/lib/providers/types.ts`. Returns the
-fields the state machine + analyses store need:
+fields the analyses store needs:
   - `description`           — LLM 1–2 sentence summary
-  - `people_present`/_count — from the always-on `people_present` block
+  - `people_present`/_count — legacy fields, default False/0 since
+                              Re-ID body tracking is now the source of
+                              truth. Kept on the dataclass so any cached
+                              provider response that still carries them
+                              flows through without breakage; the state
+                              machine + analyses store read the Re-ID
+                              values instead.
   - `detector_fields`       — flat dict of `<id>_detected`, `<id>_confidence`,
-                              `<id>_reasoning`, etc. Anything beyond the three
-                              top-level fields ends up here.
+                              `<id>_reasoning`, etc. Anything beyond the
+                              three top-level fields ends up here.
 """
 
 from collections.abc import Sequence
@@ -19,9 +25,9 @@ from src.services.detection.prompt import DetectorSpec
 @dataclass(frozen=True)
 class ProviderResult:
     description: str
-    people_present: bool
-    people_count: int
     detector_fields: dict[str, Any]
+    people_present: bool = False
+    people_count: int = 0
 
 
 class Provider(Protocol):

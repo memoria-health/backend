@@ -23,10 +23,11 @@ from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
-from sqlalchemy import select, update
+from sqlalchemy import exists, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.db.camera import Camera
 from src.db.pi_discovery import PiDiscovery
 
 
@@ -81,12 +82,25 @@ async def list_unclaimed_recent(
     Used by the caregiver-facing list endpoint to populate the
     "Add a camera" picker. The recency filter is the only thing
     preventing dead Pis (e.g. unplugged for days) from showing up.
+
+    The picker also excludes any discovery whose stream URL already
+    matches an existing camera row. This is defensive: the normal
+    web pair flow always claims the discovery (which already removes
+    it from the list), but cameras created via direct-URL mode
+    (provision scripts, curl-based admin tooling) skip the claim
+    step and leave the discovery orphaned. Without this URL filter
+    the picker shows the same Pi as "available" forever even though
+    it's already in the patient's cameras list.
     """
     cutoff = datetime.now(UTC) - timedelta(seconds=seen_within_seconds)
+    already_paired = exists().where(
+        Camera.pi_stream_url == PiDiscovery.current_url,
+    )
     result = await session.execute(
         select(PiDiscovery)
         .where(PiDiscovery.claimed_at.is_(None))
         .where(PiDiscovery.last_seen_at >= cutoff)
+        .where(~already_paired)
         .order_by(PiDiscovery.last_seen_at.desc())
     )
     return result.scalars().all()
@@ -124,6 +138,40 @@ async def claim(
             claimed_at=now,
             claimed_camera_id=camera_id,
             pending_ingest_token=pending_ingest_token,
+        )
+    )
+    await session.flush()
+
+
+async def unclaim_for_camera(
+    session: AsyncSession, *, camera_id: UUID,
+) -> None:
+    """Reset claim state on whichever pi_discovery currently points at
+    `camera_id`. Used by the camera-delete handlers (caregiver-facing
+    `delete_camera` and wall-phone `delete_self`) to keep the
+    discovery row from rotting into a zombie state when the camera
+    it claims is removed.
+
+    Background: `pi_discoveries.claimed_camera_id` is `ON DELETE SET
+    NULL`. Without this call, deleting a Pi-typed camera leaves the
+    discovery with `claimed_camera_id=NULL` but `claimed_at` still
+    populated. `list_unclaimed_recent` filters on `claimed_at IS NULL`,
+    so the Pi can keep announcing forever without re-appearing in the
+    caregiver-app picker. We saw this hit 2026-05-28 17:03 PDT when
+    the user deleted the bedroom camera and the Pi vanished from
+    "available cameras." Resetting the claim fields here keeps the
+    discovery picker-ready on the very next announce.
+
+    No-op when no discovery references `camera_id` (the iPhone path,
+    where there is no discovery row at all).
+    """
+    await session.execute(
+        update(PiDiscovery)
+        .where(PiDiscovery.claimed_camera_id == camera_id)
+        .values(
+            claimed_at=None,
+            claimed_camera_id=None,
+            pending_ingest_token=None,
         )
     )
     await session.flush()

@@ -143,12 +143,19 @@ _ATOMIC_UPDATE_SQL = text(
             WHEN NOT :people_present AND state = 'open'
                 AND no_people_count + 1 >= close_threshold THEN :now
             ELSE state_changed_at
-        END,
-        last_seen_at = :now
+        END
     WHERE id = :camera_id
     RETURNING state, no_people_count, close_threshold
     """
 )
+
+# Stream-presence columns (`online`, `last_seen_at`) are no longer
+# written by the state machine. `LiveKitRoomReconciler` is the sole
+# writer of those, sourced from `lkapi.room.list_participants` and
+# the per-ingest `_last_frame_at` clock. Keeping the state-machine
+# UPDATE focused on open/closed state means a paused detector tick
+# does not pretend the camera is live, and a live publisher whose
+# camera is AI-paused still gets `online=true` via the reconciler.
 
 
 async def apply_tick_update(
@@ -173,6 +180,9 @@ async def apply_tick_update(
     Raises ValueError if the camera row doesn't exist (signals a bug;
     the api-key auth path should have already resolved it).
     """
+    # `now` is still bound for the `state_changed_at` CASE in the
+    # UPDATE — the column is stamped only on a real open<->closed
+    # transition, not on every tick.
     now = datetime.now(timezone.utc)
 
     result = await session.execute(
@@ -193,10 +203,10 @@ async def apply_tick_update(
 
     # The raw SQL UPDATE bypasses SQLAlchemy's identity map. Any
     # previously-fetched Camera ORM object in this session now holds
-    # stale state/count/changed_at/last_seen_at values. Expire the
-    # identity map so subsequent reads in the same session (callers,
-    # tests, or downstream queries that join through Camera) see the
-    # committed values from our UPDATE.
+    # stale state/count/changed_at values. Expire the identity map so
+    # subsequent reads in the same session (callers, tests, or
+    # downstream queries that join through Camera) see the committed
+    # values from our UPDATE.
     session.expire_all()
 
     state, no_people_count, close_threshold = row

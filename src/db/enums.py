@@ -26,7 +26,7 @@ DetectorShapeEnum = ENUM(
     name="detector_shape", create_type=False,
 )
 DetectorSensitivityEnum = ENUM(
-    "low", "standard", "high", "off",
+    "low", "standard", "high",
     name="detector_sensitivity", create_type=False,
 )
 ReviewChoiceEnum = ENUM(

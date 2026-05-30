@@ -39,7 +39,10 @@ import logging
 import re
 from collections.abc import AsyncIterator
 
+from uuid import UUID
+
 from fastapi import APIRouter, Header, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
 from src.api.deps import SessionDep, SettingsDep
@@ -129,6 +132,23 @@ async def push_frames(
             detail="invalid_ingest_token",
         )
 
+    # ── desired_state gate ──────────────────────────────────────
+    # When the caregiver hits Disconnect for a Pi camera, this row's
+    # desired_state flips to 'disconnected'. Returning 423 LOCKED
+    # with {"paused": true} tells the Pi to stop pushing immediately
+    # and switch to its low-rate paused-mode loop, which polls
+    # `/v1/cameras/me/ingest-status` once every few seconds until the
+    # state flips back. While paused the Pi sends zero frame bytes
+    # upstream — no LiveKit egress, no ngrok request budget burn,
+    # no detector ticks for a disconnected camera. The wall phone has
+    # a symmetric path via the LiveKit publisher tear-down; this is
+    # the Pi-side equivalent.
+    if cam.desired_state == "disconnected":
+        return JSONResponse(
+            status_code=status.HTTP_423_LOCKED,
+            content={"paused": True, "reason": "desired_state_disconnected"},
+        )
+
     # ── body shape ──────────────────────────────────────────────
     boundary = _extract_boundary(content_type)
 
@@ -183,3 +203,69 @@ async def push_frames(
             _active_relays.pop(camera_key, None)
 
     return {"status": "stream_closed"}
+
+
+async def cancel_active_relay(camera_id: UUID) -> bool:
+    """Cancel any in-flight push connection for `camera_id`. Called
+    from the caregiver-facing camera PATCH handler the moment a
+    desired_state transition to 'disconnected' commits, so the Pi
+    drops its current upload stream within ~1 frame instead of
+    finishing the current 30-min connection window first.
+
+    Returns True iff a task was found and cancellation was requested.
+    Idempotent: a second call for the same camera is a cheap no-op.
+    The Pi will see EOF on its push, reconnect, hit the
+    desired_state gate in `push_frames`, and switch to paused mode.
+    """
+    task = _active_relays.pop(str(camera_id), None)
+    if task is None or task.done():
+        return False
+    task.cancel()
+    return True
+
+
+@router.get(
+    "/cameras/me/ingest-status",
+    status_code=status.HTTP_200_OK,
+    response_model=None,
+)
+async def get_ingest_status(
+    session: SessionDep,
+    authorization: str = Header(default=""),
+) -> dict[str, str]:
+    """Poll endpoint for the Pi's paused-mode loop.
+
+    While paused (after a 423 from `/v1/cameras/me/frames`) the Pi
+    cannot keep its long-lived push connection open — there's nothing
+    upstream that would push a "resume" signal down to it. Instead it
+    polls this cheap GET every few seconds and reads back the live
+    desired_state. The moment it sees 'connected' it switches back
+    into the frame-push loop.
+
+    Auth: identical shape to the push endpoint — same ingest_token
+    bearer, same `cameras.ingest_token_hash` lookup. Deliberately a
+    separate endpoint from `/v1/cameras/me/desired-state` (which is
+    api-key-authenticated for the wall phone); the Pi has only its
+    ingest token, no api_key, so it can't authenticate against the
+    wall-phone surface.
+    """
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="missing_bearer_token",
+        )
+    presented = authorization[len("bearer "):].strip()
+    if not presented:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="empty_bearer_token",
+        )
+    digest = hash_ingest_token(presented)
+    cam_stmt = select(Camera).where(Camera.ingest_token_hash == digest).limit(1)
+    cam = (await session.execute(cam_stmt)).scalar_one_or_none()
+    if cam is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="invalid_ingest_token",
+        )
+    return {"desired_state": cam.desired_state}

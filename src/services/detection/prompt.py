@@ -75,12 +75,23 @@ class BuiltPrompt:
 def build_prompt_and_schema(detectors: Sequence[DetectorSpec]) -> BuiltPrompt:
     """Assemble the final prompt + JSON-schema for the LLM call.
 
-    `BASE_PROMPT` + `PEOPLE_PRESENT_SPEC` are always included; the
-    caller-provided detectors are appended in order. Raises on
-    duplicate schema field names across detectors (signals a config
-    bug — two detectors output the same key).
+    `BASE_PROMPT` is always included; the caller-provided detectors
+    are appended in order. Raises on duplicate schema field names
+    across detectors (signals a config bug — two detectors output
+    the same key).
 
-    Verbatim port of `lib/detectors.ts:buildPromptAndSchema`.
+    `PEOPLE_PRESENT_SPEC` was previously merged in as always-on, but
+    presence is now derived from Re-ID body tracking (YOLO + BoT-SORT)
+    inside `camera_ingest`. The LLM is no longer asked to answer
+    `people_present`/`people_count` — that saved per-call prompt and
+    output tokens, and removed the two-source-of-truth conflict
+    between Re-ID's body tracks and the LLM's verdict. The constant
+    is kept defined for any external importer; if a caller passes it
+    explicitly it's silently deduped by the loop below (no schema
+    fields get added because the always-on merge is gone).
+
+    Verbatim port of `lib/detectors.ts:buildPromptAndSchema` minus
+    the always-on merge.
     """
     parts: list[str] = [BASE_PROMPT]
     schema_properties: dict[str, dict[str, str]] = {
@@ -88,12 +99,11 @@ def build_prompt_and_schema(detectors: Sequence[DetectorSpec]) -> BuiltPrompt:
     }
     schema_required: list[str] = ["description"]
 
-    # `people_present` is alwaysOn — merged unconditionally so callers
-    # don't have to pass it through. Seed `seen_identifiers` with it
-    # BEFORE the loop so a duplicate `people_present` in `detectors`
-    # is caught by the single dedupe check.
+    # PEOPLE_PRESENT_SPEC seeded into seen_identifiers so a caller that
+    # forwards it explicitly (legacy code path) is silently deduped and
+    # contributes nothing to the prompt/schema — Re-ID is authoritative.
     seen_identifiers: set[str] = {PEOPLE_PRESENT_SPEC.identifier}
-    all_specs: list[DetectorSpec] = [PEOPLE_PRESENT_SPEC]
+    all_specs: list[DetectorSpec] = []
     for d in detectors:
         if d.identifier in seen_identifiers:
             continue

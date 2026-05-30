@@ -32,7 +32,6 @@ class DetectorSensitivity(str, Enum):
     low = "low"
     standard = "standard"
     high = "high"
-    off = "off"
 
 
 class ScheduleCadence(str, Enum):

@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 from uuid import UUID
@@ -60,25 +59,13 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-# After this many consecutive vanished-row ticks, the ingest signals
-# its parent RoomWorker to remove it (the camera was deleted from the
-# DB while the worker was still running). At 10s tick cadence that's
-# ~30s — fast enough to not waste resources, slow enough to absorb a
-# legitimate DELETE/replay race without false self-destruct.
-_SELF_DESTRUCT_THRESHOLD: int = 3
-
 # Bound on how long stop() will wait for in-flight tick bodies to
 # finish before force-cancelling. Re-id-gated ticks (fast path) finish
 # in ~3s; Gemini-running ticks take up to ~28s and we'd rather
-# force-cancel them than block a DELETE API response — those would
-# otherwise write an analysis row to a now-deleted camera (FK
-# violation, silently swallowed).
+# force-cancel them than block a shutdown — those would otherwise
+# write an analysis row to a now-deleted camera (FK violation,
+# silently swallowed).
 _STOP_INFLIGHT_TIMEOUT: float = 2.0
-
-# Bound on how long the self-destruct callback (RoomWorker.remove_ingest)
-# can run before we give up on it. Generous because remove_ingest itself
-# awaits CameraIngest.stop() which has its own 2s in-flight bound.
-_SELF_DESTRUCT_CALLBACK_TIMEOUT: float = 10.0
 
 
 class CameraIngest:
@@ -98,7 +85,6 @@ class CameraIngest:
         settings: "Settings",
         reid: ReIDInference,
         livekit_identity: str | None = None,
-        on_self_destruct: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self.camera_id = camera_id
         self.patient_id = patient_id
@@ -106,8 +92,9 @@ class CameraIngest:
         self._motion_cache = motion_cache
         self._settings = settings
         self._reid = reid
+        # Retained for log identification; the actual reaper for a
+        # vanished camera lives in `LiveKitRoomReconciler`.
         self._livekit_identity = livekit_identity
-        self._on_self_destruct = on_self_destruct
         self.frame_buffer = FrameBuffer(
             window_seconds=settings.livekit_worker_window_seconds,
             target_fps=settings.livekit_worker_target_fps,
@@ -117,23 +104,34 @@ class CameraIngest:
         )
         self._lock = asyncio.Lock()
         self._tick_task: asyncio.Task[None] | None = None
+        # Monotonic timestamp of the most recent frame pushed into
+        # `frame_buffer` (set by RoomWorker._consume_video →
+        # record_frame_arrival). Read by `LiveKitRoomReconciler` to
+        # decide the second half of the two-signal online rule
+        # (REST-presence AND fresh frames). Single-writer single-reader
+        # within the asyncio loop — no lock required.
+        self._last_frame_at: float = 0.0
         # In-flight tick bodies spawned by _tick_loop. stop() awaits these
         # with a 2s bound so the most recent tick(s) have a chance to
         # finish cleanly before we force-cancel — otherwise their
         # analyses writes would FK-violate after the row CASCADE-deletes.
         self._inflight_ticks: set[asyncio.Task[None]] = set()
-        # Self-destruct state: count consecutive vanished-row failures
-        # and fire the parent callback exactly once when the threshold
-        # is hit. Asyncio is cooperative single-threaded so int increments
-        # are atomic between awaits.
-        self._camera_missing_streak: int = 0
-        self._self_destructed: bool = False
         self._log_tag = f"worker cam={camera_id}"
 
     async def start(self) -> None:
         if self._tick_task is not None:
             return
         self._tick_task = asyncio.create_task(self._tick_loop())
+
+    def record_frame_arrival(self, monotonic_ts: float) -> None:
+        """Sync callback the RoomWorker's video consumer fires every
+        time it pushes a frame to our buffer. Just stamps a monotonic
+        timestamp; the actual `cameras.online` / `last_seen_at` writes
+        live in `LiveKitRoomReconciler`, which reads this field on each
+        of its periodic REST polls (every ~10s) and combines it with
+        the REST-presence signal to decide both columns.
+        """
+        self._last_frame_at = monotonic_ts
 
     async def stop(self) -> None:
         # Cancel the loop FIRST so no new ticks get spawned while we wait
@@ -211,95 +209,30 @@ class CameraIngest:
             raise
 
     async def _run_tick_safely(self) -> None:
+        """Wrap one tick body so that failures NEVER kill the loop.
+
+        Vanished-row ticks (the camera row was deleted mid-flight) used
+        to count toward a self-destruct threshold; that mechanism was
+        removed when `LiveKitRoomReconciler` became responsible for
+        spawning and tearing down ingests based on REST presence.
+        The reconciler will stop calling our publisher's tracks (or
+        observe LiveKit Cloud no longer holding the participant) and
+        will call `RoomWorker.remove_ingest` on the next debounced
+        miss. Until then, vanished-row ticks just log and return.
+        """
         try:
             await self._run_tick()
         except CameraVanishedError:
-            # The cameras row is gone. Two possibilities:
-            #  (1) admin DELETE just landed (transient — next tick may
-            #      succeed if it was a different row),
-            #  (2) the camera is permanently gone and we should
-            #      self-destruct so we stop wasting Re-ID/LLM cycles.
-            # We can't distinguish these in a single tick, so we count
-            # consecutive misses; after _SELF_DESTRUCT_THRESHOLD in a
-            # row, fire the callback. ANY non-vanished tick resets the
-            # streak (handled in the success path below).
-            self._camera_missing_streak += 1
             log.warning(
-                "%s tick failed: camera row missing (streak=%d/%d)",
-                self._log_tag, self._camera_missing_streak,
-                _SELF_DESTRUCT_THRESHOLD,
+                "%s tick failed: camera row missing — reconciler will reap",
+                self._log_tag,
             )
-            if self._camera_missing_streak >= _SELF_DESTRUCT_THRESHOLD:
-                # Fire and forget — the trigger itself is idempotent
-                # and bounded. Scheduling as a task means the current
-                # tick body returns cleanly first, so the loop and the
-                # done-callback bookkeeping aren't disturbed.
-                asyncio.create_task(
-                    self._trigger_self_destruct(),
-                    name=f"self-destruct-{self.camera_id}",
-                )
             return
         except Exception as exc:
             # Tick failures must NEVER kill the loop. Log
             # and move on; next tick will get another shot.
             log.exception("%s tick failed: %s", self._log_tag, exc)
             return
-        # Successful tick path: reset the vanished-row streak. Transient
-        # blips (e.g. a single tick raised CameraVanishedError because
-        # of a brief read-after-write race) don't accumulate.
-        if self._camera_missing_streak > 0:
-            log.info(
-                "%s tick succeeded after %d vanished-row failure(s) — streak reset",
-                self._log_tag, self._camera_missing_streak,
-            )
-            self._camera_missing_streak = 0
-
-    async def _trigger_self_destruct(self) -> None:
-        """Signal the parent RoomWorker to remove us. Idempotent —
-        guarded by `_self_destructed` so we fire the callback at most
-        once even if multiple ticks fail concurrently after the
-        threshold is hit. Bounded by _SELF_DESTRUCT_CALLBACK_TIMEOUT so
-        a buggy parent callback can't park this task forever.
-        """
-        if self._self_destructed:
-            return
-        self._self_destructed = True
-        if self._on_self_destruct is None or self._livekit_identity is None:
-            # No parent to signal (e.g. a unit test constructed us
-            # without a RoomWorker). Log loudly so the situation is
-            # visible — the ingest can't reap itself.
-            log.error(
-                "%s self-destruct threshold reached but no callback "
-                "registered (livekit_identity=%s); ingest will keep "
-                "ticking and logging vanished-row failures",
-                self._log_tag, self._livekit_identity,
-            )
-            return
-        log.error(
-            "%s self-destruct: vanished-row streak hit %d, signalling "
-            "RoomWorker to remove ingest (identity=%s)",
-            self._log_tag, self._camera_missing_streak,
-            self._livekit_identity,
-        )
-        try:
-            await asyncio.wait_for(
-                self._on_self_destruct(self._livekit_identity),
-                timeout=_SELF_DESTRUCT_CALLBACK_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            log.error(
-                "%s self-destruct: callback timed out after %.1fs — "
-                "ingest is now orphaned from parent's dict; the next "
-                "supervisor reconnect will reap it",
-                self._log_tag, _SELF_DESTRUCT_CALLBACK_TIMEOUT,
-            )
-        except Exception:
-            log.exception(
-                "%s self-destruct: callback raised — ingest is now "
-                "orphaned from parent's dict; the next supervisor "
-                "reconnect will reap it",
-                self._log_tag,
-            )
 
     async def _run_tick(self) -> None:
         """One tick — mirrors `src/api/clips.py:ingest_clip` body."""
@@ -374,6 +307,16 @@ class CameraIngest:
                 # still skipping." camera_repo.update_partial also
                 # resets state to "open" on resume as a belt-and-
                 # suspenders against any drift that snuck in.
+                # Liveness write (online=true, last_seen_at) lives in
+                # `_liveness_writer_loop` below — driven by actual
+                # frame arrivals, not by tick scheduling. Calling
+                # `apply_liveness_only` from here was a footgun: ticks
+                # fire on a fixed cadence regardless of whether frames
+                # are arriving, so an ai-paused camera with a long-
+                # dead publisher would keep its heartbeat fresh forever
+                # because the timer kept ticking and the SKIP branch
+                # kept writing. Observed 2026-05-28 in Test 2 — Pi
+                # service stopped but online stayed true past 55s.
                 await add_analysis(
                     session,
                     camera_id=self.camera_id,
@@ -501,20 +444,40 @@ class CameraIngest:
             # Without it, a patient who hasn't enrolled would have
             # every tick skipped because Re-ID always says "not in
             # clip" against an empty gallery.
+            # The identity gate now considers TWO independent positive
+            # signals for "everyone in frame is verified not-patient":
+            #
+            #   1. `face_count > 0`: at least one face was seen and
+            #      embedded this clip; the face matcher didn't lock any
+            #      track as PATIENT. Today's signal.
+            #
+            #   2. `has_only_verified_other_tracks`: every body track in
+            #      the clip ended labeled OTHER (face_seen_attempts >=
+            #      face_checks_for_other AND face_hits = 0). Catches the
+            #      case where the helper's face is BRIEFLY visible at
+            #      various points within the clip but `face_count` could
+            #      be 0 if the brief moments didn't accumulate. The
+            #      OTHER label is now epistemically honest (Phase 1
+            #      semantic): only fires after enough verified match
+            #      failures, never on "face turned away whole clip."
+            #
+            # Either signal alone is sufficient to short-circuit. The
+            # `has_ready_enrollment` guard remains the day-zero clause —
+            # without an enrollment we can't tell "non-patient" from
+            # anything else.
             if (
                 identity.reid_ran
                 and not identity.patient_in_clip
-                and identity.face_count > 0
+                and (identity.face_count > 0 or identity.has_only_verified_other_tracks)
             ):
                 if await has_ready_enrollment(session, self.patient_id):
                     state_after = await apply_tick_update(
                         session,
                         camera_id=self.camera_id,
-                        # We saw faces but none matched. The state
-                        # machine should treat this as "people present"
-                        # (someone IS here, just not the patient), so a
-                        # household-member walking by doesn't trip the
-                        # closed-state countdown.
+                        # We saw bodies (and at least some face evidence)
+                        # but no match. State machine treats this as
+                        # "people present" so a household-member walking
+                        # by doesn't trip the closed-state countdown.
                         people_present=True,
                         motion_in_clip=motion_in_clip,
                     )
@@ -525,6 +488,8 @@ class CameraIngest:
                         "identity_patient_in_clip": False,
                         "identity_confidence": round(identity.confidence, 4),
                         "identity_face_count": identity.face_count,
+                        "identity_has_only_verified_other_tracks":
+                            identity.has_only_verified_other_tracks,
                     }
                     await add_analysis(
                         session,
@@ -533,15 +498,20 @@ class CameraIngest:
                         description="(non-patient in frame, LLM skipped)",
                         detector_fields=synthetic_fields,
                         people_present=True,
-                        people_count=identity.face_count,
+                        people_count=max(
+                            identity.face_count, identity.people_count_reid,
+                        ),
                         motion_in_clip=motion_in_clip,
                         state_after=state_after.state,
                         captured_at=captured_at,
                     )
                     await session.commit()
                     log.info(
-                        "%s SKIP identity-gated, faces=%d confidence=%.3f",
-                        self._log_tag, identity.face_count, identity.confidence,
+                        "%s SKIP identity-gated, faces=%d only_other=%s confidence=%.3f",
+                        self._log_tag,
+                        identity.face_count,
+                        identity.has_only_verified_other_tracks,
+                        identity.confidence,
                     )
                     return
 
@@ -600,12 +570,38 @@ class CameraIngest:
             result.detector_fields["identity_confidence"] = round(identity.confidence, 4)
             result.detector_fields["identity_face_count"] = identity.face_count
 
+            # Presence + count are now Re-ID-derived (YOLO + BoT-SORT
+            # body tracking), not LLM-derived. The prompt no longer
+            # asks the LLM for `people_present`/`people_count`; those
+            # fields on `result` default to (False, 0) and we ignore
+            # them whenever Re-ID returned a usable verdict.
+            #
+            # `reid_ran=True` path covers both the standard
+            # (gallery-present) case and the no-enrollment case where
+            # `body_pipeline` runs body tracking without face matching.
+            # `reid_ran=False` only happens on real infra failures
+            # (re-id disabled in settings, gallery load crashed,
+            # frame extract failed, pipeline timeout). On that path we
+            # conservatively keep the camera open (people_present=True,
+            # people_count=0) so a Re-ID outage doesn't silently close
+            # the state and stop the LLM-driven behavioral detectors.
+            if identity.reid_ran:
+                gate_people_present = identity.people_present_reid
+                gate_people_count = identity.people_count_reid
+                present_src = "reid"
+            else:
+                gate_people_present = True
+                gate_people_count = 0
+                present_src = "reid_failed_fallback"
+            result.detector_fields["people_present_src"] = present_src
+            result.detector_fields["people_count_reid"] = identity.people_count_reid
+
             # State machine + analyses + event promotion. Same session,
             # one commit at the end.
             state_after = await apply_tick_update(
                 session,
                 camera_id=self.camera_id,
-                people_present=result.people_present,
+                people_present=gate_people_present,
                 motion_in_clip=motion_in_clip,
             )
             await add_analysis(
@@ -614,8 +610,8 @@ class CameraIngest:
                 provider=used_provider,
                 description=result.description,
                 detector_fields=result.detector_fields,
-                people_present=result.people_present,
-                people_count=result.people_count,
+                people_present=gate_people_present,
+                people_count=gate_people_count,
                 motion_in_clip=motion_in_clip,
                 state_after=state_after.state,
                 captured_at=captured_at,
@@ -683,9 +679,9 @@ class CameraIngest:
                     )
 
             log.info(
-                "%s DONE provider=%s people=%s(%s) motion=%s state=%s/%s "
-                "events_fired=%d dedup=%d",
-                self._log_tag, used_provider, result.people_present, result.people_count,
-                motion_in_clip, state_after.state, state_after.no_people_count,
+                "%s DONE provider=%s people=%s(%s) src=%s motion=%s "
+                "state=%s/%s events_fired=%d dedup=%d",
+                self._log_tag, used_provider, gate_people_present, gate_people_count,
+                present_src, motion_in_clip, state_after.state, state_after.no_people_count,
                 len(promotion.fired), len(promotion.skipped_for_dedup),
             )

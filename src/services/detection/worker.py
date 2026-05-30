@@ -32,17 +32,43 @@ from livekit import api as lkapi
 
 from src.services.detection.motion_cache import MotionCache
 from src.services.detection.room_worker import RoomWorker
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from src.db.camera import Camera
+from src.db.session import get_engine
+from src.services.reid.cross_clip_body_gallery import CrossClipBodyGallery
 from src.services.reid.inference import ReIDInference
 
 if TYPE_CHECKING:
-    from sqlalchemy.ext.asyncio import async_sessionmaker
+    from sqlalchemy.ext.asyncio import AsyncConnection, async_sessionmaker
 
     from src.settings import Settings
 
 log = logging.getLogger(__name__)
+
+# Postgres advisory-lock key for "I am the authoritative detector
+# worker." Two backends pointed at the same database (a common dev
+# footgun: forgetting to kill an old uvicorn before starting a new one)
+# both spin up reconcilers that write `cameras.online` and both spawn
+# detector_worker_* identities into LiveKit. They then fight, and the
+# `online` column ping-pongs as each backend's `_last_frame_at` falls
+# stale relative to the other. The advisory lock makes the second
+# starter refuse cleanly instead of silently corrupting state.
+#
+# Key is a stable signed 64-bit integer. Any stable value works as
+# long as it doesn't collide with other advisory locks the application
+# takes. We don't take any others today, so collision risk is zero.
+# `0x4E454D52444C434B` is ASCII "NEMRDLCK" — 8 bytes exactly, fits in
+# Postgres bigint (which `pg_try_advisory_lock` requires).
+_DETECTOR_WORKER_LOCK_KEY: int = 0x4E454D52444C434B  # ASCII "NEMRDLCK"
+
+
+class DetectorWorkerLockUnavailableError(RuntimeError):
+    """Raised by `DetectorWorker.start()` when another process already
+    holds the detector-worker advisory lock. The FastAPI lifespan lets
+    this propagate so uvicorn surfaces the failure loudly at startup
+    rather than running degraded.
+    """
 
 # Upper bound on how long a RoomWorker.stop() can hold the DetectorWorker
 # lock during `ensure_room_left_if_empty`. 10s is generous for a clean
@@ -85,15 +111,37 @@ class DetectorWorker:
         self._motion_cache = MotionCache(
             ttl_seconds=settings.livekit_motion_state_ttl_seconds,
         )
+        # Cross-clip body gallery: in-memory, per-patient OSNet
+        # embedding cache that lets a face-identified person be
+        # body-identified in subsequent clips when their face is
+        # hidden. Constructed here as a backend-wide singleton so
+        # every RoomWorker's per-tick Re-ID pipeline shares one cache.
+        # Lost on backend restart (rebuilds itself).
+        self._body_gallery = CrossClipBodyGallery(settings=settings)
         # Single Re-ID inference instance shared across every RoomWorker.
         # The InsightFace model is lazy-singleton'd at module level so a
         # second instance here would be wasted; we share the instance to
         # also share the gallery cache and avoid duplicate DB reads when
         # multiple cameras of the same patient tick concurrently.
-        self._reid = ReIDInference(sessionmaker=sessionmaker, settings=settings)
+        self._reid = ReIDInference(
+            sessionmaker=sessionmaker,
+            settings=settings,
+            body_gallery=self._body_gallery,
+        )
         self._rooms: dict[str, RoomWorker] = {}
         self._lock = asyncio.Lock()
         self._started = False
+        # Shared `lkapi.LiveKitAPI` client passed into every RoomWorker
+        # so its `LiveKitRoomReconciler` can poll `list_participants`
+        # without each pod opening + closing its own HTTPS client per
+        # poll. Constructed in `start()` after the creds check; closed
+        # in `stop()`. None when LIVEKIT_* settings are not configured.
+        self._lk_api: object | None = None
+        # Dedicated long-lived connection holding the
+        # `_DETECTOR_WORKER_LOCK_KEY` advisory lock for the lifetime of
+        # this worker. Postgres releases advisory locks when the
+        # session ends, so we keep the connection open until `stop()`.
+        self._lock_conn: "AsyncConnection | None" = None
 
     async def start(self) -> None:
         if self._started:
@@ -106,7 +154,20 @@ class DetectorWorker:
                 "LIVEKIT_URL/KEY/SECRET not configured",
             )
             return
+        # Acquire the singleton advisory lock BEFORE any other
+        # side-effecting work (LiveKit connections, room reconciliation,
+        # DB writes). Failure here means another backend is already
+        # writing to this Postgres — refuse to start so we don't
+        # corrupt state.
+        await self._acquire_singleton_lock()
         self._started = True
+        # Single shared LiveKit REST client for every RoomWorker's
+        # reconciler. Avoids per-poll HTTPS client construction.
+        self._lk_api = lkapi.LiveKitAPI(
+            self._settings.livekit_url,
+            self._settings.livekit_api_key,
+            self._settings.livekit_api_secret,
+        )
         log.info("detector_worker.start awaiting webhook discovery")
         # Reconcile with LiveKit: at backend startup, query for active
         # rooms and spawn workers for any whose participant_joined
@@ -150,7 +211,96 @@ class DetectorWorker:
             *(room.stop() for room in rooms),
             return_exceptions=True,
         )
+        # Close the shared LiveKit REST client AFTER every reconciler
+        # has stopped using it. Best-effort; an aclose failure
+        # mid-shutdown is logged but does not block the lifespan.
+        if self._lk_api is not None:
+            try:
+                await self._lk_api.aclose()
+            except Exception:
+                log.exception("detector_worker.stop lkapi.aclose failed")
+            self._lk_api = None
+        # Release the advisory lock LAST so any in-flight
+        # `cameras.online` writes from the reconciler complete first
+        # under our exclusive hold. Closing the connection
+        # auto-releases the lock; the explicit unlock call is for
+        # symmetry + cleaner Postgres logs.
+        await self._release_singleton_lock()
         log.info("detector_worker.stop done")
+
+    # ── singleton advisory lock ───────────────────────────────────
+
+    async def _acquire_singleton_lock(self) -> None:
+        """Acquire the Postgres advisory lock that gates this process
+        as the authoritative detector worker.
+
+        `pg_try_advisory_lock` returns True if we got the lock, False
+        if another session holds it. Held for the lifetime of
+        `self._lock_conn`; Postgres releases it automatically when the
+        connection closes.
+        """
+        engine = get_engine()
+        conn = await engine.connect()
+        try:
+            result = await conn.execute(
+                text("SELECT pg_try_advisory_lock(:k)"),
+                {"k": _DETECTOR_WORKER_LOCK_KEY},
+            )
+            acquired = bool(result.scalar())
+        except Exception:
+            await conn.close()
+            raise
+        if not acquired:
+            await conn.close()
+            raise DetectorWorkerLockUnavailableError(
+                "Another nemara-backend process already holds the "
+                "detector-worker advisory lock on this Postgres. "
+                "Refusing to start to avoid dual-write conflicts on "
+                "cameras.online + duplicate detector_worker_* identities "
+                "kicking each other off LiveKit. Stop the other process "
+                "and retry."
+            )
+        self._lock_conn = conn
+        log.info("detector_worker.singleton_lock_acquired key=%d", _DETECTOR_WORKER_LOCK_KEY)
+
+    async def _release_singleton_lock(self) -> None:
+        """Release the advisory lock and close the holder connection.
+        Idempotent."""
+        conn = self._lock_conn
+        if conn is None:
+            return
+        self._lock_conn = None
+        try:
+            await conn.execute(
+                text("SELECT pg_advisory_unlock(:k)"),
+                {"k": _DETECTOR_WORKER_LOCK_KEY},
+            )
+        except Exception:
+            log.exception("detector_worker.singleton_unlock_failed")
+        try:
+            await conn.close()
+        except Exception:
+            log.exception("detector_worker.singleton_lock_conn_close_failed")
+
+    # ── webhook fast-path signal ───────────────────────────────────
+
+    async def signal_reconcile(self, room_name: str) -> None:
+        """Webhook fast-path hint: trigger an immediate reconciler poll
+        for the given room. No-op if we don't have a RoomWorker for
+        the room yet — the next webhook (or the startup reconciler
+        the periodic poll itself) will catch it.
+        """
+        async with self._lock:
+            worker = self._rooms.get(room_name)
+        if worker is None:
+            return
+        try:
+            await worker._reconciler.signal_tick()
+        except Exception:
+            log.exception(
+                "detector_worker.signal_reconcile failed room=%s",
+                room_name,
+            )
 
     # ── startup reconciliation ─────────────────────────────────────
 
@@ -348,14 +498,15 @@ class DetectorWorker:
                 sessionmaker=self._sessionmaker,
                 motion_cache=self._motion_cache,
                 reid=self._reid,
+                lk_api=self._lk_api,
                 # When the RoomWorker has been sitting in an empty
                 # patient_* room for the idle window with zero
                 # cam_* publishers, it calls back here to ask for
-                # removal. Common cause: P3 reconciliation joined a
-                # room whose camera was deleted (or never paired
-                # with a wall phone) while we were down. Without
-                # this hook the worker would sit there forever
-                # burning a LiveKit identity slot.
+                # removal. Common cause: startup reconciliation
+                # joined a room whose camera was deleted (or never
+                # paired with a wall phone) while we were down.
+                # Without this hook the worker would sit there
+                # forever burning a LiveKit identity slot.
                 on_idle_timeout=self._evict_room,
             )
             self._rooms[room_name] = worker

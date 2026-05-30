@@ -298,6 +298,41 @@ async def test_discovered_omits_claimed_rows(
     assert "b8:27:eb:00:00:03" not in hwids
 
 
+@pytest.mark.asyncio
+async def test_discovered_omits_discoveries_already_paired_via_url(
+    client: AsyncClient, auth_user,
+) -> None:
+    """When a Pi is paired via direct-URL mode (scripted provisioning),
+    the discovery row stays unclaimed because the claim step only fires
+    in the discovery_id branch. Defensive filter in list_unclaimed_recent
+    must still exclude any discovery whose stream URL is already on a
+    cameras row, otherwise the picker shows the same Pi forever even
+    though it's already in use."""
+    headers, pid = await _setup_patient(client, auth_user)
+    pi_url = "http://10.0.0.99:8000/stream.mjpg"
+    await client.post(
+        "/v1/cameras/pi-announce",
+        json={
+            "hardware_id": "b8:27:eb:00:00:99",
+            "device_label": "Direct-URL Provisioned",
+            "current_url": pi_url,
+        },
+    )
+    # Pair via direct-URL mode (no discovery_id) so the discovery row
+    # is left unclaimed. This is the bug-reproducer path; the assertion
+    # below pins the picker against ever surfacing the orphaned row.
+    provision_r = await client.post(
+        f"/v1/patients/{pid}/cameras/pi-provision",
+        headers=headers,
+        json={"room": "Workshop", "pi_stream_url": pi_url},
+    )
+    assert provision_r.status_code == 201, provision_r.text
+
+    r = await client.get("/v1/cameras/discovered", headers=headers)
+    hwids = {pi["hardware_id"] for pi in r.json()["pis"]}
+    assert "b8:27:eb:00:00:99" not in hwids
+
+
 # ─── pi-provision via discovery_id ───────────────────────────────
 
 

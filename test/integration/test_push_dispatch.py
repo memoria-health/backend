@@ -211,8 +211,8 @@ async def test_dispatch_posts_to_apns_with_expected_shape(
 
     import json
     payload = json.loads(call["content"])
-    assert payload["aps"]["alert"]["title"] == "Maggie"
-    assert payload["aps"]["alert"]["body"] == "Maggie fell near the bed."
+    assert payload["aps"]["alert"]["title"] == "Fall detected"
+    assert payload["aps"]["alert"]["body"] == "Maggie — Maggie fell near the bed."
     assert payload["aps"]["sound"] == "default"
     assert payload["event_id"] == str(event_id)
     assert UUID(payload["patient_id"])  # is a uuid

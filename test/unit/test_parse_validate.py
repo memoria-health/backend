@@ -15,8 +15,6 @@ from src.services.detection.providers._parse import parse_and_validate
 
 _BASE_PROPERTIES: dict[str, dict[str, str]] = {
     "description":    {"type": "string"},
-    "people_present": {"type": "boolean"},
-    "people_count":   {"type": "number"},
     "fall_detected":  {"type": "boolean"},
     "fall_confidence": {"type": "number"},
     "fall_reasoning": {"type": "string"},
@@ -25,7 +23,12 @@ _BASE_REQUIRED: list[str] = list(_BASE_PROPERTIES.keys())
 
 
 def _valid_payload(**overrides) -> dict:
-    """Build a fully-valid payload, then apply overrides."""
+    """Build a fully-valid payload, then apply overrides.
+
+    `people_present`/`people_count` are included for back-compat with
+    older provider responses, but are no longer required: Re-ID body
+    tracking is the source of truth.
+    """
     payload = {
         "description": "A person is walking in the living room.",
         "people_present": True,
@@ -120,20 +123,20 @@ def test_string_values_are_trimmed() -> None:
     }
 
 
-def test_bool_is_not_treated_as_number_for_people_count() -> None:
-    """Python gotcha: bool is a subclass of int. If the LLM returns
-    `true` where a number is expected, we must reject — silently
-    coercing to 1 would mask a model error.
+def test_bool_for_people_count_defaults_to_zero_no_raise() -> None:
+    """`people_count` is no longer required and no longer authoritative
+    (Re-ID body tracking provides the count). A bool value where a
+    number is expected gracefully degrades to 0 — the caller ignores
+    this field anyway when Re-ID ran.
     """
     payload = _valid_payload(people_count=True)
-    with pytest.raises(ValueError) as exc:
-        parse_and_validate(
-            json.dumps(payload),
-            provider="gemini",
-            required=_BASE_REQUIRED,
-            properties=_BASE_PROPERTIES,
-        )
-    assert "people_count" in str(exc.value)
+    result = parse_and_validate(
+        json.dumps(payload),
+        provider="gemini",
+        required=_BASE_REQUIRED,
+        properties=_BASE_PROPERTIES,
+    )
+    assert result.people_count == 0
 
 
 def test_bool_is_not_treated_as_number_for_other_number_fields() -> None:
@@ -188,30 +191,59 @@ def test_empty_description_string_raises() -> None:
     assert "description" in str(exc.value)
 
 
-def test_missing_people_present_raises() -> None:
+def test_missing_people_present_defaults_to_false_no_raise() -> None:
+    """`people_present` is no longer in the prompt; absence from the
+    response defaults the parsed field to False. Callers ignore it
+    when Re-ID returns a verdict.
+    """
     payload = _valid_payload()
     del payload["people_present"]
-    with pytest.raises(ValueError) as exc:
-        parse_and_validate(
-            json.dumps(payload),
-            provider="gemini",
-            required=_BASE_REQUIRED,
-            properties=_BASE_PROPERTIES,
-        )
-    assert "people_present" in str(exc.value)
+    result = parse_and_validate(
+        json.dumps(payload),
+        provider="gemini",
+        required=_BASE_REQUIRED,
+        properties=_BASE_PROPERTIES,
+    )
+    assert result.people_present is False
+    # The remaining required fields still parse normally.
+    assert result.description == "A person is walking in the living room."
+    assert result.detector_fields["fall_detected"] is False
 
 
-def test_missing_people_count_raises() -> None:
+def test_missing_people_count_defaults_to_zero_no_raise() -> None:
+    """Same as above for `people_count`."""
     payload = _valid_payload()
     del payload["people_count"]
-    with pytest.raises(ValueError) as exc:
-        parse_and_validate(
-            json.dumps(payload),
-            provider="gemini",
-            required=_BASE_REQUIRED,
-            properties=_BASE_PROPERTIES,
-        )
-    assert "people_count" in str(exc.value)
+    result = parse_and_validate(
+        json.dumps(payload),
+        provider="gemini",
+        required=_BASE_REQUIRED,
+        properties=_BASE_PROPERTIES,
+    )
+    assert result.people_count == 0
+
+
+def test_both_people_fields_absent_still_parses_full_payload() -> None:
+    """The realistic post-refactor case: provider response carries
+    `description` + detector fields only, no people_*.
+    """
+    payload = _valid_payload()
+    del payload["people_present"]
+    del payload["people_count"]
+    result = parse_and_validate(
+        json.dumps(payload),
+        provider="gemini",
+        required=_BASE_REQUIRED,
+        properties=_BASE_PROPERTIES,
+    )
+    assert result.description == "A person is walking in the living room."
+    assert result.people_present is False
+    assert result.people_count == 0
+    assert result.detector_fields == {
+        "fall_detected": False,
+        "fall_confidence": 0.1,
+        "fall_reasoning": "no abnormal motion",
+    }
 
 
 def test_extra_fields_land_in_detector_fields_not_dropped() -> None:

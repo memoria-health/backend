@@ -22,6 +22,7 @@ from sqlalchemy import delete, func, select
 
 log = logging.getLogger(__name__)
 
+from src.api import cameras_ingest as pi_ingest_module
 from src.api.deps import CameraAuth, CaregiverAuth, SessionDep, SettingsDep
 from src.services.ingest.pi.auth import mint_ingest_token
 from src.db.camera import Camera
@@ -50,10 +51,19 @@ router = APIRouter(prefix="/v1", tags=["camera"])
 
 
 def _to_response(c: Camera) -> CameraResponse:
-    # `paired` is derived from `api_key_hash` (which we never expose
-    # to clients). The ORM row has no `paired` attribute, so we can't
-    # use plain `model_validate(c, from_attributes=True)` — that would
-    # raise for the missing field. Build the dict explicitly instead.
+    # `paired` is derived from whichever auth-credential column is
+    # populated for this camera's source_type. iPhone cameras use
+    # api_key_hash (issued at pairing-code redemption); Pi cameras
+    # skip that flow and instead carry ingest_token_hash, minted at
+    # provision time. Both columns are server-private — clients only
+    # see the boolean. The ORM row has no `paired` attribute so a
+    # plain `model_validate(c, from_attributes=True)` would raise;
+    # build the dict explicitly instead.
+    paired = (
+        c.ingest_token_hash is not None
+        if c.source_type == "pi"
+        else c.api_key_hash is not None
+    )
     return CameraResponse(
         id=c.id,
         patient_id=c.patient_id,
@@ -64,10 +74,11 @@ def _to_response(c: Camera) -> CameraResponse:
         disabled=c.disabled,
         ai_paused=c.ai_paused,
         desired_state=c.desired_state,  # type: ignore[arg-type]
+        source_type=c.source_type,  # type: ignore[arg-type]
         livekit_identity=c.livekit_identity,
         last_seen_at=c.last_seen_at,
         created_at=c.created_at,
-        paired=c.api_key_hash is not None,
+        paired=paired,
     )
 
 
@@ -416,6 +427,19 @@ async def delete_camera(
     session: SessionDep,
     request: Request,
 ) -> None:
+    # Reset the matching pi_discovery's claim state BEFORE the camera
+    # row goes away. The pi_discoveries.claimed_camera_id FK is
+    # `ON DELETE SET NULL`, so without this the discovery survives the
+    # cascade in a zombie state — claimed_camera_id=NULL but
+    # claimed_at still set, which makes the row a paired-but-pointing-
+    # at-nothing record. The /discovered endpoint filters on
+    # `claimed_at IS NULL`, so the Pi can't be re-paired without
+    # operator-level SQL surgery (which we just had to do at 17:03
+    # PDT 2026-05-28 when the bedroom camera was deleted). Clearing
+    # claimed_at and pending_ingest_token here lets the Pi appear in
+    # /discovered immediately on the next caregiver-app refresh.
+    # No-op when the camera was never a Pi (no matching discovery row).
+    await pi_discovery_repo.unclaim_for_camera(session, camera_id=camera_id)
     deleted = await camera_repo.delete_by_id(session, camera_id, caregiver_id=auth.id)
     if not deleted:
         raise HTTPException(
@@ -562,6 +586,66 @@ async def get_my_desired_state(
     )
 
 
+@router.delete(
+    "/cameras/me",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
+)
+async def delete_self(
+    auth: CameraAuth,
+    session: SessionDep,
+    request: Request,
+) -> None:
+    """Wall-phone self-delete on user-initiated unpair.
+
+    The wall phone calls this immediately before wiping its local
+    Keychain so the cameras row doesn't orphan with `api_key_hash`
+    still set. Without this, the caregiver dashboard accumulates one
+    "paired but silent" row per unpair cycle (which has been the
+    actual situation we kept hitting locally).
+
+    Mirror of the caregiver-facing `delete_camera` (route id-based,
+    `CaregiverAuth`) — same DB-then-worker order, same best-effort
+    worker shutdown on a 5s budget, same 204 even if the worker
+    stop misses (the P1 self-destruct cleans up zombie ticks).
+
+    No-op behavior: returns 204 if the row is already gone (e.g.
+    caregiver deleted it concurrently). The api_key bearer would
+    have already raised 404 inside `camera_auth` in that case, so
+    by the time we land here the row definitely existed at request
+    time.
+    """
+    camera_id = auth.id
+    # Symmetric with delete_camera: reset the matching pi_discovery
+    # claim state before the FK cascade strands it. No-op for wall
+    # phone (no discovery row), but kept here so the contract is
+    # uniform across both delete paths and we don't recreate the
+    # zombie-discovery bug if the wall-phone DELETE ever runs against
+    # a Pi-typed row by accident.
+    await pi_discovery_repo.unclaim_for_camera(session, camera_id=camera_id)
+    await session.execute(delete(Camera).where(Camera.id == camera_id))
+    await session.commit()
+    worker = getattr(request.app.state, "detector_worker", None)
+    if worker is not None:
+        try:
+            await asyncio.wait_for(
+                worker.stop_worker_for_camera(camera_id, timeout=4.0),
+                timeout=5.0,
+            )
+        except asyncio.TimeoutError:
+            log.warning(
+                "delete_self worker_stop_timeout camera=%s, "
+                "P1 self-destruct will reap the zombie within ~30s",
+                camera_id,
+            )
+        except Exception:
+            log.exception(
+                "delete_self worker_stop_failed camera=%s, "
+                "P1 self-destruct will reap the zombie within ~30s",
+                camera_id,
+            )
+
+
 @router.patch(
     "/cameras/me/desired-state",
     response_model=DesiredStateResponse,
@@ -687,6 +771,19 @@ async def update_camera(
             detail="camera_not_found",
         )
     await session.commit()
+    # If the caregiver just disconnected a Pi camera, cancel the in-flight
+    # HTTP push so the Pi sees EOF, reconnects, hits the desired_state
+    # gate in /v1/cameras/me/frames, and switches into paused mode within
+    # ~1 frame. Without this the Pi would keep streaming for the rest of
+    # the existing push connection's lifetime (long-lived). No-op for
+    # wall-phone rows (they have no active relay) and no-op when nothing
+    # is currently pushing — both safe by construction in
+    # cancel_active_relay.
+    if (
+        body.desired_state == "disconnected"
+        and cam.source_type == "pi"
+    ):
+        await pi_ingest_module.cancel_active_relay(camera_id)
     # Use the helper that derives `paired` from api_key_hash — bare
     # model_validate would fail since the ORM row has no `paired`
     # attribute (it's a Pydantic-only computed field).

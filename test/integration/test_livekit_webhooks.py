@@ -56,12 +56,16 @@ class _RecordingWorker:
     """
     joined: list[str] = field(default_factory=list)
     left_checked: list[str] = field(default_factory=list)
+    signalled: list[str] = field(default_factory=list)
 
     async def ensure_room_joined(self, room_name: str) -> None:
         self.joined.append(room_name)
 
     async def ensure_room_left_if_empty(self, room_name: str) -> None:
         self.left_checked.append(room_name)
+
+    async def signal_reconcile(self, room_name: str) -> None:
+        self.signalled.append(room_name)
 
 
 @pytest.fixture
@@ -130,6 +134,11 @@ async def test_participant_joined_for_camera_calls_ensure_joined(
         "patient_5b1c0312-44a0-4f9d-9a3a-2d4f44a1f0bb",
     ]
     assert installed_worker.left_checked == []
+    # Webhook is a fast-path HINT — it must trigger an immediate
+    # reconciler tick so cameras.online updates inside ~1s.
+    assert installed_worker.signalled == [
+        "patient_5b1c0312-44a0-4f9d-9a3a-2d4f44a1f0bb",
+    ]
 
 
 @pytest.mark.asyncio
@@ -151,6 +160,9 @@ async def test_participant_left_for_camera_calls_ensure_left(
         "patient_5b1c0312-44a0-4f9d-9a3a-2d4f44a1f0bb",
     ]
     assert installed_worker.joined == []
+    assert installed_worker.signalled == [
+        "patient_5b1c0312-44a0-4f9d-9a3a-2d4f44a1f0bb",
+    ]
 
 
 # ─── filtering ────────────────────────────────────────────────────
