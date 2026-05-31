@@ -996,15 +996,21 @@ class RoomWorker:
         )
 
     def _identity(self) -> str:
-        # `detector_worker_<8 hex of room>` — STABLE per patient. On a
-        # backend redeploy the new pod connects with the same identity
-        # and LiveKit Cloud kicks the dying pod's leftover session
-        # (default duplicate-identity behavior). Previously we appended
-        # a random suffix to avoid a DuplicateIdentity reconnect loop;
-        # with REST-driven reconciliation that loop no longer occurs
-        # because the new pod's reconciler does not wait for the SDK
-        # to deliver a `participant_left` for the old self.
-        short = self.room_name.removeprefix("patient_")[:8]
+        # `detector_worker_<last 12 hex of patient UUID>`. STABLE per
+        # patient. On a backend redeploy the new pod connects with the
+        # same identity and LiveKit Cloud kicks the dying pod's
+        # leftover session (default duplicate-identity behavior).
+        # Previously we appended a random suffix to avoid a
+        # DuplicateIdentity reconnect loop; with REST-driven
+        # reconciliation that loop no longer occurs because the new
+        # pod's reconciler does not wait for the SDK to deliver a
+        # `participant_left` for the old self.
+        #
+        # 12 hex chars = the last group of the UUID after dashes are
+        # split. Collision probability per random pair is ~1 in 280
+        # trillion (birthday-safe to ~17 million patients). Was 8
+        # previously; raised for production headroom.
+        short = self.room_name.removeprefix("patient_")[-12:]
         return f"{_WORKER_IDENTITY_PREFIX}{short}"
 
     @staticmethod
