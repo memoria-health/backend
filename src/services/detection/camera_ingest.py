@@ -570,37 +570,35 @@ class CameraIngest:
             result.detector_fields["identity_confidence"] = round(identity.confidence, 4)
             result.detector_fields["identity_face_count"] = identity.face_count
 
-            # Presence + count are now Re-ID-derived (YOLO + BoT-SORT
-            # body tracking), not LLM-derived. The prompt no longer
-            # asks the LLM for `people_present`/`people_count`; those
-            # fields on `result` default to (False, 0) and we ignore
-            # them whenever Re-ID returned a usable verdict.
+            # Presence gate. The LLM is the GENERIC people detector — it's
+            # looser / more sensitive than YOLO body tracking — and the re-ID
+            # FACE match (the patient / POI) is the override. `people_present`
+            # comes from the LLM's always-on prompt block (PEOPLE_PRESENT_SPEC
+            # in prompt.py).
             #
-            # `reid_ran=True` path covers both the standard
-            # (gallery-present) case and the no-enrollment case where
-            # `body_pipeline` runs body tracking without face matching.
-            # `reid_ran=False` only happens on real infra failures
-            # (re-id disabled in settings, gallery load crashed,
-            # frame extract failed, pipeline timeout). On that path we
-            # conservatively keep the camera open (people_present=True,
-            # people_count=0) so a Re-ID outage doesn't silently close
-            # the state and stop the LLM-driven behavioral detectors.
-            # Presence gate, mode-dependent:
-            #   • faces NOT enrolled -> the original LLM-driven close: trust
-            #     the LLM's `people_present` verdict (always-on prompt block).
-            #     YOLO/re-ID was skipped entirely for this patient.
-            #   • faces enrolled + re-ID ran -> trust YOLO/re-ID body tracking.
+            #   • faces NOT enrolled -> presence is purely the LLM (no POI).
+            #   • faces enrolled + re-ID ran -> presence = LLM OR patient-matched.
+            #     A matched patient (POI) is present even if the LLM disagrees;
+            #     otherwise trust the LLM (so an LLM-yes / YOLO-no tick reads as
+            #     "person"). YOLO body COUNT no longer gates presence — only its
+            #     face match (the POI) does.
             #   • faces enrolled + re-ID infra failure (timeout/crash) ->
             #     conservatively keep the camera open so an outage doesn't
             #     silently stop monitoring.
             if not identity.faces_enrolled:
-                gate_people_present = result.people_present
+                gate_people_present = bool(result.people_present)
                 gate_people_count = result.people_count
                 present_src = "llm_no_enrollment"
             elif identity.reid_ran:
-                gate_people_present = identity.people_present_reid
-                gate_people_count = identity.people_count_reid
-                present_src = "reid"
+                gate_people_present = bool(
+                    result.people_present or identity.patient_in_clip
+                )
+                gate_people_count = max(
+                    result.people_count, identity.people_count_reid
+                )
+                present_src = (
+                    "reid_poi" if identity.patient_in_clip else "llm_enrolled"
+                )
             else:
                 gate_people_present = True
                 gate_people_count = 0

@@ -80,15 +80,13 @@ def build_prompt_and_schema(detectors: Sequence[DetectorSpec]) -> BuiltPrompt:
     across detectors (signals a config bug — two detectors output
     the same key).
 
-    `PEOPLE_PRESENT_SPEC` was previously merged in as always-on, but
-    presence is now derived from Re-ID body tracking (YOLO + BoT-SORT)
-    inside `camera_ingest`. The LLM is no longer asked to answer
-    `people_present`/`people_count` — that saved per-call prompt and
-    output tokens, and removed the two-source-of-truth conflict
-    between Re-ID's body tracks and the LLM's verdict. The constant
-    is kept defined for any external importer; if a caller passes it
-    explicitly it's silently deduped by the loop below (no schema
-    fields get added because the always-on merge is gone).
+    `PEOPLE_PRESENT_SPEC` is merged in as always-on: the LLM is the
+    generic presence detector. `camera_ingest` reads `result.people_present`
+    as the looser-than-YOLO presence signal, with the re-ID face match
+    (the patient / POI) as the override. (It was briefly removed in favor
+    of YOLO-derived presence, but YOLO body count misses people the LLM
+    catches, so the LLM verdict is authoritative for generic presence and
+    re-ID's face match is authoritative for "is it the patient.")
 
     Verbatim port of `lib/detectors.ts:buildPromptAndSchema` minus
     the always-on merge.
@@ -99,11 +97,14 @@ def build_prompt_and_schema(detectors: Sequence[DetectorSpec]) -> BuiltPrompt:
     }
     schema_required: list[str] = ["description"]
 
-    # PEOPLE_PRESENT_SPEC seeded into seen_identifiers so a caller that
-    # forwards it explicitly (legacy code path) is silently deduped and
-    # contributes nothing to the prompt/schema — Re-ID is authoritative.
+    # Always-on people_present block, RE-ENABLED. The LLM is the generic
+    # presence detector again (camera_ingest's gate reads result.people_present
+    # — looser than YOLO body count, with the re-ID face match as the POI
+    # override). Prepended so its prompt_fragment + schema_fields are always
+    # emitted; its identifier stays in `seen_identifiers` so a caller that also
+    # forwards it is deduped (no duplicate schema field).
+    all_specs: list[DetectorSpec] = [PEOPLE_PRESENT_SPEC]
     seen_identifiers: set[str] = {PEOPLE_PRESENT_SPEC.identifier}
-    all_specs: list[DetectorSpec] = []
     for d in detectors:
         if d.identifier in seen_identifiers:
             continue
