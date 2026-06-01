@@ -83,7 +83,6 @@ async def pair_camera(
     cam.api_key_hash = api_key_hash
     cam.pairing_code = None
     cam.pairing_expires_at = None
-    cam.last_seen_at = now
     await session.commit()
 
     backend_base_url = _backend_base_url(request)
@@ -133,7 +132,6 @@ async def _pair_demo_camera(
         api_key.encode("utf-8"),
         bcrypt.gensalt(rounds=settings.bcrypt_rounds),
     ).decode("utf-8")
-    cam.last_seen_at = now
     await session.commit()
 
     return PairResponse(

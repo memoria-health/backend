@@ -76,7 +76,6 @@ def _to_response(c: Camera) -> CameraResponse:
         desired_state=c.desired_state,  # type: ignore[arg-type]
         source_type=c.source_type,  # type: ignore[arg-type]
         livekit_identity=c.livekit_identity,
-        last_seen_at=c.last_seen_at,
         created_at=c.created_at,
         paired=paired,
     )
@@ -208,7 +207,6 @@ async def create_pairing_code(
         room=body.room,
         icon_name=body.icon_name,
         online=False,
-        last_seen_at=None,
         created_at=now,
         pairing_code=code,
         pairing_expires_at=expires_at,
@@ -365,7 +363,6 @@ async def provision_pi_camera(
         room=body.room,
         icon_name=body.icon_name,
         online=False,
-        last_seen_at=None,
         created_at=now,
         # Pi rows skip the pairing-code / api_key dance used by the
         # iPhone path. Instead, the Pi authenticates with the

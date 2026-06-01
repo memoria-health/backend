@@ -126,10 +126,10 @@ class CameraIngest:
     def record_frame_arrival(self, monotonic_ts: float) -> None:
         """Sync callback the RoomWorker's video consumer fires every
         time it pushes a frame to our buffer. Just stamps a monotonic
-        timestamp; the actual `cameras.online` / `last_seen_at` writes
-        live in `LiveKitRoomReconciler`, which reads this field on each
-        of its periodic REST polls (every ~10s) and combines it with
-        the REST-presence signal to decide both columns.
+        timestamp; the actual `cameras.online` write lives in
+        `LiveKitRoomReconciler`, which reads this field on each of its
+        periodic REST polls (every ~10s) and combines it with the
+        REST-presence signal to decide the column.
         """
         self._last_frame_at = monotonic_ts
 
@@ -307,8 +307,8 @@ class CameraIngest:
                 # still skipping." camera_repo.update_partial also
                 # resets state to "open" on resume as a belt-and-
                 # suspenders against any drift that snuck in.
-                # Liveness write (online=true, last_seen_at) lives in
-                # `_liveness_writer_loop` below — driven by actual
+                # Liveness write (online=true) lives in
+                # `_liveness_writer_loop` below, driven by actual
                 # frame arrivals, not by tick scheduling. Calling
                 # `apply_liveness_only` from here was a footgun: ticks
                 # fire on a fixed cadence regardless of whether frames
@@ -462,7 +462,7 @@ class CameraIngest:
             #      failures, never on "face turned away whole clip."
             #
             # Either signal alone is sufficient to short-circuit. The
-            # `has_ready_enrollment` guard remains the day-zero clause —
+            # `has_ready_enrollment` guard remains the day-zero clause,
             # without an enrollment we can't tell "non-patient" from
             # anything else.
             if (

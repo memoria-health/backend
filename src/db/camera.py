@@ -30,8 +30,6 @@ class Camera(Base):
     online: Mapped[bool] = mapped_column(Boolean)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
-    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
-
     # ── Pairing flow ───────────────────────────────────────────────
     # `pairing_code` + `pairing_expires_at` are populated when the
     # caregiver mints a code and cleared when the wall phone exchanges

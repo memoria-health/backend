@@ -162,7 +162,6 @@ create table public.cameras (
   room                text not null,
   icon_name           text not null default 'tv',
   online              boolean not null default false,
-  last_seen_at        timestamptz,
   created_at          timestamptz not null default now(),
   -- ── Pairing flow ────────────────────────────────────────────────
   -- pairing_code is set when the caregiver mints a code; cleared when

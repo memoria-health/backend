@@ -149,13 +149,13 @@ _ATOMIC_UPDATE_SQL = text(
     """
 )
 
-# Stream-presence columns (`online`, `last_seen_at`) are no longer
-# written by the state machine. `LiveKitRoomReconciler` is the sole
-# writer of those, sourced from `lkapi.room.list_participants` and
-# the per-ingest `_last_frame_at` clock. Keeping the state-machine
-# UPDATE focused on open/closed state means a paused detector tick
-# does not pretend the camera is live, and a live publisher whose
-# camera is AI-paused still gets `online=true` via the reconciler.
+# The `online` column is no longer written by the state machine.
+# `LiveKitRoomReconciler` is the sole writer, sourced from
+# `lkapi.room.list_participants` and the per-ingest `_last_frame_at`
+# clock. Keeping the state-machine UPDATE focused on open/closed
+# state means a paused detector tick does not pretend the camera is
+# live, and a live publisher whose camera is AI-paused still gets
+# `online=true` via the reconciler.
 
 
 async def apply_tick_update(

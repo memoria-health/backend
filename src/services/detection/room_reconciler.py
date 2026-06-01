@@ -110,11 +110,12 @@ _DEFAULT_WEBHOOK_DEBOUNCE_S: float = 1.0
 # silently freezing the periodic loop. We saw this in production
 # 2026-05-30: the loop fired once at startup, then sat parked for ~70
 # minutes (matching the OS TCP keepalive timeout) before recovering for
-# one more pass and stalling again. `cameras.last_seen_at` was the
-# user-visible symptom — frozen at startup, the live grid showed
-# "Last seen 3h ago" while frames kept flowing. 5s is conservative:
-# LiveKit's REST p99 is sub-second; anything over 5s is a degenerate
-# network condition we want to abort and retry next tick.
+# one more pass and stalling again. `cameras.online` stayed True
+# silently while publishers had already dropped, so the live grid
+# showed stale tiles for every camera until the backend was restarted.
+# 5s is conservative: LiveKit's REST p99 is sub-second; anything over
+# 5s is a degenerate network condition we want to abort and retry next
+# tick.
 _DEFAULT_REST_TIMEOUT_S: float = 5.0
 
 
@@ -146,7 +147,6 @@ _SET_ONLINE_TRUE_FRESH_START_SQL = text(
     """
     UPDATE public.cameras
     SET online = true,
-        last_seen_at = :now,
         state = 'open',
         no_people_count = 0,
         state_changed_at = :now
@@ -161,8 +161,7 @@ _SET_ONLINE_TRUE_FRESH_START_SQL = text(
 _SET_ONLINE_TRUE_KEEP_STATE_SQL = text(
     """
     UPDATE public.cameras
-    SET online = true,
-        last_seen_at = :now
+    SET online = true
     WHERE id = :camera_id
     """
 )

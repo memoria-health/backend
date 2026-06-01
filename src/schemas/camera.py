@@ -81,7 +81,6 @@ class CameraResponse(BaseModel):
     # can map a Camera row to a subscribed LiveKit track without
     # reconstructing the identity from the UUID prefix client-side.
     livekit_identity: str | None
-    last_seen_at: datetime | None
     created_at: datetime
     # True once the wall phone has called /v1/cameras/pair and we've
     # set the api_key_hash. False = "row exists with an open pairing

@@ -102,11 +102,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.scheduler = scheduler
     await scheduler.start()
-    # `cameras.online` and `last_seen_at` are now owned by each
-    # `RoomWorker`'s `LiveKitRoomReconciler` (see room_reconciler.py).
-    # The standalone `StaleOnlineSweeper` was removed because REST
-    # polling produces the same staleness signal without a separate
-    # DB sweep.
+    # `cameras.online` is now owned by each `RoomWorker`'s
+    # `LiveKitRoomReconciler` (see room_reconciler.py). The standalone
+    # `StaleOnlineSweeper` was removed because REST polling produces
+    # the same staleness signal without a separate DB sweep.
     try:
         yield
     finally:
