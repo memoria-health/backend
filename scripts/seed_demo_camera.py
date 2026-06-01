@@ -91,7 +91,6 @@ async def seed(email: str, code: str) -> None:
                 room=DEMO_ROOM,
                 icon_name="tv",
                 online=False,
-                last_seen_at=None,
                 created_at=now,
                 pairing_code=code,
                 pairing_expires_at=far_future,

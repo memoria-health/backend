@@ -143,7 +143,6 @@ async def seed_patient(session: AsyncSession, caregiver_id: UUID) -> Patient:
                 room=room,
                 icon_name=icon,
                 online=True,
-                last_seen_at=now,
                 created_at=now,
             )
         )

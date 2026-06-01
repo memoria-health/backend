@@ -487,7 +487,6 @@ def mint_pairing_code(
                 room=room,
                 icon_name=icon,
                 online=False,
-                last_seen_at=None,
                 created_at=now,
                 pairing_code=code,
                 pairing_expires_at=now + timedelta(minutes=10),
