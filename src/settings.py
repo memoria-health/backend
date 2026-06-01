@@ -93,6 +93,13 @@ class Settings(BaseSettings):
     # Pairing-code lifetime in seconds. Dashboard uses 10 minutes; we
     # keep the same for parity.
     pairing_code_ttl_seconds: int = Field(ge=60, le=3600, default=600)
+    # App Review demo pairing code (NEMARA_DEMO_PAIRING_CODE). When set,
+    # `POST /v1/cameras/pair` special-cases this exact code: it pairs the
+    # camera row that holds it WITHOUT expiry or single-use clearing, so
+    # an Apple reviewer can pair a fresh NemaraCam install repeatedly
+    # against the seeded demo camera. None (unset) disables the path
+    # entirely — production is the only env that sets it.
+    demo_pairing_code: str | None = Field(default=None)
 
     # ── Supabase Storage (Phase 4) ──────────────────────────────
     # Two private buckets, signed URLs at read time. Bucket names are

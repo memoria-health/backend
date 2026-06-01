@@ -115,7 +115,7 @@ def _event_html(*, patient_name: str, title: str, narrative: str, location: str)
         f"{patient_name} · {location}</p>"
         f"<p style=\"margin:0 0 16px;font-size:15px;line-height:1.5\">{narrative}</p>"
         f"<p style=\"margin:0;color:#6b6357;font-size:12px\">"
-        f"Sent by Nemara because you enabled email alerts. "
+        f"Sent by Memoria because you enabled email alerts. "
         f"Manage alerts in your dashboard settings.</p>"
         f"</div>"
     )
@@ -208,7 +208,7 @@ async def send_support_email(
     recipients = list(settings.support_email_recipients or [])
     if not recipients:
         return "No support recipients are configured."
-    full_subject = f"[Nemara support] {subject.strip() or '(no subject)'}"
+    full_subject = f"[Memoria support] {subject.strip() or '(no subject)'}"
     body_html = _support_html(
         caregiver_name=caregiver.display_name,
         caregiver_email=caregiver.email,
@@ -232,7 +232,7 @@ def _support_html(*, caregiver_name: str, caregiver_email: str, message: str) ->
     return (
         "<div style=\"font-family:-apple-system,Segoe UI,sans-serif;color:#1c1a17\">"
         f"<p style=\"margin:0 0 12px;color:#6b6357;font-size:13px\">"
-        f"From {caregiver_name} &lt;{caregiver_email}&gt; via the Nemara iOS app."
+        f"From {caregiver_name} &lt;{caregiver_email}&gt; via the Memoria iOS app."
         "</p>"
         f"<div style=\"margin:0;font-size:15px;line-height:1.5\">{safe}</div>"
         "</div>"
@@ -255,12 +255,12 @@ async def send_test_email(
     patient_name = patient.preferred_name or patient.full_name
     await _send(
         to=recipients,
-        subject=f"Nemara test alert — {patient_name}",
+        subject=f"Memoria test alert — {patient_name}",
         html=_event_html(
             patient_name=patient_name,
             title="Test alert",
             narrative=(
-                "This is a test email from Nemara. If you received it, email "
+                "This is a test email from Memoria. If you received it, email "
                 f"alerts for {patient_name} are set up correctly."
             ),
             location="Living room",

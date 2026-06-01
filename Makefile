@@ -57,6 +57,7 @@ db-stop:
 db-reset:
 	supabase db reset
 	$(PY) python scripts/seed.py
+	@bash scripts/ensure_buckets.sh
 
 studio:
 	open http://localhost:54343

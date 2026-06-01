@@ -82,10 +82,10 @@ async def create_patient(
 ) -> PatientResponse:
     """Create a patient under the current caregiver.
 
-    Auto-seeds the four preset detectors (Falls / Agitation / Wandering
-    / Medication adherence) via `services.onboarding.seed_detectors_for_patient`
-    in the same transaction. Lands in step 7 of the build sequence;
-    until then, new patients have an empty detector list.
+    Auto-seeds preset detectors via `services.onboarding.seed_detectors_for_patient`
+    in the same transaction. The set is age-based: under-18 patients get the
+    child set (Falls / Climbing / Distress); 18+ or unknown birthday get the
+    older-adult set (Falls / Agitation / Wandering / Medication adherence).
     """
     now = datetime.now(timezone.utc)
     p = Patient(
@@ -105,7 +105,7 @@ async def create_patient(
         last_event_at=None,
     )
     await patient_repo.insert(session, p)
-    await onboarding.seed_detectors_for_patient(session, p.id)
+    await onboarding.seed_detectors_for_patient(session, p.id, p.date_of_birth)
     await session.commit()
     return _to_response(p)
 

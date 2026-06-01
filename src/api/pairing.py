@@ -29,6 +29,13 @@ from src.schemas.pairing import PairRequest, PairResponse
 
 router = APIRouter(prefix="/v1", tags=["camera"])
 
+# Stable identity marker for the App Review demo camera. The demo-pair
+# path matches the camera by THIS, not by pairing_code — the caregiver
+# app rotates an unpaired camera's pairing_code whenever its detail screen
+# is opened, which would otherwise silently break the 424242 demo. The
+# seed (scripts/seed_demo_camera.py) stamps this identity on the demo row.
+DEMO_CAMERA_IDENTITY = "cam_demo"
+
 
 @router.post(
     "/cameras/pair",
@@ -42,6 +49,16 @@ async def pair_camera(
     settings: SettingsDep,
 ) -> PairResponse:
     now = datetime.now(timezone.utc)
+
+    # App Review demo path: a configured, never-expiring, reusable code.
+    # Lets an Apple reviewer pair a fresh NemaraCam install against the
+    # seeded demo camera without a live 10-minute pairing window. We mint
+    # a fresh api_key each time but deliberately leave the pairing fields
+    # intact so the code stays reusable across review installs. Disabled
+    # (and falls through to the normal path) whenever the setting is unset.
+    demo = settings.demo_pairing_code
+    if demo and body.pairing_code == demo:
+        return await _pair_demo_camera(session, settings, request, now)
 
     stmt = (
         select(Camera)
@@ -79,6 +96,54 @@ async def pair_camera(
         livekit_identity=cam.livekit_identity or f"cam_{cam.id.hex[:8]}",
         livekit_room=cam.livekit_room or f"patient_{cam.patient_id}",
         backend_base_url=backend_base_url,
+    )
+
+
+async def _pair_demo_camera(
+    session: SessionDep,
+    settings: SettingsDep,
+    request: Request,
+    now: datetime,
+) -> PairResponse:
+    """Pair the seeded demo camera, identified by its stable
+    `DEMO_CAMERA_IDENTITY` (not by pairing_code, which the caregiver app
+    rotates). Mirrors the normal pairing response so NemaraCam behaves
+    identically after pairing. Each call re-mints the api_key (the
+    previously-paired phone's key is invalidated, which is fine for review).
+    """
+    cam = (
+        await session.execute(
+            select(Camera)
+            .where(Camera.livekit_identity == DEMO_CAMERA_IDENTITY)
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if cam is None:
+        # The setting is on but no camera carries the demo identity — the
+        # demo camera wasn't seeded. Surface a distinct 404 so it's obvious
+        # in logs (vs the opaque 401 the normal path returns). Run
+        # scripts/seed_demo_camera.py to provision it.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="demo_camera_not_provisioned",
+        )
+
+    api_key = secrets.token_hex(32)
+    cam.api_key_hash = bcrypt.hashpw(
+        api_key.encode("utf-8"),
+        bcrypt.gensalt(rounds=settings.bcrypt_rounds),
+    ).decode("utf-8")
+    cam.last_seen_at = now
+    await session.commit()
+
+    return PairResponse(
+        api_key=api_key,
+        camera_id=cam.id,
+        patient_id=cam.patient_id,
+        livekit_url=settings.livekit_url,
+        livekit_identity=cam.livekit_identity or f"cam_{cam.id.hex[:8]}",
+        livekit_room=cam.livekit_room or f"patient_{cam.patient_id}",
+        backend_base_url=_backend_base_url(request),
     )
 
 

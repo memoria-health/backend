@@ -117,7 +117,6 @@ async def seed_patient(session: AsyncSession, caregiver_id: UUID) -> Patient:
         state="critical",
         status_line="Possible fall, living room",
         last_event_at=now - timedelta(minutes=42),
-        battery_percent=82,
         cameras_paused=False,
         created_at=now,
         updated_at=now,

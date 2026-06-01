@@ -6,13 +6,14 @@ Caregiver:
 - `to_response` — ORM → wire shape.
 
 Patient:
-- `seed_detectors_for_patient` — writes the four preset detectors
-  (Falls / Agitation / Wandering / Medication adherence) right after a
-  new patient row lands. Same shape the iOS mock store uses today.
+- `seed_detectors_for_patient` — writes the preset detectors right after a
+  new patient row lands. The set is age-based: under-18 patients get the
+  child set (Falls / Climbing / Distress); 18+ or unknown birthday get the
+  older-adult set (Falls / Agitation / Wandering / Medication adherence).
 """
 
 from collections.abc import Sequence
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -196,6 +197,57 @@ _MEDICATION_PROMPT_FRAGMENT = (
 )
 
 
+# ── Child-specific prompts (used for under-18 patients) ──────────────
+# Falls is reused verbatim from the adult set (children fall too, same
+# camera geometry). Climbing + Distress are new and child-oriented. Their
+# wording is a sensible starting point — detection accuracy should be
+# field-tuned, same as any prompt.
+
+_CLIMBING_PROMPT_FRAGMENT = (
+    "climbing_detected: boolean. TRUE if a child is climbing onto something "
+    "they shouldn't — pulling up onto furniture (sofa back, table, kitchen "
+    "counter, shelf, windowsill, railing), scaling a crib rail or safety gate, "
+    "or already standing / perched on an elevated surface in a way that risks "
+    "a fall. The climbing motion OR the child clearly perched on the elevated "
+    "surface must be visible in the clip.\n"
+    "\n"
+    "Set FALSE if any of:\n"
+    "  - the child is sitting, standing, or playing normally on the floor;\n"
+    "  - an adult is holding or lifting the child;\n"
+    "  - the child is seated in a high chair, crib, or stroller in normal use;\n"
+    "  - no child is visible;\n"
+    "  - you only hear sounds without seeing the climbing.\n"
+    "\n"
+    "climbing_confidence: number 0–1. 0 = no climbing. 0.3–0.6 = ambiguous "
+    "(child near furniture but not clearly climbing). 0.7+ = clearly climbing "
+    "onto or perched on an elevated surface.\n"
+    "climbing_reasoning: 1 short sentence describing what you saw (e.g. "
+    "'toddler pulled up onto the coffee table at 5s', 'child sitting on the "
+    "floor playing — no climbing', 'no child visible')."
+)
+
+_DISTRESS_PROMPT_FRAGMENT = (
+    "distress_detected: boolean. TRUE if a child shows sustained distress "
+    "across the clip — crying, wailing, or visibly upset (scrunched / red "
+    "face, flailing, reaching out while crying) for multiple seconds. Audio "
+    "(crying / wailing) is SUPPORTING evidence that can corroborate a visual "
+    "judgment, but audio alone is NEVER sufficient — if the child is visually "
+    "calm, off-camera, or not visible, set FALSE.\n"
+    "\n"
+    "Set FALSE if any of:\n"
+    "  - the child is calm, playing, laughing, or sleeping;\n"
+    "  - the upset is a single brief moment rather than sustained;\n"
+    "  - no child is visible.\n"
+    "\n"
+    "distress_confidence: number 0–1. 0 = calm / no child. 0.3–0.6 = some "
+    "fussing but ambiguous. 0.7+ = clear sustained distress; raise within the "
+    "band when crying audio corroborates the visual signal.\n"
+    "distress_reasoning: 1 short sentence (e.g. 'child crying and reaching out "
+    "for ~8s, audio wailing', 'child playing happily — calm', 'audible fussing "
+    "but no child visible — not distress', 'no child visible')."
+)
+
+
 def _detection_schema(identifier: str) -> dict[str, dict[str, str]]:
     """Per-detector JSON-schema field map for detectors whose schema
     follows the standard `<id>_detected / _confidence / _reasoning`
@@ -208,7 +260,7 @@ def _detection_schema(identifier: str) -> dict[str, dict[str, str]]:
     }
 
 
-_PRESET_DETECTORS: tuple[dict[str, object], ...] = (
+_PRESET_DETECTORS_ADULT: tuple[dict[str, object], ...] = (
     {
         "identifier":      "fall",
         "name":            "Falls",
@@ -266,24 +318,90 @@ _PRESET_DETECTORS: tuple[dict[str, object], ...] = (
 )
 
 
+# Child set (under-18 patients). Falls reused verbatim; Climbing + Distress
+# are child-oriented. Distinct identifiers so they never collide with the
+# adult set under the per-patient unique-identifier constraint.
+_PRESET_DETECTORS_CHILD: tuple[dict[str, object], ...] = (
+    {
+        "identifier":      "fall",
+        "name":            "Falls",
+        "icon_name":       "figure.fall",
+        "description":     "Sudden fall events across all rooms.",
+        "category":        "safety",
+        "shape":           "point_in_time",
+        "where_scope":     "ALL ROOMS",
+        "when_scope":      "ALWAYS",
+        "prompt_fragment": _FALL_PROMPT_FRAGMENT,
+        "schema_json":     _detection_schema("fall"),
+    },
+    {
+        "identifier":      "climbing",
+        "name":            "Climbing",
+        "icon_name":       "figure.climbing",
+        "description":     "Climbing onto furniture or elevated surfaces.",
+        "category":        "safety",
+        "shape":           "state",
+        "where_scope":     "ALL ROOMS",
+        "when_scope":      "ALWAYS",
+        "prompt_fragment": _CLIMBING_PROMPT_FRAGMENT,
+        "schema_json":     _detection_schema("climbing"),
+    },
+    {
+        "identifier":      "distress",
+        "name":            "Distress",
+        "icon_name":       "exclamationmark.bubble",
+        "description":     "Sustained crying or visible distress.",
+        "category":        "safety",
+        "shape":           "state",
+        "where_scope":     "ALL ROOMS",
+        "when_scope":      "ALWAYS",
+        "prompt_fragment": _DISTRESS_PROMPT_FRAGMENT,
+        "schema_json":     _detection_schema("distress"),
+    },
+)
+
+
+def _is_minor(date_of_birth: date) -> bool:
+    """True if the patient is under 18 as of today (UTC). Subtracts a year
+    when this year's birthday hasn't occurred yet."""
+    today = datetime.now(timezone.utc).date()
+    age = today.year - date_of_birth.year - (
+        (today.month, today.day) < (date_of_birth.month, date_of_birth.day)
+    )
+    return age < 18
+
+
 async def seed_detectors_for_patient(
-    session: AsyncSession, patient_id: UUID
+    session: AsyncSession,
+    patient_id: UUID,
+    date_of_birth: date | None = None,
 ) -> Sequence[Detector]:
-    """Create the four preset detectors for a freshly-created patient.
+    """Create the preset detectors for a freshly-created patient.
+
+    The set is chosen by age at creation: under 18 → the child set
+    (Falls / Climbing / Distress); 18+ or unknown birthday → the
+    older-adult set (Falls / Agitation / Wandering / Medication). An
+    absent `date_of_birth` falls back to the adult set, preserving the
+    prior default behavior.
 
     Caller owns the transaction (no commit here). Detectors land in
     insertion order, which becomes the iOS list order. Each row carries
     the runtime contract (identifier / prompt_fragment / schema_json)
     the detector pipeline reads when building Gemini/OpenAI calls.
     """
+    presets = (
+        _PRESET_DETECTORS_CHILD
+        if date_of_birth is not None and _is_minor(date_of_birth)
+        else _PRESET_DETECTORS_ADULT
+    )
     # Stamp each preset with a microsecond-apart `created_at` so the
     # `ORDER BY created_at ASC` in `detector_repo.list_for_patient`
     # returns them in insertion order deterministically. Without this,
-    # all four rows share `created_at` and Postgres's heap-scan order
-    # can drift after autovacuum (caused intermittent test flakes).
+    # rows share `created_at` and Postgres's heap-scan order can drift
+    # after autovacuum (caused intermittent test flakes).
     base = datetime.now(timezone.utc)
     inserted: list[Detector] = []
-    for i, preset in enumerate(_PRESET_DETECTORS):
+    for i, preset in enumerate(presets):
         now = base + timedelta(microseconds=i)
         det = Detector(
             id=uuid4(),

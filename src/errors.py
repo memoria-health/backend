@@ -32,3 +32,16 @@ class StorageError(NemaraError):
     failures (timeout, non-2xx, transport error). The API layer maps
     most of these to 4xx/5xx; the caller decides which.
     """
+
+
+# ─── Auth admin ──────────────────────────────────────────────────
+
+
+class AuthAdminError(NemaraError):
+    """A Supabase Auth Admin (GoTrue) API call failed.
+
+    Raised by `src.services.auth_admin` when deleting an auth user
+    returns a non-2xx (and non-404) status, or the HTTP transport
+    fails. The account-deletion endpoint maps this to a 5xx so the
+    client can retry rather than believing the account is gone.
+    """

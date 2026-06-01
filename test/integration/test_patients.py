@@ -485,3 +485,81 @@ async def test_patch_cameras_paused_does_not_cascade_to_other_caregivers_cameras
 
     assert await _camera_desired_state(a_cam) == "disconnected"
     assert await _camera_desired_state(b_cam) == "connected"
+
+
+# ─── Age-based preset detectors ──────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_under_18_seeds_child_detectors(
+    client: AsyncClient, auth_user
+) -> None:
+    """A patient under 18 gets the child preset set (fall / climbing /
+    distress), not the older-adult agitation/wandering/medication set."""
+    uid, email = auth_user
+    headers = {"Authorization": f"Bearer {mint_test_jwt(uid, email)}"}
+    pid = (
+        await client.post(
+            "/v1/patients",
+            headers=headers,
+            json={
+                "full_name": "Sam Lee",
+                "preferred_name": "Sam",
+                "relation": "other",
+                "date_of_birth": "2015-06-01",  # a minor
+            },
+        )
+    ).json()["id"]
+    dets = (await client.get(f"/v1/patients/{pid}/detectors", headers=headers)).json()
+    ids = {d["identifier"] for d in dets}
+    assert ids == {"fall", "climbing", "distress"}
+
+
+@pytest.mark.asyncio
+async def test_adult_and_unknown_age_seed_adult_detectors(
+    client: AsyncClient, auth_user
+) -> None:
+    """18+ and unknown-birthday patients both get the older-adult set."""
+    uid, email = auth_user
+    headers = {"Authorization": f"Bearer {mint_test_jwt(uid, email)}"}
+
+    adult_pid = (
+        await client.post(
+            "/v1/patients",
+            headers=headers,
+            json={
+                "full_name": "Margaret O'Brien",
+                "preferred_name": "Maggie",
+                "relation": "parent",
+                "date_of_birth": "1951-03-18",
+            },
+        )
+    ).json()["id"]
+    adult_ids = {
+        d["identifier"]
+        for d in (
+            await client.get(f"/v1/patients/{adult_pid}/detectors", headers=headers)
+        ).json()
+    }
+    assert adult_ids == {"fall", "agitation", "wandering", "medication"}
+
+    # No date_of_birth → adult default (unchanged prior behavior).
+    nodob_pid = (
+        await client.post(
+            "/v1/patients",
+            headers=headers,
+            json={
+                "full_name": "No Birthday",
+                "preferred_name": "Nb",
+                "relation": "other",
+            },
+        )
+    ).json()["id"]
+    nodob_ids = {
+        d["identifier"]
+        for d in (
+            await client.get(f"/v1/patients/{nodob_pid}/detectors", headers=headers)
+        ).json()
+    }
+    assert "agitation" in nodob_ids
+    assert "climbing" not in nodob_ids
