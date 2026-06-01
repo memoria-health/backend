@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import secrets
 import time
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
@@ -90,6 +91,17 @@ _MOTION_STATE_TOPIC = "motion_state"
 _RECONNECT_BACKOFF_INITIAL = 2.0
 _RECONNECT_BACKOFF_MAX = 60.0
 
+# Storm detection. A healthy LiveKit session lives for many seconds (up
+# to the token-recycle interval). A connect that drops in under this many
+# seconds — especially on DuplicateIdentity — means another worker is
+# contending for our identity. We do NOT reset backoff in that case (so we
+# don't hammer LiveKit Cloud in a tight evict/reconnect loop) and, after a
+# few rapid cycles, log at ERROR so the condition is *visible* instead of
+# buried in INFO/WARNING noise. With per-instance unique identities this
+# should never trip; it's defense + observability.
+_STORM_SESSION_THRESHOLD_S = 8.0
+_STORM_ALERT_CYCLES = 3
+
 # Per-track consumer (audio / video) backoff. The room may stay
 # connected while a single track's stream throws — usually a brief
 # decode hiccup. Retry in-place a few times before giving up; the
@@ -137,6 +149,18 @@ class RoomWorker:
         on_idle_timeout: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self.room_name = room_name
+        # Per-INSTANCE random suffix on the LiveKit identity. Stable for
+        # this worker's lifetime (so reconnects keep the same identity),
+        # but unique across instances. This is the keystone that prevents
+        # the DuplicateIdentity reconnect storm: a leaked/overlapping
+        # worker (slow teardown, deploy overlap, or a 2nd backend on the
+        # same LiveKit project) now joins with a DIFFERENT identity, so
+        # LiveKit never evicts anyone — worst case is one redundant
+        # analysis that self-heals, not an infinite evict/reconnect loop.
+        # Stale sessions are cleared by `_reap_zombie_workers` (REST
+        # remove_participant) on startup reconcile, NOT by relying on
+        # DuplicateIdentity eviction.
+        self._instance_token = secrets.token_hex(3)
         self._settings = settings
         self._sessionmaker = sessionmaker
         self._motion_cache = motion_cache
@@ -335,17 +359,44 @@ class RoomWorker:
         connect the backoff resets.
         """
         backoff = _RECONNECT_BACKOFF_INITIAL
+        rapid_cycles = 0
         while not self._stopped:
+            cycle_started = time.monotonic()
             try:
                 disconnect_reason = await self._connect_and_wait()
-                log.warning(
-                    "room_worker.disconnected room=%s reason=%s — reconnecting",
-                    self.room_name, disconnect_reason,
-                )
-                # A clean session reached steady state, so reset
-                # backoff: this disconnect was a network blip, not a
-                # repeated mint/connect failure.
-                backoff = _RECONNECT_BACKOFF_INITIAL
+                session_secs = time.monotonic() - cycle_started
+                is_duplicate = "duplicate" in disconnect_reason.lower()
+                if is_duplicate or session_secs < _STORM_SESSION_THRESHOLD_S:
+                    # Session died almost immediately — another worker is
+                    # contending for this identity (should be impossible
+                    # with per-instance identities). Escalate backoff
+                    # instead of fast-reconnecting, and surface it loudly.
+                    rapid_cycles += 1
+                    backoff = min(backoff * 2, _RECONNECT_BACKOFF_MAX)
+                    if rapid_cycles >= _STORM_ALERT_CYCLES:
+                        log.error(
+                            "room_worker.reconnect_storm room=%s reason=%s "
+                            "session=%.1fs rapid_cycles=%d identity=%s — another "
+                            "worker is contending for this identity; backing off "
+                            "%.1fs",
+                            self.room_name, disconnect_reason, session_secs,
+                            rapid_cycles, self._identity(), backoff,
+                        )
+                    else:
+                        log.warning(
+                            "room_worker.disconnected room=%s reason=%s "
+                            "session=%.1fs — reconnecting in %.1fs",
+                            self.room_name, disconnect_reason, session_secs, backoff,
+                        )
+                else:
+                    # A healthy session that dropped after steady state —
+                    # an ordinary network blip. Reset backoff.
+                    log.warning(
+                        "room_worker.disconnected room=%s reason=%s — reconnecting",
+                        self.room_name, disconnect_reason,
+                    )
+                    rapid_cycles = 0
+                    backoff = _RECONNECT_BACKOFF_INITIAL
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -353,6 +404,7 @@ class RoomWorker:
                     "room_worker.connect_failed room=%s — retry in %.1fs",
                     self.room_name, backoff,
                 )
+                backoff = min(backoff * 2, _RECONNECT_BACKOFF_MAX)
             finally:
                 await self._teardown_active_session()
             if self._stopped:
@@ -361,7 +413,6 @@ class RoomWorker:
                 await asyncio.sleep(backoff)
             except asyncio.CancelledError:
                 raise
-            backoff = min(backoff * 2, _RECONNECT_BACKOFF_MAX)
 
     async def _connect_and_wait(self) -> str:
         """One connect cycle. Returns the disconnect reason the SDK
@@ -996,22 +1047,27 @@ class RoomWorker:
         )
 
     def _identity(self) -> str:
-        # `detector_worker_<last 12 hex of patient UUID>`. STABLE per
-        # patient. On a backend redeploy the new pod connects with the
-        # same identity and LiveKit Cloud kicks the dying pod's
-        # leftover session (default duplicate-identity behavior).
-        # Previously we appended a random suffix to avoid a
-        # DuplicateIdentity reconnect loop; with REST-driven
-        # reconciliation that loop no longer occurs because the new
-        # pod's reconciler does not wait for the SDK to deliver a
-        # `participant_left` for the old self.
+        # `detector_worker_<last 12 hex of patient UUID>_<instance>`.
+        # The patient segment groups a worker to its room (used by the
+        # zombie reap's prefix match); the per-instance suffix makes the
+        # full identity UNIQUE per worker instance.
         #
-        # 12 hex chars = the last group of the UUID after dashes are
-        # split. Collision probability per random pair is ~1 in 280
-        # trillion (birthday-safe to ~17 million patients). Was 8
-        # previously; raised for production headroom.
+        # WHY the suffix is back: a previous version dropped it and let
+        # the identity be STABLE per patient, deliberately relying on
+        # LiveKit's DuplicateIdentity eviction to kick a dying pod's
+        # leftover session. The assumption was "REST-driven reconciliation
+        # means the reconnect loop no longer occurs." That assumption is
+        # FALSE in practice — when a RoomWorker.stop() is slow (e.g. CPU
+        # under re-ID load) the old session is stranded and the new worker
+        # joins with the SAME identity, so the two evict each other every
+        # ~3s forever and no ticks complete. Making the identity unique
+        # turns that catastrophic storm into, at worst, one redundant
+        # analysis until the stale session is reaped/times out.
+        #
+        # 12 hex chars = the last UUID group (birthday-safe to ~17M
+        # patients); the 6-hex instance suffix disambiguates instances.
         short = self.room_name.removeprefix("patient_")[-12:]
-        return f"{_WORKER_IDENTITY_PREFIX}{short}"
+        return f"{_WORKER_IDENTITY_PREFIX}{short}_{self._instance_token}"
 
     @staticmethod
     def _participant_identity(participant: rtc.RemoteParticipant | None) -> str:

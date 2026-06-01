@@ -357,7 +357,7 @@ class CameraIngest:
                     session,
                     camera_id=self.camera_id,
                     provider="skipped",
-                    description="(closed — LLM skipped)",
+                    description="(idle — camera closed, no people detected; LLM skipped)",
                     detector_fields=synthetic_fields,
                     people_present=False,
                     people_count=0,
@@ -585,7 +585,19 @@ class CameraIngest:
             # conservatively keep the camera open (people_present=True,
             # people_count=0) so a Re-ID outage doesn't silently close
             # the state and stop the LLM-driven behavioral detectors.
-            if identity.reid_ran:
+            # Presence gate, mode-dependent:
+            #   • faces NOT enrolled -> the original LLM-driven close: trust
+            #     the LLM's `people_present` verdict (always-on prompt block).
+            #     YOLO/re-ID was skipped entirely for this patient.
+            #   • faces enrolled + re-ID ran -> trust YOLO/re-ID body tracking.
+            #   • faces enrolled + re-ID infra failure (timeout/crash) ->
+            #     conservatively keep the camera open so an outage doesn't
+            #     silently stop monitoring.
+            if not identity.faces_enrolled:
+                gate_people_present = result.people_present
+                gate_people_count = result.people_count
+                present_src = "llm_no_enrollment"
+            elif identity.reid_ran:
                 gate_people_present = identity.people_present_reid
                 gate_people_count = identity.people_count_reid
                 present_src = "reid"

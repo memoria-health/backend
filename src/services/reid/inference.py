@@ -124,6 +124,16 @@ class IdentityResult:
     # or when no tracks at all.
     has_only_verified_other_tracks: bool = False
 
+    # True iff this patient has at least one enrolled face embedding
+    # (non-empty gallery). Drives the camera_ingest presence gate:
+    #   faces_enrolled=True  -> trust YOLO/re-ID for open/close
+    #   faces_enrolled=False -> fall back to the LLM's people_present
+    #                           verdict (and the YOLO pipeline is skipped
+    #                           entirely for these patients to save CPU).
+    # Independent of reid_ran: a patient with faces enrolled whose tick
+    # timed out has faces_enrolled=True but reid_ran=False.
+    faces_enrolled: bool = False
+
     # Frames the Re-ID pipeline already decoded + sampled. The LLM
     # provider reuses these instead of running its own ffmpeg
     # extract_frames pass (the OpenAI fps/width settings match Re-ID's
@@ -153,7 +163,7 @@ class IdentityResult:
         return self.patient_bbox
 
     @classmethod
-    def empty(cls) -> "IdentityResult":
+    def empty(cls, *, faces_enrolled: bool = False) -> "IdentityResult":
         return cls(
             reid_ran=False,
             patient_in_clip=False,
@@ -167,6 +177,7 @@ class IdentityResult:
             people_present_reid=False,
             people_count_reid=0,
             has_only_verified_other_tracks=False,
+            faces_enrolled=faces_enrolled,
         )
 
 
@@ -219,7 +230,17 @@ class ReIDInference:
         setting accordingly.
         """
         if not self._settings.reid_enabled:
-            return IdentityResult.empty()
+            return IdentityResult.empty(faces_enrolled=False)
+        # Determine enrollment up front (the gallery is cached) so the
+        # verdict is known even if the pipeline below times out, and so we
+        # can SKIP the whole YOLO/re-ID pipeline for patients with no
+        # enrolled faces — for them, presence falls back to the LLM's
+        # people_present verdict (see camera_ingest gate). This is the
+        # CPU saver: re-ID only runs for patients who actually enrolled.
+        gallery = await self._get_gallery(patient_id)
+        faces_enrolled = gallery is not None and len(gallery) > 0
+        if not faces_enrolled:
+            return IdentityResult.empty(faces_enrolled=False)
         try:
             return await asyncio.wait_for(
                 self._label_clip_inner(mp4_bytes=mp4_bytes, patient_id=patient_id),
@@ -230,12 +251,12 @@ class ReIDInference:
                 "reid.label_clip.timeout patient=%s timeout=%.1fs",
                 patient_id, self._settings.reid_timeout_seconds,
             )
-            return IdentityResult.empty()
+            return IdentityResult.empty(faces_enrolled=True)
         except Exception as exc:
             log.exception(
                 "reid.label_clip.error patient=%s err=%s", patient_id, exc,
             )
-            return IdentityResult.empty()
+            return IdentityResult.empty(faces_enrolled=True)
 
     async def _label_clip_inner(
         self,
@@ -262,10 +283,10 @@ class ReIDInference:
             )
         except RuntimeError as exc:
             log.warning("reid.frame_extract_failed err=%s", exc)
-            return IdentityResult.empty()
+            return IdentityResult.empty(faces_enrolled=True)
 
         if not frames:
-            return IdentityResult.empty()
+            return IdentityResult.empty(faces_enrolled=True)
 
         # The whole pipeline (decode + YOLO + BoT-SORT + face checks +
         # state machine) is sync work — hop into a thread once so the
@@ -468,6 +489,7 @@ class ReIDInference:
             people_present_reid=pipeline.num_tracks > 0,
             people_count_reid=pipeline.max_concurrent_tracks,
             has_only_verified_other_tracks=pipeline.has_only_verified_other_tracks,
+            faces_enrolled=True,
         )
         yolo_stats = pipeline.yolo_stats
         log.info(
