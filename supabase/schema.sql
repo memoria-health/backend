@@ -582,6 +582,24 @@ create trigger caregiver_devices_set_updated_at
   for each row execute function public.set_updated_at();
 
 
+-- ── feedback ──────────────────────────────────────────────────────
+-- Caregiver-submitted product feedback from the iOS app's Settings →
+-- Send feedback sheet (POST /v1/feedback). Storing the row is the
+-- source of truth; the handler also fires a best-effort founder email
+-- whose failure does NOT roll back the row. All free-text fields are
+-- nullable — the API requires at least a rating OR one non-blank field.
+create table public.feedback (
+  id                uuid primary key default gen_random_uuid(),
+  caregiver_id      uuid not null references public.caregivers(id) on delete cascade,
+  rating            smallint,
+  whats_working     text,
+  whats_frustrating text,
+  category          text,
+  created_at        timestamptz not null default now()
+);
+create index feedback_caregiver_idx on public.feedback(caregiver_id);
+
+
 -- ══════════════════════════════════════════════════════════════════
 -- ROW-LEVEL SECURITY
 -- ══════════════════════════════════════════════════════════════════
@@ -660,6 +678,10 @@ create policy analyses_owner on public.analyses
 
 alter table public.caregiver_devices enable row level security;
 create policy caregiver_devices_owner on public.caregiver_devices
+  for all using (caregiver_id = auth.uid()) with check (caregiver_id = auth.uid());
+
+alter table public.feedback enable row level security;
+create policy feedback_owner on public.feedback
   for all using (caregiver_id = auth.uid()) with check (caregiver_id = auth.uid());
 
 

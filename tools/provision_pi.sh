@@ -140,7 +140,7 @@ if [[ $FOR_CUSTOMER -eq 1 ]]; then
 Pi provisioned and prepared for a customer.
 
 Next power cycle, the Pi will:
-  1. Boot into AP mode with SSID like "nemara-cam-XXXX"
+  1. Boot into AP mode with SSID like "Memoria-Setup-XXXXXX"
   2. Serve a captive portal at http://192.168.4.1
   3. Wait for the customer's phone to submit their home WiFi
   4. Reconnect, then announce itself to ${BACKEND_URL}

@@ -2,7 +2,7 @@
 """Nemara camera WiFi-AP provisioning daemon. Runs on the Pi.
 
 When the Pi has no saved WiFi connection, this daemon brings up an
-open WiFi access point (named "Nemara-Setup-XXXXXX" using the last
+open WiFi access point (named "Memoria-Setup-XXXXXX" using the last
 6 of the WiFi MAC) and serves a captive portal at 192.168.4.1.
 
 Customer flow, identical on iOS / Android / Windows / macOS:
@@ -10,7 +10,7 @@ Customer flow, identical on iOS / Android / Windows / macOS:
   1. Customer plugs in the camera. Pi boots, this daemon notices
      there is no saved WiFi connection, and starts the AP.
   2. Customer connects their phone or laptop to the
-     "Nemara-Setup-XXXXXX" WiFi network. On iOS the captive portal
+     "Memoria-Setup-XXXXXX" WiFi network. On iOS the captive portal
      detector pops the setup page automatically; on other platforms
      the customer opens any URL and gets redirected.
   3. Customer picks their home WiFi from a dropdown (pre-scanned
@@ -36,7 +36,7 @@ Environment configuration (loaded by systemd from
 /etc/nemara/wifi-ap.env):
 
   NEMARA_WIFI_IFACE        optional, default "wlan0"
-  NEMARA_AP_LABEL_PREFIX   optional, default "Nemara-Setup"
+  NEMARA_AP_LABEL_PREFIX   optional, default "Memoria-Setup"
                            (full SSID = "<prefix>-<last 6 of MAC>")
   NEMARA_AP_CHANNEL        optional, default "6" (2.4 GHz)
   NEMARA_AP_BIND_ADDR      optional, default "192.168.4.1"
@@ -93,7 +93,7 @@ def load_config() -> Config:
     iface = os.environ.get("NEMARA_WIFI_IFACE", "wlan0")
     mac = _read_mac(iface)
     suffix = mac.replace(":", "").upper()[-6:]
-    prefix = os.environ.get("NEMARA_AP_LABEL_PREFIX", "Nemara-Setup")
+    prefix = os.environ.get("NEMARA_AP_LABEL_PREFIX", "Memoria-Setup")
     return Config(
         wifi_iface=iface,
         ap_ssid=f"{prefix}-{suffix}",

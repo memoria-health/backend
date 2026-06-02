@@ -73,7 +73,14 @@ async def update_partial(
     Only the user-facing toggle fields are updatable here. Lifecycle
     fields (state, no_people_count, livekit_identity, pairing_code, …)
     are owned by the detector pipeline / pairing flow and are not
-    touched by this method.
+    touched by this method. In particular `online` is NOT written here:
+    flipping `desired_state="disconnected"` makes the wall phone leave
+    the LiveKit room, which fires a `participant_left` webhook that
+    writes `online=false` via `camera_presence.mark_offline_by_identity`
+    (the single owner of the column). The clients already render
+    "offline" instantly off `desired_state`, so there's nothing to gain
+    from a redundant write on this path — see `camera_presence.py` for
+    the full trigger-point map.
 
     `desired_state` is validated at the API boundary (Pydantic
     Literal) AND at the DB layer (CHECK constraint), so by the time

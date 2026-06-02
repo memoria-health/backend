@@ -83,11 +83,16 @@ async def _send(
     html: str,
     settings: Settings,
     reply_to: str | None = None,
+    from_email: str | None = None,
 ) -> None:
-    """One Resend POST. Raises on transport error; caller logs."""
+    """One Resend POST. Raises on transport error; caller logs.
+
+    `from_email` overrides the default `settings.email_from` sender —
+    used by the feedback path so feedback comes from its own address.
+    """
     client = await _get_client()
     payload: dict[str, object] = {
-        "from": settings.email_from,
+        "from": from_email or settings.email_from,
         "to": list(to),
         "subject": subject,
         "html": html,
@@ -235,6 +240,97 @@ def _support_html(*, caregiver_name: str, caregiver_email: str, message: str) ->
         f"From {caregiver_name} &lt;{caregiver_email}&gt; via the Memoria iOS app."
         "</p>"
         f"<div style=\"margin:0;font-size:15px;line-height:1.5\">{safe}</div>"
+        "</div>"
+    )
+
+
+async def send_feedback_email(
+    *,
+    caregiver: Caregiver,
+    rating: int | None,
+    whats_working: str | None,
+    whats_frustrating: str | None,
+    category: str | None,
+    settings: Settings,
+) -> str:
+    """Forward caregiver product feedback to the founders.
+
+    Recipients come from `settings.feedback_email_recipients`; the
+    sender is `settings.feedback_email_from`; replyTo is the caregiver's
+    account email so hitting reply lands directly back with them.
+
+    This is best-effort from the caller's perspective — the
+    /v1/feedback handler has already committed the feedback row before
+    calling here and swallows any exception this raises. Like
+    send_support_email it no-ops (returns a status string) when Resend
+    isn't configured. Returns a human-readable status.
+    """
+    if not settings.resend_api_key:
+        return "Email isn't configured on the server yet (no Resend key)."
+    recipients = list(settings.feedback_email_recipients or [])
+    if not recipients:
+        return "No feedback recipients are configured."
+    rating_part = f"rating {rating}/5" if rating is not None else "no rating"
+    category_part = (category or "").strip() or "uncategorized"
+    full_subject = f"[Memoria feedback] {rating_part} — {category_part}"
+    body_html = _feedback_html(
+        caregiver_name=caregiver.display_name,
+        caregiver_email=caregiver.email,
+        rating=rating,
+        whats_working=whats_working,
+        whats_frustrating=whats_frustrating,
+        category=category,
+    )
+    await _send(
+        to=recipients,
+        subject=full_subject,
+        html=body_html,
+        settings=settings,
+        reply_to=caregiver.email,
+        from_email=settings.feedback_email_from,
+    )
+    log.info(
+        "email.feedback_sent caregiver=%s recipients=%d", caregiver.id, len(recipients),
+    )
+    return "Sent. We'll reply to your account email."
+
+
+def _feedback_html(
+    *,
+    caregiver_name: str,
+    caregiver_email: str,
+    rating: int | None,
+    whats_working: str | None,
+    whats_frustrating: str | None,
+    category: str | None,
+) -> str:
+    def esc(text: str | None) -> str:
+        return (
+            (text or "")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\n", "<br>")
+        )
+
+    rating_str = f"{rating}/5" if rating is not None else "(none)"
+    rows = (
+        f"<p style=\"margin:0 0 8px;font-size:15px\"><b>Rating:</b> {rating_str}</p>"
+        f"<p style=\"margin:0 0 8px;font-size:15px\"><b>Category:</b> "
+        f"{esc(category) or '(none)'}</p>"
+        f"<p style=\"margin:0 0 4px;font-size:15px\"><b>What's working:</b></p>"
+        f"<div style=\"margin:0 0 12px;font-size:15px;line-height:1.5\">"
+        f"{esc(whats_working) or '(none)'}</div>"
+        f"<p style=\"margin:0 0 4px;font-size:15px\"><b>What's frustrating:</b></p>"
+        f"<div style=\"margin:0 0 12px;font-size:15px;line-height:1.5\">"
+        f"{esc(whats_frustrating) or '(none)'}</div>"
+    )
+    return (
+        "<div style=\"font-family:-apple-system,Segoe UI,sans-serif;color:#1c1a17\">"
+        f"<p style=\"margin:0 0 12px;color:#6b6357;font-size:13px\">"
+        f"Feedback from {esc(caregiver_name)} &lt;{esc(caregiver_email)}&gt; "
+        f"via the Memoria iOS app."
+        "</p>"
+        f"{rows}"
         "</div>"
     )
 

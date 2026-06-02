@@ -69,17 +69,17 @@ shopt -s nullglob
 echo ">>> Stopping nemara-wifi-ap.service so its self-heal tick cant race the wipe"
 systemctl stop nemara-wifi-ap.service 2>/dev/null || true
 
-echo ">>> Backing up NM keyfiles to $NM_BACKUP (skipping Nemara-Setup AP keyfile)"
+echo ">>> Backing up NM keyfiles to $NM_BACKUP (skipping Memoria-Setup AP keyfile)"
 mkdir -p "$NM_BACKUP"
 rm -f "$NM_BACKUP"/*.nmconnection 2>/dev/null || true
 nm_backed_up=0
 for kf in "$NM_DIR"/*.nmconnection; do
-  # The pre-baked Nemara-Setup AP keyfile (installed by install.sh) is the
+  # The pre-baked Memoria-Setup AP keyfile (installed by install.sh) is the
   # fast path for the supervisors start_ap (~3s vs ~50s). We MUST keep it
   # across the wipe; otherwise the post-wipe AP startup falls back to
   # `nmcli connection add` which triggers the netplan/daemon-reload cascade
   # and the supervisor times out before NM finishes activation.
-  if [[ "$(basename "$kf")" == Nemara-Setup-*.nmconnection ]]; then
+  if [[ "$(basename "$kf")" == Memoria-Setup-*.nmconnection ]]; then
     echo "    preserving AP keyfile: $kf"
     continue
   fi
@@ -203,16 +203,16 @@ echo "[3/4] recovery timer disabled for customer-mode wipe"
 #    -> systemctl daemon-reload (~13s) -> cascading session shutdowns.
 #    If we cant complete in 30s, skip and let the reboot do the work.
 #
-#    SKIP the pre-baked Nemara-Setup-XXXXXX AP keyfile. Deleting it here
+#    SKIP the pre-baked Memoria-Setup-XXXXXX AP keyfile. Deleting it here
 #    would force the supervisors start_ap fast-path check to fail next
 #    boot, which then runs the slow `connection add` path and re-triggers
 #    the netplan/daemon-reload cascade we just paid the price to avoid
 #    by pre-baking. Skipping the AP connection here mirrors the outer
 #    scripts NM keyfile loop, which preserves the same file on disk.
-echo "[4/4] deleting in-memory NM wifi connections (best-effort, 30s cap; preserving Nemara-Setup-* AP)"
+echo "[4/4] deleting in-memory NM wifi connections (best-effort, 30s cap; preserving Memoria-Setup-* AP)"
 timeout 30 bash -c "
   nmcli -t -f TYPE,NAME connection show \
-    | awk -F: \"\\\$1==\\\"802-11-wireless\\\" && \\\$2 !~ /^Nemara-Setup-/{print \\\$2}\" \
+    | awk -F: \"\\\$1==\\\"802-11-wireless\\\" && \\\$2 !~ /^Memoria-Setup-/{print \\\$2}\" \
     | while IFS= read -r conn; do
         [ -z \"\$conn\" ] && continue
         echo \"  deleting NM connection: \$conn\"

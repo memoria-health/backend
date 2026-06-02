@@ -24,8 +24,11 @@ from typing import Annotated
 
 from fastapi import APIRouter, Header, HTTPException, Request, status
 from livekit import api as lkapi
+from starlette.requests import ClientDisconnect
 
 from src.api.deps import SettingsDep
+from src.db.session import get_sessionmaker
+from src.services.detection import camera_presence
 
 log = logging.getLogger(__name__)
 
@@ -50,7 +53,14 @@ async def receive_livekit_webhook(
 
     # Body is verified verbatim — the signed JWT in `Authorization`
     # commits to the body's SHA-256, so any tamper invalidates it.
-    body = (await request.body()).decode("utf-8")
+    try:
+        body = (await request.body()).decode("utf-8")
+    except ClientDisconnect:
+        # The webhook client (LiveKit Cloud, via ngrok in dev) hung up
+        # before the body was fully read. Nothing to verify or dispatch;
+        # ack quietly instead of surfacing an ASGI 500 traceback.
+        log.info("livekit_webhook reject reason=client_disconnect")
+        return
 
     verifier_key = settings.livekit_webhook_api_key or settings.livekit_api_key
     receiver = lkapi.WebhookReceiver(
@@ -64,16 +74,17 @@ async def receive_livekit_webhook(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_signature",
         ) from exc
 
+    # The detector worker is the per-room subscriber/reconciler. It may
+    # be absent (LiveKit disabled/mis-configured) — in that case we
+    # still write the authoritative `cameras.online` transitions below
+    # so the column never gets stuck, and just skip the worker calls.
     worker = getattr(request.app.state, "detector_worker", None)
     if worker is None:
-        # Lifespan never started the worker (disabled or
-        # mis-configured). Accept the webhook silently so LiveKit
-        # doesn't retry forever, but log loudly so operators notice.
         log.warning(
-            "livekit_webhook event=%s but no detector_worker in app.state",
+            "livekit_webhook event=%s with no detector_worker in app.state "
+            "— applying online-state transition only",
             event.event,
         )
-        return
 
     room_name = event.room.name if event.room else ""
     participant_identity = event.participant.identity if event.participant else ""
@@ -84,22 +95,45 @@ async def receive_livekit_webhook(
         return
 
     if event.event == "participant_joined" and participant_identity.startswith("cam_"):
-        await worker.ensure_room_joined(room_name)
-        # Webhook is a fast-path HINT, not authoritative for
-        # `cameras.online`. Ask the reconciler to do an immediate poll
-        # so the column updates in <1s instead of waiting up to 10s
-        # for the next periodic tick. The reconciler's REST poll +
-        # frame-arrival check is the actual source of truth.
-        await worker.signal_reconcile(room_name)
+        # A camera publisher arrived. Spawn/keep the RoomWorker; the
+        # reconciler writes `cameras.online=true` ONCE frames actually
+        # flow (two-signal liveness), so "joined but not streaming yet"
+        # reads as connecting, not online. `signal_reconcile` collapses
+        # the next poll to ~1s. No direct online write here — see
+        # `camera_presence.py` trigger-point #1.
+        if worker is not None:
+            await worker.ensure_room_joined(room_name)
+            await worker.signal_reconcile(room_name)
         log.info(
             "livekit_webhook participant_joined room=%s identity=%s -> joined",
             room_name, participant_identity,
         )
     elif event.event == "participant_left" and participant_identity.startswith("cam_"):
-        await worker.ensure_room_left_if_empty(room_name)
-        await worker.signal_reconcile(room_name)
+        # AUTHORITATIVE offline signal. LiveKit Cloud confirmed the
+        # publisher is gone, so write `online=false` NOW — this is the
+        # one trigger that always fires (the reconciler is torn down
+        # with the RoomWorker just below, and on a clean leave the SDK
+        # pops the ingest before the reconciler's next poll). See
+        # `camera_presence.py` trigger-point #2.
+        await camera_presence.mark_offline_by_identity(
+            get_sessionmaker(), participant_identity,
+        )
+        if worker is not None:
+            await worker.ensure_room_left_if_empty(room_name)
         log.info(
-            "livekit_webhook participant_left room=%s identity=%s -> left-check",
+            "livekit_webhook participant_left room=%s identity=%s -> offline",
             room_name, participant_identity,
         )
-    # Other event types are no-ops in v0.
+    elif event.event == "room_finished":
+        # The whole room went away; every camera in it is offline.
+        # See `camera_presence.py` trigger-point #3.
+        flipped = await camera_presence.mark_room_offline(
+            get_sessionmaker(), room_name,
+        )
+        if worker is not None:
+            await worker.ensure_room_left_if_empty(room_name)
+        log.info(
+            "livekit_webhook room_finished room=%s -> %d offline",
+            room_name, flipped,
+        )
+    # Other event types are no-ops.

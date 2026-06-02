@@ -56,6 +56,7 @@ from src.api.detectors import router as detectors_router
 from src.api.devices import router as devices_router
 from src.api.events import router as events_router
 from src.api.face_embeddings import router as face_embeddings_router
+from src.api.feedback import router as feedback_router
 from src.api.health import router as health_router
 from src.api.livekit import router as livekit_router
 from src.api.livekit_webhooks import router as livekit_webhooks_router
@@ -71,6 +72,7 @@ from src.db import caregiver as _caregiver  # noqa: F401
 from src.db import caregiver_device as _caregiver_device  # noqa: F401
 from src.db import detector as _detector  # noqa: F401
 from src.db import event as _event  # noqa: F401
+from src.db import feedback as _feedback  # noqa: F401
 from src.db import patient as _patient  # noqa: F401
 from src.db import patient_face_embedding as _patient_face_embedding  # noqa: F401
 from src.db import pi_discovery as _pi_discovery  # noqa: F401
@@ -144,6 +146,19 @@ def create_app() -> FastAPI:
     app.include_router(face_embeddings_router)
     # Contact Support (Resend forwarding) from the iOS app's Settings.
     app.include_router(support_router)
+    # Product Feedback (persisted + best-effort Resend) from Settings.
+    app.include_router(feedback_router)
+
+    # Experimental, non-production routes under src/internals/. Gated by
+    # NEMARA_ENABLE_INTERNALS (default off). The import lives inside the
+    # guard so a deploy without src/internals/ can never break startup.
+    if get_settings().enable_internals:
+        from src.internals.record_clip import router as internals_record_clip_router
+
+        app.include_router(internals_record_clip_router)
+        logging.getLogger(__name__).info(
+            "internals enabled: mounted record-clip endpoint"
+        )
     return app
 
 

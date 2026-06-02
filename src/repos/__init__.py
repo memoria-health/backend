@@ -12,6 +12,7 @@ from src.repos import (
     detector_repo,
     event_repo,
     face_embedding_repo,
+    feedback_repo,
     patient_repo,
     pi_discovery_repo,
 )
@@ -23,6 +24,7 @@ __all__ = [
     "detector_repo",
     "event_repo",
     "face_embedding_repo",
+    "feedback_repo",
     "patient_repo",
     "pi_discovery_repo",
 ]

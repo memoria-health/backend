@@ -80,6 +80,33 @@ def installed_worker(app):
 
 
 @pytest.fixture
+def recorded_presence(monkeypatch):
+    """Replace the `camera_presence` offline writers with recorders so the
+    routing tests assert the webhook fires the right online-state
+    transition WITHOUT needing a real `cameras` row in Postgres.
+    """
+    calls: dict = {"offline_identity": [], "room_offline": []}
+
+    async def _off_by_id(_sm, identity: str) -> bool:
+        calls["offline_identity"].append(identity)
+        return True
+
+    async def _off_room(_sm, room: str) -> int:
+        calls["room_offline"].append(room)
+        return 1
+
+    monkeypatch.setattr(
+        "src.services.detection.camera_presence.mark_offline_by_identity",
+        _off_by_id,
+    )
+    monkeypatch.setattr(
+        "src.services.detection.camera_presence.mark_room_offline",
+        _off_room,
+    )
+    return calls
+
+
+@pytest.fixture
 def fake_receiver(monkeypatch):
     """Replace `WebhookReceiver` with a stub that bypasses signature
     verification — used by the routing/filtering tests. The
@@ -142,9 +169,14 @@ async def test_participant_joined_for_camera_calls_ensure_joined(
 
 
 @pytest.mark.asyncio
-async def test_participant_left_for_camera_calls_ensure_left(
-    client: AsyncClient, installed_worker, fake_receiver,
+async def test_participant_left_for_camera_marks_offline_then_leaves(
+    client: AsyncClient, installed_worker, fake_receiver, recorded_presence,
 ) -> None:
+    """`participant_left` is the authoritative offline signal: it must
+    write `cameras.online=false` for the departing identity FIRST, then
+    tear the RoomWorker down. (It no longer calls `signal_reconcile` —
+    that was a no-op after teardown; the direct write replaces it.)
+    """
     body = _payload(
         "participant_left",
         room_name="patient_5b1c0312-44a0-4f9d-9a3a-2d4f44a1f0bb",
@@ -156,11 +188,37 @@ async def test_participant_left_for_camera_calls_ensure_left(
         headers={"Authorization": "Bearer fake.jwt", "Content-Type": "application/json"},
     )
     assert r.status_code == 204
+    # online=false written for the leaving camera.
+    assert recorded_presence["offline_identity"] == ["cam_ce110001"]
+    # ...then the worker is torn down.
     assert installed_worker.left_checked == [
         "patient_5b1c0312-44a0-4f9d-9a3a-2d4f44a1f0bb",
     ]
     assert installed_worker.joined == []
-    assert installed_worker.signalled == [
+
+
+@pytest.mark.asyncio
+async def test_room_finished_marks_room_offline_then_leaves(
+    client: AsyncClient, installed_worker, fake_receiver, recorded_presence,
+) -> None:
+    """`room_finished` means the whole room is gone: mark every camera in
+    it offline and tear the worker down.
+    """
+    body = _payload(
+        "room_finished",
+        room_name="patient_5b1c0312-44a0-4f9d-9a3a-2d4f44a1f0bb",
+        identity="",
+    )
+    r = await client.post(
+        "/v1/livekit/webhooks",
+        content=body,
+        headers={"Authorization": "Bearer fake.jwt", "Content-Type": "application/json"},
+    )
+    assert r.status_code == 204
+    assert recorded_presence["room_offline"] == [
+        "patient_5b1c0312-44a0-4f9d-9a3a-2d4f44a1f0bb",
+    ]
+    assert installed_worker.left_checked == [
         "patient_5b1c0312-44a0-4f9d-9a3a-2d4f44a1f0bb",
     ]
 

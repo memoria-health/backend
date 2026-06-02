@@ -134,7 +134,7 @@ chmod 0644 /etc/NetworkManager/dnsmasq-shared.d/01-nemara-captive.conf
 echo ">>> Writing /etc/nemara/wifi-ap.env"
 cat > /etc/nemara/wifi-ap.env <<EOF
 NEMARA_WIFI_IFACE=wlan0
-NEMARA_AP_LABEL_PREFIX=Nemara-Setup
+NEMARA_AP_LABEL_PREFIX=Memoria-Setup
 NEMARA_AP_CHANNEL=6
 NEMARA_AP_BIND_ADDR=192.168.4.1
 NEMARA_AP_HTTP_PORT=80
@@ -143,7 +143,7 @@ NEMARA_LOG_LEVEL=INFO
 EOF
 chmod 0644 /etc/nemara/wifi-ap.env
 
-# Pre-bake the Nemara-Setup AP nmconnection so the supervisors start_ap()
+# Pre-bake the Memoria-Setup AP nmconnection so the supervisors start_ap()
 # only has to `nmcli connection up`, NOT `connection add`. On Pi OS Trixie,
 # `nmcli connection add` triggers NM -> netplan-regenerate -> systemctl
 # daemon-reload (~13s) and the chain runs 2-3 times during a single up.
@@ -153,10 +153,10 @@ chmod 0644 /etc/nemara/wifi-ap.env
 # The keyfile is static config + dynamic SSID suffix (last 6 of MAC,
 # matching wifi_ap_provision.load_config()). autoconnect=no means NM
 # wont activate it automatically -- only when supervisor calls `up`.
-echo ">>> Pre-baking Nemara-Setup AP nmconnection (eliminates start_ap netplan cascade)"
+echo ">>> Pre-baking Memoria-Setup AP nmconnection (eliminates start_ap netplan cascade)"
 WLAN_MAC=$(cat /sys/class/net/wlan0/address 2>/dev/null || echo "00:00:00:00:00:00")
 MAC_SUFFIX=$(echo "$WLAN_MAC" | tr -d ':' | tr '[:lower:]' '[:upper:]' | tail -c 7 | head -c 6)
-AP_SSID="Nemara-Setup-${MAC_SUFFIX}"
+AP_SSID="Memoria-Setup-${MAC_SUFFIX}"
 AP_KEYFILE="/etc/NetworkManager/system-connections/${AP_SSID}.nmconnection"
 AP_UUID=$(cat /proc/sys/kernel/random/uuid)
 mkdir -p /etc/NetworkManager/system-connections
@@ -224,7 +224,7 @@ if [[ "${NEED_REBOOT:-0}" == "1" ]]; then
 fi
 echo ">>> Installed. On next boot:"
 echo "    nemara-wifi-ap   advertises an open WiFi AP named"
-echo "                     'Nemara-Setup-XXXXXX' (with a captive"
+echo "                     'Memoria-Setup-XXXXXX' (with a captive"
 echo "                     portal at http://192.168.4.1) UNTIL"
 echo "                     the customer enters home WiFi creds."
 echo "    nemara-announce  POSTs to $BACKEND_URL once on home WiFi."

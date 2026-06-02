@@ -30,6 +30,7 @@ from uuid import UUID
 
 from livekit import api as lkapi
 
+from src.services.detection import camera_presence
 from src.services.detection.motion_cache import MotionCache
 from src.services.detection.room_worker import RoomWorker
 from sqlalchemy import select, text
@@ -392,6 +393,21 @@ class DetectorWorker:
                 "skipped %d foreign room(s)",
                 len(candidates), skipped_foreign,
             )
+            # STALE-ONLINE SWEEP: clear `cameras.online` left true by an
+            # unclean shutdown. Any owned camera whose room is NOT a
+            # candidate (no participants right now) cannot be live, so
+            # force it offline — no reconciler ran while we were down to
+            # do it. Cameras in candidate rooms are left alone: the
+            # RoomWorker we're about to spawn re-derives their true
+            # online state from REST within one poll. Only runs when
+            # `list_rooms` succeeded (we're past its early-return), so we
+            # never blanket-offline on a transient LiveKit failure.
+            # Guarded on sessionmaker for the unit tests that build a
+            # worker with sessionmaker=None.
+            if self._sessionmaker is not None:
+                await camera_presence.sweep_stale_online(
+                    self._sessionmaker, set(candidates),
+                )
             # ZOMBIE REAPER: before joining, kick any leftover
             # detector_worker_* participants in rooms WE own. At THIS
             # moment in start() we own zero RoomWorker instances, so

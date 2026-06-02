@@ -32,9 +32,15 @@ Per `RoomWorker` we run a periodic task that:
      liveness rule:
         online = (identity in REST) AND
                  (time.monotonic() - ingest._last_frame_at < liveness_grace_s)
-     and write `cameras.online` accordingly. This loop is the SOLE
-     writer of `cameras.online` post-refactor; state_machine.py and
-     the webhook handler no longer write the column directly.
+     and write `cameras.online` accordingly. This loop is the
+     steady-state writer for a CONNECTED camera and the backstop that
+     re-derives `online` from REST when an SDK event was lost. It is
+     NOT the only writer: the `participant_left` / `room_finished`
+     webhooks write `online=false` directly (the authoritative leave
+     signal — see `camera_presence.py`), because this loop is torn down
+     with its RoomWorker the instant a camera leaves and could never
+     observe the absence itself. All writes — here and there — funnel
+     through `camera_presence.py`, the single owner of the column.
 
 SDK event handlers remain idempotent fast-path: in the common case a
 new publisher arrives → `track_subscribed` fires → an ingest is
@@ -66,7 +72,8 @@ from typing import TYPE_CHECKING
 from uuid import UUID
 
 from livekit import api as lkapi
-from sqlalchemy import text
+
+from src.services.detection import camera_presence
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -136,44 +143,11 @@ class ReconcileResult:
     online_writes: dict[str, bool] = field(default_factory=dict)
 
 
-# Online=true write when transitioning from offline -> online. Also
-# resets the open/closed state machine: a new camera session deserves
-# a fresh evaluation. Without the reset, a camera that previously
-# closed after N no-people ticks would inherit `state='closed'` across
-# disconnects and the LLM would skip almost every tick. Replicates the
-# load-bearing semantic the deleted `livekit_webhooks._set_camera_online`
-# performed at `src/api/livekit_webhooks.py:122-132` (pre-refactor).
-_SET_ONLINE_TRUE_FRESH_START_SQL = text(
-    """
-    UPDATE public.cameras
-    SET online = true,
-        state = 'open',
-        no_people_count = 0,
-        state_changed_at = :now
-    WHERE id = :camera_id
-    """
-)
-
-
-# Online=true write that does NOT reset the state machine. Used on
-# subsequent reconcile passes where the camera was already online so we
-# do not perturb a legitimately-closed state.
-_SET_ONLINE_TRUE_KEEP_STATE_SQL = text(
-    """
-    UPDATE public.cameras
-    SET online = true
-    WHERE id = :camera_id
-    """
-)
-
-
-_SET_ONLINE_FALSE_SQL = text(
-    """
-    UPDATE public.cameras
-    SET online = false
-    WHERE id = :camera_id
-    """
-)
+# The online/offline SQL the reconciler issues now lives in
+# `camera_presence.py` (the single owner of the `cameras.online` column).
+# This loop calls `camera_presence.set_camera_online_*` /
+# `set_camera_offline_by_id` and keeps the no-op gating + fresh-start
+# decision here. See `camera_presence.py` for the full trigger-point map.
 
 
 class LiveKitRoomReconciler:
@@ -571,13 +545,14 @@ class LiveKitRoomReconciler:
         try:
             now = datetime.now(timezone.utc)
             async with self._sessionmaker() as session:
-                sql = (
-                    _SET_ONLINE_TRUE_FRESH_START_SQL if fresh_start
-                    else _SET_ONLINE_TRUE_KEEP_STATE_SQL
-                )
-                await session.execute(
-                    sql, {"camera_id": camera_id, "now": now},
-                )
+                if fresh_start:
+                    await camera_presence.set_camera_online_fresh_start(
+                        session, camera_id, now,
+                    )
+                else:
+                    await camera_presence.set_camera_online_keep_state(
+                        session, camera_id,
+                    )
                 await session.commit()
         except Exception:
             log.exception(
@@ -597,9 +572,7 @@ class LiveKitRoomReconciler:
             return
         try:
             async with self._sessionmaker() as session:
-                await session.execute(
-                    _SET_ONLINE_FALSE_SQL, {"camera_id": camera_id},
-                )
+                await camera_presence.set_camera_offline_by_id(session, camera_id)
                 await session.commit()
         except Exception:
             log.exception(

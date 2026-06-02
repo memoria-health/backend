@@ -1,7 +1,7 @@
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -21,6 +21,13 @@ class Settings(BaseSettings):
 
     env: Literal["local", "test", "staging", "prod"] = "local"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+
+    # ── Internals (experimental, non-production) ─────────────────
+    # Master switch for everything under `src/internals/`. Off by
+    # default so no experimental routes mount in prod. Set
+    # `NEMARA_ENABLE_INTERNALS=true` in a local `.env` to enable the
+    # data-collection record-clip endpoint (see src/internals/).
+    enable_internals: bool = Field(default=False)
 
     # ── Public base URL ─────────────────────────────────────────
     # Public URL the backend is reachable at from Pi cameras out in
@@ -301,9 +308,39 @@ class Settings(BaseSettings):
     # the iOS app. Comma-separated in env (pydantic-settings parses).
     # replyTo is set to the caregiver's account email so hitting reply
     # in Gmail lands directly in their inbox.
-    support_email_recipients: list[str] = Field(
+    support_email_recipients: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["aryaman@menora-health.com", "sunny@menora-health.com"]
     )
+    # Recipients for caregiver-submitted product feedback (Settings →
+    # Send feedback in the iOS app). Comma-separated in env. replyTo is
+    # set to the caregiver's account email so the founders can reply
+    # straight back. Distinct from support: storing the feedback row is
+    # the source of truth, so an email failure must not fail the request.
+    feedback_email_recipients: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["aryaman@memoria-health.com", "sunny@memoria-health.com"]
+    )
+    # Sender for feedback emails. Like email_from, must be a
+    # Resend-verified domain for real sends; otherwise Resend rejects
+    # the send (the feedback row is still persisted regardless).
+    feedback_email_from: str = Field(default="feedback@memoria-health.com")
+
+    @field_validator(
+        "support_email_recipients",
+        "feedback_email_recipients",
+        mode="before",
+    )
+    @classmethod
+    def _split_csv_recipients(cls, value: object) -> object:
+        """Accept a comma-separated env string (e.g.
+        "a@x.com,b@x.com") for the recipient lists. pydantic-settings
+        would otherwise try to JSON-decode the raw env value for a
+        `list[str]` field and choke on a plain CSV string. A value
+        that's already a list (the default / programmatic construction)
+        passes through untouched.
+        """
+        if isinstance(value, str):
+            return [part.strip() for part in value.split(",") if part.strip()]
+        return value
 
 
 def get_settings() -> Settings:
