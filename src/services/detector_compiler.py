@@ -101,18 +101,41 @@ _FEW_SHOT_EXAMPLE_CONSERVATIVE = (
     "specifically you saw or didn't see."
 )
 
+# Reactive but NON-emergency (routine) detectors. These fire the moment they're
+# seen (like safety detectors) but a false alarm is merely annoying, not a
+# missed emergency — so the bar must be HIGH. Watching-TV example, the classic
+# false-positive case: a glance at the screen must NOT trip it.
+_FEW_SHOT_EXAMPLE_ROUTINE_REACTIVE = (
+    "Example for a detector named 'Watching TV' with description "
+    "'Patient is watching television':\n\n"
+    "watching_tv_detected: boolean. Be CONSERVATIVE — this is a routine, "
+    "non-emergency behaviour, so only set TRUE when the person is CLEARLY and "
+    "SUSTAINEDLY engaged with the TV: seated or lying down, oriented toward a "
+    "visibly-on screen, for most of the clip. Set FALSE for a brief glance "
+    "toward the TV, walking past it, a screen that's off or out of view, or a "
+    "person in the room doing something else. When unsure, FALSE.\n"
+    "watching_tv_confidence: number 0–1. 0 = clearly not; 0.3–0.6 = ambiguous "
+    "(keep detected FALSE); 0.7+ = clearly, sustainedly watching.\n"
+    "watching_tv_reasoning: 1 short sentence on what you saw — how long they "
+    "were engaged, the screen state, and their body orientation."
+)
+
 
 def _meta_prompt(
     *, identifier: str, name: str, description: str, user_text: str,
-    scheduled: bool,
+    scheduled: bool, category: str,
 ) -> str:
     """The instructions the compiler sends to the LLM. `identifier` is
     interpolated everywhere the runtime block needs the stable key.
 
-    `scheduled` flips the inclusivity guidance: reactive detectors are
-    inclusive (catch everything), scheduled/absence detectors are
-    conservative (only count a clear positive, so a real miss surfaces
-    the absence alert instead of being swallowed by a false positive).
+    Inclusivity is chosen by STAKES, not just shape:
+      - scheduled (absence) → conservative: only a clear positive counts, so a
+        real miss surfaces the absence alert instead of being swallowed.
+      - reactive + safety  → inclusive: a missed emergency is far worse than a
+        false alarm, so fire on borderline signs.
+      - reactive + routine → conservative: a false alarm is just noise, so only
+        a clear, sustained occurrence fires (this is the "watching TV fired on a
+        glance" fix). The LLM is told to calibrate strictness to the stakes.
     """
     if scheduled:
         detected_guidance = (
@@ -123,12 +146,25 @@ def _meta_prompt(
             "would wrongly suppress that alert."
         )
         example = _FEW_SHOT_EXAMPLE_CONSERVATIVE
-    else:
+    elif category == "safety":
         detected_guidance = (
-            "Use INCLUSIVE wording when borderline situations should still "
-            "fire — a missed event is worse than a false alarm."
+            "FIRST weigh the stakes: this is a SAFETY/health detector, so a "
+            "missed event could be an emergency. Be GENEROUS — use INCLUSIVE "
+            "criteria so borderline or partial signs still fire; set FALSE only "
+            "when you're confident nothing concerning happened."
         )
         example = _FEW_SHOT_EXAMPLE_INCLUSIVE
+    else:
+        detected_guidance = (
+            "FIRST weigh the stakes: this is a ROUTINE, non-emergency behaviour, "
+            "so a false alarm is just noise the caregiver must dismiss. Be "
+            "CONSERVATIVE — set TRUE only on a CLEAR, SUSTAINED, deliberate "
+            "occurrence; a fleeting glance, an incidental or momentary instance, "
+            "or anything ambiguous → FALSE. Use your judgment to calibrate how "
+            "strict to be: the more disruptive a false alarm would be, the "
+            "higher the bar."
+        )
+        example = _FEW_SHOT_EXAMPLE_ROUTINE_REACTIVE
 
     return (
         "You are configuring a computer-vision detector that runs on "
@@ -215,7 +251,7 @@ def _clean_fragment(raw: str, identifier: str) -> str:
 
 async def _compile_with_gemini(
     *, identifier: str, name: str, description: str, user_text: str,
-    scheduled: bool, settings: Settings,
+    scheduled: bool, category: str, settings: Settings,
 ) -> str:
     """One Gemini call. Returns the cleaned prompt_fragment string."""
     if not settings.gemini_api_key:
@@ -232,6 +268,7 @@ async def _compile_with_gemini(
                     description=description,
                     user_text=user_text,
                     scheduled=scheduled,
+                    category=category,
                 ))],
             ),
         ],
@@ -248,14 +285,18 @@ async def _compile_with_gemini(
 
 async def _compile_with_openai(
     *, identifier: str, name: str, description: str, user_text: str,
-    scheduled: bool, settings: Settings,
+    scheduled: bool, category: str, settings: Settings,
 ) -> str:
-    """One OpenAI call. Returns the cleaned prompt_fragment string."""
+    """One OpenAI call. Returns the cleaned prompt_fragment string.
+
+    Uses `openai_compile_model` (a stronger frontier/thinking model) — compile
+    is a one-off on Create, so the better prompt is worth the extra latency.
+    """
     if not settings.openai_api_key:
         raise RuntimeError("NEMARA_OPENAI_API_KEY not configured")
     client = AsyncOpenAI(api_key=settings.openai_api_key)
     response = await client.chat.completions.create(
-        model=settings.openai_model,
+        model=settings.openai_compile_model,
         messages=[
             {"role": "user", "content": _meta_prompt(
                 identifier=identifier,
@@ -263,6 +304,7 @@ async def _compile_with_openai(
                 description=description,
                 user_text=user_text,
                 scheduled=scheduled,
+                category=category,
             )},
         ],
     )
@@ -278,53 +320,34 @@ async def compile_custom_detector(
     description: str,
     user_text: str,
     scheduled: bool = False,
+    category: str = "safety",
     settings: Settings,
 ) -> CompiledDetector:
     """Compile a caregiver's natural-language description into a
     runtime-ready (identifier, prompt_fragment, schema_json) triple.
 
-    Tries Gemini first (cheaper + faster for short text); falls back to
-    OpenAI if Gemini errors out or produces a malformed response. If
-    both fail, raises RuntimeError — the caller should map this to a
-    503 and surface a clear error to the user (don't create a broken
-    detector row that silently never fires).
+    Tries the frontier OpenAI compile model FIRST (a thinking model writes a
+    sharper, better-calibrated seeded prompt; compile is a rare one-off on
+    Create, so the extra latency is fine), falling back to Gemini if OpenAI
+    errors or returns a malformed response. If both fail, raises RuntimeError —
+    the caller maps it to a "compile failed" badge (don't create a broken row
+    that silently never fires).
 
-    `user_text` is the caregiver's raw "what to detect" string. We
-    intentionally pass `name` + `description` separately so the model
-    has a chance to disambiguate (e.g., the user might use a vague
-    word in `user_text` but a clearer phrase in `description`).
+    `user_text` is the caregiver's raw "what to detect" string. `name` +
+    `description` are passed separately so the model can disambiguate.
 
-    `scheduled` tunes the per-tick detection's bias: reactive detectors
-    are inclusive (catch everything), scheduled/absence detectors are
-    conservative (only a clear positive counts, so a real miss surfaces
-    the absence alert).
+    `scheduled` + `category` tune the firing bias: scheduled (absence) and
+    routine reactive detectors are conservative (only a clear, sustained
+    positive fires); safety reactive detectors stay inclusive (a missed
+    emergency is worse than a false alarm).
     """
     identifier = _gen_identifier()
 
     try:
-        fragment = await _compile_with_gemini(
-            identifier=identifier, name=name, description=description,
-            user_text=user_text, scheduled=scheduled, settings=settings,
-        )
-        log.info(
-            "detector_compiler.gemini_ok identifier=%s name=%r fragment_chars=%d",
-            identifier, name, len(fragment),
-        )
-        return CompiledDetector(
-            identifier=identifier,
-            prompt_fragment=fragment,
-            schema_json=_schema_for(identifier),
-        )
-    except Exception as gemini_err:
-        log.warning(
-            "detector_compiler.gemini_failed identifier=%s name=%r err=%s — trying openai",
-            identifier, name, gemini_err,
-        )
-
-    try:
         fragment = await _compile_with_openai(
             identifier=identifier, name=name, description=description,
-            user_text=user_text, scheduled=scheduled, settings=settings,
+            user_text=user_text, scheduled=scheduled, category=category,
+            settings=settings,
         )
         log.info(
             "detector_compiler.openai_ok identifier=%s name=%r fragment_chars=%d",
@@ -336,14 +359,35 @@ async def compile_custom_detector(
             schema_json=_schema_for(identifier),
         )
     except Exception as openai_err:
-        log.error(
-            "detector_compiler.both_providers_failed identifier=%s name=%r err=%s",
+        log.warning(
+            "detector_compiler.openai_failed identifier=%s name=%r err=%s — trying gemini",
             identifier, name, openai_err,
         )
+
+    try:
+        fragment = await _compile_with_gemini(
+            identifier=identifier, name=name, description=description,
+            user_text=user_text, scheduled=scheduled, category=category,
+            settings=settings,
+        )
+        log.info(
+            "detector_compiler.gemini_ok identifier=%s name=%r fragment_chars=%d",
+            identifier, name, len(fragment),
+        )
+        return CompiledDetector(
+            identifier=identifier,
+            prompt_fragment=fragment,
+            schema_json=_schema_for(identifier),
+        )
+    except Exception as gemini_err:
+        log.error(
+            "detector_compiler.both_providers_failed identifier=%s name=%r err=%s",
+            identifier, name, gemini_err,
+        )
         raise RuntimeError(
-            "could not compile detector — both gemini and openai failed; "
-            "check NEMARA_GEMINI_API_KEY and NEMARA_OPENAI_API_KEY"
-        ) from openai_err
+            "could not compile detector — both openai and gemini failed; "
+            "check NEMARA_OPENAI_API_KEY and NEMARA_GEMINI_API_KEY"
+        ) from gemini_err
 
 
 # ── Inference: classify + structure a plain-English ask ─────────────
@@ -382,10 +426,20 @@ def _infer_meta_prompt(*, name: str | None, prompt: str) -> str:
         "it's seen (falls, wandering, agitation, a visitor, etc.).\n\n"
         "JSON fields:\n"
         '  "shape": "point_in_time" | "scheduled"\n'
-        '  "category": "safety" | "routine"  (medication/meals/hydration/'
-        'routines = routine; falls/wandering/agitation/hazards = safety)\n'
+        '  "category": "safety" | "routine".\n'
+        '     - "safety" = could be an emergency or cause harm if missed: '
+        'falls, wandering / leaving the house, fire / stove / hazards, choking, '
+        'aggression or injury, prolonged no-movement, medication missed. '
+        'When bodily harm or a health risk is plausible, choose "safety".\n'
+        '     - "routine" = everyday, non-emergency behaviour where a false '
+        'alarm is merely annoying noise: watching TV, using a phone or tablet, '
+        'a visitor arriving, eating a snack, reading, sitting on the couch, '
+        'ordinary daily activity.\n'
         f'  "icon_name": one of {_ALLOWED_ICONS}\n'
-        '  "sensitivity": "low" | "standard" | "high"  (default "standard")\n'
+        '  "sensitivity": "low" | "standard" | "high" (default "standard"). '
+        'Lower it for low-stakes routine behaviours where a false alarm is just '
+        'noise (e.g. watching TV -> "low"); raise it for high-stakes safety '
+        'events where a miss is dangerous (e.g. a fall -> "high").\n'
         '  "schedule": null if point_in_time. If scheduled, an object:\n'
         '     {"cadence":"daily"|"weekly",'
         ' "days_of_week":[0..6 or null] (0=Mon..6=Sun, weekly only),'

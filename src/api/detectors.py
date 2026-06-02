@@ -197,6 +197,7 @@ async def create_detector(
             description=body.description,
             user_text=body.custom_prompt,
             scheduled=body.shape == DetectorShape.scheduled,
+            category=det.category,
             settings=settings,
         )
     )
@@ -211,6 +212,7 @@ async def _compile_and_update_detector(
     description: str,
     user_text: str,
     scheduled: bool,
+    category: str,
     settings: Settings,
 ) -> None:
     """Background task: run Gemini compile + UPDATE the detector row.
@@ -224,7 +226,8 @@ async def _compile_and_update_detector(
     try:
         compiled = await compile_custom_detector(
             name=name, description=description,
-            user_text=user_text, scheduled=scheduled, settings=settings,
+            user_text=user_text, scheduled=scheduled, category=category,
+            settings=settings,
         )
     except Exception as e:
         log.error(

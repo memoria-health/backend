@@ -63,6 +63,11 @@ class Settings(BaseSettings):
 
     openai_api_key: str = Field(default="")
     openai_model: str = Field(default="gpt-5.4")
+    # Model used to COMPILE a detector's seeded prompt (one-off on Create).
+    # Decoupled from the per-tick runtime model so compile can use a stronger
+    # frontier/thinking model without slowing or inflating the cost of the hot
+    # detection loop. Override via NEMARA_OPENAI_COMPILE_MODEL.
+    openai_compile_model: str = Field(default="gpt-5.4")
     openai_frames_fps: int = Field(ge=1, le=30, default=5)
 
     # ── LiveKit (Phase 0+) ──────────────────────────────────────
