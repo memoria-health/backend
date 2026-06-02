@@ -604,9 +604,19 @@ class CameraIngest:
                     "reid_poi" if identity.patient_in_clip else "llm_enrolled"
                 )
             else:
-                gate_people_present = True
-                gate_people_count = 0
-                present_src = "reid_failed_fallback"
+                # Re-ID didn't run this tick — either no bodies to match (an
+                # empty room, the common case) or an infra timeout/crash.
+                # Defer to the LLM rather than forcing "person": the LLM still
+                # ran and is a reliable presence signal, so a room it
+                # confidently calls empty closes normally after the no-people
+                # streak. Re-ID only OVERRIDES to "person" when it positively
+                # matches the POI (the elif branch above); it must never
+                # invent presence the LLM denies. (Previously this hard-forced
+                # people_present=True, which kept an empty room "occupied"
+                # forever and overrode a clear LLM "no person".)
+                gate_people_present = bool(result.people_present)
+                gate_people_count = result.people_count
+                present_src = "reid_unavailable_llm"
             result.detector_fields["people_present_src"] = present_src
             result.detector_fields["people_count_reid"] = identity.people_count_reid
 
