@@ -275,26 +275,30 @@ class CameraIngest:
                 patient.cameras_paused,
             )
 
-            # User-facing "off" short-circuit. Any of the three flags
-            # suppresses the LLM call:
-            #   - cam.disabled         → user hid + paused via Hide button
-            #   - cam.ai_paused        → user paused AI only (video still flows)
-            #   - patient.cameras_paused → patient-wide monitoring off
+            # User-facing "off" short-circuit. A camera's OWN flags
+            # suppress the LLM call:
+            #   - cam.disabled  → user hid + paused via Hide button
+            #   - cam.ai_paused → user paused AI only (video still flows)
+            #
+            # The patient-level `cameras_paused` (the bulk disconnect-all /
+            # reconnect-all switch) is deliberately NOT a detection gate.
+            # Detection follows each camera's own state: disconnect-all
+            # already stops detection the correct way — by disconnecting the
+            # cameras (no stream → no frames → no ticks). It must NOT also
+            # suppress a camera that's been individually brought back online
+            # while the patient flag still reads paused. (That mismatch is
+            # exactly the "camera's open but no analyses" bug.)
             # We still write a synthetic "skipped" row so the debug feed
-            # shows ticks happening (and the state machine stays
-            # consistent — counters keep advancing). The LiveKit
-            # connection + frame buffer stay alive in all three cases so
-            # re-enabling is instant.
-            if cam.disabled or cam.ai_paused or patient.cameras_paused:
+            # shows ticks happening (and the state machine stays consistent
+            # — counters keep advancing). The LiveKit connection + frame
+            # buffer stay alive so re-enabling is instant.
+            if cam.disabled or cam.ai_paused:
                 if cam.disabled:
                     reason = "camera_disabled"
                     description = "(disabled — LLM skipped)"
-                elif cam.ai_paused:
+                else:
                     reason = "ai_paused"
                     description = "(AI paused — LLM skipped)"
-                else:
-                    reason = "monitoring_paused"
-                    description = "(monitoring paused — LLM skipped)"
                 # DO NOT advance the state machine here. We have no real
                 # observation — we're explicitly skipping the LLM. The
                 # previous version called apply_tick_update with

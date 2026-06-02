@@ -134,7 +134,14 @@ async def _resolve_camera_or_401(
     short-circuit of trying caregiver-JWT first)."""
     try:
         return await camera_auth(session, credentials)
-    except HTTPException:
+    except HTTPException as exc:
+        # Preserve the 404 `camera_not_found` so a DELETED camera's
+        # token-mint is distinguishable from a transient auth failure —
+        # the wall phone treats 404 as "I've been unpaired" (see
+        # DesiredStateMonitor). Every other auth failure collapses to the
+        # router's 401.
+        if exc.status_code == status.HTTP_404_NOT_FOUND:
+            raise
         raise _INVALID from None
 
 
