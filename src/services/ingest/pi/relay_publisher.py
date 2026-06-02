@@ -78,6 +78,24 @@ log = logging.getLogger(__name__)
 # backend's MotionCache TTL works the same for Pi and iPhone cameras.
 DEFAULT_MOTION_HEARTBEAT_SECONDS: float = 5.0
 
+# SAD-tile motion threshold for the Pi relay, OVERRIDING the iOS-tuned
+# MotionConfig default (1.5). The iPhone's clean sensor sits below 1.5
+# when still, so its consecutive-frame counter resets at rest and a
+# rising edge fires on each real movement. The Pi's re-compressed MJPEG
+# has a far higher per-tile noise floor — MEASURED ~2.1-2.6 max_tile_sad
+# on a *static, empty* scene — which is ABOVE 1.5. At threshold=1.5 the
+# `max_tile_sad >= threshold` test is permanently true, so the
+# consecutive counter never resets, climbs monotonically, and the
+# rising-edge condition (count == required) fires exactly ONCE at startup
+# and never again: a closed Pi camera goes permanently blind to new
+# motion (the symptom: it only re-opened via an AI pause/resume, which
+# just force-sets state=open). Real frantic motion measured 17-124, so
+# 8.0 sits comfortably above the noise floor (further guarded by the
+# 2-consecutive-frame requirement) and well below real motion. Re-measure
+# / tune via the `pi_relay.fps … max_tile_sad=` telemetry if a camera's
+# environment (lighting, sensor) pushes the static floor higher.
+_PI_MOTION_THRESHOLD: float = 8.0
+
 # LiveKit data packet topic the iPhone publishes motion state on.
 # Mirrored exactly so the existing RoomWorker._handle_data_packet
 # logic recognizes Pi packets without changes.
@@ -129,7 +147,12 @@ class RelayConfig:
     # parallel; audio-stream failures degrade to video-only without
     # taking down the video relay.
     pi_audio_url: str | None = None
-    motion_config: MotionConfig = field(default_factory=MotionConfig)
+    # Pi-tuned threshold (see _PI_MOTION_THRESHOLD) — NOT the iOS default
+    # 1.5, which is below the Pi MJPEG noise floor and silently disables
+    # motion detection on a closed camera.
+    motion_config: MotionConfig = field(
+        default_factory=lambda: MotionConfig(threshold=_PI_MOTION_THRESHOLD)
+    )
     motion_heartbeat_seconds: float = DEFAULT_MOTION_HEARTBEAT_SECONDS
     token_ttl_seconds: int = DEFAULT_TOKEN_TTL_SECONDS
     max_video_bitrate_bps: int = DEFAULT_MAX_VIDEO_BITRATE_BPS
@@ -354,28 +377,37 @@ class RelayPublisher:
         )
         source.capture_frame(frame)
 
-        # Throughput telemetry: log fps every _fps_log_interval_s so
-        # we can diagnose Pi-side encode rate, network drops, or
-        # backend backpressure separately from any other symptom.
-        self._frames_since_log += 1
-        now = self._clock()
-        elapsed = now - self._last_fps_log_t
-        if elapsed >= self._fps_log_interval_s:
-            log.info(
-                "pi_relay.fps camera=%s frames=%d elapsed_s=%.2f fps=%.2f",
-                self._config.camera_identity,
-                self._frames_since_log,
-                elapsed,
-                self._frames_since_log / elapsed,
-            )
-            self._frames_since_log = 0
-            self._last_fps_log_t = now
-
+        # Run the motion detector on every frame BEFORE the telemetry log
+        # so the fps line can also report the live SAD scores — that one
+        # line answers "is the detector even seeing pixel change?" (mean/
+        # max SAD near zero ⇒ decode/plane problem) vs "is the threshold
+        # too high?" (SAD high but never latches).
         result = self._motion_detector.process(decoded.y_plane)
         if result.in_motion:
             # Rising edge: latch in_motion=True. The heartbeat loop
             # will publish this as soon as its cadence permits.
             self._in_motion = True
+
+        # Throughput + motion telemetry: log every _fps_log_interval_s so
+        # we can diagnose encode rate, drops, backpressure AND motion
+        # detection from a single line.
+        self._frames_since_log += 1
+        now = self._clock()
+        elapsed = now - self._last_fps_log_t
+        if elapsed >= self._fps_log_interval_s:
+            log.info(
+                "pi_relay.fps camera=%s frames=%d elapsed_s=%.2f fps=%.2f "
+                "mean_sad=%.1f max_tile_sad=%.1f in_motion_latched=%s",
+                self._config.camera_identity,
+                self._frames_since_log,
+                elapsed,
+                self._frames_since_log / elapsed,
+                result.mean_sad,
+                result.max_tile_sad,
+                self._in_motion,
+            )
+            self._frames_since_log = 0
+            self._last_fps_log_t = now
 
     async def _audio_publish_loop(
         self, room: rtc.Room, disconnected: asyncio.Event
