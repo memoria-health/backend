@@ -136,3 +136,17 @@ class Camera(Base):
     ingest_token_created_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None,
     )
+
+    # ── Memoria Sensor app-present heartbeat (iPhone only) ──────────
+    # True while the Memoria Sensor app is RUNNING on this camera's
+    # phone (it polls /v1/cameras/me/desired-state every 1s). Owned
+    # solely by `services/detection/presence_sweeper.py`, which flips
+    # it on transitions from an in-memory heartbeat cache — never
+    # written on the request hot path. Distinct from `online`
+    # (publishing) and `desired_state` (caregiver intent): false here
+    # means "app closed, must reopen" vs a reconnectable disconnect.
+    # Only ever written for source_type='iphone'; Pi cameras have no
+    # app to close and stay true.
+    app_present: Mapped[bool] = mapped_column(
+        Boolean, server_default=text("true"), default=True,
+    )

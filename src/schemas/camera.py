@@ -89,6 +89,15 @@ class CameraResponse(BaseModel):
     # button on the detail page, and skip the LiveKit tile subscription
     # (there's no published track until pairing completes).
     paired: bool
+    # True while the Memoria Sensor app is RUNNING on this camera's
+    # iPhone (it polls desired-state every 1s when open). false = app
+    # closed / phone off → clients show "App closed, open Memoria
+    # Sensor" instead of a reconnectable "Disconnected". Only
+    # meaningful for source_type='iphone'; Pi cameras stay true (no app
+    # to close). Defaulted True so older backends / un-migrated rows /
+    # any not-yet-updated construction site degrade gracefully to
+    # "present" and never falsely show "app closed".
+    app_present: bool = True
 
     @model_validator(mode="after")
     def _validate_source_pi_url_consistency(self) -> "CameraResponse":

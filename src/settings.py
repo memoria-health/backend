@@ -55,9 +55,11 @@ class Settings(BaseSettings):
     # production; in tests we monkeypatch the provider callables.
     gemini_api_key: str = Field(default="")
     # Default model and fps shape match the dashboard's `.env.example`.
-    # Empty fps = let Gemini choose its own video sampling rate.
+    # Video sampling rate sent to Gemini. "" = Gemini auto (~1fps); we pin 4 to
+    # match the 4fps frame source + openai_frames_fps (lower than the old 5 to
+    # cut frames-per-call cost).
     gemini_model: str = Field(default="gemini-3.5-flash")
-    gemini_video_fps: str = Field(default="")
+    gemini_video_fps: str = Field(default="4")
     # 'low' | 'medium' | 'high' | '' (Gemini default). Lowercased at call.
     gemini_media_resolution: str = Field(default="")
 
@@ -68,7 +70,7 @@ class Settings(BaseSettings):
     # frontier/thinking model without slowing or inflating the cost of the hot
     # detection loop. Override via NEMARA_OPENAI_COMPILE_MODEL.
     openai_compile_model: str = Field(default="gpt-5.4")
-    openai_frames_fps: int = Field(ge=1, le=30, default=5)
+    openai_frames_fps: int = Field(ge=1, le=30, default=4)
 
     # ── LiveKit (Phase 0+) ──────────────────────────────────────
     # Server-side token minting. The publish URL the wall phone connects
@@ -87,15 +89,36 @@ class Settings(BaseSettings):
     # a camera has connected), so it idles at zero cost until a wall
     # phone is paired and publishing.
     livekit_worker_tick_seconds: int = Field(ge=5, le=60, default=10)
-    # Sliding window the tick re-muxes to MP4 for Gemini. 15s matches
-    # the dashboard's clip length.
-    livekit_worker_window_seconds: int = Field(ge=5, le=60, default=15)
+    # Sliding ANALYSIS window the tick re-muxes to MP4 for the LLM. 11s (down
+    # from 15s) trims frames per call to save cost: 11s × 4fps ≈ 44 frames vs
+    # the old 75. (Distinct from the incident-clip post-roll, which is unchanged.)
+    livekit_worker_window_seconds: int = Field(ge=5, le=60, default=11)
     # Target fps after publish-side downsampling in the frame buffer.
-    # 5 matches `openai_frames_fps`; Gemini accepts the same rate.
-    livekit_worker_target_fps: int = Field(ge=1, le=15, default=5)
+    # 4 matches `openai_frames_fps` + `gemini_video_fps`.
+    livekit_worker_target_fps: int = Field(ge=1, le=15, default=4)
     # TTL for the per-camera motion_state cache. Wall phones publish
     # motion heartbeats every ~5s; missing/stale → motion_in_clip=false.
     livekit_motion_state_ttl_seconds: int = Field(ge=5, le=60, default=15)
+
+    # ── Memoria Sensor app-present heartbeat (iPhone sensors) ────
+    # A live iPhone sensor polls /v1/cameras/me/desired-state every 1s
+    # while its app is open. PresenceSweeper records that heartbeat
+    # in-memory and flips `cameras.app_present` on transitions, so the
+    # caregiver can tell "disconnected (reconnectable)" from "app closed
+    # (must reopen)". Pi cameras never poll this endpoint and are never
+    # touched. `enabled=false` is the kill switch: the poll no-ops and
+    # the sweeper doesn't run, so the column stays at its true default.
+    sensor_presence_enabled: bool = Field(default=True)
+    # A sensor unseen for this many seconds is considered "app closed"
+    # (covers force-quit AND backgrounded — the sensor stops polling on
+    # both). 8s ≈ 16 missed 0.5s polls — snappy enough that backgrounding
+    # the sensor surfaces quickly, while still absorbing brief network
+    # jitter. Stays well under the ~30s iOS background-suspend window.
+    sensor_presence_stale_seconds: int = Field(ge=5, le=300, default=8)
+    # How often the sweep compares the heartbeat cache to the DB and
+    # flips app_present on transitions. Cheap (one scoped SELECT + only
+    # transition UPDATEs), so a few seconds keeps the UI responsive.
+    sensor_presence_sweep_seconds: int = Field(ge=2, le=60, default=5)
 
     # ── Pairing / camera api-key auth (Phase 0+) ────────────────
     # bcrypt rounds for the per-camera api_key_hash. 10 matches the

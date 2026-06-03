@@ -78,6 +78,8 @@ from src.db import patient_face_embedding as _patient_face_embedding  # noqa: F4
 from src.db import pi_discovery as _pi_discovery  # noqa: F401
 from src.db.session import get_engine, get_sessionmaker
 from src.services import email, push
+from src.services.detection.presence_cache import PresenceCache
+from src.services.detection.presence_sweeper import PresenceSweeper
 from src.services.detection.worker import DetectorWorker
 from src.services.scheduling.scheduler import ScheduledDetectorRunner
 from src.settings import get_settings
@@ -108,9 +110,31 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # `LiveKitRoomReconciler` (see room_reconciler.py). The standalone
     # `StaleOnlineSweeper` was removed because REST polling produces
     # the same staleness signal without a separate DB sweep.
+    #
+    # `cameras.app_present` (is the Memoria Sensor iPhone app open?) is a
+    # SEPARATE, poll-based, room-independent signal: the desired-state
+    # poll handler touches an in-memory PresenceCache (no DB write on
+    # that 1s hot path) and PresenceSweeper flips the column on
+    # transitions. Unlike `online`, this has no per-room owner — a
+    # camera whose app is alive but not publishing has no RoomWorker —
+    # so it MUST be swept globally here. The cache lives on app.state so
+    # the poll handler (api/cameras.py) and the sweeper share one
+    # instance. SINGLE REPLICA ONLY (see presence_cache.py).
+    presence_cache = PresenceCache(
+        stale_seconds=get_settings().sensor_presence_stale_seconds,
+    )
+    app.state.presence_cache = presence_cache
+    presence_sweeper = PresenceSweeper(
+        settings=get_settings(),
+        sessionmaker=get_sessionmaker(),
+        cache=presence_cache,
+    )
+    app.state.presence_sweeper = presence_sweeper
+    await presence_sweeper.start()
     try:
         yield
     finally:
+        await presence_sweeper.stop()
         await scheduler.stop()
         await worker.stop()
         await push.close()

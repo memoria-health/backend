@@ -78,6 +78,7 @@ def _to_response(c: Camera) -> CameraResponse:
         livekit_identity=c.livekit_identity,
         created_at=c.created_at,
         paired=paired,
+        app_present=c.app_present,
     )
 
 
@@ -558,6 +559,7 @@ async def regenerate_pairing_code(
 )
 async def get_my_desired_state(
     auth: CameraAuth,
+    request: Request,
 ) -> DesiredStateResponse:
     """Polled by the wall phone every 1s. `CameraAuth` already
     resolves the bearer api_key against `cameras.api_key_hash` and
@@ -577,6 +579,16 @@ async def get_my_desired_state(
     the CHECK constraint, but if a migration ever drifts), Pydantic
     raises 500 here. Fail-loud aligned.
     """
+    # App-present heartbeat. This 1s poll IS the "Memoria Sensor app is
+    # open" signal — record it in the in-memory PresenceCache so the
+    # PresenceSweeper can tell a closed app from a reconnectable
+    # disconnect. Pure in-memory: NO DB write on this hot path (a
+    # per-poll write is exactly what exhausted the pool before).
+    # getattr-guarded so a missing cache (presence disabled, or a
+    # startup race before lifespan wired it) can never 500 the poll.
+    cache = getattr(request.app.state, "presence_cache", None)
+    if cache is not None:
+        cache.touch(auth.id)
     return DesiredStateResponse(
         desired_state=auth.desired_state,  # type: ignore[arg-type]
         polled_at=datetime.now(timezone.utc),

@@ -248,6 +248,21 @@ create table public.cameras (
   -- LiveKit directly with their own per-session tokens).
   ingest_token_hash       text,
   ingest_token_created_at timestamptz,
+  -- ── Memoria Sensor app-present heartbeat (iPhone only) ───────────
+  -- Answers: is the Memoria Sensor app actually RUNNING on this
+  -- camera's phone right now? Distinct from `online` (publishing) and
+  -- `desired_state` (caregiver intent). An iPhone sensor polls
+  -- GET /v1/cameras/me/desired-state every 1s the whole time the app
+  -- is open; the backend's PresenceSweeper records that heartbeat
+  -- in-memory and flips this column on transitions. false = app
+  -- closed / force-quit / phone off → caregiver must OPEN the app
+  -- (Reconnect can't help, the phone isn't polling). true = app alive
+  -- (so "Disconnected" means reconnectable). Default true so a live
+  -- sensor never flashes "closed" on rollout. ONLY meaningful for
+  -- source_type='iphone' — Pi cameras never poll this endpoint, so the
+  -- sweeper never writes them and they stay true (a Pi has no app to
+  -- close). See services/detection/presence_sweeper.py.
+  app_present             boolean not null default true,
   constraint cameras_pi_stream_url_length
     check (pi_stream_url is null or length(pi_stream_url) <= 2048),
   constraint cameras_pi_audio_url_length
