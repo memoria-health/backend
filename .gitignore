@@ -40,3 +40,9 @@ htmlcov/
 # private repo so clones stay small.
 yolo11n.pt
 *.pt
+
+# OneDrive/iCloud sync conflict copies. These repos live in a cloud-
+# synced folder whose sync daemons spawn "<name> 2.<ext>" duplicate
+# files (see CLAUDE.md cloud-sync note). Ignore them so they never
+# clutter git status or get committed by accident.
+* [2-9].*
