@@ -817,6 +817,16 @@ class RoomWorker:
         self._motion_cache.put(
             ingest.camera_id, in_motion=in_motion, received_at=time.monotonic(),
         )
+        # Diagnostic: confirms motion_state packets are actually reaching
+        # the detector worker, and their value. If this never logs while a
+        # publisher is up, the data-channel path is broken (room/subscribe);
+        # if it logs in_motion=False while someone is moving, the SAD
+        # detector isn't latching (see pi_relay SAD telemetry). Dial to
+        # debug once the Pi motion path is confirmed healthy.
+        log.info(
+            "room_worker.motion_received room=%s camera=%s in_motion=%s",
+            self.room_name, ingest.camera_id, in_motion,
+        )
 
     # ── audio consumer ─────────────────────────────────────────────
 
@@ -851,7 +861,19 @@ class RoomWorker:
         copy into bytes, and push into the per-camera buffer. Same
         bounded retry pattern as `_consume_audio`."""
 
+        # One-shot per (re)subscribe: kick the reconciler the instant
+        # frames actually start flowing, so `cameras.online` flips true
+        # within ~1s instead of trailing up to one poll interval (~10s).
+        # The `participant_joined` webhook fires an immediate reconcile,
+        # but that poll lands BEFORE frames arrive (Pi connect+publish+
+        # subscribe takes a few seconds) and sees "no fresh frames", so
+        # without this nudge online only flips on the next periodic poll
+        # — the visible reconnect lag. A fresh `_consume_video` runs on
+        # every subscribe, so this re-arms naturally on reconnect.
+        online_signaled = False
+
         def _push_video(event: rtc.VideoEvent) -> None:
+            nonlocal online_signaled
             frame = event.frame
             if frame.type != rtc.VideoBufferType.I420:
                 frame = frame.convert(rtc.VideoBufferType.I420)
@@ -871,6 +893,9 @@ class RoomWorker:
             # gets its `_last_frame_at` advanced here, so `online`
             # tracks actual stream presence, not detector activity.
             ingest.record_frame_arrival(now_mono)
+            if not online_signaled:
+                online_signaled = True
+                asyncio.create_task(self._reconciler.signal_tick())
 
         await self._consume_with_retry(
             label="video",
