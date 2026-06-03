@@ -142,6 +142,11 @@ class DesiredStateResponse(BaseModel):
 
     desired_state: DesiredState
     polled_at: datetime
+    # The caregiver-assigned room/display name for this camera (e.g.
+    # "Living Room"). Echoed on every 1s poll so the wall phone can show
+    # its human name (and pick up renames live) instead of only the
+    # opaque cam_<hex> identity.
+    room: str
 
 
 class UpdateMyDesiredStateRequest(BaseModel):

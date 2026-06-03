@@ -592,6 +592,7 @@ async def get_my_desired_state(
     return DesiredStateResponse(
         desired_state=auth.desired_state,  # type: ignore[arg-type]
         polled_at=datetime.now(timezone.utc),
+        room=auth.room,
     )
 
 
@@ -679,6 +680,7 @@ async def update_my_desired_state(
     return DesiredStateResponse(
         desired_state=body.desired_state,
         polled_at=datetime.now(timezone.utc),
+        room=auth.room,
     )
 
 
