@@ -62,7 +62,7 @@ def _event_title_for(detector: Detector) -> str:
 _PROMOTION_RULES: dict[str, tuple[str, str | None, float]] = {
     "fall":       ("fall_detected",       "fall_confidence",       0.70),
     "wandering":  ("wandering_detected",  "wandering_confidence",  0.60),
-    "agitation":  ("agitation_detected",  "agitation_confidence",  0.60),
+    "agitation":  ("agitation_detected",  "agitation_confidence",  0.70),
     "medication": ("medication_taken",    "medication_confidence", 0.60),
 }
 
