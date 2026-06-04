@@ -1,48 +1,56 @@
-"""Experimental: caregiver-triggered 15s clip capture (data collection).
+"""Experimental: caregiver-triggered server-side clip recorder (data collection).
 
 NON-PRODUCTION. Mounted only when `settings.enable_internals` is true
-(see src/main.py). Lets a caregiver press a button in the iOS app to
-make a specific wall camera record the next N seconds locally and ship
-the MP4 to a laptop receiver — deterministic training data for the
-detectors.
+(see src/main.py).
 
-The camera side is already built and dormant: the wall phone decodes a
-`{"type": "record_trigger", "duration_seconds": N}` LiveKit data packet
-on the `record_trigger` topic, records the next N s to a local MP4, and
-POSTs it to its configured "Experiment Server URL" (the receiver in
-clip_receiver.py). This endpoint's only job is to emit that packet to
-one camera's LiveKit identity.
+On a record-clip request, kicks off a server-side LiveKit recording (see
+src/internals/clip_recorder.py): the backend connects its OWN subscriber
+to the patient's room, captures `duration` seconds of the target
+camera's video+audio, and writes ONE MP4 (with the real LiveKit audio)
+to the dump dir. No on-device recording — the camera never drops off
+LiveKit, the audio is never silenced by WebRTC mic contention, and the
+clip is a true `duration` seconds, independent of the model's analysis
+window.
 
-Auth + ownership reuse the Talk-mode helpers verbatim so the security
-posture is identical: a caregiver can only address cameras belonging to
-a patient they own.
+Fire-and-forget: the recording runs ~`duration` s in the background, so
+the HTTP request returns immediately instead of hanging for the whole
+clip.
+
+Auth + ownership reuse the Talk-mode helper verbatim: a caregiver can
+only address cameras belonging to a patient they own.
 """
 
-import json
+import asyncio
 import logging
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, status
-from livekit import api as lkapi
 from pydantic import BaseModel, Field
 
 from src.api.deps import CaregiverAuth, SessionDep, SettingsDep
-from src.api.talk import _ensure_livekit_configured, _resolve_owned_cameras_or_403
-from src.db.camera import Camera
+from src.api.talk import _resolve_owned_cameras_or_403
+from src.internals import clip_recorder
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1", tags=["internals"])
 
-# Mirrors the camera-side clamp at ContentView.swift:372.
 _MIN_DURATION = 5
-_MAX_DURATION = 300
+_MAX_DURATION = 60
 _DEFAULT_DURATION = 15
 
 _CAMERA_NOT_OWNED = HTTPException(
     status_code=status.HTTP_403_FORBIDDEN,
     detail="camera_not_owned_by_patient",
 )
+_CAMERA_NOT_LIVE = HTTPException(
+    status_code=status.HTTP_409_CONFLICT,
+    detail="camera_has_no_livekit_identity",
+)
+
+# Hold strong refs to in-flight recording tasks so the event loop can't
+# GC them mid-run (fire-and-forget). Cleared on completion.
+_bg_tasks: set[asyncio.Task] = set()
 
 
 class RecordClipRequest(BaseModel):
@@ -63,16 +71,15 @@ async def record_clip(
     auth: CaregiverAuth,
     body: RecordClipRequest | None = None,
 ) -> None:
-    """Tell one camera to record the next N seconds and upload it.
+    """Start a server-side recording of one camera for the next N seconds.
 
     403 unless the caregiver owns the patient AND `camera_id` is one of
-    that patient's paired cameras (same check as `talk/start`). The
-    packet is sent to a single target identity, not broadcast.
+    that patient's paired cameras (same check as `talk/start`). 409 if
+    the camera has never paired to LiveKit (no identity to subscribe to).
     """
     cameras = await _resolve_owned_cameras_or_403(
         session, caregiver_id=auth.id, patient_id=patient_id,
     )
-    _ensure_livekit_configured(settings)
 
     target = next((c for c in cameras if c.id == camera_id), None)
     if target is None:
@@ -81,53 +88,25 @@ async def record_clip(
             auth.id, patient_id, camera_id,
         )
         raise _CAMERA_NOT_OWNED
+    if not target.livekit_identity:
+        raise _CAMERA_NOT_LIVE
 
     requested = body.duration_seconds if body else _DEFAULT_DURATION
     duration = max(_MIN_DURATION, min(requested, _MAX_DURATION))
 
-    await _send_record_packet(
-        settings=settings,
-        room=f"patient_{patient_id}",
-        camera=target,
-        duration_seconds=duration,
-    )
-    log.info(
-        "record_clip routed patient_id=%s camera_id=%s identity=%s duration=%ds",
-        patient_id, camera_id, target.livekit_identity, duration,
-    )
-
-
-async def _send_record_packet(
-    *,
-    settings,
-    room: str,
-    camera: Camera,
-    duration_seconds: int,
-) -> None:
-    """Send a `{type: "record_trigger", duration_seconds}` packet to one
-    camera's LiveKit identity. Mirrors `talk._send_talk_packet`: a fresh
-    LiveKitAPI client per call — at v0 scale that's fine.
-    """
-    if camera.livekit_identity is None:
-        # `_resolve_owned_cameras_or_403` already excludes these.
-        return
-    payload = json.dumps(
-        {"type": "record_trigger", "duration_seconds": duration_seconds}
-    ).encode("utf-8")
-    lk = lkapi.LiveKitAPI(
-        settings.livekit_url,
-        settings.livekit_api_key,
-        settings.livekit_api_secret,
-    )
-    try:
-        await lk.room.send_data(
-            lkapi.SendDataRequest(
-                room=room,
-                data=payload,
-                kind=lkapi.DataPacket.Kind.RELIABLE,
-                destination_identities=[camera.livekit_identity],
-                topic="record_trigger",
-            )
+    task = asyncio.create_task(
+        clip_recorder.record_clip(
+            settings=settings,
+            room_name=f"patient_{patient_id}",
+            camera_identity=target.livekit_identity,
+            duration=duration,
         )
-    finally:
-        await lk.aclose()
+    )
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+    log.info(
+        "record_clip started server-side recording patient_id=%s camera_id=%s "
+        "identity=%s duration=%ds -> %s",
+        patient_id, camera_id, target.livekit_identity, duration, clip_recorder.output_dir(),
+    )
