@@ -164,3 +164,31 @@ class UpdateDetectorRequest(BaseModel):
     sensitivity: DetectorSensitivity | None = None
     is_on: bool | None = None
     custom_prompt: Prompt | None = None
+
+
+class DetectorLibraryEntry(BaseModel):
+    """One detector-catalog entry, returned by
+    GET /v1/patients/{id}/detectors/library. `already_added` is true when the
+    patient already has a detector with this identifier (so the picker can
+    pre-check / disable it)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    key: str
+    name: Name
+    icon_name: IconName
+    description: Description
+    category: DetectorCategory
+    cohort: str                 # "child" | "adult" | "both"
+    recommended: bool
+    already_added: bool
+
+
+class AddFromLibraryRequest(BaseModel):
+    """Body of POST /v1/patients/{id}/detectors/from-library — the catalog keys
+    to instantiate as preset detectors for the patient. Unknown keys and keys
+    the patient already has are skipped server-side; an empty list is a 422."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    keys: list[str] = Field(min_length=1)
