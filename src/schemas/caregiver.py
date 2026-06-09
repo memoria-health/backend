@@ -8,12 +8,35 @@ from datetime import datetime
 from typing import Annotated
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
 DisplayName = Annotated[str, Field(min_length=1, max_length=80)]
 Email = Annotated[str, Field(min_length=3, max_length=255)]
-# E.164: leading +, then 1–15 digits.
-Phone = Annotated[str, Field(pattern=r"^\+[1-9]\d{1,14}$")]
+
+
+def _to_e164(value: object) -> object:
+    """Normalize common phone input to E.164 so the iOS app can send a plain
+    10-digit US number, "(464) 474-4928", "+1 464-474-4928", etc. A bare
+    10-digit number is assumed US (+1); "+"-prefixed input keeps its country
+    code. Non-strings pass through for Pydantic to reject normally."""
+    if not isinstance(value, str):
+        return value
+    s = value.strip()
+    if not s:
+        return s
+    digits = "".join(c for c in s if c.isdigit())
+    if s.startswith("+"):
+        return "+" + digits
+    if len(digits) == 10:
+        return "+1" + digits
+    if len(digits) == 11 and digits.startswith("1"):
+        return "+" + digits
+    return "+" + digits
+
+
+# E.164: leading +, then 1–15 digits. Input is normalized first (so a plain
+# 10-digit number from the iOS app is accepted and stored as +1XXXXXXXXXX).
+Phone = Annotated[str, BeforeValidator(_to_e164), Field(pattern=r"^\+[1-9]\d{1,14}$")]
 
 
 class CaregiverResponse(BaseModel):

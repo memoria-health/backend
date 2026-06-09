@@ -167,17 +167,26 @@ async def test_patch_me_rejects_unknown_fields(
 
 
 @pytest.mark.asyncio
-async def test_patch_me_rejects_invalid_phone_format(
+async def test_patch_me_normalizes_phone(
     client: AsyncClient, auth_user
 ) -> None:
-    """Phone must be E.164 (`^\\+[1-9]\\d{1,14}$`)."""
+    """Phone is normalized to E.164: a plain/formatted US number is accepted
+    and stored as +1XXXXXXXXXX; input with no digits is still rejected."""
     uid, email = auth_user
     headers = {"Authorization": f"Bearer {mint_test_jwt(uid, email)}"}
     await client.post(
         "/v1/me", headers=headers, json={"display_name": "PhoneTester"},
     )
 
+    # A formatted 10-digit US number is accepted and normalized to E.164.
     r = await client.patch(
-        "/v1/me", headers=headers, json={"phone": "415-555-1234"},     # not E.164
+        "/v1/me", headers=headers, json={"phone": "415-555-1234"},
+    )
+    assert r.status_code == 200
+    assert r.json()["phone"] == "+14155551234"
+
+    # Input with no digits is still rejected.
+    r = await client.patch(
+        "/v1/me", headers=headers, json={"phone": "not a phone"},
     )
     assert r.status_code == 422
