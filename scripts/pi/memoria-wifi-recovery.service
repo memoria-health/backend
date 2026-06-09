@@ -1,5 +1,5 @@
 [Unit]
-Description=Nemara WiFi recovery (auto-restore after failed AP provisioning)
+Description=Memoria WiFi recovery (auto-restore after failed AP provisioning)
 # Only run after NetworkManager is up; we read/write /etc/netplan
 # files that NM picks up on reboot.
 After=NetworkManager.service
@@ -7,7 +7,7 @@ After=NetworkManager.service
 [Service]
 Type=oneshot
 User=root
-ExecStart=/opt/nemara/wifi_recovery.sh
+ExecStart=/opt/memoria/wifi_recovery.sh
 StandardOutput=journal
 StandardError=journal
 

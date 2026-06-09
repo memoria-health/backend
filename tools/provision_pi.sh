@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Provision a fresh Raspberry Pi into a Nemara sensor camera in one
+# Provision a fresh Raspberry Pi into a Memoria sensor camera in one
 # shot from the developer's Mac.
 #
 # What this does, in order:
 #   1. Verifies we can SSH into the Pi (key-based, no password prompt).
-#   2. Copies the scripts/pi/ directory to /tmp/nemara-pi/ on the Pi.
+#   2. Copies the scripts/pi/ directory to /tmp/memoria-pi/ on the Pi.
 #   3. Runs install.sh on the Pi with the chosen backend URL. install.sh
 #      handles: apt deps, dtoverlay=imx219, persistent journal, dnsmasq
 #      captive-portal wildcard, systemd units for announce + stream
@@ -17,7 +17,7 @@
 #   ./tools/provision_pi.sh <pi-host> <backend-url> [--for-customer]
 #
 # Example (dev, leave on local WiFi):
-#   ./tools/provision_pi.sh nemara-cam.local https://api.dev.nemara
+#   ./tools/provision_pi.sh memoria-cam.local https://api.dev.nemara
 #
 # Example (production, ready to ship):
 #   ./tools/provision_pi.sh 192.168.1.42 \
@@ -37,7 +37,7 @@ usage() {
   cat >&2 <<EOF
 Usage: $0 <pi-host> <backend-url> [--for-customer]
 
-  <pi-host>       hostname or IP of the Pi (e.g. nemara-cam.local, 10.0.0.44)
+  <pi-host>       hostname or IP of the Pi (e.g. memoria-cam.local, 10.0.0.44)
   <backend-url>   backend the Pi will announce to and push frames into
   --for-customer  wipe saved WiFi at the end so the Pi boots into AP mode
                   on its next power cycle (use when shipping to a customer)
@@ -111,7 +111,7 @@ if echo "$PI_INFO" | grep -q "sudo-needs-password"; then
 The Pi requires a password for sudo. install.sh runs as root and
 expects passwordless sudo. Add this on the Pi (one-time):
 
-    sudo visudo -f /etc/sudoers.d/nemara
+    sudo visudo -f /etc/sudoers.d/memoria
     # add this line:
     ${PI_USER} ALL=(ALL) NOPASSWD: ALL
 
@@ -120,20 +120,20 @@ EOF
   exit 1
 fi
 
-echo ">>> Copying scripts/pi/ to ${TARGET}:/tmp/nemara-pi/"
-$SSH "$TARGET" 'rm -rf /tmp/nemara-pi && mkdir -p /tmp/nemara-pi'
-$SCP -r "$PI_SCRIPTS_DIR"/* "${TARGET}:/tmp/nemara-pi/"
-$SSH "$TARGET" 'chmod +x /tmp/nemara-pi/*.sh /tmp/nemara-pi/*.py 2>/dev/null || true'
+echo ">>> Copying scripts/pi/ to ${TARGET}:/tmp/memoria-pi/"
+$SSH "$TARGET" 'rm -rf /tmp/memoria-pi && mkdir -p /tmp/memoria-pi'
+$SCP -r "$PI_SCRIPTS_DIR"/* "${TARGET}:/tmp/memoria-pi/"
+$SSH "$TARGET" 'chmod +x /tmp/memoria-pi/*.sh /tmp/memoria-pi/*.py 2>/dev/null || true'
 
 echo ">>> Running install.sh on Pi with BACKEND_URL=${BACKEND_URL}"
-$SSH "$TARGET" "sudo /tmp/nemara-pi/install.sh '${BACKEND_URL}'"
+$SSH "$TARGET" "sudo /tmp/memoria-pi/install.sh '${BACKEND_URL}'"
 
 if [[ $FOR_CUSTOMER -eq 1 ]]; then
   echo ">>> Wiping saved WiFi (Pi will reboot into AP mode)"
   # wifi_wipe_safe.sh ends with `reboot`, which kills the SSH session
   # before ssh sees a clean exit. We treat non-zero here as expected.
   # If the wipe step itself errored, its stderr already printed above.
-  $SSH "$TARGET" 'sudo /opt/nemara/wifi_wipe_safe.sh' || true
+  $SSH "$TARGET" 'sudo /opt/memoria/wifi_wipe_safe.sh' || true
   cat <<EOF
 
 ================================================================
@@ -157,7 +157,7 @@ Pi provisioned and left on its current WiFi.
 It will start announcing to ${BACKEND_URL} after the next service
 restart or reboot. To verify:
 
-    ssh ${TARGET} 'sudo journalctl -u nemara-announce.service -f'
+    ssh ${TARGET} 'sudo journalctl -u memoria-announce.service -f'
 
 When you are ready to hand it to a customer, re-run with
 --for-customer to wipe the WiFi.

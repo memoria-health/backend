@@ -1,23 +1,23 @@
 [Unit]
-Description=Nemara camera push streamer
+Description=Memoria camera push streamer
 # Only run after the announce daemon has written ingest.env. The
 # announce daemon triggers `systemctl restart` on this unit the
 # moment it picks up a fresh token from the backend, so the
 # ConditionPathExists check below makes pre-pairing boots a no-op.
-After=NetworkManager.service nemara-announce.service
+After=NetworkManager.service memoria-announce.service
 Wants=NetworkManager.service
 # Only start once the env file exists; before then we have no
 # token and the pusher would just exit. Announce daemon writes
 # this file the first time the backend hands us a freshly-minted
 # token.
-ConditionPathExists=/etc/nemara/ingest.env
+ConditionPathExists=/etc/memoria/ingest.env
 
 [Service]
 Type=simple
 User=root
-EnvironmentFile=/etc/nemara/ingest.env
-EnvironmentFile=-/etc/nemara/camera-stream.env
-ExecStart=/usr/bin/python3 /opt/nemara/mjpeg_pusher.py
+EnvironmentFile=/etc/memoria/ingest.env
+EnvironmentFile=-/etc/memoria/camera-stream.env
+ExecStart=/usr/bin/python3 /opt/memoria/mjpeg_pusher.py
 # Restart on failure (network drop, server reconnect), but NOT on
 # exit code 2 which the pusher uses to signal "token invalid, wait
 # for fresh provision".

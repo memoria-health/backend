@@ -101,9 +101,14 @@ _PI_MOTION_THRESHOLD: float = 8.0
 # logic recognizes Pi packets without changes.
 MOTION_STATE_TOPIC: str = "motion_state"
 
-# Match the iPhone publish settings: simulcast off, max bitrate
-# 2.5 Mbps. Set on the track publish options.
-DEFAULT_MAX_VIDEO_BITRATE_BPS: int = 2_500_000
+# LiveKit re-publish (H.264) bitrate ceiling, set on the track publish
+# options. The iPhone publishes 720p at 2.5 Mbps; Pi cameras now stream
+# full-FOV 1080p, so the cap is lifted to 4 Mbps so the extra detail
+# survives the re-encode to BOTH the caregiver live view and the
+# detection pipeline (both consume this H.264 track, not the raw MJPEG).
+# It is a ceiling, not a target — a still room uses far less and only
+# high-motion 1080p scenes approach it. simulcast off.
+DEFAULT_MAX_VIDEO_BITRATE_BPS: int = 4_000_000
 
 # Required-field cap on the publish-side framerate. The LiveKit
 # Python SDK's protobuf for `publish_track.options.video_encoding`

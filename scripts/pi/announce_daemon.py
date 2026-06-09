@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Nemara camera announce daemon. Runs on the Pi.
+"""Memoria camera announce daemon. Runs on the Pi.
 
 Sends a heartbeat to the backend's /v1/cameras/pi-announce endpoint
 every `INTERVAL_SECONDS` seconds with this device's stable hardware
@@ -9,23 +9,23 @@ a camera" picker until they bind it to a patient.
 
 Once paired, the backend's announce response includes the
 `ingest_url` + `ingest_token` (delivered exactly once). This daemon
-writes those values to /etc/nemara/ingest.env atomically and
-triggers the `nemara-camera-stream.service` unit, which then opens
+writes those values to /etc/memoria/ingest.env atomically and
+triggers the `memoria-camera-stream.service` unit, which then opens
 the long-lived push connection.
 
 Configuration via env vars (loaded by systemd unit from
-/etc/nemara/announce.env):
+/etc/memoria/announce.env):
 
-  NEMARA_BACKEND_URL           required, e.g. https://api.nemara.app
-  NEMARA_CAMERA_STREAM_URL     optional (vestigial; only used by the
+  MEMORIA_BACKEND_URL           required, e.g. https://api.nemara.app
+  MEMORIA_CAMERA_STREAM_URL     optional (vestigial; only used by the
                                legacy pull-mode path)
-  NEMARA_CAMERA_AUDIO_URL      optional, ditto
-  NEMARA_CAMERA_LABEL_PREFIX   optional, default "Nemara Camera"
+  MEMORIA_CAMERA_AUDIO_URL      optional, ditto
+  MEMORIA_CAMERA_LABEL_PREFIX   optional, default "Memoria Camera"
                                label becomes "<prefix> <last-6-of-MAC>"
-  NEMARA_ANNOUNCE_INTERVAL_S   optional, default 60
-  NEMARA_WIFI_IFACE            optional, default "wlan0"
-  NEMARA_INGEST_ENV_PATH       optional, default /etc/nemara/ingest.env
-  NEMARA_STREAM_SERVICE_NAME   optional, default nemara-camera-stream.service
+  MEMORIA_ANNOUNCE_INTERVAL_S   optional, default 60
+  MEMORIA_WIFI_IFACE            optional, default "wlan0"
+  MEMORIA_INGEST_ENV_PATH       optional, default /etc/memoria/ingest.env
+  MEMORIA_STREAM_SERVICE_NAME   optional, default memoria-camera-stream.service
 
 Failure model: a backend that returns non-2xx or is unreachable
 logs a warning and tries again on the next interval. Never crashes
@@ -46,30 +46,30 @@ from pathlib import Path
 
 import httpx
 
-log = logging.getLogger("nemara.announce")
+log = logging.getLogger("memoria.announce")
 
 # Default file the announce daemon writes when it receives a freshly-
 # minted ingest token in the announce response. The camera-stream
 # systemd unit reads this file at start to learn its bearer + URL.
-DEFAULT_INGEST_ENV_PATH = "/etc/nemara/ingest.env"
+DEFAULT_INGEST_ENV_PATH = "/etc/memoria/ingest.env"
 
 # Default systemd unit name that consumes the ingest.env. Triggering
 # it after writing the env file is what flips a paired Pi from idle
 # (just announcing) to actively pushing frames.
-DEFAULT_STREAM_SERVICE = "nemara-camera-stream.service"
+DEFAULT_STREAM_SERVICE = "memoria-camera-stream.service"
 
 
 def _read_mac(iface: str) -> str:
     """Read the MAC address of `iface` from /sys. The MAC is stable
     across reboots (modulo MAC randomization, which we do NOT enable
-    on Nemara cameras), so it is the right identity key.
+    on Memoria cameras), so it is the right identity key.
     """
     path = Path(f"/sys/class/net/{iface}/address")
     return path.read_text().strip()
 
 
 def _device_label(mac: str, prefix: str) -> str:
-    """e.g. 'Nemara Camera A4B7C2' from MAC 'b8:27:eb:a4:b7:c2'."""
+    """e.g. 'Memoria Camera A4B7C2' from MAC 'b8:27:eb:a4:b7:c2'."""
     suffix = mac.replace(":", "").upper()[-6:]
     return f"{prefix} {suffix}"
 
@@ -91,7 +91,7 @@ def _current_ip() -> str:
 def _substitute_ip(template_url: str, ip: str) -> str:
     """If the configured URL contains `{ip}`, fill in the current
     address. This lets the operator write
-    NEMARA_CAMERA_STREAM_URL=http://{ip}:8000/stream.mjpg and have
+    MEMORIA_CAMERA_STREAM_URL=http://{ip}:8000/stream.mjpg and have
     the daemon refresh it on every announcement, surviving DHCP
     lease changes.
     """
@@ -114,8 +114,8 @@ def _write_ingest_env_atomic(
     # tolerates quoted values, and the token uses URL-safe-base64
     # which is shell-safe anyway. Quoting is defense-in-depth.
     contents = (
-        f"NEMARA_INGEST_URL={shlex.quote(ingest_url)}\n"
-        f"NEMARA_INGEST_TOKEN={shlex.quote(ingest_token)}\n"
+        f"MEMORIA_INGEST_URL={shlex.quote(ingest_url)}\n"
+        f"MEMORIA_INGEST_TOKEN={shlex.quote(ingest_token)}\n"
     )
     fd, tmp_path = tempfile.mkstemp(
         prefix=".ingest.env.", dir=str(target.parent), text=True,
@@ -156,21 +156,21 @@ def _systemctl_restart(unit: str) -> None:
 
 
 async def announce_loop() -> None:
-    backend_url = os.environ["NEMARA_BACKEND_URL"].rstrip("/")
-    label_prefix = os.environ.get("NEMARA_CAMERA_LABEL_PREFIX", "Nemara Camera")
-    interval_s = int(os.environ.get("NEMARA_ANNOUNCE_INTERVAL_S", "60"))
-    iface = os.environ.get("NEMARA_WIFI_IFACE", "wlan0")
+    backend_url = os.environ["MEMORIA_BACKEND_URL"].rstrip("/")
+    label_prefix = os.environ.get("MEMORIA_CAMERA_LABEL_PREFIX", "Memoria Camera")
+    interval_s = int(os.environ.get("MEMORIA_ANNOUNCE_INTERVAL_S", "60"))
+    iface = os.environ.get("MEMORIA_WIFI_IFACE", "wlan0")
     # Vestigial pull-mode values: kept in env for backwards compat
     # but the backend ignores them after the push refactor.
-    stream_url_tpl = os.environ.get("NEMARA_CAMERA_STREAM_URL", "")
-    audio_url_tpl = os.environ.get("NEMARA_CAMERA_AUDIO_URL")
+    stream_url_tpl = os.environ.get("MEMORIA_CAMERA_STREAM_URL", "")
+    audio_url_tpl = os.environ.get("MEMORIA_CAMERA_AUDIO_URL")
     # New push-mode handoff: where to write the ingest token and
     # which systemd unit to kick after writing it.
     ingest_env_path = os.environ.get(
-        "NEMARA_INGEST_ENV_PATH", DEFAULT_INGEST_ENV_PATH,
+        "MEMORIA_INGEST_ENV_PATH", DEFAULT_INGEST_ENV_PATH,
     )
     stream_service = os.environ.get(
-        "NEMARA_STREAM_SERVICE_NAME", DEFAULT_STREAM_SERVICE,
+        "MEMORIA_STREAM_SERVICE_NAME", DEFAULT_STREAM_SERVICE,
     )
 
     mac = _read_mac(iface)
@@ -253,7 +253,7 @@ async def announce_loop() -> None:
 
 def main() -> None:
     logging.basicConfig(
-        level=os.environ.get("NEMARA_LOG_LEVEL", "INFO"),
+        level=os.environ.get("MEMORIA_LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     try:

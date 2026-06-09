@@ -1,18 +1,18 @@
 [Unit]
-Description=Nemara camera announce daemon
+Description=Memoria camera announce daemon
 After=network-online.target NetworkManager.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-# Must run as root because the daemon writes /etc/nemara/ingest.env
+# Must run as root because the daemon writes /etc/memoria/ingest.env
 # (the camera-stream service's EnvironmentFile, which is root-owned
 # at 0600 so the ingest bearer token isn't world-readable) and
-# triggers `systemctl restart nemara-camera-stream.service` on
+# triggers `systemctl restart memoria-camera-stream.service` on
 # pairing handoff. Both operations require root.
 User=root
-EnvironmentFile=/etc/nemara/announce.env
-ExecStart=/usr/bin/python3 /opt/nemara/announce_daemon.py
+EnvironmentFile=/etc/memoria/announce.env
+ExecStart=/usr/bin/python3 /opt/memoria/announce_daemon.py
 Restart=always
 RestartSec=10
 StandardOutput=journal

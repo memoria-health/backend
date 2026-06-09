@@ -21,13 +21,13 @@
 #   2. Back up netplan WiFi YAMLs to $BACKUP_DIR/netplan/
 #   3. Delete originals from both locations
 #   4. Remove the provisioning marker
-#   5. Enable nemara-wifi-recovery.timer (5-min auto-restore)
+#   5. Enable memoria-wifi-recovery.timer (5-min auto-restore)
 #   6. Reboot
 #
 # After reboot:
-#   - nemara-wifi-ap.service brings up the AP (or fails loudly)
+#   - memoria-wifi-ap.service brings up the AP (or fails loudly)
 #   - If a customer completes the captive portal within 5 min,
-#     /var/lib/nemara/provisioned is touched; recovery short-circuits.
+#     /var/lib/memoria/provisioned is touched; recovery short-circuits.
 #   - If 5 min passes with no marker, recovery restores both backups
 #     and reboots so we keep SSH access.
 #
@@ -40,7 +40,7 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-BACKUP_DIR="/var/lib/nemara/wifi-backup"
+BACKUP_DIR="/var/lib/memoria/wifi-backup"
 NM_BACKUP="$BACKUP_DIR/nm-system-connections"
 NETPLAN_BACKUP="$BACKUP_DIR/netplan"
 
@@ -60,14 +60,14 @@ shopt -s nullglob
 #     reports it as briefly active during teardown)
 # If the supervisor ticks in that window it re-touches the marker and
 # the next boot sees state="provisioned" -> no AP. Confirmed 2026-05-28
-# from /var/log/nemara-wipe.log + journal: supervisor.tick at 22:34:29
+# from /var/log/memoria-wipe.log + journal: supervisor.tick at 22:34:29
 # self-healed between marker-rm at 22:34:11 and reboot at 22:34:21.
 # Stopping the service here is sufficient because (a) systemctl stop is
 # not "failure" so on-failure restart wont fire, and (b) on next boot
 # the service auto-starts and sees marker-absent + no-active-wifi
 # (because by then the wipe + reboot has cleared everything) -> AP mode.
-echo ">>> Stopping nemara-wifi-ap.service so its self-heal tick cant race the wipe"
-systemctl stop nemara-wifi-ap.service 2>/dev/null || true
+echo ">>> Stopping memoria-wifi-ap.service so its self-heal tick cant race the wipe"
+systemctl stop memoria-wifi-ap.service 2>/dev/null || true
 
 echo ">>> Backing up NM keyfiles to $NM_BACKUP (skipping Memoria-Setup AP keyfile)"
 mkdir -p "$NM_BACKUP"
@@ -148,20 +148,20 @@ fi
 # in the failed run, and removing the boot-partition seeds already
 # achieves the goal (cloud-init re-reads them on next boot).
 echo ">>> Scheduling destructive wipe + reboot via systemd (will run in 2s, detached)"
-systemd-run --no-block --on-active=2s --unit=nemara-wipe-execute \
+systemd-run --no-block --on-active=2s --unit=memoria-wipe-execute \
   --property=TimeoutStartSec=infinity \
   --property=KillMode=process \
   bash -c '
 set -uxo pipefail
-exec >>/var/log/nemara-wipe.log 2>&1
-echo "=== nemara-wipe-execute starting at $(date) ==="
+exec >>/var/log/memoria-wipe.log 2>&1
+echo "=== memoria-wipe-execute starting at $(date) ==="
 
 # 1. CRITICAL: remove the provisioning marker FIRST. wifi_ap_provision.py
 #    reads this as is-this-Pi-paired; absence forces AP mode on next boot.
 #    If everything else fails after this point, the Pi still boots into
 #    AP mode and is recoverable via captive portal.
 echo "[1/4] removing provisioning marker"
-rm -fv /var/lib/nemara/provisioned || true
+rm -fv /var/lib/memoria/provisioned || true
 
 # 2. CRITICAL: remove the boot-partition seeds. Without this, cloud-init
 #    plus netplan would regenerate the wifi connection on the very next
@@ -192,7 +192,7 @@ fi
 #    isnt there. The supervisor itself loops indefinitely (30-min AP
 #    window -> 30s idle -> 30-min AP window -> forever) so a customer
 #    who steps away and comes back will still find the AP up. If you
-#    need the safety net for in-house dev, enable nemara-wifi-recovery
+#    need the safety net for in-house dev, enable memoria-wifi-recovery
 #    .timer manually after install.
 echo "[3/4] recovery timer disabled for customer-mode wipe"
 
