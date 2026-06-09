@@ -337,7 +337,7 @@ class Settings(BaseSettings):
     # replyTo is set to the caregiver's account email so hitting reply
     # in Gmail lands directly in their inbox.
     support_email_recipients: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: ["aryaman@menora-health.com", "sunny@menora-health.com"]
+        default_factory=lambda: ["sunny.work.2002@gmail.com"]
     )
     # Recipients for caregiver-submitted product feedback (Settings →
     # Send feedback in the iOS app). Comma-separated in env. replyTo is
