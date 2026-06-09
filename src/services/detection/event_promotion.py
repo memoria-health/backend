@@ -27,6 +27,7 @@ from src.db.camera import Camera
 from src.db.detector import Detector
 from src.db.event import Event
 from src.db.patient import Patient
+from src.services.detection import catalog
 
 _log = logging.getLogger(__name__)
 
@@ -56,15 +57,55 @@ def _event_title_for(detector: Detector) -> str:
     return f"Possible {name}"
 
 
-# (detection-field-name, confidence-field-name, min-confidence)
-# Falling back to confidence-field-name = None means no confidence
-# gate (any True fires).
-_PROMOTION_RULES: dict[str, tuple[str, str | None, float]] = {
-    "fall":       ("fall_detected",       "fall_confidence",       0.70),
-    "wandering":  ("wandering_detected",  "wandering_confidence",  0.60),
-    "agitation":  ("agitation_detected",  "agitation_confidence",  0.70),
-    "medication": ("medication_taken",    "medication_confidence", 0.60),
+# Per-built-in (detected-field, confidence-field, standard-base-threshold), from
+# the catalog (handles medication's `medication_taken`). Custom detectors aren't
+# in the catalog — they use the default base below. Either way the FINAL bar is
+# `base + sensitivity offset` (see `_effective_threshold`), so EVERY detector is
+# confidence-gated and the caregiver's sensitivity picker actually moves the bar.
+_PROMOTION_SPECS: dict[str, tuple[str, str, float]] = catalog.promotion_rules()
+
+# Custom detectors (not in the catalog) gate at this standard base; their
+# compiled schema emits `<id>_detected` / `<id>_confidence`.
+_DEFAULT_BASE_THRESHOLD = 0.70
+
+# Sensitivity moves the per-detector base. With every base at 0.70 this yields
+# low=0.85, standard=0.70, high=0.40 — matching the iOS picker ("low = fewer /
+# clearest", "high = more alerts"). Offsets (not fixed numbers) so it stays
+# correct if a base is ever tuned per-detector later.
+_SENSITIVITY_OFFSET: dict[str, float] = {
+    "low":      0.15,    # stricter → fewer alerts
+    "standard": 0.0,
+    "high":     -0.30,   # looser → more alerts
 }
+_THRESHOLD_FLOOR = 0.05
+_THRESHOLD_CEIL = 0.95
+
+
+def _effective_threshold(base: float, sensitivity: str) -> float:
+    """Final firing bar = base + sensitivity offset, clamped to a sane band.
+    An unknown sensitivity (impossible via the DB enum + the iOS picker, which
+    only offers low/standard/high) fails LOUD and falls back to standard rather
+    than silently inventing a bar."""
+    offset = _SENSITIVITY_OFFSET.get(sensitivity)
+    if offset is None:
+        _log.error(
+            "[event_promotion] unknown sensitivity %r — using standard", sensitivity,
+        )
+        offset = _SENSITIVITY_OFFSET["standard"]
+    return min(_THRESHOLD_CEIL, max(_THRESHOLD_FLOOR, base + offset))
+
+
+def _promotion_spec_for(det: Detector) -> tuple[str, str, float]:
+    """(detected-field, confidence-field, base-threshold) for a detector — from
+    the catalog for built-ins (so medication's `medication_taken` is respected),
+    else the standard `<id>_detected`/`<id>_confidence` naming + default base for
+    custom detectors."""
+    spec = _PROMOTION_SPECS.get(det.identifier or "")
+    if spec is not None:
+        return spec
+    ident = det.identifier
+    return f"{ident}_detected", f"{ident}_confidence", _DEFAULT_BASE_THRESHOLD
+
 
 _DEDUP_WINDOW = timedelta(seconds=30)
 
@@ -119,57 +160,43 @@ async def maybe_promote_analysis(
     fired: list[Event] = []
     skipped: list[str] = []
 
-    # Built-in rules.
-    for ident, (detected_field, conf_field, min_conf) in _PROMOTION_RULES.items():
-        if not _is_truthy_bool(detector_fields.get(detected_field)):
-            continue
-        if conf_field is not None:
-            conf = detector_fields.get(conf_field)
-            if not isinstance(conf, (int, float)) or isinstance(conf, bool):
-                continue
-            if float(conf) < min_conf:
-                continue
-        det = detectors_by_id.get(ident)
-        if det is None or not det.is_on:
-            continue
-
-        if await _within_dedup_window(
-            session, patient_id=patient_id, detector_id=det.id, now=occurred_at,
-        ):
-            skipped.append(ident)
-            continue
-
-        fired.append(
-            await _insert_event(
-                session,
-                detector=det,
-                patient=patient,
-                camera=cam,
-                occurred_at=occurred_at,
-                description=description,
-            )
-        )
-
-    # Custom detectors (anything not in _PROMOTION_RULES): fire on bare
-    # `<identifier>_detected: true` with no confidence gate.
+    # One unified firing path for EVERY detector (preset, library, custom):
+    # `<id>_detected` is true AND `<id>_confidence` clears the sensitivity-
+    # adjusted threshold. The caregiver's sensitivity picker sets the bar.
     for ident, det in detectors_by_id.items():
-        if ident in _PROMOTION_RULES:
-            continue
         if not det.is_on:
             continue
-        # Scheduled ("absence") detectors run per-tick (their
-        # `<id>_detected` lands in analyses, which the scheduler reads),
-        # but they must NOT fire reactively — they fire only via the
-        # ScheduledDetectorRunner at their deadline, on ABSENCE.
+        # Scheduled ("absence") detectors land their `<id>_detected` in analyses
+        # for the scheduler to read, but must NOT fire reactively here — they
+        # fire only via the ScheduledDetectorRunner at their deadline, on ABSENCE.
         if det.shape == "scheduled":
             continue
-        if not _is_truthy_bool(detector_fields.get(f"{ident}_detected")):
+
+        detected_field, conf_field, base = _promotion_spec_for(det)
+        if not _is_truthy_bool(detector_fields.get(detected_field)):
             continue
+
+        conf = detector_fields.get(conf_field)
+        if not isinstance(conf, (int, float)) or isinstance(conf, bool):
+            # Detected=true but no usable confidence. Don't silently fire AND
+            # don't silently drop — log loudly so a miswired detector surfaces.
+            _log.warning(
+                "[event_promotion] detector %s (%s) detected=true but confidence "
+                "field %r missing/invalid (%r) — NOT firing",
+                det.id, ident, conf_field, conf,
+            )
+            continue
+
+        threshold = _effective_threshold(base, det.sensitivity)
+        if float(conf) < threshold:
+            continue
+
         if await _within_dedup_window(
             session, patient_id=patient_id, detector_id=det.id, now=occurred_at,
         ):
             skipped.append(ident)
             continue
+
         fired.append(
             await _insert_event(
                 session,

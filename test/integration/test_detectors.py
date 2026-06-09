@@ -309,3 +309,164 @@ async def test_delete_patient_cascades_to_detectors(
     post = await client.get(f"/v1/patients/{pid}/detectors", headers=headers)
     assert post.status_code == 200
     assert post.json() == []
+
+
+# ─── Detection library (GET library + POST from-library) ─────────
+
+
+_MINOR_PATIENT_BODY = {
+    "full_name": "Tommy Toddler",
+    "preferred_name": "Tommy",
+    "relation": "parent",
+    "date_of_birth": "2021-03-01",  # a toddler -> child cohort
+}
+
+
+@pytest.mark.asyncio
+async def test_library_lists_adult_cohort_with_already_added(
+    client: AsyncClient, auth_user
+) -> None:
+    headers, pid = await _setup_patient(client, auth_user)  # adult (no DOB)
+    r = await client.get(f"/v1/patients/{pid}/detectors/library", headers=headers)
+    assert r.status_code == 200
+    entries = {e["key"]: e for e in r.json()}
+    # The 4 presets are auto-seeded -> already_added.
+    for key in ("fall", "agitation", "wandering", "medication"):
+        assert entries[key]["already_added"] is True, key
+    # Only `fall` is in the special "Recommended" group; the other presets are
+    # seeded-but-not-recommended (pre-checked, but listed under More detectors).
+    assert entries["fall"]["recommended"] is True
+    for key in ("agitation", "wandering", "medication"):
+        assert entries[key]["recommended"] is False, key
+    # Library + both-cohort entries present, not yet added.
+    for key in ("calling_for_help", "emergency", "fire_smoke", "possible_intruder"):
+        assert entries[key]["already_added"] is False, key
+        assert entries[key]["recommended"] is False, key
+    # Child-only entries are NOT offered to an adult patient.
+    for key in ("climbing", "distress", "child_crib_exit"):
+        assert key not in entries, key
+
+
+@pytest.mark.asyncio
+async def test_library_lists_child_cohort(client: AsyncClient, auth_user) -> None:
+    uid, email = auth_user
+    headers = {"Authorization": f"Bearer {mint_test_jwt(uid, email)}"}
+    await client.post("/v1/me", headers=headers, json={"display_name": "Test"})
+    pid = (
+        await client.post("/v1/patients", headers=headers, json=_MINOR_PATIENT_BODY)
+    ).json()["id"]
+    r = await client.get(f"/v1/patients/{pid}/detectors/library", headers=headers)
+    assert r.status_code == 200
+    entries = {e["key"]: e for e in r.json()}
+    for key in ("fall", "climbing", "distress"):
+        assert entries[key]["already_added"] is True, key
+    # Only `fall` is recommended; climbing/distress are seeded-not-recommended.
+    assert entries["fall"]["recommended"] is True
+    for key in ("climbing", "distress"):
+        assert entries[key]["recommended"] is False, key
+    assert "child_crib_exit" in entries
+    assert entries["child_crib_exit"]["already_added"] is False
+    # Adult-only entries not offered to a child patient.
+    for key in ("wandering", "agitation", "medication"):
+        assert key not in entries, key
+
+
+@pytest.mark.asyncio
+async def test_add_from_library_creates_detector(
+    client: AsyncClient, auth_user
+) -> None:
+    headers, pid = await _setup_patient(client, auth_user)
+    r = await client.post(
+        f"/v1/patients/{pid}/detectors/from-library",
+        headers=headers, json={"keys": ["emergency"]},
+    )
+    assert r.status_code == 201
+    created = r.json()
+    assert len(created) == 1
+    assert created[0]["identifier"] == "emergency"
+    assert created[0]["name"] == "General Emergency"
+    assert created[0]["source"] == "preset"
+    assert created[0]["is_on"] is True
+    # Now in the patient's list (5 total: 4 presets + emergency).
+    dets = (await client.get(f"/v1/patients/{pid}/detectors", headers=headers)).json()
+    assert len(dets) == 5
+    assert any(d["identifier"] == "emergency" for d in dets)
+
+
+@pytest.mark.asyncio
+async def test_add_from_library_skips_already_present(
+    client: AsyncClient, auth_user
+) -> None:
+    headers, pid = await _setup_patient(client, auth_user)
+    # 'fall' is already auto-seeded -> skipped, nothing created.
+    r = await client.post(
+        f"/v1/patients/{pid}/detectors/from-library",
+        headers=headers, json={"keys": ["fall"]},
+    )
+    assert r.status_code == 201
+    assert r.json() == []
+    dets = (await client.get(f"/v1/patients/{pid}/detectors", headers=headers)).json()
+    assert len(dets) == 4  # no duplicate 'fall'
+
+
+@pytest.mark.asyncio
+async def test_add_from_library_partial_skip(
+    client: AsyncClient, auth_user
+) -> None:
+    headers, pid = await _setup_patient(client, auth_user)
+    # 'fall' present (skip); 'choking' + 'meal_eaten' new (created).
+    r = await client.post(
+        f"/v1/patients/{pid}/detectors/from-library",
+        headers=headers, json={"keys": ["fall", "choking", "meal_eaten"]},
+    )
+    assert r.status_code == 201
+    assert {d["identifier"] for d in r.json()} == {"choking", "meal_eaten"}
+    dets = (await client.get(f"/v1/patients/{pid}/detectors", headers=headers)).json()
+    assert len(dets) == 6
+
+
+@pytest.mark.asyncio
+async def test_add_from_library_unknown_key_422(
+    client: AsyncClient, auth_user
+) -> None:
+    headers, pid = await _setup_patient(client, auth_user)
+    r = await client.post(
+        f"/v1/patients/{pid}/detectors/from-library",
+        headers=headers, json={"keys": ["totally_made_up"]},
+    )
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_add_from_library_empty_keys_422(
+    client: AsyncClient, auth_user
+) -> None:
+    headers, pid = await _setup_patient(client, auth_user)
+    r = await client.post(
+        f"/v1/patients/{pid}/detectors/from-library",
+        headers=headers, json={"keys": []},
+    )
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_library_endpoints_on_other_caregivers_patient_404(
+    client: AsyncClient, auth_user_factory
+) -> None:
+    a_uid, a_email = await auth_user_factory()
+    b_uid, b_email = await auth_user_factory()
+    h_a = {"Authorization": f"Bearer {mint_test_jwt(a_uid, a_email)}"}
+    h_b = {"Authorization": f"Bearer {mint_test_jwt(b_uid, b_email)}"}
+    await client.post("/v1/me", headers=h_a, json={"display_name": "A"})
+    await client.post("/v1/me", headers=h_b, json={"display_name": "B"})
+    pid = (await client.post("/v1/patients", headers=h_a, json=_PATIENT_BODY)).json()["id"]
+
+    assert (
+        await client.get(f"/v1/patients/{pid}/detectors/library", headers=h_b)
+    ).status_code == 404
+    assert (
+        await client.post(
+            f"/v1/patients/{pid}/detectors/from-library",
+            headers=h_b, json={"keys": ["emergency"]},
+        )
+    ).status_code == 404

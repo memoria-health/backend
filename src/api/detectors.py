@@ -11,7 +11,7 @@ attempts.
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, HTTPException, status
@@ -22,7 +22,9 @@ from src.db.detector import Detector
 from src.db.session import get_sessionmaker
 from src.repos import camera_detector_repo, detector_repo, patient_repo
 from src.schemas.detector import (
+    AddFromLibraryRequest,
     CreateDetectorRequest,
+    DetectorLibraryEntry,
     DetectorResponse,
     DetectorShape,
     InferDetectorRequest,
@@ -30,6 +32,7 @@ from src.schemas.detector import (
     ScheduleConfig,
     UpdateDetectorRequest,
 )
+from src.services.detection import catalog
 from src.services.detector_compiler import (
     compile_custom_detector,
     infer_detector_config,
@@ -56,6 +59,159 @@ async def list_detectors(
 ) -> list[DetectorResponse]:
     rows = await detector_repo.list_for_patient(session, patient_id, caregiver_id=auth.id)
     return [_to_response(d) for d in rows]
+
+
+@router.get(
+    "/patients/{patient_id}/detectors/library",
+    response_model=list[DetectorLibraryEntry],
+)
+async def list_detector_library(
+    patient_id: UUID,
+    auth: CaregiverAuth,
+    session: SessionDep,
+) -> list[DetectorLibraryEntry]:
+    """The detection library for THIS patient's cohort (child if under 18, else
+    adult — plus the `both` entries), in catalog order (recommended first).
+
+    `already_added` is true for entries the patient already has by identifier,
+    so the picker can pre-check / disable them. Pure catalog read + one detector
+    list; no LLM, no writes.
+    """
+    patient = await patient_repo.find_by_id(session, patient_id, caregiver_id=auth.id)
+    if patient is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="patient_not_found",
+        )
+    existing = {
+        d.identifier
+        for d in await detector_repo.list_for_patient(
+            session, patient_id, caregiver_id=auth.id,
+        )
+        if d.identifier
+    }
+    minor = catalog.is_minor(patient.date_of_birth)
+    entries = catalog.for_cohort(minor)
+    log.info(
+        "[detectors] library patient=%s minor=%s -> %d entries (%d already added)",
+        patient_id, minor, len(entries),
+        sum(1 for e in entries if e.key in existing),
+    )
+    return [
+        DetectorLibraryEntry(
+            key=e.key,
+            name=e.name,
+            icon_name=e.icon_name,
+            description=e.description,
+            category=e.category,  # str -> DetectorCategory (pydantic coerces)
+            cohort=e.cohort,
+            recommended=e.recommended,
+            already_added=e.key in existing,
+        )
+        for e in entries
+    ]
+
+
+@router.post(
+    "/patients/{patient_id}/detectors/from-library",
+    response_model=list[DetectorResponse],
+    status_code=status.HTTP_201_CREATED,
+)
+async def add_detectors_from_library(
+    patient_id: UUID,
+    auth: CaregiverAuth,
+    body: AddFromLibraryRequest,
+    session: SessionDep,
+) -> list[DetectorResponse]:
+    """Instantiate one or more catalog detectors for the patient.
+
+    Unlike custom detectors there is **NO compile step** — catalog entries
+    already carry the runtime contract (identifier / prompt_fragment /
+    schema_json), so the rows are immediately usable by the pipeline. They are
+    `source="preset"`, so they auto-attach to newly-paired cameras exactly like
+    the auto-seeded presets.
+
+    - Unknown keys → 422 (fail loud; the client should only send catalog keys).
+    - Keys the patient already has (by identifier) → skipped (idempotent).
+    - Each new detector is auto-assigned to the patient's cameras by its
+      `where_scope`. No-op if the patient has no cameras yet (onboarding); the
+      detector attaches when the first camera is paired.
+    """
+    patient = await patient_repo.find_by_id(session, patient_id, caregiver_id=auth.id)
+    if patient is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="patient_not_found",
+        )
+
+    requested = list(dict.fromkeys(body.keys))  # dedupe, preserve order
+    unknown = [k for k in requested if catalog.by_key(k) is None]
+    if unknown:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"unknown_detector_keys:{','.join(unknown)}",
+        )
+
+    existing = {
+        d.identifier
+        for d in await detector_repo.list_for_patient(
+            session, patient_id, caregiver_id=auth.id,
+        )
+        if d.identifier
+    }
+
+    now = datetime.now(timezone.utc)
+    created: list[Detector] = []
+    skipped: list[str] = []
+    for i, key in enumerate(requested):
+        if key in existing:
+            skipped.append(key)
+            continue
+        e = catalog.by_key(key)
+        if e is None:  # unreachable — guarded above; defensive, fail loud
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"unknown_detector_key:{key}",
+            )
+        ts = now + timedelta(microseconds=i)
+        det = Detector(
+            id=uuid4(),
+            patient_id=patient_id,
+            name=e.name,
+            icon_name=e.icon_name,
+            description=e.description,
+            category=e.category,
+            source="preset",
+            shape=e.shape,
+            where_scope=e.where_scope,
+            when_scope=e.when_scope,
+            sensitivity="standard",
+            is_on=True,
+            created_at=ts,
+            updated_at=ts,
+            custom_prompt=None,
+            identifier=e.key,
+            prompt_fragment=e.prompt_fragment,
+            schema_json=e.schema_json,
+            always_on=False,
+            is_builtin=True,
+            schedule_config=None,
+        )
+        await detector_repo.insert(session, det)
+        room = None if e.where_scope == "ALL ROOMS" else e.where_scope
+        assigned = await camera_detector_repo.assign_detector_to_cameras(
+            session, det.id, patient_id, room=room,
+        )
+        log.info(
+            "[detectors] from-library add key=%s detector=%s patient=%s assigned_cameras=%d",
+            e.key, det.id, patient_id, assigned,
+        )
+        created.append(det)
+
+    await session.commit()
+    log.info(
+        "[detectors] from-library patient=%s created=%d skipped_already_present=%s",
+        patient_id, len(created), skipped,
+    )
+    return [_to_response(d) for d in created]
 
 
 @router.post("/detectors/infer", response_model=InferDetectorResponse)
