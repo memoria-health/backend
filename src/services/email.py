@@ -217,6 +217,7 @@ async def send_support_email(
     body_html = _support_html(
         caregiver_name=caregiver.display_name,
         caregiver_email=caregiver.email,
+        caregiver_phone=caregiver.phone,
         message=message,
     )
     await _send(
@@ -232,13 +233,29 @@ async def send_support_email(
     return "Sent. We'll reply to your account email."
 
 
-def _support_html(*, caregiver_name: str, caregiver_email: str, message: str) -> str:
+def _support_html(
+    *,
+    caregiver_name: str,
+    caregiver_email: str,
+    caregiver_phone: str | None,
+    message: str,
+) -> str:
     safe = message.replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
+    # Tap-to-text line: on iOS Mail the sms: link opens Messages addressed to
+    # the caregiver, so a founder can reply to their phone in one tap.
+    phone_line = ""
+    if caregiver_phone:
+        phone_line = (
+            "<p style=\"margin:0 0 12px;font-size:15px\">"
+            f"\U0001F4F1 Text back: <a href=\"sms:{caregiver_phone}\">{caregiver_phone}</a>"
+            "</p>"
+        )
     return (
         "<div style=\"font-family:-apple-system,Segoe UI,sans-serif;color:#1c1a17\">"
         f"<p style=\"margin:0 0 12px;color:#6b6357;font-size:13px\">"
         f"From {caregiver_name} &lt;{caregiver_email}&gt; via the Memoria iOS app."
         "</p>"
+        f"{phone_line}"
         f"<div style=\"margin:0;font-size:15px;line-height:1.5\">{safe}</div>"
         "</div>"
     )

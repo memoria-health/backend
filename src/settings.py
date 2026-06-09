@@ -352,25 +352,9 @@ class Settings(BaseSettings):
     # the send (the feedback row is still persisted regardless).
     feedback_email_from: str = Field(default="feedback@memoria-health.com")
 
-    # ── Support SMS (Twilio) ────────────────────────────────────
-    # When any of the three Twilio values is empty the SMS sender
-    # no-ops (logs a warning) so dev + tests run without the
-    # integration — the Contact Support email still sends regardless.
-    # `twilio_from_number` is the Twilio-owned sender number (must be
-    # bought in Twilio; a personal cell cannot send through Twilio);
-    # `support_sms_recipients` is the founder cell(s) that receive the
-    # inbound help text. Comma-separated in env.
-    twilio_account_sid: str = Field(default="")
-    twilio_auth_token: str = Field(default="")
-    twilio_from_number: str = Field(default="")
-    support_sms_recipients: Annotated[list[str], NoDecode] = Field(
-        default_factory=list
-    )
-
     @field_validator(
         "support_email_recipients",
         "feedback_email_recipients",
-        "support_sms_recipients",
         mode="before",
     )
     @classmethod
