@@ -2,7 +2,7 @@
 embeddings via boxmot.
 
 Verbatim port of `nemara-reid-experiment/src/reid/pipeline/tracker.py`.
-Track IDs are stable WITHIN a session (== one 15-second tick). They
+Track IDs are stable WITHIN a session (== one per-tick clip, ~11s). They
 are NOT cross-tick or cross-session identifiers — that role belongs
 to face recognition (`embeddings.embed_image_bytes`).
 

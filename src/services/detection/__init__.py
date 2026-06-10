@@ -19,7 +19,7 @@ Module layout:
     providers/types.py   — ProviderResult / Provider protocol
     providers/_parse.py  — shared JSON validation + clamping
     providers/gemini.py  — Gemini path (MP4 inline)
-    providers/openai.py  — OpenAI fallback (extracted frames @ 5fps)
+    providers/openai.py  — OpenAI fallback (extracted frames, 4fps default)
     frame_extraction.py  — ffmpeg subprocess for OpenAI frames
     state_machine.py     — open/closed transitions per camera
     analyses_store.py    — INSERT into `analyses`

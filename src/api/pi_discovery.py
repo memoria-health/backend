@@ -4,12 +4,12 @@
   - GET  /v1/cameras/discovered        (caregiver-authenticated)
 
 The announce endpoint is intentionally unauthenticated because the
-Pi device has no credentials before pairing. BLE-based provisioning
-(scripts/pi/ble_provision.py) is the trust anchor in the customer
-flow: physical proximity to write WiFi credentials. v2 will add a
-per-device secret negotiated over BLE that the announcement
-carries, so the backend can attribute discoveries to specific
-caregivers.
+Pi device has no credentials before pairing. The WiFi captive-portal
+provisioning flow (scripts/pi/wifi_ap_provision.py) is the trust
+anchor in the customer flow: physical proximity to write WiFi
+credentials. v2 will add a per-device secret negotiated at setup
+that the announcement carries, so the backend can attribute
+discoveries to specific caregivers.
 
 The discovered endpoint is caregiver-authenticated and filters to
 recently-seen unclaimed Pis so stale devices fall off the picker.

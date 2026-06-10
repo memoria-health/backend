@@ -88,8 +88,9 @@ async def annotate_jpeg_async(
     bbox: tuple[float, float, float, float],
 ) -> bytes:
     """Run the cv2 work in a thread so we don't block the event loop.
-    OpenAI/Gemini providers process ~75 frames per tick at most, and
-    each draw is ~5ms, so this stays well inside the tick budget.
+    OpenAI/Gemini providers process ~44 frames per tick at the
+    defaults (11s window × 4fps), and each draw is ~5ms, so this
+    stays well inside the tick budget.
     """
     return await asyncio.to_thread(annotate_jpeg, jpeg_bytes, bbox)
 

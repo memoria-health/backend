@@ -17,8 +17,8 @@ Design notes:
 - **Time-based trim.** Every push drops frames older than
   `window_seconds`, keeping the buffer at most
   ``window_seconds * target_fps + 1`` entries.
-- **I420 storage cost.** A 720p I420 frame is ~1.4 MB; at 5 fps × 15 s
-  that's ~105 MB per camera in steady state. Acceptable for v0 (one
+- **I420 storage cost.** A 720p I420 frame is ~1.4 MB; at the default
+  4 fps × 11 s that's ~62 MB per camera in steady state. Acceptable for v0 (one
   or two cameras per patient on a backend with modest RAM); revisit if
   load tests show pressure (downsample to 480p on push, or store JPEGs).
 """
@@ -54,7 +54,7 @@ class FrameBuffer:
     """Bounded ring of recent I420 frames.
 
     Two knobs:
-      - `window_seconds`: how much history to keep (e.g. 15s).
+      - `window_seconds`: how much history to keep (e.g. 11s).
       - `target_fps`: sampling rate after publish-side downsample.
 
     Capacity is ``window_seconds * target_fps + 1`` frames (the +1

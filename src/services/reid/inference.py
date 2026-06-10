@@ -2,7 +2,7 @@
 periodic face check per track → state machine → locked PATIENT bbox.
 
 Verbatim port of `nemara-reid-experiment/src/reid/pipeline/identifier.py`
-adapted for the production tick budget (one 15-second clip per tick,
+adapted for the production tick budget (one ~11s clip per tick,
 state is intentionally per-tick).
 
 Pipeline per tick:

@@ -1,7 +1,7 @@
 """OpenAI fallback provider.
 
 Verbatim port of `nemara-temp-dashboard/lib/providers/openai.ts`. Uses
-ffmpeg-extracted frames @ 5fps (env `OPENAI_FRAMES_FPS`), sends each
+ffmpeg-extracted frames (4fps default, env `OPENAI_FRAMES_FPS`), sends each
 frame as a base64 image_url part with `detail: 'low'`, requests
 `response_format={type: 'json_schema', strict: true}`.
 

@@ -10,9 +10,9 @@ asks LiveKit for one shape and pushes that shape only. Storing those
 two as buffer-level fields keeps every chunk identically shaped so the
 tick body can pass the concatenated bytes straight to ffmpeg.
 
-Storage cost: 16 kHz x 2 bytes/sample x 1 channel = 32 kB/s. A 15s
-window is ~480 kB per camera — a rounding error vs the I420 frame
-buffer's ~100 MB.
+Storage cost: 16 kHz x 2 bytes/sample x 1 channel = 32 kB/s. The
+default 11s window is ~350 kB per camera — a rounding error vs the
+I420 frame buffer's ~60 MB.
 """
 
 from __future__ import annotations

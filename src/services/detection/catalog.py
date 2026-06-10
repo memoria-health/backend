@@ -16,7 +16,7 @@ preset behaviour (auto-attach to newly-paired cameras via
 event titles) with no new branching.
 
 The 6 original presets (fall / agitation / wandering / medication / climbing /
-distress) moved here VERBATIM from `onboarding.py`. The 14 library detectors are
+distress) moved here VERBATIM from `onboarding.py`. The 16 library detectors are
 new; their prompts follow the same `<id>_detected / _confidence / _reasoning`
 contract and need the same field tuning as any prompt.
 

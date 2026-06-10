@@ -285,8 +285,9 @@ async def provision_pi_camera(
     as iPhone cameras so the detection pipeline (RoomWorker,
     CameraIngest) treats Pi cameras identically once they appear
     in the room. The row appears with `online=false` and
-    `state='open'`. The pi_ingest worker flips `online=true` after
-    its first successful frame pull.
+    `state='open'`. Once the Pi starts pushing frames and the relay
+    publishes into LiveKit, the room reconciler flips `online=true`
+    (two-signal rule: REST participant present + fresh frames).
     """
     # Caregiver must own the patient. RLS would also catch this but
     # an explicit 404 is the right wire shape for "this patient isn't
