@@ -1,10 +1,10 @@
 [Unit]
-Description=Nemara camera WiFi AP-mode provisioning supervisor
+Description=Memoria camera WiFi AP-mode provisioning supervisor
 # Run AFTER NetworkManager is up, since we use nmcli to bring the
 # AP up and down. The daemon is a long-running supervisor (post
 # bugfix): it periodically re-checks the provisioned state and
 # brings the AP back up whenever the marker file disappears, so a
-# customer-initiated factory reset (rm /var/lib/nemara/provisioned)
+# customer-initiated factory reset (rm /var/lib/memoria/provisioned)
 # rearms the AP within ~30 s without a reboot.
 After=NetworkManager.service dbus.service
 Wants=NetworkManager.service
@@ -13,8 +13,8 @@ Wants=NetworkManager.service
 Type=simple
 # Must run as root to manage WiFi via nmcli + bind to port 80.
 User=root
-EnvironmentFile=-/etc/nemara/wifi-ap.env
-ExecStart=/usr/bin/python3 /opt/nemara/wifi_ap_provision.py
+EnvironmentFile=-/etc/memoria/wifi-ap.env
+ExecStart=/usr/bin/python3 /opt/memoria/wifi_ap_provision.py
 # Always restart: the supervisor is meant to run for the lifetime of
 # the device. Even on clean exit (which only happens via SIGINT in
 # practice now that the loop is permanent), systemd brings it back

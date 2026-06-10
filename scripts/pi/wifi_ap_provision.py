@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Nemara camera WiFi-AP provisioning daemon. Runs on the Pi.
+"""Memoria camera WiFi-AP provisioning daemon. Runs on the Pi.
 
 When the Pi has no saved WiFi connection, this daemon brings up an
 open WiFi access point (named "Memoria-Setup-XXXXXX" using the last
@@ -33,16 +33,16 @@ a single CLI. Pi OS Bookworm + Trixie ship with NetworkManager
 by default.
 
 Environment configuration (loaded by systemd from
-/etc/nemara/wifi-ap.env):
+/etc/memoria/wifi-ap.env):
 
-  NEMARA_WIFI_IFACE        optional, default "wlan0"
-  NEMARA_AP_LABEL_PREFIX   optional, default "Memoria-Setup"
+  MEMORIA_WIFI_IFACE        optional, default "wlan0"
+  MEMORIA_AP_LABEL_PREFIX   optional, default "Memoria-Setup"
                            (full SSID = "<prefix>-<last 6 of MAC>")
-  NEMARA_AP_CHANNEL        optional, default "6" (2.4 GHz)
-  NEMARA_AP_BIND_ADDR      optional, default "192.168.4.1"
-  NEMARA_AP_HTTP_PORT      optional, default "80"
-  NEMARA_PROVISIONED_FILE  optional, default "/var/lib/nemara/provisioned"
-  NEMARA_LOG_LEVEL         optional, default "INFO"
+  MEMORIA_AP_CHANNEL        optional, default "6" (2.4 GHz)
+  MEMORIA_AP_BIND_ADDR      optional, default "192.168.4.1"
+  MEMORIA_AP_HTTP_PORT      optional, default "80"
+  MEMORIA_PROVISIONED_FILE  optional, default "/var/lib/memoria/provisioned"
+  MEMORIA_LOG_LEVEL         optional, default "INFO"
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs
 
-log = logging.getLogger("nemara.wifi_ap")
+log = logging.getLogger("memoria.wifi_ap")
 
 # How long the daemon stays up before giving up on a customer. Long
 # enough that someone can take their time finding the WiFi network
@@ -90,19 +90,19 @@ class Config:
 
 
 def load_config() -> Config:
-    iface = os.environ.get("NEMARA_WIFI_IFACE", "wlan0")
+    iface = os.environ.get("MEMORIA_WIFI_IFACE", "wlan0")
     mac = _read_mac(iface)
     suffix = mac.replace(":", "").upper()[-6:]
-    prefix = os.environ.get("NEMARA_AP_LABEL_PREFIX", "Memoria-Setup")
+    prefix = os.environ.get("MEMORIA_AP_LABEL_PREFIX", "Memoria-Setup")
     return Config(
         wifi_iface=iface,
         ap_ssid=f"{prefix}-{suffix}",
-        ap_channel=os.environ.get("NEMARA_AP_CHANNEL", "6"),
-        bind_addr=os.environ.get("NEMARA_AP_BIND_ADDR", "192.168.4.1"),
-        http_port=int(os.environ.get("NEMARA_AP_HTTP_PORT", "80")),
+        ap_channel=os.environ.get("MEMORIA_AP_CHANNEL", "6"),
+        bind_addr=os.environ.get("MEMORIA_AP_BIND_ADDR", "192.168.4.1"),
+        http_port=int(os.environ.get("MEMORIA_AP_HTTP_PORT", "80")),
         marker_path=Path(
             os.environ.get(
-                "NEMARA_PROVISIONED_FILE", "/var/lib/nemara/provisioned"
+                "MEMORIA_PROVISIONED_FILE", "/var/lib/memoria/provisioned"
             )
         ),
     )
@@ -172,28 +172,41 @@ def already_provisioned(marker: Path) -> bool:
     return False
 
 
-def scan_nearby_networks(iface: str) -> list[str]:
-    """One-shot scan before we enter AP mode. nmcli prints the SSIDs
-    of all visible WiFi networks; we de-duplicate and return them.
-    Returning an empty list is fine, the customer can still type the
-    SSID manually.
+# Number of back-to-back scan passes before AP mode. A single nmcli
+# rescan routinely misses a weak/distant 2.4 GHz beacon (the Zero 2 W is
+# 2.4 GHz-only), so we run a few and union the results — the home
+# network is far more likely to appear on the first portal load. We
+# can NOT re-scan once the AP is up (single radio, busy hosting the AP),
+# which is exactly why we front-load it here and also allow manual SSID
+# entry as the guaranteed fallback.
+_SCAN_PASSES: int = 3
+
+
+def scan_nearby_networks(iface: str, passes: int = _SCAN_PASSES) -> list[str]:
+    """Scan `passes` times before we enter AP mode and union the SSIDs.
+    A single scan often misses a weak beacon; multiple passes give the
+    radio several windows to hear it. De-duplicated, first-seen order
+    preserved. An empty list is fine — the customer can still type the
+    SSID manually (hidden networks, which broadcast an empty SSID,
+    always require that).
     """
-    try:
-        out = subprocess.run(
-            [
-                "nmcli", "-t", "-f", "SSID", "device", "wifi", "list",
-                "ifname", iface, "--rescan", "yes",
-            ],
-            check=True, capture_output=True, text=True, timeout=20,
-        ).stdout
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
-        log.warning("Network scan failed: %s", exc)
-        return []
     seen: list[str] = []
-    for line in out.splitlines():
-        ssid = line.strip()
-        if ssid and ssid not in seen:
-            seen.append(ssid)
+    for i in range(max(1, passes)):
+        try:
+            out = subprocess.run(
+                [
+                    "nmcli", "-t", "-f", "SSID", "device", "wifi", "list",
+                    "ifname", iface, "--rescan", "yes",
+                ],
+                check=True, capture_output=True, text=True, timeout=20,
+            ).stdout
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
+            log.warning("Network scan pass %d/%d failed: %s", i + 1, passes, exc)
+            continue
+        for line in out.splitlines():
+            ssid = line.strip()
+            if ssid and ssid not in seen:
+                seen.append(ssid)
     return seen
 
 
@@ -365,6 +378,85 @@ def stop_ap(cfg: Config) -> None:
     )
 
 
+# How long to wait for a real connection after `nmcli connection up`
+# returns 0. `up` exiting 0 is NOT proof of a working join — it can exit
+# 0 while the WiFi association never actually completed (the false-
+# success that stranded a Pi on 2026-06-06: wrong password, yet the
+# portal reported connected and tore down the AP). We poll the device
+# for a '100 (connected)' state + an IPv4 lease up to this long before
+# declaring the join failed. DHCP after association is usually a few
+# seconds; 20s is generous headroom on a slow Zero 2 W.
+_CONNECT_VERIFY_TIMEOUT_S: float = 20.0
+
+
+def _parse_device_connectivity(nmcli_device_show: str) -> tuple[bool, str | None]:
+    """Parse `nmcli -t -f GENERAL.STATE,IP4.ADDRESS device show <iface>`
+    into (connected, ipv4).
+
+    `connected` is True only when the device reports GENERAL.STATE
+    '100 (connected)' AND an IP4.ADDRESS is present. A wrong WiFi
+    password leaves the device short of that with no DHCP lease, which
+    is exactly what distinguishes a real join from nmcli's optimistic
+    `connection up` exit code. Pure (no I/O) so it is unit-testable
+    without a radio.
+    """
+    connected = False
+    ipv4: str | None = None
+    for raw in nmcli_device_show.splitlines():
+        line = raw.strip()
+        if line.startswith("GENERAL.STATE:"):
+            connected = "100 (connected)" in line
+        elif line.startswith("IP4.ADDRESS"):
+            # Terse form: "IP4.ADDRESS[1]:192.168.1.50/24"
+            _, _, val = line.partition(":")
+            val = val.strip()
+            if val:
+                ipv4 = val
+    return (connected and ipv4 is not None), ipv4
+
+
+def _verify_connectivity(
+    iface: str, timeout_s: float,
+) -> tuple[bool, str | None]:
+    """Poll the device until it reports a real connection (state
+    '100 (connected)' + an IPv4 lease) or `timeout_s` elapses. This is
+    the load-bearing check that turns nmcli's optimistic `connection up`
+    exit code into a real go/no-go.
+    """
+    deadline = time.monotonic() + timeout_s
+    last_ip: str | None = None
+    while True:
+        try:
+            out = subprocess.run(
+                ["nmcli", "-t", "-f", "GENERAL.STATE,IP4.ADDRESS",
+                 "device", "show", iface],
+                capture_output=True, text=True, timeout=10,
+            ).stdout
+        except (subprocess.SubprocessError, OSError) as exc:
+            log.warning("connectivity check failed: %s", exc)
+            out = ""
+        ok, ip = _parse_device_connectivity(out)
+        if ip:
+            last_ip = ip
+        if ok:
+            return True, ip
+        if time.monotonic() >= deadline:
+            return False, last_ip
+        time.sleep(1.0)
+
+
+def _delete_connection(name: str) -> None:
+    """Best-effort delete of an NM connection profile by name. Scrubs a
+    profile whose join failed so NM does not keep autoconnecting to a
+    dead network — a lingering wrong-password profile (autoconnect=yes)
+    is part of what stranded the Pi.
+    """
+    subprocess.run(
+        ["nmcli", "connection", "delete", name],
+        capture_output=True, check=False,
+    )
+
+
 def join_wifi(cfg: Config, ssid: str, psk: str) -> tuple[bool, str]:
     """Attempt to connect to the customer's home WiFi. Returns
     (success, message). On success NetworkManager saves the
@@ -423,12 +515,36 @@ def join_wifi(cfg: Config, ssid: str, psk: str) -> tuple[bool, str]:
             ["nmcli", "connection", "up", ssid, "ifname", cfg.wifi_iface],
             capture_output=True, text=True, timeout=_NMCLI_UP_TIMEOUT_S,
         )
-        if up_proc.returncode == 0:
-            return True, up_proc.stdout.strip()
-        msg = (up_proc.stderr or up_proc.stdout).strip()
-        log.warning("nmcli connection up failed: %s", msg)
-        return False, msg
+        if up_proc.returncode != 0:
+            msg = (up_proc.stderr or up_proc.stdout).strip()
+            log.warning("nmcli connection up failed: %s", msg)
+            _delete_connection(ssid)
+            return False, msg or "Couldn't connect — check the password."
+        # `nmcli connection up` exiting 0 is NOT proof of a working join
+        # — it can return 0 while the association never completed (the
+        # false-success that stranded a Pi on 2026-06-06). Require a real
+        # connection (device '100 (connected)' + an IPv4 lease) before
+        # reporting success. A wrong password never yields a lease, so
+        # this surfaces the error and lets the supervisor restart the AP
+        # for a retry instead of marking the Pi provisioned on a dead
+        # network and tearing the AP down for good.
+        connected, ip = _verify_connectivity(
+            cfg.wifi_iface, _CONNECT_VERIFY_TIMEOUT_S,
+        )
+        if not connected:
+            log.warning(
+                "join ssid=%r: nmcli up rc=0 but no lease; treating as failure",
+                ssid,
+            )
+            _delete_connection(ssid)
+            return False, (
+                "Connected to the network but couldn't get an address — "
+                "double-check the WiFi password and try again."
+            )
+        log.info("joined home WiFi ssid=%r ip=%s", ssid, ip)
+        return True, f"connected ip={ip}"
     except subprocess.TimeoutExpired:
+        _delete_connection(ssid)
         return False, "Connection attempt timed out."
 
 
@@ -442,6 +558,12 @@ def mark_provisioned(marker: Path) -> None:
 
 _PROVISION_RESULT: dict[str, str] = {}  # mutated by the handler
 _DONE = threading.Event()
+# Set by `_join_then_signal` when a join attempt FAILS, so `serve()`
+# brings the AP back immediately (with the error shown) instead of
+# leaving the device dark until `_SETUP_TIMEOUT_S`. Without this, a wrong
+# password tore the AP down and the device went unreachable for up to 30
+# minutes — the 2026-06-06 wizard-test failure.
+_RETRY = threading.Event()
 
 
 _SETUP_PAGE_TEMPLATE = """<!doctype html>
@@ -449,7 +571,7 @@ _SETUP_PAGE_TEMPLATE = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="theme-color" content="#EFE6DA">
-<title>Nemara camera setup</title>
+<title>Memoria camera setup</title>
 <style>
   :root {{
     --paper: #EFE6DA;
@@ -571,7 +693,7 @@ _SETUP_PAGE_TEMPLATE = """<!doctype html>
 </style>
 </head><body>
 <main class="card">
-  <p class="eyebrow">Nemara &middot; Camera setup</p>
+  <p class="eyebrow">Memoria &middot; Camera setup</p>
   <h1>Set up your camera</h1>
   <p class="lede">Pick your home WiFi and enter the password. Your camera
   will join your network and this setup network will disappear in about
@@ -677,7 +799,7 @@ _SUCCESS_PAGE_TEMPLATE = """<!doctype html>
   <p class="eyebrow" id="eyebrow">Connecting</p>
   <h1 id="heading">Connecting your camera</h1>
   <p id="body">Your camera is joining <span class="ssid">{ssid}</span>.
-  It will appear in the Nemara app in about a minute.</p>
+  It will appear in the Memoria app in about a minute.</p>
   <p class="hint" id="hint">This tab will close automatically.</p>
 </main>
 <script>
@@ -707,7 +829,7 @@ _SUCCESS_PAGE_TEMPLATE = """<!doctype html>
       var h = document.getElementById('heading');
       if (h) h.textContent = 'Your camera is connected';
       var b = document.getElementById('body');
-      if (b) b.innerHTML = 'Open the Nemara app to add this camera. It will appear under <b>Add a camera</b> within about a minute.';
+      if (b) b.innerHTML = 'Open the Memoria app to add this camera. It will appear under <b>Add a camera</b> within about a minute.';
       var hint = document.getElementById('hint');
       if (hint) hint.textContent = 'You can close this tab.';
       // Try to close the tab (works only when opened via window.open
@@ -761,7 +883,7 @@ def _render_success_page(ssid: str) -> bytes:
 # unconditionally cleared after a successful provision. Living on the
 # durable /var partition means a power cycle between failure and
 # the user's retry doesn't lose the message.
-_LAST_JOIN_ERROR_FILE: Path = Path("/var/lib/nemara/last_join_error")
+_LAST_JOIN_ERROR_FILE: Path = Path("/var/lib/memoria/last_join_error")
 
 
 def _persist_join_error(message: str) -> None:
@@ -832,22 +954,39 @@ def _join_then_signal(cfg: "Config", ssid: str, psk: str) -> None:
     else:
         log.error("background join failed for ssid=%r: %s", ssid, msg)
         _persist_join_error(f"Couldn't join {ssid!r}: {msg}")
+        # Bring the AP back up NOW (with this error shown) so the
+        # customer can retry — don't let the device sit dark until
+        # _SETUP_TIMEOUT_S (the 30-minute blackout).
+        _RETRY.set()
 
 
 def _render_setup_page(networks: list[str], error: str | None = None) -> bytes:
+    # A real <select> of the scanned networks (readable, tap-to-pick),
+    # plus a SEPARATE optional free-text box for a network the scan
+    # missed or a hidden SSID. The handler prefers the typed value when
+    # present (see _pick_ssid), else the dropdown. We use a <select>
+    # rather than a <datalist> because iOS renders datalist as cramped
+    # keyboard autocomplete chips (~3 visible, unreadable); the text box
+    # keeps a missed/hidden SSID from ever being unselectable (the
+    # 2026-06-06 strand).
     if networks:
-        opts = "\n".join(
+        opts = "".join(
             f'<option value="{_html_escape(s)}">{_html_escape(s)}</option>'
             for s in networks
         )
-        ssid_input = (
-            f'<select id="ssid" name="ssid" required>{opts}</select>'
+        select = (
+            '<select id="ssid" name="ssid">'
+            '<option value="">Select your network</option>'
+            f"{opts}</select>"
         )
     else:
-        ssid_input = (
-            '<input type="text" id="ssid" name="ssid" required '
-            f'maxlength="{_MAX_SSID_LEN}" autocomplete="off">'
-        )
+        select = ""
+    manual = (
+        '<input type="text" id="ssid_manual" name="ssid_manual" '
+        f'maxlength="{_MAX_SSID_LEN}" autocomplete="off" '
+        'placeholder="Or type your network name" style="margin-top:10px">'
+    )
+    ssid_input = select + manual
     error_block = (
         f'<div class="err">{_html_escape(error)}</div>' if error else ""
     )
@@ -864,6 +1003,15 @@ def _html_escape(s: str) -> str:
         .replace(">", "&gt;")
         .replace('"', "&quot;")
     )
+
+
+def _pick_ssid(dropdown: str | None, manual: str | None) -> str:
+    """Resolve the chosen SSID from the captive-portal form. A typed
+    manual entry wins over the dropdown selection (the dropdown's blank
+    placeholder is ''), so a network the scan missed or a hidden SSID is
+    always reachable.
+    """
+    return (manual or "").strip() or (dropdown or "").strip()
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -912,11 +1060,13 @@ class _Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length).decode("utf-8", errors="replace")
         form = parse_qs(raw)
-        ssid = (form.get("ssid", [""])[0] or "").strip()
+        ssid = _pick_ssid(
+            form.get("ssid", [""])[0], form.get("ssid_manual", [""])[0],
+        )
         psk = (form.get("psk", [""])[0] or "").strip()
 
         if not ssid or len(ssid) > _MAX_SSID_LEN:
-            return self._reshow_with_error("Please pick a network.")
+            return self._reshow_with_error("Please pick or type your network.")
         if len(psk) < _MIN_PSK_LEN or len(psk) > _MAX_PSK_LEN:
             return self._reshow_with_error(
                 "Password must be between 8 and 63 characters."
@@ -929,7 +1079,7 @@ class _Handler(BaseHTTPRequestHandler):
         # down the AP and stranding the phone before it can render
         # anything. So the page reads as pending ("Connecting your
         # camera...") rather than past-tense success. The real
-        # confirmation is the camera appearing in the Nemara app.
+        # confirmation is the camera appearing in the Memoria app.
         body = _render_success_page(ssid)
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -990,11 +1140,28 @@ def serve(cfg: Config) -> None:
     server_thread = threading.Thread(target=_serve, daemon=True)
     server_thread.start()
 
-    if _DONE.wait(timeout=_SETUP_TIMEOUT_S):
-        log.info("provisioning succeeded for ssid=%r", _PROVISION_RESULT.get("ssid"))
-        mark_provisioned(cfg.marker_path)
-    else:
-        log.warning("setup timed out after %d s with no successful provision", _SETUP_TIMEOUT_S)
+    # Wait for either a successful join (_DONE) or a FAILED attempt
+    # (_RETRY). A failed join tore the AP down, so bring it back
+    # immediately with the error shown — never leave the device dark
+    # until the idle timeout (the 2026-06-06 30-minute blackout). Only a
+    # genuine no-activity stretch hits _SETUP_TIMEOUT_S and exits.
+    deadline = time.monotonic() + _SETUP_TIMEOUT_S
+    while True:
+        if _DONE.wait(timeout=2.0):
+            log.info("provisioning succeeded for ssid=%r", _PROVISION_RESULT.get("ssid"))
+            mark_provisioned(cfg.marker_path)
+            break
+        if _RETRY.is_set():
+            _RETRY.clear()
+            err = _consume_join_error()
+            handler.last_error = err
+            log.info("join failed (%s); bringing AP back for retry", err)
+            start_ap(cfg)
+            deadline = time.monotonic() + _SETUP_TIMEOUT_S
+            continue
+        if time.monotonic() >= deadline:
+            log.warning("setup timed out after %d s with no successful provision", _SETUP_TIMEOUT_S)
+            break
 
     server.shutdown()
     stop_ap(cfg)
@@ -1028,7 +1195,7 @@ def main() -> None:
         persistent failure), continue.
     """
     logging.basicConfig(
-        level=os.environ.get("NEMARA_LOG_LEVEL", "INFO"),
+        level=os.environ.get("MEMORIA_LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     cfg = load_config()

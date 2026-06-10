@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the Nemara camera daemons on a fresh Raspberry Pi.
+# Install the Memoria camera daemons on a fresh Raspberry Pi.
 #
 # Requires Raspberry Pi OS Bookworm or Trixie (Lite is fine).
 # Must be run with sudo.
@@ -11,7 +11,7 @@
 #   sudo ./install.sh https://api.your-nemara-backend.example
 #
 # The single positional argument is the backend URL the announce
-# daemon will POST to. It is written into /etc/nemara/announce.env.
+# daemon will POST to. It is written into /etc/memoria/announce.env.
 #
 # What this installs:
 #   wifi_ap_provision.py    First-boot WiFi setup via an open AP
@@ -63,13 +63,13 @@ else
   echo "    dtoverlay already configured"
 fi
 
-echo ">>> Deploying daemon scripts to /opt/nemara"
-install -d /opt/nemara
-install -m 0755 "$SCRIPT_DIR/announce_daemon.py"     /opt/nemara/announce_daemon.py
-install -m 0755 "$SCRIPT_DIR/wifi_ap_provision.py"   /opt/nemara/wifi_ap_provision.py
-install -m 0755 "$SCRIPT_DIR/mjpeg_pusher.py"        /opt/nemara/mjpeg_pusher.py
-install -m 0755 "$SCRIPT_DIR/wifi_wipe_safe.sh"      /opt/nemara/wifi_wipe_safe.sh
-install -m 0755 "$SCRIPT_DIR/wifi_recovery.sh"       /opt/nemara/wifi_recovery.sh
+echo ">>> Deploying daemon scripts to /opt/memoria"
+install -d /opt/memoria
+install -m 0755 "$SCRIPT_DIR/announce_daemon.py"     /opt/memoria/announce_daemon.py
+install -m 0755 "$SCRIPT_DIR/wifi_ap_provision.py"   /opt/memoria/wifi_ap_provision.py
+install -m 0755 "$SCRIPT_DIR/mjpeg_pusher.py"        /opt/memoria/mjpeg_pusher.py
+install -m 0755 "$SCRIPT_DIR/wifi_wipe_safe.sh"      /opt/memoria/wifi_wipe_safe.sh
+install -m 0755 "$SCRIPT_DIR/wifi_recovery.sh"       /opt/memoria/wifi_recovery.sh
 
 echo ">>> Enabling persistent journal so previous-boot logs survive a reboot"
 # Pi OS ships /usr/lib/systemd/journald.conf.d/40-rpi-volatile-storage.conf
@@ -77,44 +77,95 @@ echo ">>> Enabling persistent journal so previous-boot logs survive a reboot"
 # We need a higher-numbered drop-in in /etc/ to win the merge.
 # Essential for AP-mode debug: when AP setup fails and the recovery
 # timer reboots us back to home WiFi, we want
-# `journalctl --boot=-1 -u nemara-wifi-ap.service` to show why.
+# `journalctl --boot=-1 -u memoria-wifi-ap.service` to show why.
 install -d -m 2755 /var/log/journal
 install -d /etc/systemd/journald.conf.d
-cat > /etc/systemd/journald.conf.d/99-nemara-persistent.conf <<'EOF'
+cat > /etc/systemd/journald.conf.d/99-memoria-persistent.conf <<'EOF'
 [Journal]
 Storage=persistent
 SystemMaxUse=64M
 EOF
-chmod 0644 /etc/systemd/journald.conf.d/99-nemara-persistent.conf
+chmod 0644 /etc/systemd/journald.conf.d/99-memoria-persistent.conf
 systemctl restart systemd-journald
 
-echo ">>> Writing /etc/nemara/announce.env"
-install -d /etc/nemara
-cat > /etc/nemara/announce.env <<EOF
-NEMARA_BACKEND_URL=$BACKEND_URL
-NEMARA_ANNOUNCE_INTERVAL_S=60
-NEMARA_WIFI_IFACE=wlan0
-NEMARA_LOG_LEVEL=INFO
+echo ">>> Writing /etc/memoria/announce.env"
+install -d /etc/memoria
+cat > /etc/memoria/announce.env <<EOF
+MEMORIA_BACKEND_URL=$BACKEND_URL
+MEMORIA_ANNOUNCE_INTERVAL_S=60
+MEMORIA_WIFI_IFACE=wlan0
+MEMORIA_LOG_LEVEL=INFO
 EOF
-chmod 0644 /etc/nemara/announce.env
+chmod 0644 /etc/memoria/announce.env
 
-echo ">>> Writing /etc/nemara/camera-stream.env (per-camera tuning)"
-# Pinned to 720p15 @ 4 Mbps: matches the iPhone publish ceiling
-# closely, stays comfortably within typical home WiFi uplink, and is
-# the rate the MJPEG hardware encoder was validated against on Pi
-# Zero W (sustains the full 15 fps without dropping). The QUALITY
-# env var is legacy from the libjpeg path and is ignored by the
-# current MJPEGEncoder; left in place so existing installs don't
-# error on a missing var, but BITRATE_BPS is the real knob now.
-cat > /etc/nemara/camera-stream.env <<EOF
-NEMARA_CAMERA_WIDTH=1280
-NEMARA_CAMERA_HEIGHT=720
-NEMARA_CAMERA_FPS=15
-NEMARA_CAMERA_BITRATE_BPS=4000000
-NEMARA_CAMERA_QUALITY=80
-NEMARA_LOG_LEVEL=INFO
+echo ">>> Deploying lens-shading/color tuning for the Arducam 105° M12 lens"
+# The stock libcamera imx219.json is calibrated for the Pi Camera Module 2,
+# NOT this Arducam 8MP IMX219 105° M12 lens — its lens-shading (ALSC) leaves
+# a magenta vignette ring. imx219_arducam_105_m12.json carries the
+# lens-specific ALSC calibration (luminance ~2.05 vs stock ~2.9) measured
+# against a flat white field. Deploy it as the active VC4 tuning (the Zero
+# 2 W / Pi 3-class ISP), backing up the stock file once. A re-flash without
+# this step reverts to stock and the ring returns.
+TUNING_SRC="$SCRIPT_DIR/imx219_arducam_105_m12.json"
+TUNING_DST="/usr/share/libcamera/ipa/rpi/vc4/imx219.json"
+if [[ -f "$TUNING_SRC" && -f "$TUNING_DST" ]]; then
+  [[ -f "$TUNING_DST.stock-orig" ]] || cp "$TUNING_DST" "$TUNING_DST.stock-orig"
+  install -m 0644 "$TUNING_SRC" "$TUNING_DST"
+  echo "    installed Arducam-calibrated tuning -> $TUNING_DST"
+else
+  echo "    WARN: tuning src/dst missing — leaving stock imx219.json in place"
+fi
+
+echo ">>> Writing /etc/memoria/camera-stream.env (per-camera tuning)"
+# Full-FOV 1080p15 for a whole-room shot. The IMX219's native 1920x1080
+# readout is a center CROP (narrower FOV), so we pin the raw sensor mode
+# to the full 3280x2464 and let the ISP downscale to 1080p — this keeps
+# the whole-room field of view. Full resolution caps the sensor at
+# ~15 fps. Drop to 1280x720 + remove the SENSOR_* lines to fall back to
+# the binned full-FOV 720p mode if the Zero 2 W uplink can't sustain it.
+#
+# QUALITY_LEVEL: the bare hardware MJPEGEncoder is bitrate-targeted and
+# caps ~90-100 KB/frame at 1080p regardless of level (MEDIUM..VERY_HIGH
+# differ by <15%); VERY_HIGH just requests the encoder's max target.
+#
+# ── IMAGE QUALITY: CALIBRATED FOR THE ARDUCAM 8MP IMX219 105° M12 LENS ──
+# The image tuning here is specific to THIS lens/sensor module (Arducam
+# B09VSRH14M, standard IR-cut). It is NOT generic — a different lens/module
+# needs its own calibration. Two lens-specific pieces:
+#
+#   1. Colour — lens shading (ALSC) AND white balance (AWB ct_curve) are
+#      baked into the deployed imx219_arducam_105_m12.json tuning (see the
+#      deploy step above). The stock tuning targets the original Pi Camera
+#      Module 2; on this lens it leaves a magenta vignette ring (ALSC) and
+#      a ~25% magenta cast (AWB grey-point model). The bundled tuning
+#      carries a flat-field ALSC calibration and an AWB ct_curve corrected
+#      (r*1.05, b*1.15) so AUTO white balance lands ~neutral on this lens
+#      while still adapting to room lighting. A faint residual cool cast
+#      remains; removing it fully needs a multi-colour-temperature grey
+#      calibration.
+#
+#   2. DENOISE=off — the stock libcamera "Fast" denoise massively over-
+#      smooths this low-gain (~2.0) module, throwing away ~73% of real
+#      detail (lap-var 260 -> 71) to fight grain that barely exists in a
+#      lit room. "off" restores detail. Caveat: in genuine low light the
+#      gain climbs and "off" gets noisy — switch to a tuned rpi.sdn for
+#      night use.
+#
+# To PIN a fixed white balance instead of auto (perfectly neutral but
+# static — only better if the room's light colour never changes), set
+# MEMORIA_CAMERA_AWB_GAINS="<red>,<blue>" (1.385,1.448 was the wall-
+# calibrated value for this room) to disable auto-AWB.
+cat > /etc/memoria/camera-stream.env <<EOF
+MEMORIA_CAMERA_WIDTH=1920
+MEMORIA_CAMERA_HEIGHT=1080
+MEMORIA_CAMERA_FPS=15
+MEMORIA_CAMERA_SENSOR_WIDTH=3280
+MEMORIA_CAMERA_SENSOR_HEIGHT=2464
+MEMORIA_CAMERA_QUALITY_LEVEL=VERY_HIGH
+MEMORIA_CAMERA_DENOISE=off
+MEMORIA_LOG_LEVEL=INFO
 EOF
-chmod 0644 /etc/nemara/camera-stream.env
+chmod 0644 /etc/memoria/camera-stream.env
 
 echo ">>> Installing captive-portal DNS wildcard for NM shared mode"
 # When NetworkManager runs a wifi connection with ipv4.method=shared
@@ -126,22 +177,22 @@ echo ">>> Installing captive-portal DNS wildcard for NM shared mode"
 # answer 192.168.4.1 (the Pi) for every name, which makes the probe
 # 302-redirect to our setup page and triggers the captive portal UI.
 install -d /etc/NetworkManager/dnsmasq-shared.d
-cat > /etc/NetworkManager/dnsmasq-shared.d/01-nemara-captive.conf <<EOF
+cat > /etc/NetworkManager/dnsmasq-shared.d/01-memoria-captive.conf <<EOF
 address=/#/192.168.4.1
 EOF
-chmod 0644 /etc/NetworkManager/dnsmasq-shared.d/01-nemara-captive.conf
+chmod 0644 /etc/NetworkManager/dnsmasq-shared.d/01-memoria-captive.conf
 
-echo ">>> Writing /etc/nemara/wifi-ap.env"
-cat > /etc/nemara/wifi-ap.env <<EOF
-NEMARA_WIFI_IFACE=wlan0
-NEMARA_AP_LABEL_PREFIX=Memoria-Setup
-NEMARA_AP_CHANNEL=6
-NEMARA_AP_BIND_ADDR=192.168.4.1
-NEMARA_AP_HTTP_PORT=80
-NEMARA_PROVISIONED_FILE=/var/lib/nemara/provisioned
-NEMARA_LOG_LEVEL=INFO
+echo ">>> Writing /etc/memoria/wifi-ap.env"
+cat > /etc/memoria/wifi-ap.env <<EOF
+MEMORIA_WIFI_IFACE=wlan0
+MEMORIA_AP_LABEL_PREFIX=Memoria-Setup
+MEMORIA_AP_CHANNEL=6
+MEMORIA_AP_BIND_ADDR=192.168.4.1
+MEMORIA_AP_HTTP_PORT=80
+MEMORIA_PROVISIONED_FILE=/var/lib/memoria/provisioned
+MEMORIA_LOG_LEVEL=INFO
 EOF
-chmod 0644 /etc/nemara/wifi-ap.env
+chmod 0644 /etc/memoria/wifi-ap.env
 
 # Pre-bake the Memoria-Setup AP nmconnection so the supervisors start_ap()
 # only has to `nmcli connection up`, NOT `connection add`. On Pi OS Trixie,
@@ -188,24 +239,24 @@ echo "    wrote $AP_KEYFILE (ssid=$AP_SSID)"
 nmcli connection reload 2>/dev/null || true
 
 echo ">>> Installing systemd units"
-install -m 0644 "$SCRIPT_DIR/nemara-announce.service"      /etc/systemd/system/
-install -m 0644 "$SCRIPT_DIR/nemara-wifi-ap.service"       /etc/systemd/system/
-install -m 0644 "$SCRIPT_DIR/nemara-camera-stream.service" /etc/systemd/system/
-install -m 0644 "$SCRIPT_DIR/nemara-wifi-recovery.service" /etc/systemd/system/
-install -m 0644 "$SCRIPT_DIR/nemara-wifi-recovery.timer"   /etc/systemd/system/
+install -m 0644 "$SCRIPT_DIR/memoria-announce.service"      /etc/systemd/system/
+install -m 0644 "$SCRIPT_DIR/memoria-wifi-ap.service"       /etc/systemd/system/
+install -m 0644 "$SCRIPT_DIR/memoria-camera-stream.service" /etc/systemd/system/
+install -m 0644 "$SCRIPT_DIR/memoria-wifi-recovery.service" /etc/systemd/system/
+install -m 0644 "$SCRIPT_DIR/memoria-wifi-recovery.timer"   /etc/systemd/system/
 # Remove the old BLE provisioning unit from any prior install of
 # this script. Failure here is fine (the unit may never have been
 # installed).
 systemctl disable --now nemara-ble-provision.service 2>/dev/null || true
-rm -f /etc/systemd/system/nemara-ble-provision.service /opt/nemara/ble_provision.py /etc/nemara/ble.env
+rm -f /etc/systemd/system/nemara-ble-provision.service /opt/memoria/ble_provision.py /etc/memoria/ble.env
 systemctl daemon-reload
-systemctl enable nemara-announce.service
-systemctl enable nemara-wifi-ap.service
+systemctl enable memoria-announce.service
+systemctl enable memoria-wifi-ap.service
 # The camera-stream unit is enabled but won't start until
-# /etc/nemara/ingest.env exists (ConditionPathExists). The announce
+# /etc/memoria/ingest.env exists (ConditionPathExists). The announce
 # daemon writes that file the moment the backend hands us a fresh
 # token, then triggers `systemctl restart` on this unit.
-systemctl enable nemara-camera-stream.service
+systemctl enable memoria-camera-stream.service
 
 # Touch the provisioning marker. wifi_ap_provision.py treats the marker
 # as the sole signal for "this Pi has wifi, skip AP mode." Dev-mode
@@ -213,8 +264,8 @@ systemctl enable nemara-camera-stream.service
 # the imager's wifi across reboots. `wifi_wipe_safe.sh` explicitly
 # clears the marker to force the next boot into AP-mode provisioning
 # for a customer handoff.
-mkdir -p /var/lib/nemara
-touch /var/lib/nemara/provisioned
+mkdir -p /var/lib/memoria
+touch /var/lib/memoria/provisioned
 
 echo ""
 if [[ "${NEED_REBOOT:-0}" == "1" ]]; then
@@ -223,21 +274,21 @@ if [[ "${NEED_REBOOT:-0}" == "1" ]]; then
   echo ""
 fi
 echo ">>> Installed. On next boot:"
-echo "    nemara-wifi-ap   advertises an open WiFi AP named"
+echo "    memoria-wifi-ap   advertises an open WiFi AP named"
 echo "                     'Memoria-Setup-XXXXXX' (with a captive"
 echo "                     portal at http://192.168.4.1) UNTIL"
 echo "                     the customer enters home WiFi creds."
-echo "    nemara-announce  POSTs to $BACKEND_URL once on home WiFi."
+echo "    memoria-announce  POSTs to $BACKEND_URL once on home WiFi."
 echo ""
 echo ">>> To start now without rebooting:"
-echo "    sudo systemctl start nemara-wifi-ap.service"
-echo "    sudo systemctl start nemara-announce.service"
+echo "    sudo systemctl start memoria-wifi-ap.service"
+echo "    sudo systemctl start memoria-announce.service"
 echo ""
 echo ">>> To watch logs:"
-echo "    journalctl -u nemara-wifi-ap.service -f"
-echo "    journalctl -u nemara-announce.service -f"
+echo "    journalctl -u memoria-wifi-ap.service -f"
+echo "    journalctl -u memoria-announce.service -f"
 echo ""
 echo ">>> To re-trigger setup mode (wipe saved WiFi + marker):"
-echo "    sudo rm /var/lib/nemara/provisioned"
+echo "    sudo rm /var/lib/memoria/provisioned"
 echo "    sudo nmcli connection delete <home-wifi-ssid>"
-echo "    sudo systemctl restart nemara-wifi-ap.service"
+echo "    sudo systemctl restart memoria-wifi-ap.service"

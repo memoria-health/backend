@@ -7,11 +7,11 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 
-# Env
-# .env is intentionally tracked in this PRIVATE repo so partner clones
-# work out-of-the-box. Move it back to gitignored before flipping the
-# repo public — all secrets in it (LiveKit keys, Gemini/OpenAI keys,
-# APNs .p8 contents) need rotation in that case.
+# Env — secrets stay OUT of git. Dev secrets live in a local .env (share
+# with teammates via a secret manager / 1Password, not the repo). Prod
+# secrets live only in Railway. (.env was previously tracked for partner
+# onboarding; it has been untracked and its leaked secrets rotated.)
+.env
 .env.local
 
 # Local-start.sh runtime state (PIDs + log files for backend + ngrok)

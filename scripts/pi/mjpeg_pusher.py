@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Nemara camera MJPEG pusher. Runs on the Pi.
+"""Memoria camera MJPEG pusher. Runs on the Pi.
 
 Opens a long-lived HTTPS POST to the backend's
 `/v1/cameras/me/frames` endpoint and streams JPEG frames captured
 from the Pi camera. Authenticates with a per-camera bearer token
-written to /etc/nemara/ingest.env by the announce daemon once
+written to /etc/memoria/ingest.env by the announce daemon once
 pairing completes.
 
 Why outbound POST (not inbound MJPEG serving):
@@ -15,18 +15,30 @@ Why outbound POST (not inbound MJPEG serving):
   needed.
 
 Configuration via env vars (loaded by systemd unit from
-/etc/nemara/camera-stream.env + /etc/nemara/ingest.env):
+/etc/memoria/camera-stream.env + /etc/memoria/ingest.env):
 
-  NEMARA_INGEST_URL          required, e.g. https://api.nemara.app/v1/cameras/me/frames
-  NEMARA_INGEST_TOKEN        required, plaintext bearer token
-  NEMARA_CAMERA_WIDTH        optional, default 1280
-  NEMARA_CAMERA_HEIGHT       optional, default 720
-  NEMARA_CAMERA_FPS          optional, default 15
-  NEMARA_CAMERA_BITRATE_BPS  MJPEGEncoder target bitrate, default 4000000
-                             (4 Mbps; rough guide for 720p: 4M clean,
-                             6M sharp, 8M visually lossless)
-  NEMARA_PUSH_RECONNECT_S    optional backoff base seconds, default 2.0
-  NEMARA_LOG_LEVEL           optional, default INFO
+  MEMORIA_INGEST_URL          required, e.g. https://api.nemara.app/v1/cameras/me/frames
+  MEMORIA_INGEST_TOKEN        required, plaintext bearer token
+  MEMORIA_CAMERA_WIDTH        optional, default 1280
+  MEMORIA_CAMERA_HEIGHT       optional, default 720
+  MEMORIA_CAMERA_FPS          optional, default 15
+  MEMORIA_CAMERA_SENSOR_WIDTH  optional; with _HEIGHT pins the raw sensor
+  MEMORIA_CAMERA_SENSOR_HEIGHT mode to this resolution and lets the ISP
+                             downscale to WIDTH x HEIGHT. Use the full
+                             sensor size (IMX219: 3280x2464) to keep the
+                             full field of view at 1080p — the sensor's
+                             native 1080p readout is a center CROP. Unset
+                             -> picamera2 picks the mode (binned full-FOV
+                             for <=720p).
+  MEMORIA_CAMERA_QUALITY_LEVEL optional MJPEG quality: VERY_LOW | LOW |
+                             MEDIUM | HIGH | VERY_HIGH. Unset -> encoder
+                             default (the validated 720p behavior).
+  MEMORIA_CAMERA_BITRATE_BPS  read but currently INERT — bare
+                             MJPEGEncoder() ignores it (passing bitrate=
+                             yields blurry frames). Use
+                             MEMORIA_CAMERA_QUALITY_LEVEL instead.
+  MEMORIA_PUSH_RECONNECT_S    optional backoff base seconds, default 2.0
+  MEMORIA_LOG_LEVEL           optional, default INFO
 
 Failure model:
   - Network drop / 5xx -> sleep `reconnect_s` then reconnect (with
@@ -56,7 +68,7 @@ if TYPE_CHECKING:
     # local-dev type-checking working on Linux/macOS without it.
     from picamera2 import Picamera2
 
-log = logging.getLogger("nemara.pusher")
+log = logging.getLogger("memoria.pusher")
 
 # MIME boundary string used in the multipart body. Arbitrary token
 # that does not appear in JPEG payloads (JPEGs always begin with
@@ -133,6 +145,7 @@ class _JpegRing(io.BufferedIOBase):
 
 def _build_camera_and_encoder(
     width: int, height: int, fps: int, bitrate_bps: int,
+    sensor_width: int = 0, sensor_height: int = 0,
 ):
     """Configure picamera2 with the hardware JpegEncoder feeding a
     `_JpegRing`. The hardware encoder uses the SoC's ISP for the
@@ -165,10 +178,54 @@ def _build_camera_and_encoder(
         # `FrameRate` control pins the sensor to the requested fps
         # (matches the old stream.py's working config). The encoder
         # then emits at the sensor rate.
-        cfg = cam.create_video_configuration(
-            main={"size": (width, height)},
-            controls={"FrameRate": float(fps)},
-        )
+        # When sensor_width/height are provided, pin the raw sensor mode
+        # to that resolution and let the ISP downscale to the `main`
+        # size. On the IMX219 the native 1920x1080 readout is a center
+        # CROP (narrower FOV); requesting the full 3280x2464 sensor mode
+        # and downscaling preserves the whole-room field of view. Full
+        # resolution caps the IMX219 at ~15 fps. Left at 0, picamera2
+        # picks its own mode (the binned 1640x1232 full-FOV mode for
+        # <=720p), preserving the original behavior.
+        config_kwargs: dict = {
+            "main": {"size": (width, height)},
+            "controls": {"FrameRate": float(fps)},
+        }
+        # Optional manual white balance. The stock AWB drifts green on the
+        # Arducam 105° M12 lens; MEMORIA_CAMERA_AWB_GAINS="<red>,<blue>"
+        # pins fixed ColourGains (and disables auto-AWB) — appropriate for
+        # a fixed-mount camera and avoids AWB hunting. Unset -> auto AWB.
+        _gains = os.environ.get("MEMORIA_CAMERA_AWB_GAINS", "").strip()
+        if _gains:
+            try:
+                _r, _b = (float(x) for x in _gains.split(","))
+                config_kwargs["controls"]["AwbEnable"] = False
+                config_kwargs["controls"]["ColourGains"] = (_r, _b)
+            except ValueError:
+                log.warning("ignoring bad MEMORIA_CAMERA_AWB_GAINS=%r", _gains)
+        # Optional ISP denoise strength. The stock "Fast" denoise is far too
+        # aggressive for this low-gain (~2.0) Arducam IMX219 — it smears fine
+        # detail (measured: lap-var 260 -> 71, ~73% of detail gone) and only
+        # trades against grain that barely exists in a lit room. "Minimal"
+        # behaves identically to "Fast" on the VC4 ISP, so the useful knob is
+        # off vs a tuned profile. MEMORIA_CAMERA_DENOISE=off|minimal|fast|hq.
+        # Unset -> camera default (Fast). Note: in genuine low light the gain
+        # climbs and "off" gets noisy — prefer a tuned rpi.sdn for night use.
+        _denoise = os.environ.get("MEMORIA_CAMERA_DENOISE", "").strip().lower()
+        if _denoise:
+            from libcamera import controls as _lc
+            _nr = {
+                "off": _lc.draft.NoiseReductionModeEnum.Off,
+                "minimal": _lc.draft.NoiseReductionModeEnum.Minimal,
+                "fast": _lc.draft.NoiseReductionModeEnum.Fast,
+                "hq": _lc.draft.NoiseReductionModeEnum.HighQuality,
+            }.get(_denoise)
+            if _nr is not None:
+                config_kwargs["controls"]["NoiseReductionMode"] = _nr
+            else:
+                log.warning("ignoring bad MEMORIA_CAMERA_DENOISE=%r", _denoise)
+        if sensor_width > 0 and sensor_height > 0:
+            config_kwargs["raw"] = {"size": (sensor_width, sensor_height)}
+        cfg = cam.create_video_configuration(**config_kwargs)
         cam.configure(cfg)
         # MJPEGEncoder() with no args is what the original
         # nemara-cam-viewer/stream.py used and produced clean
@@ -268,6 +325,30 @@ _PUSH_RESULT_CLOSED = "closed"
 _PUSH_RESULT_PAUSED = "paused"
 
 
+def _resolve_quality(level: str | None):
+    """Map a MEMORIA_CAMERA_QUALITY_LEVEL string to a picamera2 `Quality`
+    enum, or None to use the encoder default.
+
+    `Quality` is the SUPPORTED knob for trading MJPEG frame size against
+    sharpness on the hardware encoder. Passing `bitrate=` to
+    `MJPEGEncoder()` is the trap that maps to a very low
+    compression_quality and produces blurry ~16 KB frames (see
+    `_build_camera_and_encoder`). Returns None for unset/invalid so the
+    caller falls back to `start_recording` without a quality override.
+    """
+    if not level:
+        return None
+    from picamera2.encoders import Quality
+    try:
+        return Quality[level.upper()]
+    except KeyError:
+        log.warning(
+            "ignoring invalid MEMORIA_CAMERA_QUALITY_LEVEL=%r "
+            "(want VERY_LOW|LOW|MEDIUM|HIGH|VERY_HIGH)", level,
+        )
+        return None
+
+
 async def push_once(
     *,
     ingest_url: str,
@@ -276,6 +357,9 @@ async def push_once(
     height: int,
     fps: int,
     bitrate_bps: int,
+    sensor_width: int = 0,
+    sensor_height: int = 0,
+    quality_level: str | None = None,
 ) -> str:
     """Open one push connection and stream frames until the camera
     or the server closes it.
@@ -293,16 +377,21 @@ async def push_once(
     """
     cam, encoder, output, ring = _build_camera_and_encoder(
         width, height, fps, bitrate_bps,
+        sensor_width=sensor_width, sensor_height=sensor_height,
     )
     stop = asyncio.Event()
-    cam.start_recording(encoder, output)
+    quality = _resolve_quality(quality_level)
+    if quality is not None:
+        cam.start_recording(encoder, output, quality=quality)
+    else:
+        cam.start_recording(encoder, output)
     try:
         frames = _capture_frames(ring, stop=stop)
         body = _stream_body(frames)
         headers = {
             "Authorization": f"Bearer {ingest_token}",
             "Content-Type": f'multipart/x-mixed-replace; boundary="{_BOUNDARY.decode()}"',
-            "User-Agent": "nemara-camera-pusher/1",
+            "User-Agent": "memoria-camera-pusher/1",
         }
         # No total timeout: this is a long-lived stream. Read/write
         # timeouts are also disabled because the connection stays
@@ -402,7 +491,7 @@ async def fetch_desired_state(
     """
     headers = {
         "Authorization": f"Bearer {ingest_token}",
-        "User-Agent": "nemara-camera-pusher/1",
+        "User-Agent": "memoria-camera-pusher/1",
     }
     timeout = httpx.Timeout(connect=5.0, read=5.0, write=5.0, pool=5.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -436,7 +525,7 @@ async def wait_until_active(
     """
     headers = {
         "Authorization": f"Bearer {ingest_token}",
-        "User-Agent": "nemara-camera-pusher/1",
+        "User-Agent": "memoria-camera-pusher/1",
     }
     timeout = httpx.Timeout(connect=5.0, read=5.0, write=5.0, pool=5.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -480,21 +569,28 @@ async def wait_until_active(
 
 
 async def main_loop() -> None:
-    ingest_url = os.environ["NEMARA_INGEST_URL"]
-    ingest_token = os.environ["NEMARA_INGEST_TOKEN"]
+    ingest_url = os.environ["MEMORIA_INGEST_URL"]
+    ingest_token = os.environ["MEMORIA_INGEST_TOKEN"]
     status_url = _derive_status_url(ingest_url)
-    width = int(os.environ.get("NEMARA_CAMERA_WIDTH", "1280"))
-    height = int(os.environ.get("NEMARA_CAMERA_HEIGHT", "720"))
-    fps = int(os.environ.get("NEMARA_CAMERA_FPS", "15"))
+    width = int(os.environ.get("MEMORIA_CAMERA_WIDTH", "1280"))
+    height = int(os.environ.get("MEMORIA_CAMERA_HEIGHT", "720"))
+    fps = int(os.environ.get("MEMORIA_CAMERA_FPS", "15"))
     # Target bitrate for MJPEGEncoder. Default 4 Mbps gives clean
     # 720p; raise for sharper image at higher bandwidth cost.
-    bitrate_bps = int(os.environ.get("NEMARA_CAMERA_BITRATE_BPS", "4000000"))
-    base_backoff_s = float(os.environ.get("NEMARA_PUSH_RECONNECT_S", "2.0"))
-    paused_poll_s = float(os.environ.get("NEMARA_PAUSED_POLL_S", "5.0"))
+    bitrate_bps = int(os.environ.get("MEMORIA_CAMERA_BITRATE_BPS", "4000000"))
+    # Optional raw sensor mode (see _build_camera_and_encoder): set both
+    # to the full sensor resolution to keep the full FOV at 1080p.
+    sensor_width = int(os.environ.get("MEMORIA_CAMERA_SENSOR_WIDTH", "0"))
+    sensor_height = int(os.environ.get("MEMORIA_CAMERA_SENSOR_HEIGHT", "0"))
+    quality_level = os.environ.get("MEMORIA_CAMERA_QUALITY_LEVEL") or None
+    base_backoff_s = float(os.environ.get("MEMORIA_PUSH_RECONNECT_S", "2.0"))
+    paused_poll_s = float(os.environ.get("MEMORIA_PAUSED_POLL_S", "5.0"))
 
     log.info(
-        "starting pusher url=%s status_url=%s res=%dx%d fps=%d bitrate_mbps=%.1f",
-        ingest_url, status_url, width, height, fps, bitrate_bps / 1_000_000,
+        "starting pusher url=%s status_url=%s res=%dx%d fps=%d "
+        "sensor=%dx%d quality=%s",
+        ingest_url, status_url, width, height, fps,
+        sensor_width, sensor_height, quality_level or "default",
     )
 
     backoff = base_backoff_s
@@ -539,6 +635,8 @@ async def main_loop() -> None:
                 ingest_token=ingest_token,
                 width=width, height=height,
                 fps=fps, bitrate_bps=bitrate_bps,
+                sensor_width=sensor_width, sensor_height=sensor_height,
+                quality_level=quality_level,
             )
             backoff = base_backoff_s
             if result == _PUSH_RESULT_PAUSED:
@@ -566,7 +664,7 @@ async def main_loop() -> None:
 
 def main() -> None:
     logging.basicConfig(
-        level=os.environ.get("NEMARA_LOG_LEVEL", "INFO"),
+        level=os.environ.get("MEMORIA_LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     try:
