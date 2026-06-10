@@ -123,7 +123,7 @@ _FEW_SHOT_EXAMPLE_ROUTINE_REACTIVE = (
 
 def _meta_prompt(
     *, identifier: str, name: str, description: str, user_text: str,
-    scheduled: bool, category: str,
+    scheduled: bool, category: str, clip_seconds: int,
 ) -> str:
     """The instructions the compiler sends to the LLM. `identifier` is
     interpolated everywhere the runtime block needs the stable key.
@@ -168,7 +168,7 @@ def _meta_prompt(
 
     return (
         "You are configuring a computer-vision detector that runs on "
-        "short (~15s) clips from a wall-mounted home security camera.\n\n"
+        f"short (~{clip_seconds}s) clips from a wall-mounted home security camera.\n\n"
         "The caregiver wants a new detector with this description:\n"
         f"  Name:        {name!r}\n"
         f"  Description: {description!r}\n"
@@ -269,6 +269,7 @@ async def _compile_with_gemini(
                     user_text=user_text,
                     scheduled=scheduled,
                     category=category,
+                    clip_seconds=settings.livekit_worker_window_seconds,
                 ))],
             ),
         ],
@@ -305,6 +306,7 @@ async def _compile_with_openai(
                 user_text=user_text,
                 scheduled=scheduled,
                 category=category,
+                clip_seconds=settings.livekit_worker_window_seconds,
             )},
         ],
     )

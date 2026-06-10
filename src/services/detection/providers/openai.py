@@ -113,7 +113,8 @@ async def openai_provider(
                         "text": (
                             f"{built.prompt}\n\n"
                             f"The following {len(frames)} images are sequential "
-                            f"video frames sampled at {fps} fps from a 15-second "
+                            f"video frames sampled at {fps} fps from a "
+                            f"~{max(1, round(len(frames) / fps))}-second "
                             f"clip (frame 1 is earliest, frame {len(frames)} is "
                             f"most recent). Reason over them as a temporal sequence."
                             f"{identity_addendum}"

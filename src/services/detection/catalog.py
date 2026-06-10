@@ -50,7 +50,7 @@ _FALL_PROMPT_FRAGMENT = (
 )
 
 _WANDERING_PROMPT_FRAGMENT = (
-    "wandering_detected: boolean. TRUE only if, within this 15-second clip, "
+    "wandering_detected: boolean. TRUE only if, within this clip, "
     "you SEE a person walk through the RIGHT-SIDE doorway and LEAVE the room — "
     "they were inside the room earlier in the clip, and by the end of the clip "
     "they are no longer inside it. Only OUTBOUND exits through the right door count.\n"
@@ -65,7 +65,7 @@ _WANDERING_PROMPT_FRAGMENT = (
     "toward it, but does not actually walk through. Intent doesn't count.\n"
     "  - The person walks out of camera frame in a direction that isn't a "
     "clearly visible doorway (e.g. steps behind furniture or off to the side).\n"
-    "  - The person leaves and returns within the same 15-second clip.\n"
+    "  - The person leaves and returns within the same clip.\n"
     "  - No person is visible at any point.\n"
     "\n"
     "It only counts when you literally see them, starting inside the room, "

@@ -1,5 +1,5 @@
 """One-shot: update every existing fall detector's prompt_fragment to
-the latest version from `services.onboarding._FALL_PROMPT_FRAGMENT`.
+the latest version from the detection catalog (`catalog.by_key`).
 
 The fall preset prompt is stored per-detector in the DB at creation
 time. Updating the Python constant doesn't retroactively patch live
@@ -17,7 +17,11 @@ from sqlalchemy import select, update
 
 from src.db.detector import Detector
 from src.db.session import get_sessionmaker
-from src.services.onboarding import _FALL_PROMPT_FRAGMENT
+from src.services.detection.catalog import by_key
+
+_entry = by_key("fall")
+assert _entry is not None, "fall missing from catalog"
+_FALL_PROMPT_FRAGMENT = _entry.prompt_fragment
 
 
 async def main() -> None:
