@@ -16,6 +16,8 @@ events row (which is already committed).
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import logging
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
@@ -84,11 +86,16 @@ async def _send(
     settings: Settings,
     reply_to: str | None = None,
     from_email: str | None = None,
+    attachments: Sequence[dict[str, str]] | None = None,
 ) -> None:
     """One Resend POST. Raises on transport error; caller logs.
 
     `from_email` overrides the default `settings.email_from` sender —
     used by the feedback path so feedback comes from its own address.
+
+    `attachments` is Resend's attachment array — each item
+    `{"filename": ..., "content": <base64>}`. Used by the feedback path
+    to forward caregiver screenshots.
     """
     client = await _get_client()
     payload: dict[str, object] = {
@@ -99,6 +106,8 @@ async def _send(
     }
     if reply_to:
         payload["reply_to"] = reply_to
+    if attachments:
+        payload["attachments"] = list(attachments)
     resp = await client.post(
         _RESEND_ENDPOINT,
         headers={"Authorization": f"Bearer {settings.resend_api_key}"},
@@ -269,12 +278,18 @@ async def send_feedback_email(
     whats_frustrating: str | None,
     category: str | None,
     settings: Settings,
+    attachments: Sequence[str] | None = None,
 ) -> str:
     """Forward caregiver product feedback to the founders.
 
     Recipients come from `settings.feedback_email_recipients`; the
     sender is `settings.feedback_email_from`; replyTo is the caregiver's
     account email so hitting reply lands directly back with them.
+
+    `attachments` are base64-encoded JPEG screenshots from the feedback
+    form — forwarded as email attachments, never persisted. A screenshot
+    that fails to decode is skipped (logged) so one bad image can't drop
+    the whole notification.
 
     This is best-effort from the caller's perspective — the
     /v1/feedback handler has already committed the feedback row before
@@ -298,6 +313,7 @@ async def send_feedback_email(
         whats_frustrating=whats_frustrating,
         category=category,
     )
+    resend_attachments = _build_screenshot_attachments(attachments)
     await _send(
         to=recipients,
         subject=full_subject,
@@ -305,11 +321,37 @@ async def send_feedback_email(
         settings=settings,
         reply_to=caregiver.email,
         from_email=settings.feedback_email_from,
+        attachments=resend_attachments or None,
     )
     log.info(
-        "email.feedback_sent caregiver=%s recipients=%d", caregiver.id, len(recipients),
+        "email.feedback_sent caregiver=%s recipients=%d screenshots=%d",
+        caregiver.id, len(recipients), len(resend_attachments),
     )
     return "Sent. We'll reply to your account email."
+
+
+def _build_screenshot_attachments(
+    attachments: Sequence[str] | None,
+) -> list[dict[str, str]]:
+    """Turn base64 JPEG strings into Resend attachment dicts, skipping any
+    that don't decode as valid base64 (a malformed image must not drop the
+    whole feedback email). A leading `data:` URI prefix is stripped if the
+    client sent one."""
+    if not attachments:
+        return []
+    out: list[dict[str, str]] = []
+    for idx, raw in enumerate(attachments, start=1):
+        b64 = raw.strip()
+        if b64.startswith("data:"):
+            # data:image/jpeg;base64,XXXX → keep only the payload.
+            _, _, b64 = b64.partition(",")
+        try:
+            base64.b64decode(b64, validate=True)
+        except (ValueError, binascii.Error):
+            log.warning("email.feedback_attachment_invalid index=%d — skipped", idx)
+            continue
+        out.append({"filename": f"screenshot-{idx}.jpg", "content": b64})
+    return out
 
 
 def _feedback_html(

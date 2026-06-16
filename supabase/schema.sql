@@ -615,6 +615,52 @@ create table public.feedback (
 create index feedback_caregiver_idx on public.feedback(caregiver_id);
 
 
+-- ── ui_events ─────────────────────────────────────────────────────
+-- Raw UI-interaction analytics from the iOS caregiver app: one row per
+-- button tap, screen view, toggle, and app-lifecycle transition. The app
+-- buffers events in memory + on disk and flushes batches directly into
+-- this table via the authed Supabase client (no backend endpoint) — RLS
+-- scopes every insert/select to the caregiver who generated it.
+--
+-- This is a write-mostly append log used for product analysis (which
+-- buttons users press, in what order, with what timing). Logging is a
+-- synchronous, non-throwing, fire-and-forget side effect in the app, so a
+-- failed flush never affects app behavior — events just retry next flush.
+--
+--   session_id  — one UUID per app launch; groups a session's events.
+--   seq         — monotonic per-session counter; gives EXACT ordering even
+--                 when two occurred_at timestamps collide.
+--   occurred_at — CLIENT clock (ISO8601, ms precision) — real event time.
+--   received_at — SERVER clock (default now()) — lets us spot a device with
+--                 a badly-skewed clock by comparing the two.
+--   event_type  — 'button' | 'screen' | 'toggle' | 'lifecycle'.
+--   name        — button id / screen name / lifecycle name (e.g.
+--                 'app_background'); button id is an explicit track label
+--                 when set, else the button title.
+--   screen      — the screen the event happened on (button/toggle context).
+create table public.ui_events (
+  id            uuid primary key default gen_random_uuid(),
+  caregiver_id  uuid not null references public.caregivers(id) on delete cascade,
+  session_id    uuid not null,
+  seq           bigint not null,
+  event_type    text not null,
+  name          text not null,
+  screen        text,
+  occurred_at   timestamptz not null,
+  received_at   timestamptz not null default now(),
+  app_build     text,
+  os_version    text,
+  device_model  text,
+  metadata      jsonb
+);
+-- Per-caregiver, per-session, in event order — the shape every analysis
+-- query reads (reconstruct a session as an ordered stream).
+create index ui_events_session_idx
+  on public.ui_events(caregiver_id, session_id, seq);
+-- Time-range scans across all caregivers (e.g. "all taps last 24h").
+create index ui_events_occurred_idx on public.ui_events(occurred_at);
+
+
 -- ══════════════════════════════════════════════════════════════════
 -- ROW-LEVEL SECURITY
 -- ══════════════════════════════════════════════════════════════════
@@ -697,6 +743,14 @@ create policy caregiver_devices_owner on public.caregiver_devices
 
 alter table public.feedback enable row level security;
 create policy feedback_owner on public.feedback
+  for all using (caregiver_id = auth.uid()) with check (caregiver_id = auth.uid());
+
+-- ui_events: a caregiver can only write/read their own interaction events.
+-- The insert check (caregiver_id = auth.uid()) is what makes direct
+-- client-side inserts safe — a caregiver physically cannot write a row
+-- attributed to anyone else.
+alter table public.ui_events enable row level security;
+create policy ui_events_owner on public.ui_events
   for all using (caregiver_id = auth.uid()) with check (caregiver_id = auth.uid());
 
 

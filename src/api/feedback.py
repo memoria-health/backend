@@ -57,6 +57,7 @@ async def post_feedback(
             whats_working=body.whats_working,
             whats_frustrating=body.whats_frustrating,
             category=body.category,
+            attachments=body.attachments,
             settings=settings,
         )
     except Exception:  # noqa: BLE001

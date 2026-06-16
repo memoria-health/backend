@@ -177,8 +177,22 @@ class ScheduledDetectorRunner:
             log.info("scheduled_runner.seen detector=%s date=%s — no alert", det.id, today)
             return
 
-        # Absent → uptime context, then fire an absence event.
+        # Absent. But "not detected" is only meaningful if we were actually
+        # watching. With no sensor connected — or AI paused / the camera
+        # disconnected for the whole window — there are zero analyzing ticks
+        # and uptime is 0%. Firing then is a false alarm: you can't say a thing
+        # "didn't happen" when you weren't looking at all. Suppress that case.
+        # Partial coverage still fires (with the low-coverage caveat in the
+        # narrative) — we only drop the genuinely-blind case.
         pct = await self._uptime_pct(session, patient.id, start_utc, end_utc)
+        if pct == 0:
+            await session.commit()
+            log.info(
+                "scheduled_runner.no_monitoring detector=%s date=%s — suppressed (0%% coverage)",
+                det.id, today,
+            )
+            return
+
         event = self._build_absence_event(
             det=det, patient=patient, ws=ws, we=we, deadline_utc=deadline_local.astimezone(timezone.utc),
             uptime_pct=pct,
@@ -221,12 +235,16 @@ class ScheduledDetectorRunner:
         self, *, det: Detector, patient: Patient, ws: time, we: time,
         deadline_utc: datetime, uptime_pct: int,
     ) -> Event:
-        title = f"{det.name}: possibly not seen today"
+        title = f"Not detected: {det.name}"
+        coverage_note = (
+            " Coverage was low during this window, so treat this as uncertain."
+            if uptime_pct < 60 else ""
+        )
         narrative = (
-            f"No '{det.name}' was detected today between "
-            f"{ws.strftime('%H:%M')} and {we.strftime('%H:%M')}. "
-            f"Detection was active about {uptime_pct}% of that window — "
-            f"{'treat with caution if low' if uptime_pct < 60 else 'good coverage'}."
+            f"Memoria didn't detect \"{det.name}\" between "
+            f"{ws.strftime('%H:%M')} and {we.strftime('%H:%M')} today. "
+            f"Cameras were actively monitoring about {uptime_pct}% of that window."
+            f"{coverage_note}"
         )
         return Event(
             id=uuid4(),

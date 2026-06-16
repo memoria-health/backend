@@ -4,8 +4,8 @@
 #
 # What runs after this script exits successfully:
 #   • Supabase local (Postgres + Auth + Storage + Studio)
-#   • Backend (uvicorn on :8002, backgrounded)
-#   • ngrok tunnel pointing at :8002 (backgrounded)
+#   • Backend (uvicorn on :8000, backgrounded)
+#   • ngrok tunnel pointing at :8000 (backgrounded)
 #
 # What's left for you afterwards:
 #   • Paste the printed ngrok URL into LiveKit Cloud's webhook config.
@@ -104,10 +104,10 @@ kill_by_pidfile() {
 # ── 1. Stop stale processes ─────────────────────────────────────
 step "Stopping backend"
 kill_by_pidfile "$DEV_DIR/backend.pid" "backend"
-# Sweep stray uvicorn on :8002 (a prior `make dev` foreground run).
-if PIDS=$(lsof -ti:8002 2>/dev/null) && [[ -n "$PIDS" ]]; then
+# Sweep stray uvicorn on :8000 (a prior `make dev` foreground run).
+if PIDS=$(lsof -ti:8000 2>/dev/null) && [[ -n "$PIDS" ]]; then
   echo "$PIDS" | xargs kill -9 2>/dev/null || true
-  ok "swept stray process(es) on :8002"
+  ok "swept stray process(es) on :8000"
 fi
 
 step "Stopping ngrok"
@@ -180,7 +180,7 @@ else
 fi
 
 # ── 5. Start backend (background) ───────────────────────────────
-step "Starting backend on :8002"
+step "Starting backend on :8000"
 # Plain uvicorn (not `make dev`) so we control PID + log redirection.
 # Logs go to .dev/backend.log; PID to .dev/backend.pid.
 #
@@ -195,7 +195,7 @@ if [[ -n "${LAN_IP:-}" ]]; then
   ok "Supabase URL pinned to LAN: $NEMARA_SUPABASE_URL"
 fi
 PYTHONPATH=. nohup uv run uvicorn src.main:app \
-  --host 0.0.0.0 --port 8002 --no-access-log \
+  --host 0.0.0.0 --port 8000 --no-access-log \
   > "$DEV_DIR/backend.log" 2>&1 &
 echo $! > "$DEV_DIR/backend.pid"
 BACKEND_PID=$(cat "$DEV_DIR/backend.pid")
@@ -204,7 +204,7 @@ BACKEND_PID=$(cat "$DEV_DIR/backend.pid")
 # startup, so the first response can take 5-10s on a cold env.
 HEALTHY=false
 for i in $(seq 1 30); do
-  if curl -fsS -m 1 http://127.0.0.1:8002/health >/dev/null 2>&1; then
+  if curl -fsS -m 1 http://127.0.0.1:8000/health >/dev/null 2>&1; then
     HEALTHY=true
     break
   fi
@@ -233,7 +233,7 @@ if $WITH_NGROK; then
   # .env.local, and LiveKit Cloud webhook config has to be re-pasted.
   # Override via env var to swap to a different reserved domain.
   NGROK_DOMAIN="${NGROK_DOMAIN:-unpoeticised-mozell-unavengeable.ngrok-free.dev}"
-  nohup ngrok http --domain="$NGROK_DOMAIN" 8002 --log=stdout > "$DEV_DIR/ngrok.log" 2>&1 &
+  nohup ngrok http --domain="$NGROK_DOMAIN" 8000 --log=stdout > "$DEV_DIR/ngrok.log" 2>&1 &
   echo $! > "$DEV_DIR/ngrok.pid"
   NGROK_PID=$(cat "$DEV_DIR/ngrok.pid")
 
@@ -269,7 +269,7 @@ fi
 echo
 ok "Local stack is up."
 echo
-echo "Health:  http://127.0.0.1:8002/health"
+echo "Health:  http://127.0.0.1:8000/health"
 echo "Studio:  http://127.0.0.1:54343"
 echo "Logs:    tail -f $DEV_DIR/backend.log   # backend"
 if $WITH_NGROK && [[ -n "$NGROK_URL" ]]; then

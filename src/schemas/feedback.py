@@ -20,6 +20,16 @@ class FeedbackRequest(BaseModel):
     whats_working: Annotated[str | None, Field(max_length=5000)] = None
     whats_frustrating: Annotated[str | None, Field(max_length=5000)] = None
     category: Annotated[str | None, Field(max_length=120)] = None
+    # Optional screenshots, each a base64-encoded JPEG (no data: URI
+    # prefix). These are NOT persisted — they ride along to the founder
+    # notification email only, so we cap count and per-image size to keep
+    # the request body and the outgoing email sane. ~4 MB of base64 ≈ a
+    # ~3 MB JPEG, comfortably above an iPhone screenshot compressed to
+    # JPEG, so a legitimate attachment never trips the limit.
+    attachments: Annotated[
+        list[Annotated[str, Field(min_length=1, max_length=4_000_000)]] | None,
+        Field(max_length=4),
+    ] = None
 
     @model_validator(mode="after")
     def _require_some_content(self) -> "FeedbackRequest":

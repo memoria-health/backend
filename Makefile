@@ -29,7 +29,7 @@ install:
 	fi
 
 dev: db-start
-	$(PY) uvicorn src.main:app --reload --host 0.0.0.0 --port 8002
+	$(PY) uvicorn src.main:app --reload --host 0.0.0.0 --port 8000
 
 test:
 	$(PY) pytest test/ -v
