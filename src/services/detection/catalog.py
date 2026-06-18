@@ -655,6 +655,32 @@ _FIRE_SMOKE_PROMPT_FRAGMENT = (
     "visible')."
 )
 
+# Internal one-time setup test. NOT a safety/routine detector — its only job is
+# to let a family verify, during setup, that the whole alert path (detection →
+# push → email) works, by holding three fingers up to a camera. Seeded hidden +
+# fire-once (see CatalogEntry.hidden / .fire_once); disabled the instant it fires
+# so it can never fire twice. Deliberately a HUMAN-HAND gesture, not a printed
+# digit, so an ambient "3" on a clock/TV/book can't trip it.
+_SETUP_TEST_PROMPT_FRAGMENT = (
+    "setup_test_detected: boolean. TRUE only if a PERSON deliberately holds up "
+    "ONE HAND toward the camera showing exactly THREE extended fingers — the "
+    "'number 3' hand gesture — clearly and intentionally, as if presenting it to "
+    "the camera. The hand should be reasonably close to / facing the lens with "
+    "three fingers plainly extended and the others folded.\n"
+    "\n"
+    "Set FALSE for everything else, including: a hand at rest, waving, a thumbs-up, "
+    "a peace sign (two fingers), an open hand (four or five fingers), a single "
+    "finger, fingers that are ambiguous or partially hidden, or a printed/written "
+    "number '3' on a clock, phone, TV, book, or sign (it must be a live human "
+    "hand, not a drawn or displayed digit).\n"
+    "\n"
+    "setup_test_confidence: number 0–1. 0 = no three-finger gesture. 0.7+ = a "
+    "person is clearly and deliberately holding up three fingers to the camera.\n"
+    "setup_test_reasoning: 1 short sentence describing the hand you saw "
+    "(e.g. 'a person held three fingers up to the lens', 'an open five-finger "
+    "hand — not three', 'no raised-hand gesture')."
+)
+
 
 # ══════════════════════════════════════════════════════════════════
 # Catalog entry
@@ -693,6 +719,16 @@ class CatalogEntry:
     # A seeded-but-not-recommended detector is pre-selected when making a
     # patient yet still listed under "More detectors".
     seeded: bool = False
+    # Internal detectors the caregiver should never see or manage. Excluded
+    # from `for_cohort` (so it's not in the library picker) and filtered out of
+    # `detector_repo.list_for_patient` (so it's not in the detectors list). It
+    # still SEEDS (via `seeded_for_cohort`, which reads CATALOG directly) and
+    # still RUNS (the worker's registry query is independent of the UI list).
+    hidden: bool = False
+    # Fires exactly once per patient, then disables itself. `event_promotion`
+    # flips the (single, per-patient) detector row's `is_on=false` the instant
+    # it promotes an event, so it can't fire again on this or any other camera.
+    fire_once: bool = False
 
     @property
     def detected_key(self) -> str:
@@ -888,6 +924,18 @@ CATALOG: tuple[CatalogEntry, ...] = (
         recommended=False, prompt_fragment=_FIRE_SMOKE_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
+    # ── internal: one-time setup self-test (hidden, fire-once) ──
+    # Seeded for every new patient and assigned to every camera (source=preset),
+    # but never shown in the app. Fires once when someone holds three fingers up
+    # to a camera, proving the alert path end-to-end, then disables itself.
+    CatalogEntry(
+        key="setup_test", name="Setup test", icon_name="hand.raised.fingers.spread",
+        description="Internal one-time alert self-test.",
+        category="routine", shape="point_in_time", cohort="both",
+        recommended=False, seeded=True, hidden=True, fire_once=True,
+        prompt_fragment=_SETUP_TEST_PROMPT_FRAGMENT,
+        promotion_threshold=0.70,
+    ),
 )
 
 
@@ -938,18 +986,33 @@ def is_minor(date_of_birth: date | None) -> bool:
 
 
 def for_cohort(minor: bool) -> list[CatalogEntry]:
-    """Catalog entries shown to this cohort: the cohort-specific ones
-    (`child` or `adult`) plus the `both` entries, in CATALOG order
-    (recommended first)."""
+    """Catalog entries shown to this cohort in the library UI: the cohort-
+    specific ones (`child` or `adult`) plus the `both` entries, in CATALOG order
+    (recommended first). `hidden` entries are excluded — they seed + run but are
+    never offered in the picker."""
     want = "child" if minor else "adult"
-    return [e for e in CATALOG if e.cohort in (want, "both")]
+    return [e for e in CATALOG if e.cohort in (want, "both") and not e.hidden]
 
 
 def seeded_for_cohort(minor: bool) -> list[CatalogEntry]:
     """The subset auto-seeded on patient create AND pre-checked at onboarding —
-    fall + the cohort presets. This is the `seeded` set, NOT `recommended` (which
-    is only the library's "Recommended" UI group, i.e. just fall)."""
-    return [e for e in for_cohort(minor) if e.seeded]
+    fall + the cohort presets (+ any hidden internal detectors like the setup
+    self-test). Reads CATALOG directly rather than via `for_cohort` so a `hidden`
+    detector still seeds even though it's excluded from the library UI."""
+    want = "child" if minor else "adult"
+    return [e for e in CATALOG if e.cohort in (want, "both") and e.seeded]
+
+
+def hidden_keys() -> list[str]:
+    """Identifiers of internal detectors that must never appear in any caregiver-
+    facing list. `detector_repo.list_for_patient` filters these out."""
+    return [e.key for e in CATALOG if e.hidden]
+
+
+def fire_once_keys() -> frozenset[str]:
+    """Identifiers that fire exactly once then disable themselves.
+    `event_promotion` flips `is_on=false` on the row right after promoting."""
+    return frozenset(e.key for e in CATALOG if e.fire_once)
 
 
 def by_key(key: str) -> CatalogEntry | None:

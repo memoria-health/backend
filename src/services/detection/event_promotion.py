@@ -41,7 +41,24 @@ _EVENT_TITLE_BY_IDENTIFIER: dict[str, str] = {
     "wandering":  "Possible Wandering",
     "agitation":  "Possible Agitation",
     "medication": "Possible Medication Event",
+    # Internal setup self-test — a success confirmation, NOT a "Possible …" alert.
+    "setup_test": "Memoria Test Alert successful",
 }
+
+# Identifiers that fire exactly once then disable themselves (the hidden setup
+# self-test). On promotion we flip the detector row's `is_on=false`; because the
+# row is per-patient (shared across all their cameras), that one flip stops it
+# everywhere — it can never fire a second time on any camera.
+_FIRE_ONCE_KEYS = catalog.fire_once_keys()
+
+# Fixed narrative for the setup self-test. The default event narrative is the
+# VLM's free-text scene description; for the test we want a deterministic,
+# reassuring confirmation that the whole alert path worked.
+_SETUP_TEST_NARRATIVE = (
+    "Your alerts are working. Memoria saw three fingers held up to the camera "
+    "and ran this test end-to-end — detection, push, and email. This test runs "
+    "only once."
+)
 
 
 def _event_title_for(detector: Detector) -> str:
@@ -208,6 +225,17 @@ async def maybe_promote_analysis(
             )
         )
 
+        # Fire-once: the moment a self-test promotes, disable its (single,
+        # per-patient) row so it can never fire again — on this camera or any
+        # other. The caller commits this session, persisting is_on=false; the
+        # next tick's registry query (is_on=true filter) drops it everywhere.
+        if ident in _FIRE_ONCE_KEYS:
+            det.is_on = False
+            _log.info(
+                "[event_promotion] fire-once detector %s (%s) disabled after "
+                "first fire for patient %s", det.id, ident, patient_id,
+            )
+
     return PromotionResult(fired=fired, skipped_for_dedup=skipped)
 
 
@@ -248,6 +276,13 @@ async def _insert_event(
     occurred_at: datetime,
     description: str,
 ) -> Event:
+    # The setup self-test gets a fixed, reassuring confirmation rather than the
+    # VLM's raw scene description.
+    narrative = (
+        _SETUP_TEST_NARRATIVE
+        if detector.identifier in _FIRE_ONCE_KEYS
+        else description
+    )
     row = Event(
         id=uuid4(),
         patient_id=patient.id,
@@ -262,7 +297,7 @@ async def _insert_event(
         # Phase 0: no clips yet (HTTP clip ingest doesn't archive).
         # Phase 4 wires LiveKit Track Egress → has_clip=true.
         has_clip=False,
-        narrative=description,
+        narrative=narrative,
         opened=False,
         reviewed=False,
         review_choice=None,

@@ -8,11 +8,12 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.detector import Detector
 from src.db.patient import Patient
+from src.services.detection import catalog
 
 
 async def list_for_patient(
@@ -21,14 +22,26 @@ async def list_for_patient(
     """Return every detector for a caregiver-owned patient.
 
     Joins through `patients` so a request for someone else's
-    patient_id silently returns empty.
+    patient_id silently returns empty. Internal `hidden` detectors (the
+    setup self-test) are filtered out so they never show in the app — the
+    detection worker reads them through a separate registry query, so this
+    filter doesn't affect whether they run.
     """
+    # NULL-safe: custom detectors mid-compile have a NULL identifier and must
+    # still be listed (`identifier NOT IN (...)` is NULL → would drop them).
+    hidden = catalog.hidden_keys()
+    hide_clause = (
+        or_(Detector.identifier.is_(None), Detector.identifier.notin_(hidden))
+        if hidden
+        else True
+    )
     result = await session.execute(
         select(Detector)
         .join(Patient, Patient.id == Detector.patient_id)
         .where(
             Detector.patient_id == patient_id,
             Patient.caregiver_id == caregiver_id,
+            hide_clause,
         )
         # `id` is a stable tie-breaker — `onboarding.seed_detectors_for_patient`
         # currently stamps all four presets with the same `now`, so without a
