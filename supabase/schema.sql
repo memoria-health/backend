@@ -92,6 +92,11 @@ create table public.caregivers (
   -- client auto-detects browser tz and PATCHes /v1/me; this default
   -- is the fallback for accounts that never loaded the web app.
   timezone     text not null default 'America/New_York',
+  -- Per-account VLM override: 'gemini' | 'openai' | 'openrouter'.
+  -- NULL = use the server's default_vlm_provider. Lets us move a single
+  -- family onto a different model (e.g. Qwen3-VL via OpenRouter) by
+  -- flipping this column — no deploy. Read on the detection hot path.
+  vlm_provider text,
   created_at   timestamptz not null default now(),
   updated_at   timestamptz not null default now()
 );
