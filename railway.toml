@@ -1,0 +1,13 @@
+# Railway build configuration for nemara-backend.
+#
+# Pins the Dockerfile path so relocating it into docker/ does NOT break
+# Railway's previously auto-detected root-Dockerfile build. The build
+# context remains the repository root, so the Dockerfile's COPY paths
+# (pyproject.toml, uv.lock, src/, supabase/, scripts/, README.md) resolve
+# unchanged.
+#
+# If you ever rename/move the prod image again, update dockerfilePath here
+# rather than relying on dashboard auto-detection.
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "docker/Dockerfile"

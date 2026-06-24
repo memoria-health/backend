@@ -1,0 +1,43 @@
+# Run nemara-backend as a managed container against the Supabase-CLI local
+# stack (which you start separately: `make db-start` / `supabase start`).
+#
+# This replaces ad-hoc backgrounded `uvicorn` host processes: one container,
+# `make backend-up` / `make backend-down`, and `docker compose down` reaps it
+# cleanly. No more orphaned uvicorn/ngrok lingering across sessions.
+#
+# This file lives in docker/, so every relative path resolves from HERE:
+#   build context -> ..        (repo root, for the Dockerfile COPY paths)
+#   env_file      -> ../.env
+#   src mount     -> ../src
+name: memoria-backend
+
+services:
+  backend:
+    container_name: memoria-backend
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.dev
+    # All config + secrets come straight from the local .env.
+    env_file: ../.env
+    environment:
+      # .env points the DB at 127.0.0.1:54342 — inside the container that is
+      # the container itself. Reach the host-published Supabase DB instead.
+      NEMARA_DB_URL: "postgresql+asyncpg://postgres:postgres@host.docker.internal:54342/postgres"
+      # NEMARA_SUPABASE_URL is intentionally NOT overridden: it must stay the
+      # host LAN IP from .env, because the backend both CALLS Supabase with it
+      # AND hands the iOS app signed storage URLs built from it (split horizon
+      # — one address must work for both the container and the device).
+      # Re-ID off locally — the dev image skips the ML model bake.
+      NEMARA_REID_ENABLED: "false"
+      PORT: "8002"
+    ports:
+      - "8002:8002"
+    # Lets the container resolve host.docker.internal on Linux too (Docker
+    # Desktop on macOS provides it automatically; harmless to declare).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Bind-mount source for hot reload (uvicorn --reload watches /app/src).
+    volumes:
+      - ../src:/app/src
+    # Dev: never auto-restart, so `make backend-down` / Ctrl-stop is final.
+    restart: "no"

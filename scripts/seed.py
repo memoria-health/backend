@@ -114,9 +114,9 @@ async def seed_patient(session: AsyncSession, caregiver_id: UUID) -> Patient:
         gender="Female",
         relation="parent",
         home_address="84 Birch Lane, Cambridge MA",
-        state="critical",
-        status_line="Possible fall, living room",
-        last_event_at=now - timedelta(minutes=42),
+        state="calm",
+        status_line="All quiet",
+        last_event_at=None,
         cameras_paused=False,
         created_at=now,
         updated_at=now,
@@ -147,37 +147,17 @@ async def seed_patient(session: AsyncSession, caregiver_id: UUID) -> Patient:
             )
         )
 
-    # Events — covers the iOS Events tab's state matrix.
-    # `has_clip` is False on every seeded row: a real clip only exists
-    # when the detector pipeline runs against a paired camera and the
-    # archival path uploads an MP4 to Supabase Storage. Faking has_clip
-    # without writing a file makes iOS's GET /v1/events/{id}/clip-url
-    # land 409 (clip_not_ready), which is correct backend behavior but
-    # confuses anyone clicking seeded events expecting playback.
-    event_specs = [
-        # (category, source, icon, title, location, mins_ago, narrative, opened, reviewed, choice, notes)
-        ("safety",  "preset", "figure.fall",         "Possible fall",     "Living room",     42,
-         "A sharp downward motion at 14:32, followed by three minutes of stillness on the floor near the coffee table. No spoken response when we tried room audio at 14:33.",
-         False, False, None, None),
-        ("safety",  "preset", "figure.walk.motion",  "Agitation episode", "Bedroom",         120,
-         "Maggie paced from the doorway to the window for about four minutes around 13:10. Voice raised twice without clear words. Settled with the radio.",
-         True,  False, None, None),
-        ("routine", "preset", "pills",               "Medication",        "Kitchen",         420,
-         "Maggie took her morning pills at 08:05, with tea, sitting at the kitchen counter — exactly her usual pattern.",
-         False, False, None, None),
-        ("safety",  "custom", "moon.stars",          "Late kitchen visit","Kitchen",         780,
-         "Brief light in the kitchen at 02:30. Maggie got a glass of water and returned to bed within four minutes.",
-         True,  True,  "correct", None),
-        ("safety",  "preset", "door.left.hand.open", "Front door opened", "Hallway",         1380,
-         "Front door opened at 16:15. Maggie greeted someone (the home aide on her usual Tuesday visit), they came in, door closed within 20 seconds.",
-         True,  True,  "correct", None),
-        ("routine", "preset", "pills",               "Medication",        "Kitchen",         1440,
-         "Evening pills taken at 20:05.",
-         True,  True,  "correct", None),
-        ("safety",  "preset", "figure.walk.motion",  "Agitation episode", "Living room",     4320,
-         "A brief pacing episode around the news hour — calmed within five minutes.",
-         True,  True,  "correct", None),
-    ]
+    # Events — Margaret seeds CLEAN: no events, so her profile starts in
+    # the "calm" state (not highlighted with a fall). The prior 7-event
+    # fixture (fall / agitation / medication, covering the iOS Events tab
+    # state matrix) is intentionally removed; restore it from git history
+    # if you need event fixtures for demoing the Events tab.
+    #
+    # If you re-add events: keep `has_clip=False` on every seeded row. A
+    # real clip only exists once the detector pipeline uploads an MP4 to
+    # Supabase Storage; faking has_clip makes iOS's GET
+    # /v1/events/{id}/clip-url land 409 (clip_not_ready).
+    event_specs: list[tuple] = []
     for (
         category, source, icon, title, location, mins_ago,
         narrative, opened, reviewed, choice, notes,

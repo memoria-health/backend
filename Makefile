@@ -1,10 +1,13 @@
-.PHONY: help dev test test-unit test-integration lint format db-start db-stop db-reset studio install e2e fresh fresh-seed down icon
+.PHONY: help dev test test-unit test-integration lint format db-start db-stop db-reset studio install e2e fresh fresh-seed down icon backend-up backend-down backend-logs
 
 PY := PYTHONPATH=. uv run
 
 help:
 	@echo "make install          - uv sync"
 	@echo "make dev              - start nemara-backend in dev mode (auto-starts supabase)"
+	@echo "make backend-up       - run backend in Docker against the local Supabase stack"
+	@echo "make backend-down     - stop the Dockerised backend"
+	@echo "make backend-logs     - tail the Dockerised backend logs"
 	@echo "make test             - run unit + integration tests"
 	@echo "make test-unit        - run unit tests only"
 	@echo "make test-integration - run integration tests only"
@@ -29,7 +32,21 @@ install:
 	fi
 
 dev: db-start
-	$(PY) uvicorn src.main:app --reload --host 0.0.0.0 --port 8000
+	$(PY) uvicorn src.main:app --reload --host 0.0.0.0 --port 8002
+
+# ── Dockerised backend (local) ──────────────────────────────────────
+# `make backend-up` brings up the whole local backend in ONE command:
+# first the Supabase stack (Postgres + Auth/JWKS + Storage + Realtime —
+# the "database" both the backend AND the apps depend on; idempotent via
+# db-start), then the backend container. Compose file lives in docker/.
+backend-up: db-start
+	docker compose -f docker/docker-compose.local.yml up -d --build
+
+backend-down:
+	docker compose -f docker/docker-compose.local.yml down
+
+backend-logs:
+	docker compose -f docker/docker-compose.local.yml logs -f
 
 test:
 	$(PY) pytest test/ -v

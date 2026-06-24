@@ -1,0 +1,45 @@
+# docker/Dockerfile.dev — lightweight local-dev image for nemara-backend.
+#
+# Shares the production base image and the EXACT same dependency layer as
+# docker/Dockerfile (same pyproject.toml + uv.lock), so the Python runtime
+# matches prod. It deliberately diverges in two ways, for fast local iteration:
+#
+#   1. It does NOT pre-bake the InsightFace / YOLO / OSNet model weights
+#      (~300 MB, minutes of build time). Re-ID is disabled locally via
+#      NEMARA_REID_ENABLED=false in docker-compose.local.yml, so the weights
+#      aren't needed for the call/dial-in (LiveKit) work this image targets.
+#   2. It does NOT copy ./src into the image. Source is bind-mounted at
+#      runtime (see docker-compose.local.yml) and served with
+#      `uvicorn --reload`, so edits hot-reload without a rebuild.
+#
+# Build context is the repo root (see compose `context: ..`), so the COPY
+# paths below match the prod Dockerfile.
+FROM python:3.12-slim
+
+# Same native deps as prod: ffmpeg + the OpenMP/BLAS/GL runtimes that opencv
+# and onnxruntime pull in at import time even when Re-ID inference is off.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ffmpeg libgomp1 libopenblas-dev libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir uv
+
+WORKDIR /app
+
+# Identical dependency layer to prod. We install third-party deps only
+# (--no-install-project); the app's own `src` package is bind-mounted at
+# runtime rather than copied + installed, so code edits don't need a rebuild.
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
+
+# `src` is bind-mounted at /app/src by compose. Make it importable without
+# installing the project, and put the venv's binaries (uvicorn) on PATH.
+ENV PYTHONPATH=/app
+ENV PATH="/app/.venv/bin:$PATH"
+
+# Match the app's Debug expectation + the prod Dockerfile's $PORT default.
+EXPOSE 8002
+
+# --reload + --reload-dir watches the bind-mounted source for hot reload.
+CMD ["sh", "-c", "uvicorn src.main:app --host 0.0.0.0 --port ${PORT:-8002} --reload --reload-dir /app/src"]
