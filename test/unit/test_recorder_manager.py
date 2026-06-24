@@ -232,3 +232,64 @@ async def test_finalize_camera_without_session_is_noop(tmp_path) -> None:
     mgr = _make_manager(tmp_path)
     await mgr.finalize_camera(uuid4())  # must not raise
     assert mgr.active_count == 0
+
+
+async def _run_one_session(mgr, clock) -> None:
+    cam = uuid4()
+    await mgr.on_tick(cam, True, ctx=_ctx())
+    await mgr.on_tick(cam, False, ctx=_ctx())  # linger
+    clock.advance(46.0)
+    await mgr.on_tick(cam, False, ctx=_ctx())  # finalize
+    await mgr.drain()
+
+
+@pytest.mark.asyncio
+async def test_upload_retries_then_gives_up_but_still_cleans_up(tmp_path) -> None:
+    clock = _Clock()
+    uploader = _FakeUploader(fail_times=99)  # never succeeds
+    mgr = _make_manager(tmp_path, uploader=uploader, clock=clock)
+    await _run_one_session(mgr, clock)
+
+    assert len(uploader.calls) == 3  # default upload_retries, then gives up
+    assert mgr.active_count == 0
+    # Temp files are cleaned up even when every upload attempt failed.
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_upload_retries_then_succeeds(tmp_path) -> None:
+    clock = _Clock()
+    uploader = _FakeUploader(fail_times=1)  # first attempt fails, second wins
+    mgr = _make_manager(tmp_path, uploader=uploader, clock=clock)
+    await _run_one_session(mgr, clock)
+
+    assert len(uploader.calls) == 2
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_aclose_finalizes_in_flight_sessions_on_shutdown(tmp_path) -> None:
+    muxer, uploader = _FakeMuxer(), _FakeUploader()
+    mgr = _make_manager(tmp_path, muxer=muxer, uploader=uploader)
+    await mgr.on_tick(uuid4(), True, ctx=_ctx())  # recording, never lingered out
+    assert mgr.active_count == 1
+
+    await mgr.aclose()  # graceful shutdown
+
+    assert mgr.active_count == 0
+    assert len(muxer.calls) == 1
+    assert len(uploader.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_b2_not_configured_skips_upload_but_cleans_up(tmp_path) -> None:
+    clock = _Clock()
+    uploader = _FakeUploader()
+    settings = SimpleNamespace(
+        b2_key_id="", b2_app_key="", data_collection_max_concurrent=8
+    )
+    mgr = _make_manager(tmp_path, settings=settings, uploader=uploader, clock=clock)
+    await _run_one_session(mgr, clock)
+
+    assert uploader.calls == []  # never attempted without creds
+    assert list(tmp_path.iterdir()) == []  # still cleaned up
