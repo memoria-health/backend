@@ -570,8 +570,13 @@ def _reset_camera_to_unpaired(cam: Camera) -> None:
     cam.api_key_hash = None
     cam.pairing_code = None
     cam.pairing_expires_at = None
-    cam.livekit_identity = None
-    cam.livekit_room = None
+    # Keep the LiveKit identity/room — they're deterministic per camera
+    # (cam_<id> / patient_<patient_id>) and the re-pair claim does NOT
+    # rewrite them in the DB. Nulling them here left livekit_room=None, so
+    # the next Start's token request was rejected (camera_room_mismatch,
+    # cam_room=None). Restore the canonical values so re-pair → Start works.
+    cam.livekit_identity = f"cam_{cam.id.hex[:8]}"
+    cam.livekit_room = f"patient_{cam.patient_id}"
     cam.online = False
     # Start the re-paired camera DISCONNECTED, not connected. A fresh re-pair
     # isn't streaming yet, so the apps must show "Reconnect" (an action) — not
