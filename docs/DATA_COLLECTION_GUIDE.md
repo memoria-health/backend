@@ -231,14 +231,21 @@ blocker for turning it on at scale.
 - Web consent UI: component unit tests + typecheck + production build.
 - iOS consent UI: full simulator build.
 
-**Pre-existing notes (unrelated to this feature, surfaced while testing):**
-- The local backend test suite has **9 failing tests** in `test_prompt_builder.py` and
-  `test_state_machine*.py` that predate this work — they come from the recent `main` merge
-  (a prompt-builder change and a `cameras` schema change where the tests weren't updated).
-  They are **not** touched by this feature.
-- Onboarding now seeds a 5th preset detector named `setup_test` for every new patient, which
-  breaks two patient-creation tests that expect exactly 4. Also from the merge — worth a
-  look to confirm `setup_test` is intended for production.
-- Two columns the merge added to `schema.sql` (`caregivers.vlm_provider`,
-  `cameras.last_seen_at`) were missing from the **local** dev database; they were applied
-  additively (no data lost). Prod should already have them via the normal delta process.
+**Pre-existing failures (from earlier `main` merges) — now fixed in this branch:**
+The suite had 9 failing tests before this work, all stale tests that drifted from
+*intentional* code changes (none related to data collection). They were repaired:
+- `test_prompt_builder.py` (4) — the always-on `PEOPLE_PRESENT_SPEC` was **re-enabled** in
+  `prompt.py` (the LLM is the generic presence detector again, which `camera_ingest`'s gate
+  reads), but the tests still asserted it was absent. Updated to assert it's always merged.
+- `test_state_machine*.py` (4) — `cameras.last_seen_at` was deliberately dropped in
+  `bb2ad6f` ("drop last_seen_at column and writers"), but the regression tests still
+  inserted/asserted it. Removed those references; kept the still-valid "state machine never
+  writes `cameras.online`" guard (the reconciler owns that column).
+- `test_patients.py` age-preset tests (2) — were missing the `/v1/me` caregiver
+  provisioning step (FK violation); added it. `setup_test` is an **intended hidden** internal
+  detector — it's seeded but correctly filtered from the caregiver-facing detector list, so
+  the expected detector sets are unchanged.
+
+**Local dev DB note:** `caregivers.vlm_provider` was missing from the local DB (it's in
+`schema.sql` from a merge) and was applied additively — no data lost. (A `cameras.last_seen_at`
+column does **not** exist by design; it was dropped in `bb2ad6f`.)
