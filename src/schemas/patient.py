@@ -61,6 +61,11 @@ class PatientResponse(BaseModel):
     # (which always receives alerts for this patient when enabled).
     email_alerts_enabled: bool
     email_alert_recipients: list[Email]
+    # Data-collection consent. enabled = master research opt-in (default
+    # OFF). decided_at = when the caregiver decided; null = never asked,
+    # which the web + iOS apps use to show the first-open consent banner.
+    data_collection_enabled: bool
+    data_collection_decided_at: datetime | None
 
 
 class PhotoURLResponse(BaseModel):
@@ -124,3 +129,8 @@ class UpdatePatientRequest(BaseModel):
     # sending `email_alert_recipients` replaces the whole list.
     email_alerts_enabled: bool | None = None
     email_alert_recipients: list[Email] | None = None
+    # Data-collection research opt-in. Sending this (true OR false)
+    # records a consent decision: the handler stamps
+    # `data_collection_decided_at` server-side. `decided_at` itself is
+    # NOT writable here (server-managed) — `extra="forbid"` rejects it.
+    data_collection_enabled: bool | None = None

@@ -151,6 +151,13 @@ async def patch_patient(
     if "relation" in fields and fields["relation"] is not None:
         fields["relation"] = fields["relation"].value
 
+    # Data-collection consent: any time the caregiver sends the flag
+    # (Share=true or Not now=false), record WHEN they decided. A non-null
+    # decided_at is how the web + iOS apps know to stop showing the
+    # first-open consent banner. decided_at is never client-writable.
+    if "data_collection_enabled" in fields:
+        fields["data_collection_decided_at"] = datetime.now(timezone.utc)
+
     cascade_to: str | None = None
     if "cameras_paused" in fields:
         current = await patient_repo.find_by_id(
