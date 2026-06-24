@@ -1,4 +1,4 @@
-.PHONY: help dev test test-unit test-integration lint format db-start db-stop db-reset studio install e2e fresh fresh-seed down icon backend-up backend-down backend-logs
+.PHONY: help dev test test-unit test-integration lint format db-start db-stop db-reset studio install e2e fresh fresh-seed down icon backend-up backend-down backend-logs stack-up stack-down web-logs
 
 PY := PYTHONPATH=. uv run
 
@@ -8,6 +8,9 @@ help:
 	@echo "make backend-up       - run backend in Docker against the local Supabase stack"
 	@echo "make backend-down     - stop the Dockerised backend"
 	@echo "make backend-logs     - tail the Dockerised backend logs"
+	@echo "make stack-up         - bring up Supabase + backend + dashboard (web) together"
+	@echo "make stack-down       - stop the full stack (backend + dashboard)"
+	@echo "make web-logs         - tail the dashboard (web) logs"
 	@echo "make test             - run unit + integration tests"
 	@echo "make test-unit        - run unit tests only"
 	@echo "make test-integration - run integration tests only"
@@ -47,6 +50,20 @@ backend-down:
 
 backend-logs:
 	docker compose -f docker/docker-compose.local.yml logs -f
+
+# ── Full local stack: Supabase + backend + dashboard (web) ──────────
+# `make stack-up` brings up EVERYTHING in one command: the Supabase stack
+# (db-start), then the backend AND the caregiver dashboard (the `web` compose
+# profile, source from ../../nemara-web-app). Dashboard serves on
+# http://localhost:3000 and reaches the backend via the host LAN IP.
+stack-up: db-start
+	docker compose -f docker/docker-compose.local.yml --profile web up -d --build
+
+stack-down:
+	docker compose -f docker/docker-compose.local.yml --profile web down
+
+web-logs:
+	docker compose -f docker/docker-compose.local.yml logs -f web
 
 test:
 	$(PY) pytest test/ -v

@@ -41,3 +41,34 @@ services:
       - ../src:/app/src
     # Dev: never auto-restart, so `make backend-down` / Ctrl-stop is final.
     restart: "no"
+
+  # The caregiver dashboard (separate repo: ../../nemara-web-app), wired into
+  # the same stack so `make stack-up` brings up Supabase + backend + dashboard
+  # in one shot. Behind the `web` profile so the lean `make backend-up` stays
+  # backend-only (and a web build failure can't block the backend).
+  web:
+    container_name: memoria-web
+    profiles: ["web"]
+    build:
+      context: ../../nemara-web-app
+      dockerfile: Dockerfile.dev
+    # NEXT_PUBLIC_* (backend URL, Supabase, LiveKit) come from the
+    # bind-mounted .env.local, which uses the host LAN IP so it resolves from
+    # BOTH the browser AND this container's server-side fetches (Next.js does
+    # both). Polling makes file-watching reliable across the macOS bind-mount.
+    environment:
+      WATCHPACK_POLLING: "true"
+      CHOKIDAR_USEPOLLING: "true"
+    ports:
+      - "3000:3000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ../../nemara-web-app:/app
+      # Anonymous volumes: keep the image's node_modules + container-local
+      # .next out of the host bind-mount (perf + avoids cloud-sync dup files).
+      - /app/node_modules
+      - /app/.next
+    depends_on:
+      - backend
+    restart: "no"
