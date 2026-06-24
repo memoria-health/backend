@@ -137,6 +137,15 @@ create table public.patients (
   -- alerts when enabled). JSON array of strings.
   email_alerts_enabled    boolean not null default false,
   email_alert_recipients  jsonb   not null default '[]'::jsonb,
+  -- Data-collection consent (research opt-in). `data_collection_enabled`
+  -- is the master switch to store short video+audio clips of this
+  -- patient for research, only when someone is present; default OFF
+  -- until the caregiver explicitly opts in. `data_collection_decided_at`
+  -- records WHEN the caregiver decided: NULL = never asked, which drives
+  -- the first-open consent banner (web + iOS). Both "Share" and "Not
+  -- now" stamp it so the banner never re-nags.
+  data_collection_enabled    boolean not null default false,
+  data_collection_decided_at timestamptz,
   -- Bucket-relative key in `patient-photos` (e.g. "{patient_id}.jpg").
   -- NULL until the caregiver uploads an avatar; the roster + header
   -- fall back to initials while NULL. The signed URL is minted at

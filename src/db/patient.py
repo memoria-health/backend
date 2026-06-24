@@ -52,3 +52,19 @@ class Patient(Base):
     email_alert_recipients: Mapped[list[str]] = mapped_column(
         JSONB, server_default=text("'[]'::jsonb"), default_factory=list,
     )
+
+    # ── Data-collection consent (research opt-in) ────────────────
+    # Per-patient switch to store short video+audio clips of this
+    # patient for research (only while someone is present).
+    # `data_collection_enabled` is the master on/off — default OFF, so
+    # nothing records until the caregiver explicitly opts in.
+    # `data_collection_decided_at` records WHEN a decision was made:
+    # NULL = never asked, which drives the first-open consent banner on
+    # web + iOS. Both "Share" and "Not now" stamp it, so once a decision
+    # exists the banner never re-nags.
+    data_collection_enabled: Mapped[bool] = mapped_column(
+        Boolean, server_default=text("false"), default=False,
+    )
+    data_collection_decided_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None,
+    )
