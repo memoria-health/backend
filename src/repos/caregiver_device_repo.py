@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -74,3 +74,24 @@ async def find_by_caregiver(
         .order_by(CaregiverDevice.created_at)
     )
     return (await session.execute(stmt)).scalars().all()
+
+
+async def delete_by_token(
+    session: AsyncSession,
+    *,
+    caregiver_id: UUID,
+    apns_token: str,
+) -> int:
+    """Remove the device row for `apns_token` IF it's owned by
+    `caregiver_id`. Used on sign-out so a signed-out account stops
+    receiving pushes on a device it's left. Scoped to the caller's own
+    rows so one caregiver can't unregister another's device. Returns the
+    number of rows deleted (0 if the token was already gone or had moved
+    to a different caregiver — both fine, idempotent)."""
+    result = await session.execute(
+        delete(CaregiverDevice).where(
+            CaregiverDevice.apns_token == apns_token,
+            CaregiverDevice.caregiver_id == caregiver_id,
+        )
+    )
+    return result.rowcount or 0

@@ -39,3 +39,10 @@ class Caregiver(Base):
     timezone: Mapped[str] = mapped_column(
         String(64), server_default=text("'America/New_York'"), default="America/New_York",
     )
+
+    # Per-account VLM override: "gemini" | "openai" | "openrouter".
+    # NULL ⇒ use the global `settings.default_vlm_provider`. Lets us route
+    # individual families onto a different model (e.g. Qwen3-VL via
+    # OpenRouter) by flipping this one column — no deploy. Read (cached) by
+    # services/detection/vlm_routing.py on the detection hot path.
+    vlm_provider: Mapped[str | None] = mapped_column(String(20), default=None)

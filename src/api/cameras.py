@@ -554,6 +554,119 @@ async def regenerate_pairing_code(
     )
 
 
+def _reset_camera_to_unpaired(cam: Camera) -> None:
+    """Transition a camera from paired → UNPAIRED in place, keeping the
+    row (and its room / detectors / event history).
+
+    Clearing `api_key_hash` is the operative move: the wire `paired` flag
+    is derived from it, so this flips `paired` to False, which (a) re-opens
+    the "Show pairing code" / re-pair path in the apps (gated on
+    `!paired`), and (b) invalidates the old sensor's key so its next poll
+    401s and it bounces back to its own pairing screen. The connection /
+    identity / state-machine fields are reset so a fresh pairing starts
+    clean; caregiver preferences (disabled / ai_paused) and the room/icon
+    are intentionally preserved.
+    """
+    cam.api_key_hash = None
+    cam.pairing_code = None
+    cam.pairing_expires_at = None
+    # Keep the LiveKit identity/room — they're deterministic per camera
+    # (cam_<id> / patient_<patient_id>) and the re-pair claim does NOT
+    # rewrite them in the DB. Nulling them here left livekit_room=None, so
+    # the next Start's token request was rejected (camera_room_mismatch,
+    # cam_room=None). Restore the canonical values so re-pair → Start works.
+    cam.livekit_identity = f"cam_{cam.id.hex[:8]}"
+    cam.livekit_room = f"patient_{cam.patient_id}"
+    cam.online = False
+    # Start the re-paired camera DISCONNECTED, not connected. A fresh re-pair
+    # isn't streaming yet, so the apps must show "Reconnect" (an action) — not
+    # "Disconnect" / "connecting…", which implies it's already live and forces
+    # the caregiver to disconnect something that was never connected. The
+    # sensor honours this on its desired-state poll and stays idle until the
+    # caregiver explicitly reconnects.
+    cam.desired_state = "disconnected"
+    cam.state = "open"
+    cam.no_people_count = 0
+    cam.battery_percent = None
+    cam.app_present = True  # reset heartbeat flag; moot while unpaired
+
+
+async def _stop_worker_best_effort(request: Request, camera_id: UUID) -> None:
+    """Stop the detector worker for a camera, best-effort (same 5s budget
+    and P1-self-destruct safety net as the delete paths)."""
+    worker = getattr(request.app.state, "detector_worker", None)
+    if worker is None:
+        return
+    try:
+        await asyncio.wait_for(
+            worker.stop_worker_for_camera(camera_id, timeout=4.0), timeout=5.0,
+        )
+    except asyncio.TimeoutError:
+        log.warning(
+            "unpair worker_stop_timeout camera=%s — P1 self-destruct reaps within ~30s",
+            camera_id,
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("unpair worker_stop_failed camera=%s", camera_id)
+
+
+# NOTE: `/cameras/me/unpair` MUST be declared before `/cameras/{camera_id}/unpair`
+# or Starlette would match the literal "me" as a camera_id path param (→ 422).
+@router.post(
+    "/cameras/me/unpair",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
+)
+async def unpair_self(
+    auth: CameraAuth,
+    session: SessionDep,
+    request: Request,
+) -> None:
+    """Wall-phone self-unpair (soft). The sensor clears its OWN pairing so
+    the camera row STAYS but goes UNPAIRED + re-pairable, then wipes its
+    local creds. Soft counterpart to DELETE /v1/cameras/me: same auth, but
+    keeps the row + its history/detectors so a caregiver (or this phone)
+    can re-pair to it later from the app.
+    """
+    cam = await session.get(Camera, auth.id)
+    if cam is None:
+        return  # already gone — nothing to unpair
+    _reset_camera_to_unpaired(cam)
+    await session.commit()
+    await _stop_worker_best_effort(request, auth.id)
+
+
+@router.post(
+    "/cameras/{camera_id}/unpair",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
+)
+async def unpair_camera(
+    camera_id: UUID,
+    auth: CaregiverAuth,
+    session: SessionDep,
+    request: Request,
+) -> None:
+    """Caregiver-initiated soft unpair: return the camera to the UNPAIRED
+    state without deleting it. Room, detectors, and event history are
+    preserved, and the camera becomes re-pairable via the existing "Show
+    pairing code" flow. Any currently-paired sensor loses its key and
+    returns to its pairing screen on the next poll.
+
+    Distinct from DELETE /v1/cameras/{id} (removes the row) and from
+    "APP CLOSED"/offline (still paired, just not streaming). 404 if the
+    camera isn't owned by this caregiver's patient.
+    """
+    cam = await camera_repo.find_by_id(session, camera_id, caregiver_id=auth.id)
+    if cam is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="camera_not_found",
+        )
+    _reset_camera_to_unpaired(cam)
+    await session.commit()
+    await _stop_worker_best_effort(request, camera_id)
+
+
 @router.get(
     "/cameras/me/desired-state",
     response_model=DesiredStateResponse,

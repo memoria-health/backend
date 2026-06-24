@@ -41,9 +41,7 @@ from src.services.detection.event_promotion import maybe_promote_analysis
 from src.services.detection.frame_buffer import FrameBuffer
 from src.services.detection.motion_cache import MotionCache
 from src.services.detection.mp4_remux import Mp4RemuxError, frames_to_mp4
-from src.services.detection.providers.gemini import gemini_provider
-from src.services.detection.providers.openai import openai_provider
-from src.services.detection.providers.types import ProviderResult
+from src.services.detection.vlm_routing import resolve_vlm_provider, run_vlm
 from src.services.detection.registry import (
     CameraVanishedError,
     get_enabled_detectors_for_camera,
@@ -519,50 +517,32 @@ class CameraIngest:
                     )
                     return
 
-            # Provider fallback: Gemini -> OpenAI. Gemini-3.5-flash
-            # processes the MP4 as actual video (native temporal
-            # reasoning + higher per-frame fidelity) which is
-            # materially better at the safety-critical detectors:
-            # wandering (did the body cross a doorway through a door
-            # swing?) and fall (sudden downward motion at a specific
-            # instant). gpt-5.4-nano on 75 low-detail jpegs handles
-            # state-style detectors (agitation, medication) fine but
-            # was producing false negatives on threshold-crossing
-            # events. Cost is ~2-3x higher per tick on Gemini, paid
-            # back by not missing real safety incidents. Keep OpenAI
-            # in the fallback slot for when Gemini errors or rate-
-            # limits. Both providers accept the same MP4 bytes;
-            # `openai_provider` extracts frames internally via
-            # `extract_frames`.
-            used_provider: str
-            result: ProviderResult
+            # Per-account VLM routing + fallback chain. Which model this
+            # family runs on comes from `caregivers.vlm_provider` (cached
+            # ~60s, so flipping it takes effect within a minute and adds no
+            # per-tick query). `run_vlm` runs that provider and falls back
+            # through the rest of the chain so a single provider's outage /
+            # rate-limit can't blind the family. Gemini gets native video;
+            # openai / openrouter share the frame-sampling path. See
+            # services/detection/vlm_routing.py.
+            vlm_choice = await resolve_vlm_provider(
+                session, patient.caregiver_id, self._settings,
+            )
             try:
-                used_provider = "gemini"
-                result = await gemini_provider(
-                    mp4=mp4_bytes, detectors=detectors,
-                    log_tag=self._log_tag, settings=self._settings,
-                    patient_in_clip=identity.patient_in_clip,
-                    patient_bbox=identity.patient_bbox,
+                used_provider, result = await run_vlm(
+                    choice=vlm_choice,
+                    mp4=mp4_bytes,
+                    detectors=detectors,
+                    identity=identity,
+                    log_tag=self._log_tag,
+                    settings=self._settings,
                 )
-            except Exception as gem_err:
-                log.warning("%s gemini failed, trying openai: %s", self._log_tag, gem_err)
-                try:
-                    used_provider = "openai"
-                    result = await openai_provider(
-                        mp4=mp4_bytes, detectors=detectors,
-                        log_tag=self._log_tag, settings=self._settings,
-                        patient_in_clip=identity.patient_in_clip,
-                        patient_bbox=identity.patient_bbox,
-                        pre_extracted_frames=identity.extracted_frames,
-                        per_frame_bboxes=identity.per_frame_bboxes,
-                        sample_fps=identity.sample_fps,
-                    )
-                except Exception as oa_err:
-                    log.error(
-                        "%s both providers failed: gemini=%s openai=%s",
-                        self._log_tag, gem_err, oa_err,
-                    )
-                    return
+            except Exception:  # noqa: BLE001
+                log.error(
+                    "%s all VLM providers failed (choice=%s)",
+                    self._log_tag, vlm_choice,
+                )
+                return
 
             # Stash identity in detector_fields so the analyses row
             # carries it for the dashboard / event_promotion path.
