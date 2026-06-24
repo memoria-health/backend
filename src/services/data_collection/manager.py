@@ -79,12 +79,24 @@ class RecorderManager:
 
         self._sessions: dict[UUID, SessionRecorder] = {}
         self._pending_uploads: set[asyncio.Task] = set()
+        # Detection ticks for one camera can OVERLAP (the tick loop is
+        # fire-and-forget and the LLM call outlasts the tick interval),
+        # so on_tick must be serialized per camera or two overlapping
+        # ticks could both try to start/transition the same session.
+        self._tick_locks: dict[UUID, asyncio.Lock] = {}
 
     @property
     def active_count(self) -> int:
         return sum(1 for r in self._sessions.values() if r.is_active)
 
     # ── tick + frame entry points (called from the detection hooks) ──
+
+    def _lock_for(self, camera_id: UUID) -> asyncio.Lock:
+        lock = self._tick_locks.get(camera_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._tick_locks[camera_id] = lock
+        return lock
 
     async def on_tick(
         self,
@@ -95,27 +107,43 @@ class RecorderManager:
         lead_in_frames: Sequence[Any] | None = None,
         lead_in_audio: bytes | None = None,
     ) -> None:
-        rec = self._sessions.get(camera_id)
-        if rec is None:
-            if not collect:
-                return  # idle camera, nothing to record
-            if self.active_count >= self._max_concurrent:
-                logger.warning(
-                    "data_collection: session cap %d reached; not recording camera %s",
-                    self._max_concurrent,
-                    camera_id,
-                )
-                return
-            rec = self._make_recorder(camera_id, ctx)
-            self._sessions[camera_id] = rec
+        async with self._lock_for(camera_id):
+            rec = self._sessions.get(camera_id)
+            if rec is None:
+                if not collect:
+                    return  # idle camera, nothing to record
+                if self.active_count >= self._max_concurrent:
+                    logger.warning(
+                        "data_collection: session cap %d reached; "
+                        "not recording camera %s",
+                        self._max_concurrent,
+                        camera_id,
+                    )
+                    return
+                rec = self._make_recorder(camera_id, ctx)
+                self._sessions[camera_id] = rec
 
-        await rec.on_tick(
-            collect, lead_in_frames=lead_in_frames, lead_in_audio=lead_in_audio
-        )
-        # Drop fully-idle recorders so the dict (and the cap math) stays
-        # tight — a session that just finalized is back to IDLE.
-        if not rec.is_active:
-            self._sessions.pop(camera_id, None)
+            await rec.on_tick(
+                collect, lead_in_frames=lead_in_frames, lead_in_audio=lead_in_audio
+            )
+            # Drop fully-idle recorders so the dict (and the cap math)
+            # stays tight — a session that just finalized is back to IDLE.
+            if not rec.is_active:
+                self._sessions.pop(camera_id, None)
+
+    async def finalize_camera(self, camera_id: UUID) -> None:
+        """Force-finalize a single camera's in-flight session (called when
+        the camera is removed / vanishes mid-session). The clip's upload
+        still proceeds via the normal fire-and-forget path."""
+        async with self._lock_for(camera_id):
+            rec = self._sessions.pop(camera_id, None)
+        if rec is not None and rec.is_active:
+            try:
+                await rec.aclose()
+            except Exception:
+                logger.exception(
+                    "data_collection: finalize_camera failed for %s", camera_id
+                )
 
     def feed_video(self, camera_id: UUID, width: int, height: int, data: bytes) -> None:
         rec = self._sessions.get(camera_id)

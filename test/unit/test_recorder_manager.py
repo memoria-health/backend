@@ -209,3 +209,26 @@ async def test_feed_for_unknown_camera_is_noop(tmp_path) -> None:
     # No session for this camera — must not raise.
     mgr.feed_video(uuid4(), 320, 240, _blob())
     mgr.feed_audio(uuid4(), b"\x00")
+
+
+@pytest.mark.asyncio
+async def test_finalize_camera_flushes_in_flight_session(tmp_path) -> None:
+    muxer, uploader = _FakeMuxer(), _FakeUploader()
+    mgr = _make_manager(tmp_path, muxer=muxer, uploader=uploader)
+    cam = uuid4()
+    await mgr.on_tick(cam, True, ctx=_ctx())  # session in flight
+    assert mgr.active_count == 1
+
+    await mgr.finalize_camera(cam)  # camera removed mid-session
+    await mgr.drain()
+
+    assert mgr.active_count == 0
+    assert len(muxer.calls) == 1
+    assert len(uploader.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_finalize_camera_without_session_is_noop(tmp_path) -> None:
+    mgr = _make_manager(tmp_path)
+    await mgr.finalize_camera(uuid4())  # must not raise
+    assert mgr.active_count == 0

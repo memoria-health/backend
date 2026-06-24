@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 from uuid import UUID
@@ -49,11 +50,14 @@ from src.services.detection.registry import (
 from src.services.detection.state_machine import apply_tick_update
 from src.repos.face_embedding_repo import has_ready_enrollment
 from src.services.reid.inference import IdentityResult, ReIDInference
+from src.services.data_collection.gate import should_collect
+from src.services.data_collection.session import RecorderCtx
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
     from src.settings import Settings
+    from src.services.data_collection.manager import RecorderManager
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +68,22 @@ log = logging.getLogger(__name__)
 # write an analysis row to a now-deleted camera (FK violation,
 # silently swallowed).
 _STOP_INFLIGHT_TIMEOUT: float = 2.0
+
+
+@dataclass
+class _RecorderDecision:
+    """Per-tick verdict handed to the data-collection recorder.
+
+    Created fresh each tick (ticks can overlap, so this must NOT be
+    shared instance state). Defaults to "don't collect" so an early-
+    return tick still drives any open session toward finalize; the
+    fields are filled in as the tick learns presence + identity.
+    """
+
+    collect: bool = False
+    ctx: "RecorderCtx | None" = None
+    lead_frames: list | None = None
+    lead_audio: bytes | None = None
 
 
 class CameraIngest:
@@ -83,6 +103,7 @@ class CameraIngest:
         settings: "Settings",
         reid: ReIDInference,
         livekit_identity: str | None = None,
+        recorder: "RecorderManager | None" = None,
     ) -> None:
         self.camera_id = camera_id
         self.patient_id = patient_id
@@ -90,6 +111,10 @@ class CameraIngest:
         self._motion_cache = motion_cache
         self._settings = settings
         self._reid = reid
+        # Data-collection recorder (owned by the RoomWorker, shared
+        # across the room's cameras). None when the feature is off /
+        # not wired — then every recorder hook is a no-op.
+        self._recorder = recorder
         # Retained for log identification; the actual reaper for a
         # vanished camera lives in `LiveKitRoomReconciler`.
         self._livekit_identity = livekit_identity
@@ -233,6 +258,37 @@ class CameraIngest:
             return
 
     async def _run_tick(self) -> None:
+        """Run one tick, then drive the data-collection recorder.
+
+        The recorder is driven in a `finally` so EVERY tick path —
+        including the early-return short-circuits below — gets a chance
+        to advance an open recording session toward its linger/finalize.
+        `_drive_recorder` is a no-op unless the feature is wired and the
+        tick got far enough to know which patient it's for.
+        """
+        decision = _RecorderDecision()
+        try:
+            await self._run_tick_inner(decision)
+        finally:
+            await self._drive_recorder(decision)
+
+    async def _drive_recorder(self, decision: "_RecorderDecision") -> None:
+        """Hand the per-tick decision to the recorder. Never raises into
+        the tick — recording must never affect detection."""
+        if self._recorder is None or decision.ctx is None:
+            return
+        try:
+            await self._recorder.on_tick(
+                self.camera_id,
+                decision.collect,
+                ctx=decision.ctx,
+                lead_in_frames=decision.lead_frames,
+                lead_in_audio=decision.lead_audio,
+            )
+        except Exception:
+            log.exception("%s data-collection recorder tick failed", self._log_tag)
+
+    async def _run_tick_inner(self, decision: "_RecorderDecision") -> None:
         """One tick — mirrors `src/api/clips.py:ingest_clip` body."""
         motion_in_clip = self._motion_cache.get(self.camera_id)
         captured_at = datetime.now(timezone.utc)
@@ -257,6 +313,18 @@ class CameraIngest:
             if patient is None:
                 log.warning("%s patient row vanished mid-flight", self._log_tag)
                 return
+
+            # Base recorder context, refined once presence is known
+            # below. Set here (after the patient + camera rows load) so
+            # that even an early-return tick can drive an open session
+            # toward finalize — `collect` stays False on those paths.
+            decision.ctx = RecorderCtx(
+                caregiver_id=patient.caregiver_id,
+                patient_id=self.patient_id,
+                room=cam.room,
+                gate="person",
+                confidence=None,
+            )
 
             log.info(
                 "%s START detectors=%s motion=%s prior_state=%s "
@@ -599,6 +667,27 @@ class CameraIngest:
                 present_src = "reid_unavailable_llm"
             result.detector_fields["people_present_src"] = present_src
             result.detector_fields["people_count_reid"] = identity.people_count_reid
+
+            # Data-collection recorder decision — READ-ONLY over the
+            # signals detection just computed (opt-in flag + motion +
+            # presence). Reuses the analysis window/pcm already snapshotted
+            # above as the session lead-in. Never alters detection; the
+            # actual recording happens in the RoomWorker-owned recorder.
+            if should_collect(
+                data_collection_enabled=patient.data_collection_enabled,
+                motion_in_clip=motion_in_clip,
+                gate_people_present=gate_people_present,
+            ):
+                decision.collect = True
+                decision.ctx = RecorderCtx(
+                    caregiver_id=patient.caregiver_id,
+                    patient_id=self.patient_id,
+                    room=cam.room,
+                    gate="poi" if identity.patient_in_clip else "person",
+                    confidence=identity.confidence,
+                )
+                decision.lead_frames = window
+                decision.lead_audio = pcm
 
             # State machine + analyses + event promotion. Same session,
             # one commit at the end.
