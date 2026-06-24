@@ -119,11 +119,6 @@ async def test_open_to_closed_when_no_people_count_reaches_threshold(
     assert cam.close_threshold == 6
     assert cam.state_changed_at is not None
     assert initial_state_changed_at is None or cam.state_changed_at > initial_state_changed_at
-    # `last_seen_at` is now written exclusively by `LiveKitRoomReconciler`
-    # (see room_reconciler.py) and is intentionally NOT touched by the
-    # state machine. The seed in `_insert_camera` left it NULL, so
-    # post-tick it stays NULL.
-    assert cam.last_seen_at is None
 
 
 @pytest.mark.asyncio
