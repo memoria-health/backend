@@ -174,6 +174,29 @@ class Settings(BaseSettings):
     # that a shared URL goes stale fast.
     storage_signed_url_default_ttl_seconds: int = Field(ge=30, le=3600, default=600)
 
+    # ── Data-collection recorder + Backblaze B2 (research opt-in) ──
+    # The in-process recorder uploads one MP4 per presence session to a
+    # Backblaze B2 bucket (S3-compatible). All default empty/safe so
+    # local dev + tests run without B2 creds — the uploader no-ops when
+    # creds are absent (see services/data_collection/b2.b2_configured),
+    # so the recorder degrades to "record but don't upload" rather than
+    # crashing. endpoint_url + region MUST match the region the bucket
+    # was created in (e.g. us-west-004, eu-central-003) — B2 application
+    # keys are region-scoped.
+    b2_key_id: str = Field(default="")
+    b2_app_key: str = Field(default="")
+    b2_bucket: str = Field(default="nemara-data")
+    b2_endpoint_url: str = Field(default="https://s3.us-west-004.backblazeb2.com")
+    b2_region: str = Field(default="us-west-004")
+    # Hard ceiling on a single clip file. ~15min of H.264 720p @2.5Mbps
+    # is ~280 MB; 1.5 GB leaves generous headroom for the roll + audio.
+    data_collection_max_clip_bytes: int = Field(ge=1024, default=1_500_000_000)
+    # Max simultaneous recording sessions per worker process. Over the
+    # cap a new session is not started (logged + skipped), so a surge of
+    # active cameras can't exhaust CPU/disk. Shard the fleet to scale
+    # past it (see the recorder plan's Scaling note).
+    data_collection_max_concurrent: int = Field(ge=1, le=128, default=8)
+
     # ── Re-ID (Phase 1+) ────────────────────────────────────────
     # Feature flag: when False, the enrollment API still accepts
     # photos but the inference pipeline does NOT consult the gallery
