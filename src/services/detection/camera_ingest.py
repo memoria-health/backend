@@ -673,11 +673,25 @@ class CameraIngest:
             # presence). Reuses the analysis window/pcm already snapshotted
             # above as the session lead-in. Never alters detection; the
             # actual recording happens in the RoomWorker-owned recorder.
-            if should_collect(
+            collect = should_collect(
                 data_collection_enabled=patient.data_collection_enabled,
                 motion_in_clip=motion_in_clip,
                 gate_people_present=gate_people_present,
-            ):
+            )
+            # TEMP verbose gate log for local data-collection testing. Only
+            # fires for opted-in patients, so prod stays quiet for everyone
+            # else. Drop to DEBUG or remove before PR.
+            if patient.data_collection_enabled:
+                log.info(
+                    "%s data_collection gate: collect=%s "
+                    "(motion=%s present=%s label=%s)",
+                    self._log_tag,
+                    collect,
+                    motion_in_clip,
+                    gate_people_present,
+                    "poi" if identity.patient_in_clip else "person",
+                )
+            if collect:
                 decision.collect = True
                 decision.ctx = RecorderCtx(
                     caregiver_id=patient.caregiver_id,
