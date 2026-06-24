@@ -573,7 +573,13 @@ def _reset_camera_to_unpaired(cam: Camera) -> None:
     cam.livekit_identity = None
     cam.livekit_room = None
     cam.online = False
-    cam.desired_state = "connected"
+    # Start the re-paired camera DISCONNECTED, not connected. A fresh re-pair
+    # isn't streaming yet, so the apps must show "Reconnect" (an action) — not
+    # "Disconnect" / "connecting…", which implies it's already live and forces
+    # the caregiver to disconnect something that was never connected. The
+    # sensor honours this on its desired-state poll and stays idle until the
+    # caregiver explicitly reconnects.
+    cam.desired_state = "disconnected"
     cam.state = "open"
     cam.no_people_count = 0
     cam.battery_percent = None
