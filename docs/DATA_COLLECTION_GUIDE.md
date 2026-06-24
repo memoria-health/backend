@@ -13,8 +13,8 @@ This document has three parts:
 
 ## 1. What it is
 
-We can now (optionally, per patient) **store short video + audio clips of a patient to
-help improve our AI's understanding of elderly health and disease.** This is a research
+We can now (optionally, per patient) **store video and audio clips of a patient to help
+improve our understanding of elderly health and disease.** This is a research
 data-collection feature. It is **off by default** and only ever runs after a caregiver
 **explicitly opts in** for that specific patient.
 
@@ -27,18 +27,17 @@ Caregivers can turn it off again at any time.
 
 There are two touch-points, on **both the web app and the iOS app**:
 
-- **A consent banner the first time they open a patient.** Plain-language explanation of
+- **A consent prompt the first time they open a patient.** Plain-language explanation of
   what we store and why, with two buttons: **"Share recordings"** and **"Not now."**
-  Either choice is remembered, so the banner never nags them again.
+  Either choice is remembered, so the prompt never appears again.
 - **A toggle in that patient's Settings** — *"Contribute recordings to research"* — that
   they can flip on or off whenever they want.
 
 The exact words shown:
 
-> **Help improve care for everyone.** With your permission, Memoria will securely store
-> short video and audio clips of *[patient]* — only when someone is present — to help
-> improve our AI's understanding of elderly health and disease. This is optional, never
-> required, and you can turn it off anytime in Settings.
+> **Help improve care for everyone.** With your permission, Memoria will **securely store
+> video and audio clips of [patient]** to help improve our understanding of elderly health
+> and disease. This is optional, never required, and you can turn it off anytime in Settings.
 
 ### What gets stored
 
