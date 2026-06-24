@@ -1,0 +1,211 @@
+"""Task 8 — RecorderManager (fakes: no ffmpeg, no B2, no real time).
+
+Owns one SessionRecorder per actively-collecting camera; on finalize it
+muxes, builds the B2 key, uploads with metadata, and deletes temps.
+Injected muxer/uploader/clock make the whole path deterministic.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
+from uuid import uuid4
+
+import pytest
+
+from src.services.data_collection.manager import RecorderManager
+from src.services.data_collection.session import RecorderCtx
+from src.services.detection.frame_buffer import FrameSnapshot
+
+_UTC = datetime(2026, 6, 24, 9, 0, 0, tzinfo=timezone.utc)
+
+
+def _blob(w: int = 320, h: int = 240) -> bytes:
+    return b"\x80" * (w * h * 3 // 2)
+
+
+class _FakeEncoder:
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self.fed: list[tuple[int, int, int]] = []
+
+    async def start(self) -> None:
+        self.path.write_bytes(b"")  # create the temp so cleanup is real
+
+    def feed(self, w: int, h: int, data: bytes) -> None:
+        self.fed.append((w, h, len(data)))
+
+    async def aclose(self) -> Path:
+        self.path.write_bytes(b"video-bytes")
+        return self.path
+
+
+class _Factory:
+    def __init__(self) -> None:
+        self.created: list[_FakeEncoder] = []
+
+    def __call__(self, path: Path) -> _FakeEncoder:
+        e = _FakeEncoder(path)
+        self.created.append(e)
+        return e
+
+
+class _FakeMuxer:
+    def __init__(self) -> None:
+        self.calls: list[tuple[Path, object, Path]] = []
+
+    async def __call__(self, video, audio, out, **kw) -> Path:
+        self.calls.append((Path(video), audio, Path(out)))
+        Path(out).write_bytes(b"final")
+        return Path(out)
+
+
+class _FakeUploader:
+    def __init__(self, fail_times: int = 0) -> None:
+        self.calls: list[tuple[Path, str, dict]] = []
+        self.fail_times = fail_times
+
+    async def __call__(self, path, key, *, metadata, settings) -> str:
+        self.calls.append((Path(path), key, dict(metadata)))
+        if len(self.calls) <= self.fail_times:
+            raise RuntimeError("transient upload error")
+        return key
+
+
+class _Clock:
+    def __init__(self, t: float = 1000.0) -> None:
+        self.t = t
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, dt: float) -> None:
+        self.t += dt
+
+
+async def _noop_sleep(_seconds: float) -> None:
+    return None
+
+
+def _settings(max_concurrent: int = 8) -> SimpleNamespace:
+    return SimpleNamespace(
+        b2_key_id="k",
+        b2_app_key="a",
+        b2_bucket="nemara-data",
+        data_collection_max_concurrent=max_concurrent,
+    )
+
+
+def _make_manager(tmp_path, *, settings=None, muxer=None, uploader=None, clock=None):
+    return RecorderManager(
+        settings=settings or _settings(),
+        temp_dir=tmp_path,
+        encoder_factory=_Factory(),
+        muxer=muxer or _FakeMuxer(),
+        uploader=uploader or _FakeUploader(),
+        clock=clock or _Clock(),
+        utcnow=lambda: _UTC,
+        roll_seconds=900.0,
+        linger_seconds=45.0,
+        retry_base_delay=0.0,
+        sleep=_noop_sleep,
+    )
+
+
+def _ctx(room="Living Room", gate="poi", conf=0.9) -> RecorderCtx:
+    return RecorderCtx(
+        caregiver_id=uuid4(),
+        patient_id=uuid4(),
+        room=room,
+        gate=gate,
+        confidence=conf,
+    )
+
+
+@pytest.mark.asyncio
+async def test_full_session_muxes_uploads_with_key_and_cleans_up(tmp_path) -> None:
+    clock = _Clock()
+    muxer, uploader = _FakeMuxer(), _FakeUploader()
+    mgr = RecorderManager(
+        settings=_settings(),
+        temp_dir=tmp_path,
+        encoder_factory=(factory := _Factory()),
+        muxer=muxer,
+        uploader=uploader,
+        clock=clock,
+        utcnow=lambda: _UTC,
+        roll_seconds=900.0,
+        linger_seconds=45.0,
+        retry_base_delay=0.0,
+        sleep=_noop_sleep,
+    )
+    cam = uuid4()
+    ctx = _ctx()
+    lead = [FrameSnapshot(width=320, height=240, data=_blob(), captured_at=999.0)]
+
+    await mgr.on_tick(cam, True, ctx=ctx, lead_in_frames=lead, lead_in_audio=b"\x00\x00")
+    mgr.feed_video(cam, 320, 240, _blob())
+    mgr.feed_audio(cam, b"\x01\x02")
+    await mgr.on_tick(cam, False, ctx=ctx)  # lingering
+    clock.advance(46.0)
+    await mgr.on_tick(cam, False, ctx=ctx)  # finalize
+    await mgr.drain()  # await the fire-and-forget upload
+
+    assert len(muxer.calls) == 1
+    assert len(uploader.calls) == 1
+    _, key, meta = uploader.calls[0]
+    assert key == (
+        f"nemara-data/v1/{ctx.caregiver_id}/{ctx.patient_id}"
+        f"/2026/06/24/090000Z__living-room.mp4"
+    )
+    assert meta["patient_id"] == str(ctx.patient_id)
+    assert meta["gate"] == "poi"
+    assert meta["room"] == "Living Room"
+    # All temp files removed after upload.
+    assert not factory.created[0].path.exists()
+    assert mgr.active_count == 0
+
+
+@pytest.mark.asyncio
+async def test_concurrent_session_cap_blocks_new_camera(tmp_path) -> None:
+    mgr = _make_manager(tmp_path, settings=_settings(max_concurrent=2))
+    cams = [uuid4() for _ in range(3)]
+    ctx = _ctx()
+    for c in cams[:2]:
+        await mgr.on_tick(c, True, ctx=ctx)
+    assert mgr.active_count == 2
+
+    await mgr.on_tick(cams[2], True, ctx=ctx)  # over the cap
+    assert mgr.active_count == 2  # third was not started
+
+
+@pytest.mark.asyncio
+async def test_feed_routes_to_the_right_camera(tmp_path) -> None:
+    factory = _Factory()
+    mgr = RecorderManager(
+        settings=_settings(),
+        temp_dir=tmp_path,
+        encoder_factory=factory,
+        muxer=_FakeMuxer(),
+        uploader=_FakeUploader(),
+        clock=_Clock(),
+        utcnow=lambda: _UTC,
+    )
+    cam_a, cam_b = uuid4(), uuid4()
+    ctx = _ctx()
+    await mgr.on_tick(cam_a, True, ctx=ctx)
+    await mgr.on_tick(cam_b, True, ctx=ctx)
+
+    mgr.feed_video(cam_a, 320, 240, _blob())
+    enc_a, enc_b = factory.created[0], factory.created[1]
+    assert len(enc_a.fed) == 1
+    assert len(enc_b.fed) == 0
+
+
+@pytest.mark.asyncio
+async def test_feed_for_unknown_camera_is_noop(tmp_path) -> None:
+    mgr = _make_manager(tmp_path)
+    # No session for this camera — must not raise.
+    mgr.feed_video(uuid4(), 320, 240, _blob())
+    mgr.feed_audio(uuid4(), b"\x00")
