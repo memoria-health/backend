@@ -550,7 +550,7 @@ create table public.analyses (
   -- `skipped` is the closed-state short-circuit (no LLM was called).
   -- The row is still persisted so Studio + the detector worker (Phase 2)
   -- can see the tick. See `src/api/clips.py`.
-  provider        text not null check (provider in ('gemini', 'openai', 'skipped')),
+  provider        text not null check (provider in ('gemini', 'openai', 'openrouter', 'skipped')),
   description     text not null,
   detector_fields jsonb not null default '{}'::jsonb,
   people_present  boolean not null,

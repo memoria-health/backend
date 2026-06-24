@@ -11,3 +11,11 @@
 -- family onto a different model — no deploy.
 alter table public.caregivers
   add column if not exists vlm_provider text;
+
+-- The analyses.provider CHECK constraint must allow 'openrouter' or every
+-- OpenRouter (Qwen) tick succeeds at the model but fails on INSERT.
+alter table public.analyses
+  drop constraint if exists analyses_provider_check;
+alter table public.analyses
+  add constraint analyses_provider_check
+  check (provider in ('gemini', 'openai', 'openrouter', 'skipped'));
