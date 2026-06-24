@@ -46,3 +46,24 @@ async def post_device(
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
+
+
+@router.delete(
+    "/devices/{apns_token}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
+)
+async def delete_device(
+    apns_token: str,
+    auth: CaregiverAuth,
+    session: SessionDep,
+) -> None:
+    """De-register this device for the caller, called by the app on
+    sign-out so the signed-out caregiver stops receiving pushes on a
+    device they've left. Scoped to the caller's own rows. Idempotent:
+    204 even if the token was already gone or had since moved to another
+    caregiver (e.g. a different account signed in on the same device)."""
+    await caregiver_device_repo.delete_by_token(
+        session, caregiver_id=auth.id, apns_token=apns_token,
+    )
+    await session.commit()
