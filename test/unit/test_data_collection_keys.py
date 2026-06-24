@@ -29,7 +29,7 @@ def test_build_clip_key_layout_and_has_no_colons() -> None:
     key = build_clip_key(
         caregiver_id=_CG, patient_id=_PT, room="Living Room", session_start=start
     )
-    assert key == f"nemara-data/v1/{_CG}/{_PT}/2026/06/24/090503Z__living-room.mp4"
+    assert key == f"data/v1/{_CG}/{_PT}/2026/06/24/090503Z__living-room.mp4"
     # Colons are legal in S3 keys but break downloaded-filename handling.
     assert ":" not in key
 

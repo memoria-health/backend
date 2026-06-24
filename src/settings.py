@@ -185,7 +185,7 @@ class Settings(BaseSettings):
     # keys are region-scoped.
     b2_key_id: str = Field(default="")
     b2_app_key: str = Field(default="")
-    b2_bucket: str = Field(default="nemara-data")
+    b2_bucket: str = Field(default="memoria-data")
     b2_endpoint_url: str = Field(default="https://s3.us-west-004.backblazeb2.com")
     b2_region: str = Field(default="us-west-004")
     # Hard ceiling on a single clip file. ~15min of H.264 720p @2.5Mbps

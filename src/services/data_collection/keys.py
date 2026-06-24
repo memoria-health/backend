@@ -3,7 +3,7 @@
 Pure helpers — no IO. A clip's key is deterministic from
 (caregiver, patient, session-start UTC, room):
 
-    nemara-data/v1/<caregiver_id>/<patient_id>/<YYYY>/<MM>/<DD>/<HHMMSS>Z__<room-slug>.mp4
+    data/v1/<caregiver_id>/<patient_id>/<YYYY>/<MM>/<DD>/<HHMMSS>Z__<room-slug>.mp4
 
 The date-partitioned layout sorts chronologically in a flat bucket
 listing, and scopes every clip under its owning caregiver + patient so
@@ -20,7 +20,7 @@ import re
 from datetime import datetime, timezone
 from uuid import UUID
 
-_KEY_PREFIX = "nemara-data/v1"
+_KEY_PREFIX = "data/v1"
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 
 

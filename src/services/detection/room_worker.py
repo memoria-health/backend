@@ -227,7 +227,7 @@ class RoomWorker:
         # cap bounds the whole room). Reuses the frames detection already
         # decodes — no extra LiveKit subscription. Inert unless a patient
         # has opted in; idle cameras pay an O(1) no-op feed.
-        recorder_temp_dir = Path(tempfile.gettempdir()) / "nemara-data-collection"
+        recorder_temp_dir = Path(tempfile.gettempdir()) / "memoria-data-collection"
         recorder_temp_dir.mkdir(parents=True, exist_ok=True)
         self._recorder = RecorderManager(
             settings=settings, temp_dir=recorder_temp_dir

@@ -45,7 +45,7 @@ The exact words shown:
 - One MP4 (video **and** audio) per "presence session" — i.e. per continuous stretch of
   someone being in the room. A long stretch is split into ~15-minute pieces.
 - Files land in the **Backblaze B2** bucket under a tidy, sortable path:
-  `nemara-data/v1/<caregiver>/<patient>/<year>/<month>/<day>/<time>Z__<room>.mp4`
+  `data/v1/<caregiver>/<patient>/<year>/<month>/<day>/<time>Z__<room>.mp4`
 - Default video quality is 720p H.264 at ~2.5 Mbps (the same the camera already streams).
 
 ### What is **not** affected
@@ -75,7 +75,7 @@ simply doesn't upload** (it won't crash), so a box with no creds is harmless.
 |---|---|---|
 | `NEMARA_B2_KEY_ID` | B2 application key ID | `0057...` |
 | `NEMARA_B2_APP_KEY` | B2 application key (secret) | `K005...` |
-| `NEMARA_B2_BUCKET` | bucket name | `nemara-data` |
+| `NEMARA_B2_BUCKET` | bucket name | `memoria-data` |
 | `NEMARA_B2_ENDPOINT_URL` | S3-compatible endpoint **for your bucket's region** | `https://s3.us-west-004.backblazeb2.com` |
 | `NEMARA_B2_REGION` | the bucket's region | `us-west-004` |
 | `NEMARA_DATA_COLLECTION_MAX_CONCURRENT` | max simultaneous recordings per worker (safety cap) | `8` |

@@ -85,7 +85,7 @@ async def test_presence_session_produces_one_uploaded_av_clip(tmp_path) -> None:
     settings = SimpleNamespace(
         b2_key_id="k",
         b2_app_key="a",
-        b2_bucket="nemara-data",
+        b2_bucket="memoria-data",
         data_collection_max_concurrent=8,
     )
     mgr = RecorderManager(
@@ -136,7 +136,7 @@ async def test_presence_session_produces_one_uploaded_av_clip(tmp_path) -> None:
     assert len(uploader.calls) == 1
     key, meta = uploader.calls[0]
     assert key == (
-        f"nemara-data/v1/{ctx.caregiver_id}/{ctx.patient_id}"
+        f"data/v1/{ctx.caregiver_id}/{ctx.patient_id}"
         f"/2026/06/24/090000Z__living-room.mp4"
     )
     assert meta["gate"] == "poi"

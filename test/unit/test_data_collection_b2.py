@@ -19,7 +19,7 @@ def _settings(**over: object) -> SimpleNamespace:
     base: dict[str, object] = dict(
         b2_key_id="kid",
         b2_app_key="akey",
-        b2_bucket="nemara-data",
+        b2_bucket="memoria-data",
         b2_endpoint_url="https://s3.us-west-004.backblazeb2.com",
         b2_region="us-west-004",
     )
@@ -68,7 +68,7 @@ async def test_upload_passes_bucket_key_creds_and_string_metadata(tmp_path) -> N
     f.write_bytes(b"\x00\x01\x02")
     s3 = _FakeS3()
     session = _FakeSession(s3)
-    key = "nemara-data/v1/c/p/2026/06/24/090503Z__den.mp4"
+    key = "data/v1/c/p/2026/06/24/090503Z__den.mp4"
 
     returned = await b2.upload_file_to_b2(
         f,
@@ -90,7 +90,7 @@ async def test_upload_passes_bucket_key_creds_and_string_metadata(tmp_path) -> N
     assert len(s3.calls) == 1
     call = s3.calls[0]
     assert call["Filename"] == str(f)
-    assert call["Bucket"] == "nemara-data"
+    assert call["Bucket"] == "memoria-data"
     assert call["Key"] == key
     assert call["ExtraArgs"]["ContentType"] == "video/mp4"
     # S3 object metadata values MUST be strings — confidence float → str.

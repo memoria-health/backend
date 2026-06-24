@@ -92,7 +92,7 @@ def _settings(max_concurrent: int = 8) -> SimpleNamespace:
     return SimpleNamespace(
         b2_key_id="k",
         b2_app_key="a",
-        b2_bucket="nemara-data",
+        b2_bucket="memoria-data",
         data_collection_max_concurrent=max_concurrent,
     )
 
@@ -156,7 +156,7 @@ async def test_full_session_muxes_uploads_with_key_and_cleans_up(tmp_path) -> No
     assert len(uploader.calls) == 1
     _, key, meta = uploader.calls[0]
     assert key == (
-        f"nemara-data/v1/{ctx.caregiver_id}/{ctx.patient_id}"
+        f"data/v1/{ctx.caregiver_id}/{ctx.patient_id}"
         f"/2026/06/24/090000Z__living-room.mp4"
     )
     assert meta["patient_id"] == str(ctx.patient_id)

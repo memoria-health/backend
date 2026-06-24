@@ -6,7 +6,7 @@
 
 **Goal:** When a per-patient `data_collection_enabled` flag is on, record the camera's stream to **one MP4 per presence session** (video **+ audio**), gated on the *existing* motion + person/face signals, and upload to **Backblaze B2** — all **in the detection backend, reusing the frames it already has**.
 
-**Architecture:** A second consumer of the frames already flowing through `RoomWorker._consume_video` (full 15fps, *before* the 4fps detector downsample). A `RecorderManager` owns one `SessionRecorder` per actively-collecting camera. Each session: (a) **seeds a 4fps lead-in** from the `FrameBuffer` window detection already holds — the exact frames analyzed — up to the tick where `people_present` (or `patient_in_clip`, when face embeddings are enrolled) first fires; then (b) records **15fps live forward** until the gate goes false (+ ~45s linger), with a **15-min max roll**. Video is encoded **H.264** (cheap CPU) by a **CFR pacer** (writes the latest frame at 15fps wall-clock, duplicating when stale — handles variable LiveKit fps and the 4fps lead-in, and isolates back-pressure). Audio is captured as a **side PCM file** and **muxed in once at finalize** (`-c:v copy -c:a aac`). The finished MP4 streams to B2 at `nemara-data/v1/<caregiver_id>/<patient_id>/<YYYY>/<MM>/<DD>/<HHMMSS>Z__<room-slug>.mp4` + S3 object metadata. The tick (`camera_ingest._run_tick`) only computes a boolean `should_collect` from existing signals and pokes the manager — **detection logic is never touched.**
+**Architecture:** A second consumer of the frames already flowing through `RoomWorker._consume_video` (full 15fps, *before* the 4fps detector downsample). A `RecorderManager` owns one `SessionRecorder` per actively-collecting camera. Each session: (a) **seeds a 4fps lead-in** from the `FrameBuffer` window detection already holds — the exact frames analyzed — up to the tick where `people_present` (or `patient_in_clip`, when face embeddings are enrolled) first fires; then (b) records **15fps live forward** until the gate goes false (+ ~45s linger), with a **15-min max roll**. Video is encoded **H.264** (cheap CPU) by a **CFR pacer** (writes the latest frame at 15fps wall-clock, duplicating when stale — handles variable LiveKit fps and the 4fps lead-in, and isolates back-pressure). Audio is captured as a **side PCM file** and **muxed in once at finalize** (`-c:v copy -c:a aac`). The finished MP4 streams to B2 at `data/v1/<caregiver_id>/<patient_id>/<YYYY>/<MM>/<DD>/<HHMMSS>Z__<room-slug>.mp4` + S3 object metadata. The tick (`camera_ingest._run_tick`) only computes a boolean `should_collect` from existing signals and pokes the manager — **detection logic is never touched.**
 
 **Tech Stack:** Python 3.11, FastAPI, SQLAlchemy async, pydantic-settings, pytest + pytest-asyncio (`asyncio_mode=auto`), `ffmpeg` subprocess (libx264 + AAC; **no PyAV in v1**), `aioboto3` for B2.
 
@@ -75,7 +75,7 @@ TDD: PATCH `{data_collection_enabled: true}` → 200, response reflects it, and 
 ## Phase 2 — Keys + B2 uploader (pure / I-O, no detection coupling)
 
 ### Task 3: `slugify` + `build_clip_key` (pure)
-`src/services/data_collection/keys.py` + unit tests. Key = `nemara-data/v1/<caregiver_id>/<patient_id>/<YYYY>/<MM>/<DD>/<HHMMSS>Z__<room-slug>.mp4` (UTC, no colons). Commit.
+`src/services/data_collection/keys.py` + unit tests. Key = `data/v1/<caregiver_id>/<patient_id>/<YYYY>/<MM>/<DD>/<HHMMSS>Z__<room-slug>.mp4` (UTC, no colons). Commit.
 
 ### Task 4: B2 uploader (multipart-capable) + settings
 **Files:** `pyproject.toml` (add `aioboto3`), `src/settings.py`, `src/services/data_collection/b2.py`, unit test (stub the client).
@@ -83,7 +83,7 @@ Settings (env-prefixed `NEMARA_`):
 ```python
 b2_key_id: str = Field(default="")
 b2_app_key: str = Field(default="")
-b2_bucket: str = Field(default="nemara-data")
+b2_bucket: str = Field(default="memoria-data")
 b2_endpoint_url: str = Field(default="https://s3.us-west-004.backblazeb2.com")
 b2_region: str = Field(default="us-west-004")
 data_collection_max_clip_bytes: int = Field(default=1_500_000_000)  # ~15min H.264 720p headroom
