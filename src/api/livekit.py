@@ -88,8 +88,26 @@ async def mint_livekit_token(
         # caregiver-JWT path; reuses the same verifier as the rest of
         # the backend (handles HS256 local + ES256 prod).
         principal = await caregiver_auth(settings, credentials)
-        await _ensure_caregiver_can_join(session, caregiver_id=principal.id, room=body.room)
-        if body.role == "viewer":
+        privacy = await _ensure_caregiver_can_join(
+            session, caregiver_id=principal.id, room=body.room
+        )
+        if privacy:
+            # PRIVACY MODE: the caregiver may still JOIN the room (so the
+            # app stays connected for insights + UI), but is granted
+            # neither subscribe (no live video/audio in) nor publish (no
+            # Talk audio out). Baking this into the JWT is the durable
+            # guarantee: the iOS/web SDKs reuse their token verbatim on
+            # auto-reconnect, so a severed caregiver can't wash the block
+            # out by reconnecting. The detector bot mints its OWN token
+            # independently and is unaffected — analysis keeps running.
+            grants = VideoGrants(
+                room=body.room,
+                room_join=True,
+                can_publish=False,
+                can_subscribe=False,
+                can_publish_data=False,
+            )
+        elif body.role == "viewer":
             grants = VideoGrants(
                 room=body.room,
                 room_join=True,
@@ -170,9 +188,12 @@ async def _ensure_caregiver_can_join(
     *,
     caregiver_id,
     room: str,
-) -> None:
+) -> bool:
     """Caregivers may only join rooms named `patient_<id>` for patients
     they own. The room name is the load-bearing identifier.
+
+    Returns the patient's ``privacy_mode_enabled`` flag so the caller can
+    gate the token's subscribe/publish grants in the same DB round-trip.
     """
     if not room.startswith("patient_"):
         raise _FORBIDDEN
@@ -181,13 +202,15 @@ async def _ensure_caregiver_can_join(
     except ValueError:
         raise _FORBIDDEN from None
 
-    stmt = select(Patient.id).where(
+    stmt = select(Patient.privacy_mode_enabled).where(
         Patient.id == patient_id, Patient.caregiver_id == caregiver_id,
     )
-    if (await session.execute(stmt)).scalar_one_or_none() is None:
+    privacy = (await session.execute(stmt)).scalar_one_or_none()
+    if privacy is None:
         log.info(
             "livekit.mint_token reject reason=patient_not_owned "
             "caregiver=%s patient=%s",
             caregiver_id, patient_id,
         )
         raise _FORBIDDEN
+    return bool(privacy)

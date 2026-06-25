@@ -270,6 +270,59 @@ async def test_caregiver_broadcaster_token(
     assert decoded["video"].get("canPublishData") is True
 
 
+# ─── Privacy mode severs the caregiver's media grants ────────────
+
+
+async def _set_privacy(client: AsyncClient, headers: dict[str, str], pid: str) -> None:
+    r = await client.patch(
+        f"/v1/patients/{pid}", headers=headers, json={"privacy_mode_enabled": True},
+    )
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.asyncio
+async def test_viewer_token_severed_under_privacy(
+    livekit_app, client: AsyncClient, auth_user,
+) -> None:
+    """Privacy on → a viewer token may JOIN (for insights/UI) but is
+    granted neither subscribe (no live in) nor publish (no Talk out).
+    Baked into the JWT so it survives reconnects."""
+    headers, pid = await _setup_patient(client, auth_user)
+    await _set_privacy(client, headers, pid)
+
+    r = await client.post(
+        "/v1/livekit/token",
+        headers=headers,
+        json={"room": f"patient_{pid}", "identity": "viewer-1", "role": "viewer"},
+    )
+    assert r.status_code == 200, r.text
+    v = _decode_lk(r.json()["token"])["video"]
+    assert v["roomJoin"] is True  # still in the room for insights
+    assert v.get("canSubscribe", False) is False  # no live video/audio in
+    assert v.get("canPublish", False) is False  # no Talk audio out
+    assert v.get("canPublishData", False) is False
+
+
+@pytest.mark.asyncio
+async def test_broadcaster_token_severed_under_privacy(
+    livekit_app, client: AsyncClient, auth_user,
+) -> None:
+    """Privacy on → even a broadcaster (Talk) token is fully severed."""
+    headers, pid = await _setup_patient(client, auth_user)
+    await _set_privacy(client, headers, pid)
+
+    r = await client.post(
+        "/v1/livekit/token",
+        headers=headers,
+        json={"room": f"patient_{pid}", "identity": "bc-1", "role": "broadcaster"},
+    )
+    assert r.status_code == 200, r.text
+    v = _decode_lk(r.json()["token"])["video"]
+    assert v["roomJoin"] is True
+    assert v.get("canSubscribe", False) is False
+    assert v.get("canPublish", False) is False
+
+
 # ─── Room-name validation ────────────────────────────────────────
 
 
