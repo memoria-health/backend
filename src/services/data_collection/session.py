@@ -230,6 +230,49 @@ class SessionRecorder:
         except Exception:
             logger.exception("SessionRecorder on_finalized callback failed")
 
+    async def abort(self) -> None:
+        """Force-ABORT the in-flight session: tear down the encoder and
+        DISCARD both temp files WITHOUT muxing or uploading.
+
+        This is the privacy path. The normal gate-off route
+        (RECORDING → LINGERING → linger expiry → ``_finalize`` → upload)
+        would push footage captured *before* privacy turned on straight
+        to storage. ``abort`` instead drops the bytes on the device:
+        ``_on_finalized`` (the upload hand-off) is never called.
+        """
+        encoder = self._encoder
+        audio_fh = self._audio_fh
+        video_path = self._video_path
+        audio_path = self._audio_path
+        self._encoder = None
+        self._audio_fh = None
+        self._video_path = None
+        self._audio_path = None
+        self.state = SessionState.IDLE
+
+        if audio_fh is not None:
+            try:
+                audio_fh.close()
+            except Exception:
+                logger.exception("SessionRecorder abort audio close failed")
+
+        # Tear the encoder down (terminates the ffmpeg subprocess) but
+        # ignore the returned path — we delete it instead of handing off.
+        if encoder is not None:
+            try:
+                await encoder.aclose()
+            except Exception:
+                logger.exception("SessionRecorder abort encoder aclose failed")
+
+        for path in (video_path, audio_path):
+            if path is not None:
+                try:
+                    Path(path).unlink(missing_ok=True)
+                except Exception:
+                    logger.exception(
+                        "SessionRecorder abort temp cleanup failed: %s", path
+                    )
+
     async def aclose(self) -> None:
         """Force-finalize any in-flight session (graceful shutdown)."""
         if self.state is not SessionState.IDLE:

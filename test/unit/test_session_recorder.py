@@ -176,6 +176,33 @@ async def test_feed_video_routes_only_when_active(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_abort_drops_temps_without_finalizing(tmp_path) -> None:
+    """Privacy abort: tear down the in-flight session, delete BOTH temp
+    files, and NEVER call on_finalized — footage captured before privacy
+    turned on must never reach the upload path."""
+    clock, factory, finalized = _Clock(), _Factory(), []
+    rec = _make(tmp_path, clock, factory, finalized)
+
+    await rec.on_tick(collect=True)
+    assert rec.state is SessionState.RECORDING
+    enc = factory.created[0]
+    # audio.pcm is opened on disk by _start_session; simulate the encoder
+    # having written the video file as well.
+    video_path = enc.path
+    video_path.write_bytes(b"video-bytes")
+    audio_path = rec._audio_path
+    assert audio_path is not None and audio_path.exists()
+
+    await rec.abort()
+
+    assert rec.state is SessionState.IDLE
+    assert finalized == []  # on_finalized (upload path) NEVER invoked
+    assert enc.closed is True  # encoder torn down
+    assert not video_path.exists()  # temp video discarded
+    assert not audio_path.exists()  # temp audio discarded
+
+
+@pytest.mark.asyncio
 async def test_audio_lead_in_and_appends_then_persists_on_finalize(tmp_path) -> None:
     clock, factory, finalized = _Clock(), _Factory(), []
     rec = _make(tmp_path, clock, factory, finalized, linger=45.0)
