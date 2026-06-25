@@ -234,6 +234,33 @@ async def test_finalize_camera_without_session_is_noop(tmp_path) -> None:
     assert mgr.active_count == 0
 
 
+@pytest.mark.asyncio
+async def test_abort_camera_drops_session_without_mux_or_upload(tmp_path) -> None:
+    """Privacy abort: an in-flight session is discarded — no mux, no
+    upload, temp files removed."""
+    muxer, uploader = _FakeMuxer(), _FakeUploader()
+    mgr = _make_manager(tmp_path, muxer=muxer, uploader=uploader)
+    cam = uuid4()
+    await mgr.on_tick(cam, True, ctx=_ctx())  # session recording
+    assert mgr.active_count == 1
+    assert list(tmp_path.iterdir()) != []  # temps exist while recording
+
+    await mgr.abort_camera(cam)
+    await mgr.drain()
+
+    assert mgr.active_count == 0
+    assert len(muxer.calls) == 0  # never muxed
+    assert len(uploader.calls) == 0  # never uploaded
+    assert list(tmp_path.iterdir()) == []  # temps discarded
+
+
+@pytest.mark.asyncio
+async def test_abort_camera_without_session_is_noop(tmp_path) -> None:
+    mgr = _make_manager(tmp_path)
+    await mgr.abort_camera(uuid4())  # must not raise
+    assert mgr.active_count == 0
+
+
 async def _run_one_session(mgr, clock) -> None:
     cam = uuid4()
     await mgr.on_tick(cam, True, ctx=_ctx())

@@ -145,6 +145,25 @@ class RecorderManager:
                     "data_collection: finalize_camera failed for %s", camera_id
                 )
 
+    async def abort_camera(self, camera_id: UUID) -> None:
+        """Force-ABORT a camera's in-flight session, discarding temp files
+        WITHOUT muxing or uploading.
+
+        This is the privacy path: when ``privacy_mode_enabled`` turns on
+        mid-session, the per-tick drive calls this instead of the normal
+        gate-off route so the already-captured footage never reaches B2.
+        No-op if the camera has no active session.
+        """
+        async with self._lock_for(camera_id):
+            rec = self._sessions.pop(camera_id, None)
+        if rec is not None and rec.is_active:
+            try:
+                await rec.abort()
+            except Exception:
+                logger.exception(
+                    "data_collection: abort_camera failed for %s", camera_id
+                )
+
     def feed_video(self, camera_id: UUID, width: int, height: int, data: bytes) -> None:
         rec = self._sessions.get(camera_id)
         if rec is not None:
