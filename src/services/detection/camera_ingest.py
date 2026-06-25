@@ -700,8 +700,12 @@ class CameraIngest:
                     gate="poi" if identity.patient_in_clip else "person",
                     confidence=identity.confidence,
                 )
-                decision.lead_frames = window
-                decision.lead_audio = pcm
+                # No lead-in. The 4fps analysis window can't be replayed
+                # through the CFR encoder (feed() keeps only the latest
+                # frame, so a batch collapses to one), but the matching
+                # audio window WAS written to the side-file — which desynced
+                # A/V by ~window seconds. Record live-forward only; a paced
+                # lead-in replay is a future improvement.
 
             # State machine + analyses + event promotion. Same session,
             # one commit at the end.
