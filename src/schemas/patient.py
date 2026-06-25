@@ -66,6 +66,10 @@ class PatientResponse(BaseModel):
     # which the web + iOS apps use to show the first-open consent banner.
     data_collection_enabled: bool
     data_collection_decided_at: datetime | None
+    # Privacy mode (dignity override). When true: no clips stored, live
+    # video+audio severed at the SFU, event clips stripped from insights.
+    # Overrides (suspends) data_collection_enabled without changing it.
+    privacy_mode_enabled: bool
 
 
 class PhotoURLResponse(BaseModel):
@@ -134,3 +138,8 @@ class UpdatePatientRequest(BaseModel):
     # `data_collection_decided_at` server-side. `decided_at` itself is
     # NOT writable here (server-managed) — `extra="forbid"` rejects it.
     data_collection_enabled: bool | None = None
+    # Privacy mode (dignity override). Sending this (true OR false)
+    # flips the per-patient kill switch. It SUSPENDS data collection
+    # without mutating `data_collection_enabled`, so no consent stamp is
+    # touched here. Server-side enforcement does the rest.
+    privacy_mode_enabled: bool | None = None

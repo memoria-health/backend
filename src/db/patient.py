@@ -68,3 +68,16 @@ class Patient(Base):
     data_collection_decided_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, default=None,
     )
+
+    # ── Privacy mode (dignity override) ──────────────────────────
+    # Per-patient kill switch. While ON it OVERRIDES data-collection
+    # (no clips stored, in-flight sessions aborted without upload),
+    # severs all live video+audio to caregivers at the SFU, and strips
+    # event clips from insights — while detection + TEXT insights keep
+    # flowing. A live switch, not a consent record, so no decided_at:
+    # privacy SUSPENDS `data_collection_enabled` without mutating it,
+    # so the stored consent decision is restored verbatim when privacy
+    # clears. Enforced server-side; the UI flag is cosmetic.
+    privacy_mode_enabled: Mapped[bool] = mapped_column(
+        Boolean, server_default=text("false"), default=False,
+    )
