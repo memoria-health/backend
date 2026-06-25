@@ -674,6 +674,7 @@ class CameraIngest:
             # above as the session lead-in. Never alters detection; the
             # actual recording happens in the RoomWorker-owned recorder.
             collect = should_collect(
+                privacy_mode_enabled=patient.privacy_mode_enabled,
                 data_collection_enabled=patient.data_collection_enabled,
                 motion_in_clip=motion_in_clip,
                 gate_people_present=gate_people_present,
