@@ -157,7 +157,7 @@ async def test_full_session_muxes_uploads_with_key_and_cleans_up(tmp_path) -> No
     _, key, meta = uploader.calls[0]
     assert key == (
         f"data/v1/{ctx.caregiver_id}/{ctx.patient_id}"
-        f"/2026/06/24/090000Z__living-room.mp4"
+        f"/2026-06-24/090000Z__living-room.mp4"
     )
     assert meta["patient_id"] == str(ctx.patient_id)
     assert meta["gate"] == "poi"

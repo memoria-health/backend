@@ -68,7 +68,7 @@ async def test_upload_passes_bucket_key_creds_and_string_metadata(tmp_path) -> N
     f.write_bytes(b"\x00\x01\x02")
     s3 = _FakeS3()
     session = _FakeSession(s3)
-    key = "data/v1/c/p/2026/06/24/090503Z__den.mp4"
+    key = "data/v1/c/p/2026-06-24/090503Z__den.mp4"
 
     returned = await b2.upload_file_to_b2(
         f,

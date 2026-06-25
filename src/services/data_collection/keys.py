@@ -3,7 +3,7 @@
 Pure helpers — no IO. A clip's key is deterministic from
 (caregiver, patient, session-start UTC, room):
 
-    data/v1/<caregiver_id>/<patient_id>/<YYYY>/<MM>/<DD>/<HHMMSS>Z__<room-slug>.mp4
+    data/v1/<caregiver_id>/<patient_id>/<YYYY-MM-DD>/<HHMMSS>Z__<room-slug>.mp4
 
 The date-partitioned layout sorts chronologically in a flat bucket
 listing, and scopes every clip under its owning caregiver + patient so
@@ -52,5 +52,5 @@ def build_clip_key(
     room_slug = slugify(room)
     return (
         f"{_KEY_PREFIX}/{caregiver_id}/{patient_id}/"
-        f"{ts:%Y}/{ts:%m}/{ts:%d}/{ts:%H%M%S}Z__{room_slug}.mp4"
+        f"{ts:%Y-%m-%d}/{ts:%H%M%S}Z__{room_slug}.mp4"
     )

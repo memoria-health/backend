@@ -137,7 +137,7 @@ async def test_presence_session_produces_one_uploaded_av_clip(tmp_path) -> None:
     key, meta = uploader.calls[0]
     assert key == (
         f"data/v1/{ctx.caregiver_id}/{ctx.patient_id}"
-        f"/2026/06/24/090000Z__living-room.mp4"
+        f"/2026-06-24/090000Z__living-room.mp4"
     )
     assert meta["gate"] == "poi"
     assert meta["patient_id"] == str(ctx.patient_id)
