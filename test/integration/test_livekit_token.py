@@ -397,8 +397,12 @@ async def test_503_when_livekit_not_configured(
 async def test_camera_role_with_caregiver_jwt_rejected(
     livekit_app, client: AsyncClient, auth_user,
 ) -> None:
-    """Caregiver JWT requesting role='camera' goes down the camera
-    auth path which can't resolve any camera for the bearer → 401.
+    """Caregiver JWT requesting role='camera' goes down the camera-auth
+    path. The JWT is a well-formed bearer but matches no camera
+    `api_key_hash`, so `camera_auth` raises 404 `camera_not_found` (the
+    documented "well-formed bearer, no matching camera" contract that the
+    wall phone uses to detect deletion), and `_resolve_camera_or_401`
+    preserves it. Either way the caregiver JWT cannot mint a camera token.
     """
     headers, pid = await _setup_patient(client, auth_user)
 
@@ -411,7 +415,8 @@ async def test_camera_role_with_caregiver_jwt_rejected(
             "role": "camera",
         },
     )
-    assert r.status_code == 401
+    assert r.status_code == 404
+    assert r.json()["detail"] == "camera_not_found"
 
 
 # ─── Sanity: token round-trips to a UUID-format livekit_room ──────
