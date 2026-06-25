@@ -84,6 +84,11 @@ class _RecorderDecision:
     ctx: "RecorderCtx | None" = None
     lead_frames: list | None = None
     lead_audio: bytes | None = None
+    # Privacy mode for this patient (read off the patient row once it
+    # loads). When True the drive ABORTS any in-flight session instead of
+    # taking the linger→finalize→upload route, so pre-privacy footage is
+    # dropped on the device rather than uploaded.
+    privacy: bool = False
 
 
 class CameraIngest:
@@ -278,6 +283,11 @@ class CameraIngest:
         if self._recorder is None or decision.ctx is None:
             return
         try:
+            if decision.privacy:
+                # Privacy on → drop any in-flight clip immediately, no
+                # mux/upload. Idempotent no-op when nothing is recording.
+                await self._recorder.abort_camera(self.camera_id)
+                return
             await self._recorder.on_tick(
                 self.camera_id,
                 decision.collect,
@@ -325,6 +335,10 @@ class CameraIngest:
                 gate="person",
                 confidence=None,
             )
+            # Privacy is known the moment the patient row loads — set it
+            # now so EVERY tick path (including early returns) aborts an
+            # open session rather than letting it linger toward upload.
+            decision.privacy = patient.privacy_mode_enabled
 
             log.info(
                 "%s START detectors=%s motion=%s prior_state=%s "
