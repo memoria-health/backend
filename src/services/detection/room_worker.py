@@ -35,6 +35,7 @@ from livekit.api import AccessToken, VideoGrants
 from sqlalchemy import select
 
 from src.db.camera import Camera
+from src.db.patient import Patient
 from src.services.data_collection.manager import RecorderManager
 from src.services.detection.camera_ingest import CameraIngest
 from src.services.detection.room_reconciler import LiveKitRoomReconciler
@@ -230,8 +231,18 @@ class RoomWorker:
         recorder_temp_dir = Path(tempfile.gettempdir()) / "memoria-data-collection"
         recorder_temp_dir.mkdir(parents=True, exist_ok=True)
         self._recorder = RecorderManager(
-            settings=settings, temp_dir=recorder_temp_dir
+            settings=settings,
+            temp_dir=recorder_temp_dir,
+            privacy_check=self._patient_privacy_check,
         )
+
+    async def _patient_privacy_check(self, patient_id) -> bool:
+        """Upload-boundary guard for the recorder: re-read the patient's
+        privacy flag at the moment a clip is about to leave the box, so a
+        privacy flip during the finalize→upload window still drops it."""
+        async with self._sessionmaker() as session:
+            p = await session.get(Patient, patient_id)
+            return bool(p and p.privacy_mode_enabled)
 
     # ── lifecycle ──────────────────────────────────────────────────
 

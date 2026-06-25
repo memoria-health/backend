@@ -40,10 +40,17 @@ logger = logging.getLogger(__name__)
 # Type aliases for the injectable collaborators.
 _Muxer = Callable[..., Awaitable[Path]]
 _Uploader = Callable[..., Awaitable[str]]
+_PrivacyCheck = Callable[[UUID], Awaitable[bool]]
 
 
 def _default_encoder_factory(path: Path) -> StreamingMp4Writer:
     return StreamingMp4Writer(path)
+
+
+async def _never_private(_patient_id: UUID) -> bool:
+    """Default privacy check — used when no DB-backed check is injected
+    (e.g. unit tests). Always permits the upload."""
+    return False
 
 
 class RecorderManager:
@@ -62,8 +69,10 @@ class RecorderManager:
         upload_retries: int = 3,
         retry_base_delay: float = 1.0,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        privacy_check: _PrivacyCheck = _never_private,
     ) -> None:
         self._settings = settings
+        self._privacy_check = privacy_check
         self._temp_dir = Path(temp_dir)
         self._encoder_factory = encoder_factory
         self._muxer = muxer
@@ -219,7 +228,12 @@ class RecorderManager:
 
         task = asyncio.create_task(
             self._upload_and_cleanup(
-                final_path, key, metadata, fs.video_path, fs.audio_path
+                final_path,
+                key,
+                metadata,
+                fs.video_path,
+                fs.audio_path,
+                patient_id=fs.ctx.patient_id,
             )
         )
         self._pending_uploads.add(task)
@@ -232,8 +246,30 @@ class RecorderManager:
         metadata: dict[str, str],
         video_path: Path,
         audio_path: Path | None,
+        *,
+        patient_id: UUID,
     ) -> None:
         try:
+            # Defense-in-depth: privacy can flip on AFTER a session
+            # finalized but BEFORE its bytes leave the box. Re-check at the
+            # upload boundary and drop the clip if so — nothing private
+            # ever reaches B2 even on that race. Fail-safe: if the check
+            # itself errors, do NOT upload.
+            try:
+                if await self._privacy_check(patient_id):
+                    logger.info(
+                        "data_collection: privacy on at upload; discarding clip %s",
+                        key,
+                    )
+                    return
+            except Exception:
+                logger.exception(
+                    "data_collection: privacy check failed for %s; "
+                    "discarding clip %s (fail-safe)",
+                    patient_id,
+                    key,
+                )
+                return
             if not b2_module.b2_configured(self._settings):
                 logger.warning(
                     "data_collection: B2 not configured; discarding clip %s", key
