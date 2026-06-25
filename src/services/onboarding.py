@@ -51,6 +51,7 @@ def to_response(cg: Caregiver) -> CaregiverResponse:
         updated_at=cg.updated_at,
         onboarded_web=cg.onboarded_web,
         timezone=cg.timezone,
+        show_live_analyses=cg.show_live_analyses,
     )
 
 

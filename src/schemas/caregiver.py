@@ -57,6 +57,9 @@ class CaregiverResponse(BaseModel):
     # IANA timezone scheduled detectors evaluate in. Auto-set from the
     # web client's browser timezone.
     timezone: str
+    # Per-account visibility of the dashboard's "Live analyses" feed.
+    # Defaults true; flip false to hide it for specific accounts.
+    show_live_analyses: bool
 
 
 class CreateCaregiverRequest(BaseModel):

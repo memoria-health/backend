@@ -97,6 +97,10 @@ create table public.caregivers (
   -- family onto a different model (e.g. Qwen3-VL via OpenRouter) by
   -- flipping this column — no deploy. Read on the detection hot path.
   vlm_provider text,
+  -- Per-account toggle for the dashboard's "Live analyses" feed. Default
+  -- true (everyone sees it); flip false to hide it for specific accounts
+  -- (e.g. demo logins). Web reads it from /v1/me and gates the section.
+  show_live_analyses boolean not null default true,
   created_at   timestamptz not null default now(),
   updated_at   timestamptz not null default now()
 );

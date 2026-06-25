@@ -46,3 +46,11 @@ class Caregiver(Base):
     # OpenRouter) by flipping this one column — no deploy. Read (cached) by
     # services/detection/vlm_routing.py on the detection hot path.
     vlm_provider: Mapped[str | None] = mapped_column(String(20), default=None)
+
+    # Per-account toggle for the dashboard's "Live analyses" feed. Defaults
+    # TRUE (everyone sees it) — flip to false to hide it for a specific
+    # account (e.g. demo logins) without a deploy. The web reads this from
+    # /v1/me and gates the section on it (AND a global kill-switch).
+    show_live_analyses: Mapped[bool] = mapped_column(
+        Boolean, server_default=text("true"), default=True,
+    )
