@@ -788,21 +788,29 @@ class CameraIngest:
                 # "wait then take last 15s" leaves a 5-10s hole equal
                 # to the LLM think time between pre's end and post's
                 # start.
-                pre_end_captured_at = window[-1].captured_at
-                for fired_event in promotion.fired:
-                    asyncio.create_task(
-                        clip_archival.archive_event(
-                            event_id=fired_event.id,
-                            patient_id=self.patient_id,
-                            pre_event_mp4=mp4_bytes,
-                            pre_end_captured_at=pre_end_captured_at,
-                            frame_buffer=self.frame_buffer,
-                            audio_buffer=self.audio_buffer,
-                            sessionmaker=self._sessionmaker,
-                            settings=self._settings,
-                        ),
-                        name=f"clip-archive-{fired_event.id}",
-                    )
+                #
+                # PRIVACY: the text event + push/email above still fire
+                # (the insight reaches the caregiver), but under privacy
+                # mode we DON'T archive or surface the video evidence —
+                # skip spawning the post-roll/upload work entirely.
+                # `archive_event` also re-checks privacy before upload to
+                # cover a flip during the post-roll window.
+                if not patient.privacy_mode_enabled:
+                    pre_end_captured_at = window[-1].captured_at
+                    for fired_event in promotion.fired:
+                        asyncio.create_task(
+                            clip_archival.archive_event(
+                                event_id=fired_event.id,
+                                patient_id=self.patient_id,
+                                pre_event_mp4=mp4_bytes,
+                                pre_end_captured_at=pre_end_captured_at,
+                                frame_buffer=self.frame_buffer,
+                                audio_buffer=self.audio_buffer,
+                                sessionmaker=self._sessionmaker,
+                                settings=self._settings,
+                            ),
+                            name=f"clip-archive-{fired_event.id}",
+                        )
 
             log.info(
                 "%s DONE provider=%s people=%s(%s) src=%s motion=%s "
