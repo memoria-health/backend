@@ -42,6 +42,7 @@ from src.services.detection.event_promotion import maybe_promote_analysis
 from src.services.detection.frame_buffer import FrameBuffer
 from src.services.detection.motion_cache import MotionCache
 from src.services.detection.mp4_remux import Mp4RemuxError, frames_to_mp4
+from src.services.detection.speech_filter import sanitize_speech_fields
 from src.services.detection.vlm_routing import resolve_vlm_provider, run_vlm
 from src.services.detection.registry import (
     CameraVanishedError,
@@ -625,6 +626,20 @@ class CameraIngest:
                     self._log_tag, vlm_choice,
                 )
                 return
+
+            # Deterministic guard on the model's speech fields: if the
+            # actual PCM has no voiced speech (VAD), or the transcript is a
+            # degenerate loop, blank speech_heard/speech_transcript. Audio
+            # LLMs fabricate transcripts from keyboard/room noise; this
+            # stops that reaching the analyses. Detection's native-audio
+            # reasoning (agitation tone) is untouched.
+            sanitize_speech_fields(
+                result.detector_fields,
+                pcm=pcm,
+                sample_rate=self.audio_buffer.sample_rate,
+                num_channels=self.audio_buffer.num_channels,
+                log_tag=self._log_tag,
+            )
 
             # Stash identity in detector_fields so the analyses row
             # carries it for the dashboard / event_promotion path.
