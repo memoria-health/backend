@@ -24,14 +24,17 @@ from src.services.detection.providers.types import ProviderResult
 from src.settings import Settings
 
 _SPEECH_PROMPT_FRAGMENT = (
-    "speech_heard: boolean. True if any human speech / voices are "
-    "audible (any volume, any language, including muffled or partial "
-    "words). False if silence, background noise only, or non-speech "
-    "sounds.\n"
-    "speech_transcript: string. If speech_heard is true, transcribe "
-    "the speech verbatim (best effort, up to ~200 chars). Multiple "
-    "speakers separated by ' / '. If speech_heard is false, empty "
-    "string."
+    "speech_heard: boolean. True ONLY if you can clearly hear actual, "
+    "intelligible human speech in the audio. Set FALSE for silence, "
+    "keyboard/typing, background or ambient noise, music, or any sound "
+    "you cannot clearly make out as spoken words. When in doubt, set "
+    "FALSE.\n"
+    "speech_transcript: string. ONLY transcribe words you can actually "
+    "hear, verbatim (up to ~200 chars; multiple speakers separated by "
+    "' / '). If speech_heard is false, return an empty string. Do NOT "
+    "guess, infer, or invent speech from the video, the scene, the "
+    "on-screen activity, or non-speech sounds — never fabricate a "
+    "transcript."
 )
 _SPEECH_FIELDS = {
     "speech_heard":      {"type": "boolean"},
