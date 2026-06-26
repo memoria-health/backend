@@ -196,6 +196,14 @@ async def _archive_one(
                 "(patient in privacy mode)",
                 event_id,
             )
+            # Privacy flipped on DURING the post-roll window. The event was
+            # created with clip_suppressed=false (privacy was off then), so
+            # stamp it now — the apps key the "No clip — Privacy mode"
+            # placeholder off this flag.
+            event = await session.get(Event, event_id)
+            if event is not None and not event.clip_suppressed:
+                event.clip_suppressed = True
+                await session.commit()
             return
 
     final_key = await storage.upload_clip(

@@ -279,12 +279,15 @@ async def test_archive_event_skips_upload_under_privacy(
     # Privacy dropped the clip — no upload was ever attempted.
     assert fake_httpx["captured"] == []
 
-    # Row stays without a clip (text insight already lives in the row).
+    # Row stays without a clip (text insight already lives in the row),
+    # and is stamped clip_suppressed so the apps can say WHY (privacy flip
+    # happened DURING the post-roll, so it's stamped here, not at creation).
     async with sm() as s:
         row = await s.get(Event, event_id)
     assert row is not None
     assert row.has_clip is False
     assert row.clip_storage_key is None
+    assert row.clip_suppressed is True
 
 
 @_pytestmark_ffmpeg

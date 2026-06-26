@@ -7,7 +7,7 @@ reads + PATCHes them in v0.
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String
+from sqlalchemy import Boolean, DateTime, ForeignKey, String, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.db.base import Base
@@ -43,3 +43,10 @@ class Event(Base):
     # Bucket-relative key in `incident-clips`; NULL until clip archival
     # completes (post-event window captured + ffmpeg concat uploaded).
     clip_storage_key: Mapped[str | None] = mapped_column(String, default=None)
+    # True when this event's clip was intentionally NOT archived because
+    # the patient was in privacy mode (the suppression already happens;
+    # this just records WHY, so the apps can show "No clip — Privacy mode"
+    # instead of an endless "Generating clip…" for `has_clip=false`.
+    clip_suppressed: Mapped[bool] = mapped_column(
+        Boolean, server_default=text("false"), default=False,
+    )

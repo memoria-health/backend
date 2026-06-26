@@ -542,6 +542,10 @@ create table public.events (
   -- Read at iOS-fetch time by `GET /v1/events/{id}/clip-url`, which
   -- mints a short-lived Supabase Storage signed URL.
   clip_storage_key text,
+  -- True when the clip was intentionally not archived because the patient
+  -- was in privacy mode. Lets the apps render "No clip — Privacy mode"
+  -- instead of an endless "Generating clip…" for has_clip=false events.
+  clip_suppressed boolean not null default false,
   created_at    timestamptz not null default now()
 );
 

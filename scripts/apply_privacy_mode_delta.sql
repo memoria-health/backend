@@ -13,3 +13,10 @@
 
 alter table public.patients
   add column if not exists privacy_mode_enabled boolean not null default false;
+
+-- events.clip_suppressed — true when an event's clip was intentionally
+-- NOT archived because the patient was in privacy mode. Records WHY the
+-- clip is absent so the apps show "No clip — Privacy mode" instead of an
+-- endless "Generating clip…" for has_clip=false events.
+alter table public.events
+  add column if not exists clip_suppressed boolean not null default false;
