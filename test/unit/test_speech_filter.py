@@ -26,6 +26,14 @@ def test_deloop_passes_normal_speech() -> None:
     )
 
 
+def test_deloop_passes_terse_alternating_dialogue() -> None:
+    # Real two-person back-and-forth — NOT a decoder loop. The old
+    # unique-fraction heuristic wrongly flagged this (2 unique of 4) and
+    # wiped genuine speech; the repetition-count rule must let it through.
+    assert not is_degenerate_transcript("Yes / No / Yes / No")
+    assert not is_degenerate_transcript("Hi / Hello / How are you / Good thanks")
+
+
 def test_deloop_ignores_short_strings() -> None:
     assert not is_degenerate_transcript("Yes")
     assert not is_degenerate_transcript("")

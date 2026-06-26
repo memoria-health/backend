@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import zlib
+from collections import Counter
 from collections.abc import Callable
 
 log = logging.getLogger(__name__)
@@ -89,8 +90,15 @@ def is_degenerate_transcript(text: str) -> bool:
     if len(raw) / max(len(zlib.compress(raw, 9)), 1) > 2.4:
         return True
     segs = [s.strip().lower() for s in t.split("/") if s.strip()]
-    # 3+ segments and at most half are unique → looping (e.g. "Yes / Yes / Yes").
-    return len(segs) >= 3 and len(set(segs)) <= len(segs) // 2
+    if len(segs) < 3:
+        return False
+    # A decoder loop repeats the SAME utterance many times ("Yes / Yes /
+    # Yes", or the observed "…ship? / Yes" ×3). Genuine terse dialogue
+    # ("Yes / No / Yes / No") repeats each turn at most ~twice. Gate on the
+    # max repetition count, NOT the unique fraction — the old
+    # `unique <= len//2` test wrongly flagged a real 4-turn yes/no exchange
+    # (2 unique of 4) and wiped the transcript.
+    return Counter(segs).most_common(1)[0][1] >= 3
 
 
 def sanitize_speech_fields(

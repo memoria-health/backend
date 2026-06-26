@@ -123,7 +123,21 @@ async def mint_livekit_token(
                 can_subscribe=True,
                 can_publish_data=True,
             )
+        # SECURITY: force a `caregiver_`-prefixed identity. The live
+        # privacy cut (`sever_caregiver_media`) revokes media only on
+        # `caregiver_*` participants, so a tampered/legacy client that
+        # joined with a non-prefixed identity (e.g. "viewer-1") would
+        # otherwise slip past the instant cut and keep live media until
+        # its token TTL. Real clients already send
+        # `caregiver_<id>_ios`/`_web`, so their device-distinct identity
+        # (needed for simultaneous web+iOS viewing) is preserved as-is.
         identity = body.identity
+        if not identity.startswith("caregiver_"):
+            log.warning(
+                "livekit.mint_token: caregiver identity %r lacks caregiver_ "
+                "prefix — overriding to canonical caregiver_<id>", identity,
+            )
+            identity = f"caregiver_{principal.id}"
 
     # `with_ttl` takes a `datetime.timedelta` — passing an int silently
     # corrupts the token (datetime + int raises TypeError inside to_jwt).

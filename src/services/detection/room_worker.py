@@ -242,7 +242,11 @@ class RoomWorker:
         privacy flip during the finalize→upload window still drops it."""
         async with self._sessionmaker() as session:
             p = await session.get(Patient, patient_id)
-            return bool(p and p.privacy_mode_enabled)
+        if p is None:
+            # Row vanished mid-session — fail CLOSED: never upload a clip
+            # we can't positively confirm is allowed to leave the box.
+            return True
+        return p.privacy_mode_enabled
 
     # ── lifecycle ──────────────────────────────────────────────────
 

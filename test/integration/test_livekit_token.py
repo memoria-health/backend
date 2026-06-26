@@ -203,7 +203,7 @@ async def test_caregiver_viewer_token(
         headers=headers,
         json={
             "room": f"patient_{pid}",
-            "identity": "viewer-caregiver-1",
+            "identity": "caregiver_viewer-1_ios",
             "role": "viewer",
         },
     )
@@ -212,13 +212,35 @@ async def test_caregiver_viewer_token(
     assert body["url"] == _LIVEKIT_URL
     decoded = _decode_lk(body["token"])
 
-    assert decoded["sub"] == "viewer-caregiver-1"
+    # A caregiver_-prefixed identity is preserved verbatim — the device
+    # suffix is kept so the same caregiver can view from web + iOS at once.
+    assert decoded["sub"] == "caregiver_viewer-1_ios"
     assert decoded["iss"] == _LIVEKIT_KEY
     assert decoded["video"]["room"] == f"patient_{pid}"
     assert decoded["video"]["roomJoin"] is True
     assert decoded["video"].get("canPublish", False) is False
     assert decoded["video"]["canSubscribe"] is True
     assert decoded["video"].get("canPublishData", False) is False
+
+
+@pytest.mark.asyncio
+async def test_caregiver_identity_without_prefix_is_overridden(
+    livekit_app, client: AsyncClient, auth_user,
+) -> None:
+    """A caregiver-path identity lacking the `caregiver_` prefix (a
+    tampered or legacy client) is force-rewritten to `caregiver_<id>`, so
+    the live privacy cut — which revokes media only on `caregiver_*`
+    participants — can never be bypassed by a non-conforming identity."""
+    headers, pid = await _setup_patient(client, auth_user)
+    r = await client.post(
+        "/v1/livekit/token",
+        headers=headers,
+        json={"room": f"patient_{pid}", "identity": "viewer-1", "role": "viewer"},
+    )
+    assert r.status_code == 200, r.text
+    sub = _decode_lk(r.json()["token"])["sub"]
+    assert sub != "viewer-1"
+    assert sub.startswith("caregiver_")
 
 
 @pytest.mark.asyncio

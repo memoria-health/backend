@@ -13,7 +13,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.services.livekit_privacy import sever_caregiver_media
+import src.services.livekit_privacy as livekit_privacy
+from src.services.livekit_privacy import enforce_privacy_for_room, sever_caregiver_media
+
+_SETTINGS = SimpleNamespace(
+    livekit_url="ws://x", livekit_api_key="k", livekit_api_secret="s",
+)
 
 
 class _FakeRoomService:
@@ -65,3 +70,40 @@ async def test_no_caregivers_is_noop() -> None:
     severed = await sever_caregiver_media(lk, "patient_x")
     assert severed == 0
     assert lk.room.updated == []
+
+
+@pytest.mark.asyncio
+async def test_enforce_swallows_client_construction_error(monkeypatch) -> None:
+    """Best-effort: if constructing the LiveKit client throws, the error
+    must NOT propagate. patch_patient calls this AFTER committing privacy
+    on; a 500 here would desync the client's optimistic toggle from the
+    (already-on) server state."""
+
+    def _boom(*a, **k):
+        raise RuntimeError("livekit down")
+
+    monkeypatch.setattr(livekit_privacy.lkapi, "LiveKitAPI", _boom)
+    # Must return normally, not raise.
+    await enforce_privacy_for_room(_SETTINGS, "patient-id")
+
+
+@pytest.mark.asyncio
+async def test_enforce_swallows_sever_error_and_still_closes(monkeypatch) -> None:
+    """A transient error mid-sever is swallowed AND aclose() still runs
+    (no leaked client)."""
+    closed = {"v": False}
+
+    class _RaisingRoom:
+        async def list_participants(self, req):
+            raise RuntimeError("transient")
+
+    class _LK:
+        def __init__(self, *a, **k):
+            self.room = _RaisingRoom()
+
+        async def aclose(self):
+            closed["v"] = True
+
+    monkeypatch.setattr(livekit_privacy.lkapi, "LiveKitAPI", _LK)
+    await enforce_privacy_for_room(_SETTINGS, "patient-id")  # must not raise
+    assert closed["v"] is True

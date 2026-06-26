@@ -69,12 +69,18 @@ async def enforce_privacy_for_room(settings, patient_id) -> None:
     ):
         return
     room = f"patient_{patient_id}"
-    lk = lkapi.LiveKitAPI(
-        settings.livekit_url,
-        settings.livekit_api_key,
-        settings.livekit_api_secret,
-    )
+    # Fully guarded: the LiveKit client construction AND aclose() are
+    # inside the try, so NOTHING here can raise into patch_patient. A
+    # transient LiveKit error must not 500 a PATCH that already committed
+    # privacy_mode_enabled=True (that would desync the client's optimistic
+    # toggle from the server). The token-mint gate is the durable backstop.
+    lk = None
     try:
+        lk = lkapi.LiveKitAPI(
+            settings.livekit_url,
+            settings.livekit_api_key,
+            settings.livekit_api_secret,
+        )
         n = await sever_caregiver_media(lk, room)
         log.info("privacy.sever room=%s severed_caregivers=%d", room, n)
     except Exception:
@@ -82,4 +88,8 @@ async def enforce_privacy_for_room(settings, patient_id) -> None:
             "privacy.sever failed room=%s — token-mint gate still holds", room
         )
     finally:
-        await lk.aclose()
+        if lk is not None:
+            try:
+                await lk.aclose()
+            except Exception:
+                log.exception("privacy.sever aclose failed room=%s", room)
