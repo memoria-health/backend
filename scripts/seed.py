@@ -65,14 +65,32 @@ async def upsert_auth_user(*, email: str, password: str) -> UUID:
     }
     admin_url = f"{settings.supabase_url.rstrip('/')}/auth/v1/admin/users"
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        # GoTrue's admin endpoint is `?email=` for lookup; falls back to
-        # create otherwise.
-        list_resp = await client.get(admin_url, headers=headers, params={"email": email})
-        if list_resp.status_code == 200:
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        # The GoTrue admin LIST endpoint IGNORES the `?email=` filter in our
+        # deployment — it returns a page of ALL users. The old code took
+        # users[0], which against a populated DB resolves to an UNRELATED
+        # account (in prod it returned a real pilot family's user), so a
+        # seed/reseed could wipe the wrong caregiver's data. Page through
+        # and match the email EXACTLY before falling back to create.
+        page = 1
+        while True:
+            list_resp = await client.get(
+                admin_url, headers=headers, params={"page": page, "per_page": 200},
+            )
+            if list_resp.status_code != 200:
+                break
             users = list_resp.json().get("users", [])
-            if users:
-                return UUID(users[0]["id"])
+            if not users:
+                break
+            match = next(
+                (u for u in users if (u.get("email") or "").lower() == email.lower()),
+                None,
+            )
+            if match is not None:
+                return UUID(match["id"])
+            if len(users) < 200:
+                break  # last page reached, no match → create below
+            page += 1
 
         create_resp = await client.post(
             admin_url,
