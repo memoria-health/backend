@@ -4,7 +4,7 @@
 #
 # Detailed reference: https://supabase.com/docs/guides/local-development/cli/config
 
-project_id = "nemara-backend"
+project_id = "memoria-db"
 
 [api]
 enabled = true

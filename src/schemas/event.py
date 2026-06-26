@@ -55,6 +55,9 @@ class EventResponse(BaseModel):
     review_notes: Notes | None
     reviewed_at: datetime | None
     clip_storage_key: str | None
+    # True when the clip was suppressed by privacy mode (vs still
+    # processing). Drives the "No clip — Privacy mode" placeholder.
+    clip_suppressed: bool
     created_at: datetime
 
 

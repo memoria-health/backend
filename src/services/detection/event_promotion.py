@@ -297,6 +297,11 @@ async def _insert_event(
         # Phase 0: no clips yet (HTTP clip ingest doesn't archive).
         # Phase 4 wires LiveKit Track Egress → has_clip=true.
         has_clip=False,
+        # Privacy mode suppresses the clip entirely. Stamp it at creation
+        # so the apps show "No clip — Privacy mode" rather than a forever
+        # "Generating clip…". (The post-roll race — privacy flipping on
+        # DURING archival — is stamped in clip_archival instead.)
+        clip_suppressed=patient.privacy_mode_enabled,
         narrative=narrative,
         opened=False,
         reviewed=False,

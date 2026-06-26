@@ -83,6 +83,8 @@ dependencies = [
     # constraint from the experiment's pyproject; the Pi-side numpy
     # usage is basic array ops so 1.26.x works fine.
     "numpy>=1.26,<2.0",
+    "aioboto3>=15.5.0",
+    "webrtcvad-wheels>=2.0.14",
 ]
 
 [project.scripts]

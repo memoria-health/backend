@@ -203,7 +203,7 @@ async def test_caregiver_viewer_token(
         headers=headers,
         json={
             "room": f"patient_{pid}",
-            "identity": "viewer-caregiver-1",
+            "identity": "caregiver_viewer-1_ios",
             "role": "viewer",
         },
     )
@@ -212,13 +212,35 @@ async def test_caregiver_viewer_token(
     assert body["url"] == _LIVEKIT_URL
     decoded = _decode_lk(body["token"])
 
-    assert decoded["sub"] == "viewer-caregiver-1"
+    # A caregiver_-prefixed identity is preserved verbatim — the device
+    # suffix is kept so the same caregiver can view from web + iOS at once.
+    assert decoded["sub"] == "caregiver_viewer-1_ios"
     assert decoded["iss"] == _LIVEKIT_KEY
     assert decoded["video"]["room"] == f"patient_{pid}"
     assert decoded["video"]["roomJoin"] is True
     assert decoded["video"].get("canPublish", False) is False
     assert decoded["video"]["canSubscribe"] is True
     assert decoded["video"].get("canPublishData", False) is False
+
+
+@pytest.mark.asyncio
+async def test_caregiver_identity_without_prefix_is_overridden(
+    livekit_app, client: AsyncClient, auth_user,
+) -> None:
+    """A caregiver-path identity lacking the `caregiver_` prefix (a
+    tampered or legacy client) is force-rewritten to `caregiver_<id>`, so
+    the live privacy cut — which revokes media only on `caregiver_*`
+    participants — can never be bypassed by a non-conforming identity."""
+    headers, pid = await _setup_patient(client, auth_user)
+    r = await client.post(
+        "/v1/livekit/token",
+        headers=headers,
+        json={"room": f"patient_{pid}", "identity": "viewer-1", "role": "viewer"},
+    )
+    assert r.status_code == 200, r.text
+    sub = _decode_lk(r.json()["token"])["sub"]
+    assert sub != "viewer-1"
+    assert sub.startswith("caregiver_")
 
 
 @pytest.mark.asyncio
@@ -268,6 +290,59 @@ async def test_caregiver_broadcaster_token(
     assert decoded["video"]["canPublish"] is True
     assert decoded["video"]["canSubscribe"] is True
     assert decoded["video"].get("canPublishData") is True
+
+
+# ─── Privacy mode severs the caregiver's media grants ────────────
+
+
+async def _set_privacy(client: AsyncClient, headers: dict[str, str], pid: str) -> None:
+    r = await client.patch(
+        f"/v1/patients/{pid}", headers=headers, json={"privacy_mode_enabled": True},
+    )
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.asyncio
+async def test_viewer_token_severed_under_privacy(
+    livekit_app, client: AsyncClient, auth_user,
+) -> None:
+    """Privacy on → a viewer token may JOIN (for insights/UI) but is
+    granted neither subscribe (no live in) nor publish (no Talk out).
+    Baked into the JWT so it survives reconnects."""
+    headers, pid = await _setup_patient(client, auth_user)
+    await _set_privacy(client, headers, pid)
+
+    r = await client.post(
+        "/v1/livekit/token",
+        headers=headers,
+        json={"room": f"patient_{pid}", "identity": "viewer-1", "role": "viewer"},
+    )
+    assert r.status_code == 200, r.text
+    v = _decode_lk(r.json()["token"])["video"]
+    assert v["roomJoin"] is True  # still in the room for insights
+    assert v.get("canSubscribe", False) is False  # no live video/audio in
+    assert v.get("canPublish", False) is False  # no Talk audio out
+    assert v.get("canPublishData", False) is False
+
+
+@pytest.mark.asyncio
+async def test_broadcaster_token_severed_under_privacy(
+    livekit_app, client: AsyncClient, auth_user,
+) -> None:
+    """Privacy on → even a broadcaster (Talk) token is fully severed."""
+    headers, pid = await _setup_patient(client, auth_user)
+    await _set_privacy(client, headers, pid)
+
+    r = await client.post(
+        "/v1/livekit/token",
+        headers=headers,
+        json={"room": f"patient_{pid}", "identity": "bc-1", "role": "broadcaster"},
+    )
+    assert r.status_code == 200, r.text
+    v = _decode_lk(r.json()["token"])["video"]
+    assert v["roomJoin"] is True
+    assert v.get("canSubscribe", False) is False
+    assert v.get("canPublish", False) is False
 
 
 # ─── Room-name validation ────────────────────────────────────────
@@ -344,8 +419,12 @@ async def test_503_when_livekit_not_configured(
 async def test_camera_role_with_caregiver_jwt_rejected(
     livekit_app, client: AsyncClient, auth_user,
 ) -> None:
-    """Caregiver JWT requesting role='camera' goes down the camera
-    auth path which can't resolve any camera for the bearer → 401.
+    """Caregiver JWT requesting role='camera' goes down the camera-auth
+    path. The JWT is a well-formed bearer but matches no camera
+    `api_key_hash`, so `camera_auth` raises 404 `camera_not_found` (the
+    documented "well-formed bearer, no matching camera" contract that the
+    wall phone uses to detect deletion), and `_resolve_camera_or_401`
+    preserves it. Either way the caregiver JWT cannot mint a camera token.
     """
     headers, pid = await _setup_patient(client, auth_user)
 
@@ -358,7 +437,8 @@ async def test_camera_role_with_caregiver_jwt_rejected(
             "role": "camera",
         },
     )
-    assert r.status_code == 401
+    assert r.status_code == 404
+    assert r.json()["detail"] == "camera_not_found"
 
 
 # ─── Sanity: token round-trips to a UUID-format livekit_room ──────

@@ -23,9 +23,11 @@ import asyncio
 import json
 import logging
 import secrets
+import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from livekit import rtc
@@ -33,6 +35,8 @@ from livekit.api import AccessToken, VideoGrants
 from sqlalchemy import select
 
 from src.db.camera import Camera
+from src.db.patient import Patient
+from src.services.data_collection.manager import RecorderManager
 from src.services.detection.camera_ingest import CameraIngest
 from src.services.detection.room_reconciler import LiveKitRoomReconciler
 
@@ -219,6 +223,30 @@ class RoomWorker:
             lk_api=lk_api,  # type: ignore[arg-type]
             sessionmaker=sessionmaker,
         )
+        # Per-patient video data-collection recorder. One per worker,
+        # shared across this room's cameras (so its concurrent-session
+        # cap bounds the whole room). Reuses the frames detection already
+        # decodes — no extra LiveKit subscription. Inert unless a patient
+        # has opted in; idle cameras pay an O(1) no-op feed.
+        recorder_temp_dir = Path(tempfile.gettempdir()) / "memoria-data-collection"
+        recorder_temp_dir.mkdir(parents=True, exist_ok=True)
+        self._recorder = RecorderManager(
+            settings=settings,
+            temp_dir=recorder_temp_dir,
+            privacy_check=self._patient_privacy_check,
+        )
+
+    async def _patient_privacy_check(self, patient_id) -> bool:
+        """Upload-boundary guard for the recorder: re-read the patient's
+        privacy flag at the moment a clip is about to leave the box, so a
+        privacy flip during the finalize→upload window still drops it."""
+        async with self._sessionmaker() as session:
+            p = await session.get(Patient, patient_id)
+        if p is None:
+            # Row vanished mid-session — fail CLOSED: never upload a clip
+            # we can't positively confirm is allowed to leave the box.
+            return True
+        return p.privacy_mode_enabled
 
     # ── lifecycle ──────────────────────────────────────────────────
 
@@ -278,6 +306,8 @@ class RoomWorker:
                 pass
             self._supervisor_task = None
         await self._teardown_active_session()
+        # Finalize + upload any recordings still in flight (best-effort).
+        await self._recorder.aclose()
         log.info("room_worker.stop room=%s", self.room_name)
 
     async def _monitor_idle(self) -> None:
@@ -773,6 +803,9 @@ class RoomWorker:
                 except (asyncio.CancelledError, Exception):
                     pass
         await ingest.stop()
+        # Flush any in-flight recording for this camera — no more ticks
+        # will arrive to linger it out, so finalize + upload now.
+        await self._recorder.finalize_camera(ingest.camera_id)
         # `cameras.online = false` is NOT written here. The reconciler
         # observes the same `participant_left` via its REST poll and
         # writes the column once `miss_threshold` polls have agreed.
@@ -840,6 +873,14 @@ class RoomWorker:
         16 kHz mono int16 is the shape Gemini's audio path is happiest
         with and the cheapest to encode into the clip MP4.
         """
+
+        def _push_audio(event: object) -> None:
+            pcm = bytes(event.frame.data)  # type: ignore[attr-defined]
+            ingest.audio_buffer.push(data=pcm, captured_at=time.monotonic())
+            # Fork to the data-collection recorder (sync, non-blocking;
+            # no-op unless this camera has an active session).
+            self._recorder.feed_audio(ingest.camera_id, pcm)
+
         await self._consume_with_retry(
             label="audio",
             ingest=ingest,
@@ -848,10 +889,7 @@ class RoomWorker:
                 sample_rate=ingest.audio_buffer.sample_rate,
                 num_channels=ingest.audio_buffer.num_channels,
             ),
-            consume_one=lambda event: ingest.audio_buffer.push(
-                data=bytes(event.frame.data),
-                captured_at=time.monotonic(),
-            ),
+            consume_one=_push_audio,
         )
 
     # ── video consumer ─────────────────────────────────────────────
@@ -878,11 +916,19 @@ class RoomWorker:
             if frame.type != rtc.VideoBufferType.I420:
                 frame = frame.convert(rtc.VideoBufferType.I420)
             now_mono = time.monotonic()
+            frame_bytes = bytes(frame.data)
             ingest.frame_buffer.push(
                 width=frame.width,
                 height=frame.height,
-                data=bytes(frame.data),
+                data=frame_bytes,
                 captured_at=now_mono,
+            )
+            # Fork the full-rate frame to the data-collection recorder
+            # (sync, non-blocking; an O(1) no-op unless this camera has an
+            # active session). This is the SECOND consumer of the frames,
+            # BEFORE the 4fps detector downsample inside frame_buffer.
+            self._recorder.feed_video(
+                ingest.camera_id, frame.width, frame.height, frame_bytes
             )
             # Stamp the liveness timestamp. `LiveKitRoomReconciler`
             # reads this every poll (10s) and treats frames within
@@ -979,6 +1025,7 @@ class RoomWorker:
             settings=self._settings,
             reid=self._reid,
             livekit_identity=identity,
+            recorder=self._recorder,
         )
         await ingest.start()
         self._ingests_by_identity[identity] = ingest
@@ -1047,6 +1094,9 @@ class RoomWorker:
                 "ingest.stop() raised; abandoning",
                 self.room_name, ingest.camera_id, identity,
             )
+        # Flush any in-flight recording — the tick loop is gone, so the
+        # session would otherwise never linger out.
+        await self._recorder.finalize_camera(ingest.camera_id)
         log.info(
             "room_worker.ingest_self_destructed room=%s camera=%s identity=%s",
             self.room_name, ingest.camera_id, identity,

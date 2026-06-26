@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 from uuid import UUID
@@ -41,6 +42,7 @@ from src.services.detection.event_promotion import maybe_promote_analysis
 from src.services.detection.frame_buffer import FrameBuffer
 from src.services.detection.motion_cache import MotionCache
 from src.services.detection.mp4_remux import Mp4RemuxError, frames_to_mp4
+from src.services.detection.speech_filter import sanitize_speech_fields
 from src.services.detection.vlm_routing import resolve_vlm_provider, run_vlm
 from src.services.detection.registry import (
     CameraVanishedError,
@@ -49,11 +51,14 @@ from src.services.detection.registry import (
 from src.services.detection.state_machine import apply_tick_update
 from src.repos.face_embedding_repo import has_ready_enrollment
 from src.services.reid.inference import IdentityResult, ReIDInference
+from src.services.data_collection.gate import should_collect
+from src.services.data_collection.session import RecorderCtx
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
     from src.settings import Settings
+    from src.services.data_collection.manager import RecorderManager
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +69,27 @@ log = logging.getLogger(__name__)
 # write an analysis row to a now-deleted camera (FK violation,
 # silently swallowed).
 _STOP_INFLIGHT_TIMEOUT: float = 2.0
+
+
+@dataclass
+class _RecorderDecision:
+    """Per-tick verdict handed to the data-collection recorder.
+
+    Created fresh each tick (ticks can overlap, so this must NOT be
+    shared instance state). Defaults to "don't collect" so an early-
+    return tick still drives any open session toward finalize; the
+    fields are filled in as the tick learns presence + identity.
+    """
+
+    collect: bool = False
+    ctx: "RecorderCtx | None" = None
+    lead_frames: list | None = None
+    lead_audio: bytes | None = None
+    # Privacy mode for this patient (read off the patient row once it
+    # loads). When True the drive ABORTS any in-flight session instead of
+    # taking the linger→finalize→upload route, so pre-privacy footage is
+    # dropped on the device rather than uploaded.
+    privacy: bool = False
 
 
 class CameraIngest:
@@ -83,6 +109,7 @@ class CameraIngest:
         settings: "Settings",
         reid: ReIDInference,
         livekit_identity: str | None = None,
+        recorder: "RecorderManager | None" = None,
     ) -> None:
         self.camera_id = camera_id
         self.patient_id = patient_id
@@ -90,6 +117,10 @@ class CameraIngest:
         self._motion_cache = motion_cache
         self._settings = settings
         self._reid = reid
+        # Data-collection recorder (owned by the RoomWorker, shared
+        # across the room's cameras). None when the feature is off /
+        # not wired — then every recorder hook is a no-op.
+        self._recorder = recorder
         # Retained for log identification; the actual reaper for a
         # vanished camera lives in `LiveKitRoomReconciler`.
         self._livekit_identity = livekit_identity
@@ -233,6 +264,42 @@ class CameraIngest:
             return
 
     async def _run_tick(self) -> None:
+        """Run one tick, then drive the data-collection recorder.
+
+        The recorder is driven in a `finally` so EVERY tick path —
+        including the early-return short-circuits below — gets a chance
+        to advance an open recording session toward its linger/finalize.
+        `_drive_recorder` is a no-op unless the feature is wired and the
+        tick got far enough to know which patient it's for.
+        """
+        decision = _RecorderDecision()
+        try:
+            await self._run_tick_inner(decision)
+        finally:
+            await self._drive_recorder(decision)
+
+    async def _drive_recorder(self, decision: "_RecorderDecision") -> None:
+        """Hand the per-tick decision to the recorder. Never raises into
+        the tick — recording must never affect detection."""
+        if self._recorder is None or decision.ctx is None:
+            return
+        try:
+            if decision.privacy:
+                # Privacy on → drop any in-flight clip immediately, no
+                # mux/upload. Idempotent no-op when nothing is recording.
+                await self._recorder.abort_camera(self.camera_id)
+                return
+            await self._recorder.on_tick(
+                self.camera_id,
+                decision.collect,
+                ctx=decision.ctx,
+                lead_in_frames=decision.lead_frames,
+                lead_in_audio=decision.lead_audio,
+            )
+        except Exception:
+            log.exception("%s data-collection recorder tick failed", self._log_tag)
+
+    async def _run_tick_inner(self, decision: "_RecorderDecision") -> None:
         """One tick — mirrors `src/api/clips.py:ingest_clip` body."""
         motion_in_clip = self._motion_cache.get(self.camera_id)
         captured_at = datetime.now(timezone.utc)
@@ -257,6 +324,22 @@ class CameraIngest:
             if patient is None:
                 log.warning("%s patient row vanished mid-flight", self._log_tag)
                 return
+
+            # Base recorder context, refined once presence is known
+            # below. Set here (after the patient + camera rows load) so
+            # that even an early-return tick can drive an open session
+            # toward finalize — `collect` stays False on those paths.
+            decision.ctx = RecorderCtx(
+                caregiver_id=patient.caregiver_id,
+                patient_id=self.patient_id,
+                room=cam.room,
+                gate="person",
+                confidence=None,
+            )
+            # Privacy is known the moment the patient row loads — set it
+            # now so EVERY tick path (including early returns) aborts an
+            # open session rather than letting it linger toward upload.
+            decision.privacy = patient.privacy_mode_enabled
 
             log.info(
                 "%s START detectors=%s motion=%s prior_state=%s "
@@ -544,6 +627,20 @@ class CameraIngest:
                 )
                 return
 
+            # Deterministic guard on the model's speech fields: if the
+            # actual PCM has no voiced speech (VAD), or the transcript is a
+            # degenerate loop, blank speech_heard/speech_transcript. Audio
+            # LLMs fabricate transcripts from keyboard/room noise; this
+            # stops that reaching the analyses. Detection's native-audio
+            # reasoning (agitation tone) is untouched.
+            sanitize_speech_fields(
+                result.detector_fields,
+                pcm=pcm,
+                sample_rate=self.audio_buffer.sample_rate,
+                num_channels=self.audio_buffer.num_channels,
+                log_tag=self._log_tag,
+            )
+
             # Stash identity in detector_fields so the analyses row
             # carries it for the dashboard / event_promotion path.
             # The `identity_reid_ran` flag is the gate signal that
@@ -599,6 +696,33 @@ class CameraIngest:
                 present_src = "reid_unavailable_llm"
             result.detector_fields["people_present_src"] = present_src
             result.detector_fields["people_count_reid"] = identity.people_count_reid
+
+            # Data-collection recorder decision — READ-ONLY over the
+            # signals detection just computed (opt-in flag + motion +
+            # presence). Reuses the analysis window/pcm already snapshotted
+            # above as the session lead-in. Never alters detection; the
+            # actual recording happens in the RoomWorker-owned recorder.
+            collect = should_collect(
+                privacy_mode_enabled=patient.privacy_mode_enabled,
+                data_collection_enabled=patient.data_collection_enabled,
+                motion_in_clip=motion_in_clip,
+                gate_people_present=gate_people_present,
+            )
+            if collect:
+                decision.collect = True
+                decision.ctx = RecorderCtx(
+                    caregiver_id=patient.caregiver_id,
+                    patient_id=self.patient_id,
+                    room=cam.room,
+                    gate="poi" if identity.patient_in_clip else "person",
+                    confidence=identity.confidence,
+                )
+                # No lead-in. The 4fps analysis window can't be replayed
+                # through the CFR encoder (feed() keeps only the latest
+                # frame, so a batch collapses to one), but the matching
+                # audio window WAS written to the side-file — which desynced
+                # A/V by ~window seconds. Record live-forward only; a paced
+                # lead-in replay is a future improvement.
 
             # State machine + analyses + event promotion. Same session,
             # one commit at the end.
@@ -666,21 +790,29 @@ class CameraIngest:
                 # "wait then take last 15s" leaves a 5-10s hole equal
                 # to the LLM think time between pre's end and post's
                 # start.
-                pre_end_captured_at = window[-1].captured_at
-                for fired_event in promotion.fired:
-                    asyncio.create_task(
-                        clip_archival.archive_event(
-                            event_id=fired_event.id,
-                            patient_id=self.patient_id,
-                            pre_event_mp4=mp4_bytes,
-                            pre_end_captured_at=pre_end_captured_at,
-                            frame_buffer=self.frame_buffer,
-                            audio_buffer=self.audio_buffer,
-                            sessionmaker=self._sessionmaker,
-                            settings=self._settings,
-                        ),
-                        name=f"clip-archive-{fired_event.id}",
-                    )
+                #
+                # PRIVACY: the text event + push/email above still fire
+                # (the insight reaches the caregiver), but under privacy
+                # mode we DON'T archive or surface the video evidence —
+                # skip spawning the post-roll/upload work entirely.
+                # `archive_event` also re-checks privacy before upload to
+                # cover a flip during the post-roll window.
+                if not patient.privacy_mode_enabled:
+                    pre_end_captured_at = window[-1].captured_at
+                    for fired_event in promotion.fired:
+                        asyncio.create_task(
+                            clip_archival.archive_event(
+                                event_id=fired_event.id,
+                                patient_id=self.patient_id,
+                                pre_event_mp4=mp4_bytes,
+                                pre_end_captured_at=pre_end_captured_at,
+                                frame_buffer=self.frame_buffer,
+                                audio_buffer=self.audio_buffer,
+                                sessionmaker=self._sessionmaker,
+                                settings=self._settings,
+                            ),
+                            name=f"clip-archive-{fired_event.id}",
+                        )
 
             log.info(
                 "%s DONE provider=%s people=%s(%s) src=%s motion=%s "

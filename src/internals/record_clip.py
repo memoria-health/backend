@@ -56,7 +56,7 @@ _bg_tasks: set[asyncio.Task] = set()
 class RecordClipRequest(BaseModel):
     """Optional body. Defaults to a 15s clip when omitted."""
 
-    duration_seconds: int = Field(default=_DEFAULT_DURATION, ge=1, le=600)
+    duration_seconds: int = Field(default=_DEFAULT_DURATION, ge=1, le=_MAX_DURATION)
 
 
 @router.post(

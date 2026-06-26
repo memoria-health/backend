@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING
 from uuid import UUID
 
 from src.db.event import Event
+from src.db.patient import Patient
 from src.services import storage
 from src.services.clip_annotate import annotate_clip_for_display
 from src.services.detection.mp4_remux import Mp4RemuxError, frames_to_mp4
@@ -179,6 +180,31 @@ async def _archive_one(
         settings=settings,
         reset_at_seconds=float(settings.clip_post_event_wait_seconds),
     )
+
+    # Privacy re-check at the upload boundary. The caller already skips
+    # spawning this task when privacy is on at promotion time, but privacy
+    # can also flip ON during the post-event wait window above — so re-read
+    # it here, the moment before the clip would leave the box. If on, drop
+    # the clip: no upload, events.has_clip stays False. The TEXT event
+    # (created upstream) is untouched, so the insight still reaches the
+    # caregiver — only the video is suppressed.
+    async with sessionmaker() as session:
+        patient = await session.get(Patient, patient_id)
+        if patient is not None and patient.privacy_mode_enabled:
+            log.info(
+                "clip_archival.privacy_drop event_id=%s — clip discarded "
+                "(patient in privacy mode)",
+                event_id,
+            )
+            # Privacy flipped on DURING the post-roll window. The event was
+            # created with clip_suppressed=false (privacy was off then), so
+            # stamp it now — the apps key the "No clip — Privacy mode"
+            # placeholder off this flag.
+            event = await session.get(Event, event_id)
+            if event is not None and not event.clip_suppressed:
+                event.clip_suppressed = True
+                await session.commit()
+            return
 
     final_key = await storage.upload_clip(
         event_id=event_id, mp4_bytes=annotated_mp4, settings=settings,
