@@ -708,19 +708,6 @@ class CameraIngest:
                 motion_in_clip=motion_in_clip,
                 gate_people_present=gate_people_present,
             )
-            # TEMP verbose gate log for local data-collection testing. Only
-            # fires for opted-in patients, so prod stays quiet for everyone
-            # else. Drop to DEBUG or remove before PR.
-            if patient.data_collection_enabled:
-                log.info(
-                    "%s data_collection gate: collect=%s "
-                    "(motion=%s present=%s label=%s)",
-                    self._log_tag,
-                    collect,
-                    motion_in_clip,
-                    gate_people_present,
-                    "poi" if identity.patient_in_clip else "person",
-                )
             if collect:
                 decision.collect = True
                 decision.ctx = RecorderCtx(
