@@ -46,6 +46,27 @@ for _noisy in ("boxmot", "ultralytics"):
         _lg.removeHandler(_h)
     _lg.propagate = True
 
+
+# Quiet uvicorn's access log for the docs/schema endpoints. They're hit
+# constantly by browsers + scanners and drown out real request traffic.
+# `/health` is intentionally KEPT so uptime/healthcheck pings stay
+# visible; every other route logs as normal. uvicorn.access emits args as
+# (client_addr, method, full_path, http_version, status_code), so we match
+# on the path (index 2) and drop only the chatty docs routes.
+class _AccessLogQuietFilter(logging.Filter):
+    _QUIET_PATHS = frozenset({"/openapi.json", "/docs", "/redoc"})
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3:
+            path = str(args[2]).split("?", 1)[0]
+            if path in self._QUIET_PATHS:
+                return False
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(_AccessLogQuietFilter())
+
 # Register every ORM model in SQLAlchemy metadata at startup so foreign
 # keys resolve when the first INSERT/SELECT runs. Imported for side
 # effects only.
