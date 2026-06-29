@@ -3,6 +3,12 @@ from typing import Annotated, Literal
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+# Extra seconds the per-camera frame/audio buffers retain BEYOND the
+# longest window any consumer asks for. Absorbs scheduling slack and the
+# frames that keep arriving while the post-roll task sleeps, so the post
+# snapshot's oldest frame is never trimmed before it's read.
+_CLIP_BUFFER_MARGIN_SECONDS = 2.0
+
 
 class Settings(BaseSettings):
     """Nemara backend runtime settings. Loaded from environment + `.env`.
@@ -354,10 +360,37 @@ class Settings(BaseSettings):
 
     # ── Clip archival (Phase 4) ─────────────────────────────────
     # Wait this many seconds after an event fires before snapshotting
-    # the post-event buffer window. Matches livekit_worker_window_seconds
-    # by default so pre.mp4 (T-15s..T) and post.mp4 (T..T+15s) are
-    # contiguous. Test overrides bump it down to ~0.1 to avoid waiting.
+    # the post-event buffer window. pre.mp4 (T-window..T) and post.mp4
+    # (T..T+wait) are concatenated into the incident clip; the buffer
+    # retention (frame_buffer_retention_seconds, below) is sized to cover
+    # THIS so post.mp4 is contiguous with pre.mp4 regardless of how short
+    # the analysis window gets. Test overrides bump it to ~0.1 to skip waiting.
     clip_post_event_wait_seconds: float = Field(gt=0, le=120, default=15.0)
+
+    @property
+    def frame_buffer_retention_seconds(self) -> float:
+        """Seconds of history the per-camera frame + audio buffers retain.
+
+        DERIVED, not a separate knob, so it can never drift below what a
+        consumer needs. Two consumers read these buffers:
+          * the LLM tick — snapshots `livekit_worker_window_seconds`
+          * the incident-clip post-roll — snapshots
+            `clip_post_event_wait_seconds` AFTER the event fires
+
+        The buffer must out-live the LARGER of the two. Sizing it to only
+        the analysis window (the bug this fixes) starved the post-roll:
+        cutting the window 15s→11s while the post-roll stayed 15s made the
+        post snapshot silently drop its oldest ~4s, leaving a visible gap
+        at the pre/post concat seam. Tying retention to clip length here
+        makes that drift impossible.
+        """
+        return (
+            max(
+                float(self.livekit_worker_window_seconds),
+                float(self.clip_post_event_wait_seconds),
+            )
+            + _CLIP_BUFFER_MARGIN_SECONDS
+        )
 
     # ── Scheduled ("absence") detector runtime ──────────────────
     # How often the scheduler loop wakes to check for scheduled

@@ -28,8 +28,14 @@ class _FakeRecorder:
 
 
 def _settings() -> SimpleNamespace:
+    # frame_buffer_retention_seconds is a derived property on the real
+    # Settings (max(window, post_roll) + margin = max(11, 15) + 2 = 17);
+    # the fake just supplies the resolved value the buffers are sized with.
     return SimpleNamespace(
-        livekit_worker_window_seconds=11, livekit_worker_target_fps=4
+        livekit_worker_window_seconds=11,
+        livekit_worker_target_fps=4,
+        clip_post_event_wait_seconds=15.0,
+        frame_buffer_retention_seconds=17.0,
     )
 
 
