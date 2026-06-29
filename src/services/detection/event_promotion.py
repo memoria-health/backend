@@ -189,8 +189,8 @@ def _select_primary(
 # inferred `episode_gap_seconds` — e.g. the legacy preset Agitation. Safety
 # states tighten the gap (re-alert sooner after a lull); routine states use
 # a longer one. New custom state detectors carry their own LLM-inferred gap.
-_DEFAULT_STATE_GAP_SAFETY = 120
-_DEFAULT_STATE_GAP_ROUTINE = 600
+_DEFAULT_STATE_GAP_SAFETY = 60
+_DEFAULT_STATE_GAP_ROUTINE = 300
 
 
 def _episode_gap_for(det: Detector) -> int:

@@ -405,9 +405,9 @@ async def compile_custom_detector(
 # so a bad inference can't make a detector never re-fire. Retune centrally
 # here. Default bucket when the model omits/garbles it: "moderate".
 _GAP_BUCKET_SECONDS: dict[str, int] = {
-    "brief": 120,       # pacing / restlessness / agitation — a short lull = new
-    "moderate": 600,    # eating, on the phone, reading
-    "extended": 1800,   # watching TV, sleeping, sitting — bridge brief breaks
+    "brief": 60,        # ~1 min — pacing / restlessness / agitation: a short lull = new
+    "moderate": 300,    # ~5 min — eating, on the phone, reading
+    "extended": 900,    # ~15 min — watching TV, sleeping, sitting: bridge brief breaks
 }
 _DEFAULT_GAP_BUCKET = "moderate"
 
@@ -449,10 +449,10 @@ def _infer_meta_prompt(*, name: str | None, prompt: str) -> str:
         'when shape="state" (null otherwise): how long the activity must be '
         'ABSENT before a return counts as a NEW, separate event. Pick by the '
         'activity:\n'
-        '     - "brief" (~2 min): pacing / restlessness / agitation — a short '
+        '     - "brief" (~1 min): pacing / restlessness / agitation — a short '
         'lull is a distinct episode.\n'
-        '     - "moderate" (~10 min): eating, on the phone, reading.\n'
-        '     - "extended" (~30 min): watching TV, sleeping, sitting — a brief '
+        '     - "moderate" (~5 min): eating, on the phone, reading.\n'
+        '     - "extended" (~15 min): watching TV, sleeping, sitting — a brief '
         'break (e.g. a bathroom trip) should NOT split the session.\n'
         '  "category": "safety" | "routine".\n'
         '     - "safety" = could be an emergency or cause harm if missed: '
