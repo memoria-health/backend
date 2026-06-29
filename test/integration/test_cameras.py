@@ -103,7 +103,6 @@ async def test_list_cameras_full_field_assertion(
     assert c["room"] == "Living room"
     assert c["icon_name"] == "tv"
     assert c["online"] is True
-    assert c["last_seen_at"] is None
     assert "id" in c
     assert "created_at" in c
 

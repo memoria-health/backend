@@ -194,7 +194,7 @@ async def _seed_caregiver_patient_camera(
             id=camera_id, patient_id=patient_id, display_id=1,
             room="Bedroom", icon_name="bed.double", online=online,
             api_key_hash=None, livekit_identity=livekit_identity,
-            last_seen_at=None, state=state,
+            state=state,
             no_people_count=no_people_count, close_threshold=6,
             created_at=now,
         )

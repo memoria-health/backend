@@ -116,7 +116,6 @@ async def test_mint_pairing_code_inserts_camera_row(
     assert cam.room == "Living room"
     assert cam.icon_name == "tv"
     assert cam.online is False
-    assert cam.last_seen_at is None
     assert cam.pairing_code == body["pairing_code"]
     assert cam.pairing_expires_at is not None
     assert int(cam.pairing_expires_at.timestamp()) == int(expires_at.timestamp())
@@ -231,7 +230,6 @@ async def test_pair_exchanges_code_for_api_key(
     assert bcrypt.checkpw(api_key.encode("utf-8"), cam.api_key_hash.encode("utf-8"))
     assert cam.pairing_code is None
     assert cam.pairing_expires_at is None
-    assert cam.last_seen_at is not None
     # State machine fields untouched by the exchange.
     assert cam.state == "open"
     assert cam.no_people_count == 0

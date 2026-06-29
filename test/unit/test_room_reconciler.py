@@ -208,14 +208,12 @@ class _FakeDBStore:
     ) -> None:
         entry = self.cameras.setdefault(
             camera_id,
-            {"online": None, "fresh_start_count": 0, "writes": 0, "last_seen_at": None},
+            {"online": None, "fresh_start_count": 0, "writes": 0},
         )
         entry["online"] = online
         entry["writes"] += 1
         if online and fresh_start:
             entry["fresh_start_count"] += 1
-        if now is not None:
-            entry["last_seen_at"] = now
         self.write_log.append((camera_id, online, fresh_start))
 
 
