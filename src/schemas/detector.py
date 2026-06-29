@@ -23,8 +23,8 @@ class DetectorSource(str, Enum):
 
 
 class DetectorShape(str, Enum):
-    point_in_time = "point_in_time"
-    state = "state"          # legacy preset (agitation); no longer offered in UI
+    point_in_time = "point_in_time"  # momentary — fires the moment it's seen
+    state = "state"          # continuous/ongoing activity — one event per session
     scheduled = "scheduled"  # absence detector — fires if signal absent in window
 
 
@@ -89,6 +89,8 @@ class DetectorResponse(BaseModel):
     identifier: str | None = None
     # Null for reactive detectors; the evaluation window for `scheduled`.
     schedule_config: ScheduleConfig | None = None
+    # Null unless shape == 'state'; the rising-edge episode gap (seconds).
+    episode_gap_seconds: int | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -119,6 +121,8 @@ class CreateDetectorRequest(BaseModel):
     when_scope: Scope = "ALWAYS"
     sensitivity: DetectorSensitivity = DetectorSensitivity.standard
     schedule_config: ScheduleConfig | None = None
+    # Set only for shape == 'state' (the rising-edge episode gap, seconds).
+    episode_gap_seconds: int | None = None
 
 
 class InferDetectorRequest(BaseModel):
@@ -143,6 +147,9 @@ class InferDetectorResponse(BaseModel):
     icon_name: IconName
     sensitivity: DetectorSensitivity
     schedule_config: ScheduleConfig | None = None
+    # Set when shape == 'state': the inferred rising-edge episode gap
+    # (seconds). The review screen may show/adjust it; null otherwise.
+    episode_gap_seconds: int | None = None
 
 
 class UpdateDetectorRequest(BaseModel):

@@ -23,6 +23,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.db.analysis import Analysis
 from src.db.camera import Camera
 from src.db.detector import Detector
 from src.db.event import Event
@@ -135,6 +136,9 @@ class PromotionResult:
     # one-event-per-clip pick (the model's `primary_detection`, else the
     # highest-confidence detection won). Surfaced for logging/observability.
     skipped_for_primary: list[str] = field(default_factory=list)
+    # Continuous ("state") detectors that crossed threshold but were
+    # suppressed because the activity was already ongoing (not a rising edge).
+    skipped_ongoing: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -181,6 +185,51 @@ def _select_primary(
     return min(candidates, key=_rank)
 
 
+# Fallback episode gap (seconds) for a `state` detector that has no
+# inferred `episode_gap_seconds` — e.g. the legacy preset Agitation. Safety
+# states tighten the gap (re-alert sooner after a lull); routine states use
+# a longer one. New custom state detectors carry their own LLM-inferred gap.
+_DEFAULT_STATE_GAP_SAFETY = 120
+_DEFAULT_STATE_GAP_ROUTINE = 600
+
+
+def _episode_gap_for(det: Detector) -> int:
+    """Hysteresis gap (seconds) for a `state` detector: its inferred value,
+    else a category-aware default."""
+    if det.episode_gap_seconds:
+        return det.episode_gap_seconds
+    category = str(getattr(det.category, "value", det.category))
+    return _DEFAULT_STATE_GAP_SAFETY if category == "safety" else _DEFAULT_STATE_GAP_ROUTINE
+
+
+async def _state_episode_ongoing(
+    session: AsyncSession,
+    *,
+    patient_id: UUID,
+    detected_field: str,
+    since: datetime,
+    before: datetime,
+) -> bool:
+    """True if this detector was already detected=true on a PRIOR tick within
+    [since, before) — i.e. the continuous activity is still going, so this
+    tick is NOT a fresh rising edge. Reads the per-tick `analyses` history
+    (the current tick's analysis row is excluded via the half-open `before`).
+    """
+    stmt = (
+        select(Analysis.id)
+        .where(
+            and_(
+                Analysis.patient_id == patient_id,
+                Analysis.captured_at >= since,
+                Analysis.captured_at < before,
+                Analysis.detector_fields[detected_field].astext == "true",
+            )
+        )
+        .limit(1)
+    )
+    return (await session.execute(stmt)).scalar_one_or_none() is not None
+
+
 async def maybe_promote_analysis(
     session: AsyncSession,
     *,
@@ -224,6 +273,7 @@ async def maybe_promote_analysis(
 
     fired: list[Event] = []
     skipped: list[str] = []
+    ongoing: list[str] = []
 
     # Pass 1 — collect every detector that crosses its bar this clip
     # (preset, library, custom share one path): `<id>_detected` is true AND
@@ -257,6 +307,23 @@ async def maybe_promote_analysis(
         threshold = _effective_threshold(base, det.sensitivity)
         if float(conf) < threshold:
             continue
+
+        # Continuous ("state") detectors fire only on the RISING EDGE of an
+        # episode. If the activity was already detected within this detector's
+        # hysteresis gap on a prior tick, it's ongoing — suppress, so a whole
+        # session ("watching TV") collapses to one event instead of one per
+        # tick. point_in_time detectors are unaffected (momentary events).
+        if det.shape == "state":
+            gap = _episode_gap_for(det)
+            if await _state_episode_ongoing(
+                session,
+                patient_id=patient_id,
+                detected_field=detected_field,
+                since=occurred_at - timedelta(seconds=gap),
+                before=occurred_at,
+            ):
+                ongoing.append(ident)
+                continue
 
         candidates.append(
             _Candidate(
@@ -314,9 +381,15 @@ async def maybe_promote_analysis(
             winner.identifier if winner else None,
             primary_hint, suppressed, patient_id,
         )
+    if ongoing:
+        _log.info(
+            "[event_promotion] state-episode ongoing (no new event): %r "
+            "for patient %s", ongoing, patient_id,
+        )
 
     return PromotionResult(
         fired=fired, skipped_for_dedup=skipped, skipped_for_primary=suppressed,
+        skipped_ongoing=ongoing,
     )
 
 

@@ -400,13 +400,27 @@ async def compile_custom_detector(
 # compile still happens in the background on Create, as before.
 
 
+# Continuous ("state") detector hysteresis buckets → seconds. The model
+# picks a bucket by the activity; we map to seconds and clamp to a sane band
+# so a bad inference can't make a detector never re-fire. Retune centrally
+# here. Default bucket when the model omits/garbles it: "moderate".
+_GAP_BUCKET_SECONDS: dict[str, int] = {
+    "brief": 120,       # pacing / restlessness / agitation — a short lull = new
+    "moderate": 600,    # eating, on the phone, reading
+    "extended": 1800,   # watching TV, sleeping, sitting — bridge brief breaks
+}
+_DEFAULT_GAP_BUCKET = "moderate"
+
+
 @dataclass(frozen=True)
 class InferredConfig:
-    shape: str                       # "point_in_time" | "scheduled"
+    shape: str                       # "point_in_time" | "state" | "scheduled"
     category: str                    # "safety" | "routine"
     icon_name: str
     sensitivity: str                 # "low" | "standard" | "high"
     schedule: dict | None = field(default=None)  # None unless scheduled
+    # Set only for shape == "state": the rising-edge episode gap (seconds).
+    episode_gap_seconds: int | None = field(default=None)
 
 
 def _infer_meta_prompt(*, name: str | None, prompt: str) -> str:
@@ -422,10 +436,24 @@ def _infer_meta_prompt(*, name: str | None, prompt: str) -> str:
         "'check she takes her meds between 11am and 5pm daily', 'alert me "
         "if she doesn't get up by 10am'. These fire on ABSENCE at a "
         "deadline.\n"
-        "  - 'point_in_time' for everything reactive — fires the moment "
-        "it's seen (falls, wandering, agitation, a visitor, etc.).\n\n"
+        "  - 'state' for an ONGOING activity that stays true for a sustained "
+        "stretch rather than happening in an instant — watching TV, sleeping, "
+        "sitting/resting, being on the phone, pacing/restlessness. We collapse "
+        "a whole session of these into ONE event, so you must also pick "
+        "'episode_gap' below.\n"
+        "  - 'point_in_time' for a momentary reactive event that happens in an "
+        "instant — a fall, leaving the house, choking, a visitor arriving.\n\n"
         "JSON fields:\n"
-        '  "shape": "point_in_time" | "scheduled"\n'
+        '  "shape": "point_in_time" | "state" | "scheduled"\n'
+        '  "episode_gap": "brief" | "moderate" | "extended" | null. REQUIRED '
+        'when shape="state" (null otherwise): how long the activity must be '
+        'ABSENT before a return counts as a NEW, separate event. Pick by the '
+        'activity:\n'
+        '     - "brief" (~2 min): pacing / restlessness / agitation — a short '
+        'lull is a distinct episode.\n'
+        '     - "moderate" (~10 min): eating, on the phone, reading.\n'
+        '     - "extended" (~30 min): watching TV, sleeping, sitting — a brief '
+        'break (e.g. a bathroom trip) should NOT split the session.\n'
         '  "category": "safety" | "routine".\n'
         '     - "safety" = could be an emergency or cause harm if missed: '
         'falls, wandering / leaving the house, fire / stove / hazards, choking, '
@@ -457,7 +485,7 @@ def _coerce_inferred(raw: dict) -> InferredConfig:
     Unknown enum values fall back to safe defaults; out-of-set icons
     fall back to 'eye'."""
     shape = raw.get("shape")
-    if shape not in ("point_in_time", "scheduled"):
+    if shape not in ("point_in_time", "state", "scheduled"):
         shape = "point_in_time"
     category = raw.get("category")
     if category not in ("safety", "routine"):
@@ -490,9 +518,21 @@ def _coerce_inferred(raw: dict) -> InferredConfig:
             "deadline": _hhmm(s.get("deadline")),
         }
 
+    # Continuous detectors always get a gap (default bucket if the model
+    # omitted/garbled it) so a 'state' detector can never be left without a
+    # rising-edge window. None for point_in_time / scheduled.
+    episode_gap_seconds: int | None = None
+    if shape == "state":
+        bucket = raw.get("episode_gap")
+        episode_gap_seconds = _GAP_BUCKET_SECONDS.get(
+            bucket if isinstance(bucket, str) else "",
+            _GAP_BUCKET_SECONDS[_DEFAULT_GAP_BUCKET],
+        )
+
     return InferredConfig(
         shape=shape, category=category, icon_name=icon,
         sensitivity=sensitivity, schedule=schedule,
+        episode_gap_seconds=episode_gap_seconds,
     )
 
 

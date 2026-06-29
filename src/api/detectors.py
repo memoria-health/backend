@@ -246,6 +246,7 @@ async def infer_detector(
         schedule_config=(
             ScheduleConfig(**inferred.schedule) if inferred.schedule else None
         ),
+        episode_gap_seconds=inferred.episode_gap_seconds,
     )
 
 
@@ -321,6 +322,8 @@ async def create_detector(
         schedule_config=(
             body.schedule_config.model_dump() if body.schedule_config else None
         ),
+        # Null unless shape == 'state'; the rising-edge episode gap.
+        episode_gap_seconds=body.episode_gap_seconds,
     )
     await detector_repo.insert(session, det)
 
