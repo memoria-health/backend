@@ -30,10 +30,19 @@ class DetectorSpec:
 # ── Hardcoded prompts (matches dashboard `lib/detectors.ts`) ───────
 
 BASE_PROMPT = (
-    "You are monitoring a home security camera. Respond with a JSON "
-    "object containing every field below.\n\n"
-    "description: 1–2 sentence summary of what's happening (visual). "
-    "Always present."
+    "You are monitoring a home camera to look after the person in view. "
+    "Respond with a JSON object containing every field below.\n\n"
+    "description: write this for the caregiver who could not watch live — "
+    "from it alone they should understand exactly what "
+    "happened, start to finish, and why it was flagged. So justify whatever "
+    "you detect below: describe what the person did and said and the "
+    "specific things about them that led to your conclusion, making clear "
+    "what about the person made each detector you mark true. Mention an "
+    "object only when it matters to the detection, and include a specific "
+    "detail about it (such as which medication was taken) only when you can "
+    "credibly see it — never guess or invent details. Skip surroundings and "
+    "incidental objects that don't change how the event is read. Use as many "
+    "sentences as the moment needs. Always present."
 )
 
 # always_on=true detector. NOT seeded into per-patient detectors rows
