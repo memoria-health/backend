@@ -164,6 +164,35 @@ def test_empty_detector_list_still_includes_people_present() -> None:
     assert result.schema_required[0] == "description"
 
 
+def test_primary_detection_added_when_two_or_more_firing_detectors() -> None:
+    """With ≥2 firing detectors a single action can satisfy several, so the
+    builder asks the model to name the dominant one via `primary_detection`.
+    """
+    result = build_prompt_and_schema([_fall_spec(), _wandering_spec()])
+
+    assert result.schema_properties["primary_detection"] == {"type": "string"}
+    assert "primary_detection" in result.schema_required
+    # The instruction names the candidate identifiers the model may return.
+    assert "primary_detection" in result.prompt
+    assert "fall" in result.prompt
+    assert "wandering" in result.prompt
+    # description still leads the required list.
+    assert result.schema_required[0] == "description"
+
+
+def test_primary_detection_omitted_for_single_or_no_firing_detector() -> None:
+    """0–1 firing detectors → no conflict possible → field omitted, so the
+    common single-detector prompt/schema is left exactly as before.
+    """
+    one = build_prompt_and_schema([_fall_spec()])
+    assert "primary_detection" not in one.schema_properties
+    assert "primary_detection" not in one.schema_required
+
+    none = build_prompt_and_schema([])
+    assert "primary_detection" not in none.schema_properties
+    assert "primary_detection" not in none.schema_required
+
+
 def test_caller_passing_people_present_explicitly_is_deduped() -> None:
     """A caller that also forwards `PEOPLE_PRESENT_SPEC` must NOT cause
     schema regrowth or a duplicate-field error — it's dedupe-seeded, so

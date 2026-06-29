@@ -124,12 +124,22 @@ class CameraIngest:
         # Retained for log identification; the actual reaper for a
         # vanished camera lives in `LiveKitRoomReconciler`.
         self._livekit_identity = livekit_identity
+        # Retain enough history for the LONGEST consumer — the LLM
+        # analysis window OR the incident-clip post-roll, whichever is
+        # bigger — derived from clip length so the two can never drift.
+        # The tick still snapshots only `livekit_worker_window_seconds`
+        # for the LLM (cost unchanged); the extra retention exists purely
+        # so the post-roll's post.mp4 stays contiguous with pre.mp4 and
+        # the concat seam has no gap. (Before this, the buffer was tied to
+        # the 11s analysis window while the post-roll asked for 15s, so the
+        # post snapshot lost its oldest ~4s → a visible jump at ~11s.)
+        retention_seconds = settings.frame_buffer_retention_seconds
         self.frame_buffer = FrameBuffer(
-            window_seconds=settings.livekit_worker_window_seconds,
+            window_seconds=retention_seconds,
             target_fps=settings.livekit_worker_target_fps,
         )
         self.audio_buffer = AudioBuffer(
-            window_seconds=settings.livekit_worker_window_seconds,
+            window_seconds=retention_seconds,
         )
         self._lock = asyncio.Lock()
         self._tick_task: asyncio.Task[None] | None = None

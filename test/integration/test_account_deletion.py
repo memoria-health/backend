@@ -18,6 +18,7 @@ from httpx import AsyncClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.api.pairing import DEMO_CAMERA_IDENTITY
 from src.db.camera import Camera
 from src.db.caregiver import Caregiver
 from src.db.patient import Patient
@@ -109,8 +110,12 @@ async def test_demo_pairing_code_is_reusable(
     """The configured demo code pairs the demo camera repeatedly without
     expiring or being cleared — each pair mints a fresh api_key."""
     headers, uid, pid = await _setup_caregiver_patient(client, auth_user)
-    # Seed a camera holding the demo code: mint a normal row, then rewrite
-    # its pairing_code to the demo value (what the prod seed script does).
+    # Seed the demo camera: mint a normal row, then stamp it with the stable
+    # demo identity (what scripts/seed_demo_camera.py does). The demo-pair
+    # path matches on livekit_identity == DEMO_CAMERA_IDENTITY — NOT on
+    # pairing_code (the caregiver app rotates an unpaired camera's code). We
+    # also set the demo code on the row so the "pairing fields survive each
+    # pair" assertions below stay meaningful.
     mint = (
         await client.post(
             f"/v1/patients/{pid}/cameras/pairing-code", headers=headers, json=_PAIRING_BODY
@@ -118,8 +123,11 @@ async def test_demo_pairing_code_is_reusable(
     ).json()
     camera_id = UUID(mint["camera_id"])
     await session.execute(
-        text("UPDATE cameras SET pairing_code = :c WHERE id = :id"),
-        {"c": _DEMO_CODE, "id": str(camera_id)},
+        text(
+            "UPDATE cameras SET pairing_code = :c, livekit_identity = :ident "
+            "WHERE id = :id"
+        ),
+        {"c": _DEMO_CODE, "ident": DEMO_CAMERA_IDENTITY, "id": str(camera_id)},
     )
     await session.commit()
 

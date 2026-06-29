@@ -121,6 +121,80 @@ def test_continuous_pushing_stays_within_window() -> None:
     assert 30 <= len(buf) <= 35
 
 
+def _push_pre_then_post_roll(
+    buf: FrameBuffer, *, window: float, post_roll: float, fps: int
+) -> float:
+    """Drive `buf` exactly like the live tick → post-roll sequence:
+    push frames at `fps` from t=0 through the event (pre-end at t=window)
+    and keep recording through the post-roll to t=window+post_roll.
+    Returns the pre-end timestamp (last frame the pre.mp4 snapshot saw).
+    """
+    step = 1.0 / fps
+    end = window + post_roll
+    t = 0.0
+    # Tiny payload — FrameBuffer stores bytes verbatim and never inspects
+    # size (only frames_to_mp4 validates I420 dimensions).
+    blob = _blob(2, 2)
+    while t <= end + 1e-9:
+        buf.push(width=2, height=2, data=blob, captured_at=round(t, 6))
+        t += step
+    return window
+
+
+def test_post_roll_snapshot_is_contiguous_with_pre_end() -> None:
+    """Seam regression (the prod config: 11s analysis window, 15s post-roll).
+
+    clip_archival builds the incident clip by concatenating pre.mp4 (the
+    last `window` seconds at tick time) with post.mp4 (snapshot_last_seconds
+    `post_roll` taken `post_roll` after the pre window's last frame). For
+    the concat to be seamless, the post snapshot's first frame must be
+    contiguous with the pre window's last frame.
+
+    With the DERIVED retention (max(window, post_roll)+margin), it is.
+    """
+    from src.settings import get_settings
+
+    fps, window, post_roll = 4, 11.0, 15.0
+    s = get_settings().model_copy(
+        update={
+            "livekit_worker_window_seconds": int(window),
+            "clip_post_event_wait_seconds": post_roll,
+            "livekit_worker_target_fps": fps,
+        }
+    )
+    retention = s.frame_buffer_retention_seconds  # 17.0
+    buf = FrameBuffer(window_seconds=retention, target_fps=fps)
+    pre_end = _push_pre_then_post_roll(buf, window=window, post_roll=post_roll, fps=fps)
+
+    # Anchored exactly as clip_archival does: now = pre_end + post_roll.
+    post = buf.snapshot_last_seconds(post_roll, now=pre_end + post_roll)
+    assert post, "post-roll snapshot must not be empty"
+    step = 1.0 / fps
+    gap = post[0].captured_at - pre_end
+    # Contiguous: first post frame is at (or one frame after) pre's end —
+    # NOT several seconds later. Pre-fix this gap was ~4s (post_roll-window).
+    assert gap <= step + 1e-9, (
+        f"seam gap of {gap:.2f}s: pre ended at {pre_end}, "
+        f"post starts at {post[0].captured_at}"
+    )
+
+
+def test_old_window_sized_retention_drops_post_roll_head() -> None:
+    """Documents the bug the derived retention fixes: sizing the buffer to
+    only the analysis window (11s) — what shipped — evicts the first ~4s of
+    a 15s post-roll, which is the visible jump at the concat seam.
+    """
+    fps, window, post_roll = 4, 11.0, 15.0
+    buf = FrameBuffer(window_seconds=window, target_fps=fps)  # OLD behavior
+    pre_end = _push_pre_then_post_roll(buf, window=window, post_roll=post_roll, fps=fps)
+
+    post = buf.snapshot_last_seconds(post_roll, now=pre_end + post_roll)
+    assert post, "post-roll snapshot must not be empty"
+    gap = post[0].captured_at - pre_end
+    # The hole: post can't start before (pre_end + post_roll - window).
+    assert gap >= (post_roll - window) - 1e-6  # ~4s gap, the seam jump
+
+
 def test_data_is_stored_as_is_not_referenced() -> None:
     """The buffer holds the exact bytes the caller passed in.
     Important because the SDK's frame.data memoryview is invalidated

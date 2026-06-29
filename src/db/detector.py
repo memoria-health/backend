@@ -9,7 +9,7 @@ from datetime import date, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, String
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, String
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -61,6 +61,16 @@ class Detector(Base):
     # The per-tick detection (identifier/prompt_fragment/schema_json) is
     # unchanged — the schedule just inverts + windows when it fires.
     schedule_config: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+
+    # ── Continuous ("state") detectors ──────────────────────────────
+    # Null for point_in_time / scheduled. When shape == 'state', the
+    # hysteresis gap (seconds) the activity must be ABSENT before a
+    # resumption counts as a NEW event — drives rising-edge episode
+    # promotion (see event_promotion). LLM-inferred at creation from the
+    # activity type (a brief/moderate/extended bucket mapped to seconds),
+    # so "watching TV" collapses a whole session into one event while a
+    # short lull in "pacing" starts a fresh one.
+    episode_gap_seconds: Mapped[int | None] = mapped_column(Integer, default=None)
 
     # Single-fire guard for the scheduler — the last date this scheduled
     # detector was evaluated (whether or not it fired). Internal; not

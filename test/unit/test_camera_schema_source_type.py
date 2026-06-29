@@ -35,7 +35,6 @@ def _valid_iphone_kwargs() -> dict:
         "source_type": "iphone",
         "pi_stream_url": None,
         "livekit_identity": "cam_abcd1234",
-        "last_seen_at": datetime.now(UTC),
         "created_at": datetime.now(UTC),
     }
 

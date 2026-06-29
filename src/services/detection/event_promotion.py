@@ -14,15 +14,16 @@ from filing three separate events.
 """
 
 import logging
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, select
+from sqlalchemy import Float, and_, cast, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.db.analysis import Analysis
 from src.db.camera import Camera
 from src.db.detector import Detector
 from src.db.event import Event
@@ -131,6 +132,111 @@ _DEDUP_WINDOW = timedelta(seconds=30)
 class PromotionResult:
     fired: list[Event]
     skipped_for_dedup: list[str]   # detector identifiers
+    # Detectors that crossed threshold on this clip but lost the
+    # one-event-per-clip pick (the model's `primary_detection`, else the
+    # highest-confidence detection won). Surfaced for logging/observability.
+    skipped_for_primary: list[str] = field(default_factory=list)
+    # Continuous ("state") detectors that crossed threshold but were
+    # suppressed because the activity was already ongoing (not a rising edge).
+    skipped_ongoing: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _Candidate:
+    """A detector that crossed its firing threshold on one clip and is in
+    the running to be THE single event that clip yields.
+    """
+
+    identifier: str
+    confidence: float
+    category: str
+    detector: Any   # the ORM Detector row (None in pure unit tests)
+
+
+def _select_primary(
+    candidates: Sequence["_Candidate"], *, primary_hint: str | None
+) -> "_Candidate | None":
+    """Pick the single detection to fire for one clip.
+
+    Several detectors can legitimately be true for one action (a fall is
+    also a general emergency; agitation overlaps calling-for-help), which
+    used to file one event per matching detector. We now fire exactly one:
+
+      1. the model's `primary_detection` pick, IF it names a detector that
+         actually crossed threshold this clip (the model judges which
+         action/sound dominates — the closest-association ask);
+      2. otherwise the highest-confidence detection. Ties break toward
+         `safety` over `routine`, then identifier, for determinism.
+
+    Returns None when nothing crossed threshold.
+    """
+    if not candidates:
+        return None
+    hint = (primary_hint or "").strip()
+    if hint:
+        for c in candidates:
+            if c.identifier == hint:
+                return c
+
+    def _rank(c: "_Candidate") -> tuple[float, int, str]:
+        safety_first = 0 if c.category == "safety" else 1
+        return (-c.confidence, safety_first, c.identifier)
+
+    return min(candidates, key=_rank)
+
+
+# Fallback episode gap (seconds) for a `state` detector that has no
+# inferred `episode_gap_seconds` — e.g. the legacy preset Agitation. Safety
+# states tighten the gap (re-alert sooner after a lull); routine states use
+# a longer one. New custom state detectors carry their own LLM-inferred gap.
+_DEFAULT_STATE_GAP_SAFETY = 120
+_DEFAULT_STATE_GAP_ROUTINE = 600
+
+
+def _episode_gap_for(det: Detector) -> int:
+    """Hysteresis gap (seconds) for a `state` detector: its inferred value,
+    else a category-aware default."""
+    if det.episode_gap_seconds:
+        return det.episode_gap_seconds
+    category = str(getattr(det.category, "value", det.category))
+    return _DEFAULT_STATE_GAP_SAFETY if category == "safety" else _DEFAULT_STATE_GAP_ROUTINE
+
+
+async def _state_episode_ongoing(
+    session: AsyncSession,
+    *,
+    patient_id: UUID,
+    detected_field: str,
+    conf_field: str,
+    threshold: float,
+    since: datetime,
+    before: datetime,
+) -> bool:
+    """True if this detector was already PROMOTABLE — detected=true AND
+    confidence >= threshold — on a PRIOR tick within [since, before), i.e. the
+    continuous activity was already firing-eligible, so this tick is NOT a
+    fresh rising edge.
+
+    The confidence gate matters: a prior SUB-threshold blip (detected=true but
+    below the bar, which never fires) must NOT count as "ongoing", or it would
+    swallow the genuine first above-threshold event of an episode. Reads the
+    per-tick `analyses` history; the current tick's row is excluded via the
+    half-open `before` (it has captured_at == occurred_at).
+    """
+    stmt = (
+        select(Analysis.id)
+        .where(
+            and_(
+                Analysis.patient_id == patient_id,
+                Analysis.captured_at >= since,
+                Analysis.captured_at < before,
+                Analysis.detector_fields[detected_field].astext == "true",
+                cast(Analysis.detector_fields[conf_field].astext, Float) >= threshold,
+            )
+        )
+        .limit(1)
+    )
+    return (await session.execute(stmt)).scalar_one_or_none() is not None
 
 
 async def maybe_promote_analysis(
@@ -176,10 +282,13 @@ async def maybe_promote_analysis(
 
     fired: list[Event] = []
     skipped: list[str] = []
+    ongoing: list[str] = []
 
-    # One unified firing path for EVERY detector (preset, library, custom):
-    # `<id>_detected` is true AND `<id>_confidence` clears the sensitivity-
-    # adjusted threshold. The caregiver's sensitivity picker sets the bar.
+    # Pass 1 — collect every detector that crosses its bar this clip
+    # (preset, library, custom share one path): `<id>_detected` is true AND
+    # `<id>_confidence` clears the sensitivity-adjusted threshold. The
+    # caregiver's sensitivity picker sets the bar.
+    candidates: list[_Candidate] = []
     for ident, det in detectors_by_id.items():
         if not det.is_on:
             continue
@@ -208,12 +317,67 @@ async def maybe_promote_analysis(
         if float(conf) < threshold:
             continue
 
-        if await _within_dedup_window(
-            session, patient_id=patient_id, detector_id=det.id, now=occurred_at,
-        ):
-            skipped.append(ident)
-            continue
+        # Continuous ("state") detectors fire only on the RISING EDGE of an
+        # episode. If the activity was already detected within this detector's
+        # hysteresis gap on a prior tick, it's ongoing — suppress, so a whole
+        # session ("watching TV") collapses to one event instead of one per
+        # tick. point_in_time detectors are unaffected (momentary events).
+        if det.shape == "state":
+            gap = _episode_gap_for(det)
+            if await _state_episode_ongoing(
+                session,
+                patient_id=patient_id,
+                detected_field=detected_field,
+                conf_field=conf_field,
+                threshold=threshold,
+                since=occurred_at - timedelta(seconds=gap),
+                before=occurred_at,
+            ):
+                ongoing.append(ident)
+                continue
 
+        candidates.append(
+            _Candidate(
+                identifier=ident,
+                confidence=float(conf),
+                category=str(getattr(det.category, "value", det.category)),
+                detector=det,
+            )
+        )
+
+    # Pass 2 — ONE event per clip. Overlapping detectors (fall + general
+    # emergency, agitation + calling-for-help) used to file one event each
+    # for the same clip; now we fire only the single best-fitting detection.
+    # If the best pick is within its 30s cross-tick dedup window (a repeat of a
+    # recent event), fall back to the next-best DISTINCT candidate rather than
+    # yielding no event at all — otherwise a deduped winner would suppress a
+    # genuinely different detection that also fired this clip.
+    primary_hint = detector_fields.get("primary_detection")
+    primary_hint = primary_hint if isinstance(primary_hint, str) else None
+    remaining = list(candidates)
+    winner: _Candidate | None = None
+    while remaining:
+        pick = _select_primary(remaining, primary_hint=primary_hint)
+        if pick is None:
+            break
+        if await _within_dedup_window(
+            session, patient_id=patient_id, detector_id=pick.detector.id, now=occurred_at,
+        ):
+            skipped.append(pick.identifier)
+            remaining.remove(pick)
+            continue
+        winner = pick
+        break
+
+    # Candidates that crossed threshold but neither fired nor deduped — they
+    # lost the one-event-per-clip pick.
+    suppressed = [
+        c.identifier for c in candidates
+        if c is not winner and c.identifier not in skipped
+    ]
+
+    if winner is not None:
+        det = winner.detector
         fired.append(
             await _insert_event(
                 session,
@@ -224,19 +388,36 @@ async def maybe_promote_analysis(
                 description=description,
             )
         )
-
         # Fire-once: the moment a self-test promotes, disable its (single,
-        # per-patient) row so it can never fire again — on this camera or any
-        # other. The caller commits this session, persisting is_on=false; the
-        # next tick's registry query (is_on=true filter) drops it everywhere.
-        if ident in _FIRE_ONCE_KEYS:
+        # per-patient) row so it can never fire again — on this camera or
+        # any other. The caller commits this session, persisting
+        # is_on=false; the next tick's registry query (is_on=true filter)
+        # drops it everywhere.
+        if winner.identifier in _FIRE_ONCE_KEYS:
             det.is_on = False
             _log.info(
                 "[event_promotion] fire-once detector %s (%s) disabled after "
-                "first fire for patient %s", det.id, ident, patient_id,
+                "first fire for patient %s", det.id, winner.identifier,
+                patient_id,
             )
 
-    return PromotionResult(fired=fired, skipped_for_dedup=skipped)
+    if suppressed:
+        _log.info(
+            "[event_promotion] one-event-per-clip: winner=%s (hint=%r) "
+            "suppressed=%r for patient %s",
+            winner.identifier if winner else None,
+            primary_hint, suppressed, patient_id,
+        )
+    if ongoing:
+        _log.info(
+            "[event_promotion] state-episode ongoing (no new event): %r "
+            "for patient %s", ongoing, patient_id,
+        )
+
+    return PromotionResult(
+        fired=fired, skipped_for_dedup=skipped, skipped_for_primary=suppressed,
+        skipped_ongoing=ongoing,
+    )
 
 
 def _is_truthy_bool(v: Any) -> bool:

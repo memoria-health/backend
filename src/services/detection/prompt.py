@@ -30,10 +30,19 @@ class DetectorSpec:
 # ── Hardcoded prompts (matches dashboard `lib/detectors.ts`) ───────
 
 BASE_PROMPT = (
-    "You are monitoring a home security camera. Respond with a JSON "
-    "object containing every field below.\n\n"
-    "description: 1–2 sentence summary of what's happening (visual). "
-    "Always present."
+    "You are monitoring a home camera to look after the person in view. "
+    "Respond with a JSON object containing every field below.\n\n"
+    "description: write this for the caregiver who could not watch live — "
+    "from it alone they should understand exactly what "
+    "happened, start to finish, and why it was flagged. So justify whatever "
+    "you detect below: describe what the person did and said and the "
+    "specific things about them that led to your conclusion, making clear "
+    "what about the person made each detector you mark true. Mention an "
+    "object only when it matters to the detection, and include a specific "
+    "detail about it (such as which medication was taken) only when you can "
+    "credibly see it — never guess or invent details. Skip surroundings and "
+    "incidental objects that don't change how the event is read. Use as many "
+    "sentences as the moment needs. Always present."
 )
 
 # always_on=true detector. NOT seeded into per-patient detectors rows
@@ -121,6 +130,30 @@ def build_prompt_and_schema(detectors: Sequence[DetectorSpec]) -> BuiltPrompt:
                 )
             schema_properties[name] = field
             schema_required.append(name)
+
+    # One-event-per-clip pick. When TWO OR MORE firing detectors are
+    # configured, a single action can satisfy several of them (a fall is
+    # also a general emergency; agitation overlaps calling-for-help), which
+    # would otherwise file one event per matching detector. Ask the model
+    # to name the SINGLE detection that dominates the clip; event_promotion
+    # fires only that one (falling back to highest confidence when this is
+    # empty/invalid). Omitted with 0–1 firing detectors — no conflict is
+    # possible, so the common single-detector prompt is left untouched.
+    # `people_present` is always-on (not a firing detector) and excluded.
+    firing_ids = [s.identifier for s in all_specs if not s.always_on]
+    if len(firing_ids) >= 2:
+        parts.append(
+            "primary_detection: string. Several detectors above can be true "
+            "for a single clip when one action overlaps their definitions "
+            "(for example a fall is also a general emergency, or agitation "
+            "overlaps calling for help). Of the detectors you marked "
+            "detected=true, return the ONE identifier whose triggering "
+            "action or sound is the dominant event in this clip. Valid "
+            "identifiers: " + ", ".join(firing_ids) + ". Return an empty "
+            "string if you marked no detector detected=true."
+        )
+        schema_properties["primary_detection"] = {"type": "string"}
+        schema_required.append("primary_detection")
 
     return BuiltPrompt(
         prompt="\n\n".join(parts),

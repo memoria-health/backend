@@ -409,6 +409,10 @@ create table public.detectors (
   --     "deadline":     "HH:MM" }    -- when to evaluate + fire
   -- Read by the scheduler runtime (separate from the per-tick path).
   schedule_config            jsonb,
+  -- Continuous ("state") detectors: seconds the activity must be absent
+  -- before a resumption counts as a NEW event (rising-edge episode gap).
+  -- Null for point_in_time / scheduled. LLM-inferred at creation.
+  episode_gap_seconds        integer,
   -- Single-fire guard for the scheduled runtime: the date the
   -- detector last evaluated its window. The 60s scheduler loop
   -- skips a detector if today's date matches this; NULL = never
