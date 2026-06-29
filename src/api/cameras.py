@@ -61,7 +61,7 @@ def _to_response(c: Camera) -> CameraResponse:
     # build the dict explicitly instead.
     paired = (
         c.ingest_token_hash is not None
-        if c.source_type == "pi"
+        if c.source_type in ("pi", "gateway")
         else c.api_key_hash is not None
     )
     return CameraResponse(
@@ -413,6 +413,81 @@ async def provision_pi_camera(
         livekit_identity=livekit_identity,
         livekit_room=livekit_room,
     )
+
+
+@router.post(
+    "/patients/{patient_id}/cameras/gateway-provision",
+    status_code=status.HTTP_201_CREATED,
+    response_model=None,
+)
+async def provision_gateway_camera(
+    patient_id: UUID,
+    body: CreatePairingCodeRequest,
+    auth: CaregiverAuth,
+    session: SessionDep,
+) -> dict:
+    """Register a gateway camera (a Tapo behind a mini-PC).
+
+    Like the iPhone pairing-code flow and pi-provision, but for our direct-
+    publish gateway: NO pairing code (the camera is dumb — the mini-PC pairs on
+    its behalf) and NO pi_stream_url (the gateway publishes straight to LiveKit,
+    so the backend relay never pulls anything). Creates a `source_type='pi'` row
+    with an ingest token and RETURNS the plaintext token — the only place it
+    lands — so the mini-PC's setup agent can write it into its own config.
+    """
+    patient = await patient_repo.find_by_id(session, patient_id, caregiver_id=auth.id)
+    if patient is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="patient_not_found",
+        )
+    now = datetime.now(timezone.utc)
+    camera_id = uuid4()
+    short = camera_id.hex[:8]
+    livekit_identity = f"cam_{short}"
+    livekit_room = f"patient_{patient_id}"
+    next_display_id = (await session.execute(
+        select(func.coalesce(func.max(Camera.display_id), 0)).where(
+            Camera.patient_id == patient_id)
+    )).scalar_one() + 1
+    ingest_token_plaintext, ingest_token_hash = mint_ingest_token()
+    cam = Camera(
+        id=camera_id,
+        patient_id=patient_id,
+        display_id=next_display_id,
+        room=body.room,
+        icon_name=body.icon_name,
+        online=False,
+        created_at=now,
+        pairing_code=None,
+        pairing_expires_at=None,
+        api_key_hash=None,
+        livekit_identity=livekit_identity,
+        livekit_room=livekit_room,
+        state="open",
+        no_people_count=0,
+        state_changed_at=now,
+        close_threshold=6,
+        battery_percent=None,
+        desired_state="disconnected",
+        source_type="gateway",
+        pi_stream_url=None,
+        pi_audio_url=None,
+        ingest_token_hash=ingest_token_hash,
+        ingest_token_created_at=now,
+        app_present=True,
+    )
+    session.add(cam)
+    await session.flush()
+    await camera_detector_repo.assign_preset_detectors_of_patient_to_camera(
+        session, camera_id, patient_id,
+    )
+    await session.commit()
+    return {
+        "camera_id": str(camera_id),
+        "livekit_identity": livekit_identity,
+        "livekit_room": livekit_room,
+        "ingest_token": ingest_token_plaintext,
+    }
 
 
 @router.delete(

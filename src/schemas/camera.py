@@ -20,8 +20,10 @@ DesiredState = Literal["connected", "disconnected"]
 
 # Mirrors the DB CHECK constraint on cameras.source_type. 'iphone' is
 # the existing NemaraCam wall-phone path. 'pi' is the Raspberry Pi
-# ingest path handled by services/ingest/pi/.
-SourceType = Literal["iphone", "pi"]
+# MJPEG-relay ingest path. 'gateway' is the mini-PC RTSP gateway — its
+# OWN third path: it carries an ingest token like 'pi' but publishes
+# DIRECTLY to LiveKit (no relay), so it shares none of the relay logic.
+SourceType = Literal["iphone", "pi", "gateway"]
 
 # A Pi stream URL must be an HTTP(S) URL. We do not parse / validate
 # routing here; the worker process will discover unreachable URLs
