@@ -1,18 +1,22 @@
 """Regression tests: after the REST-polled reconciler refactor,
-`apply_tick_update` MUST NOT write to `cameras.online` or
-`cameras.last_seen_at`. Those columns are owned exclusively by
-`LiveKitRoomReconciler` (see room_reconciler.py).
+`apply_tick_update` MUST NOT write to `cameras.online`. That column is
+owned exclusively by `LiveKitRoomReconciler` (see room_reconciler.py),
+which derives presence from REST polls + an in-memory fresh-frame
+timestamp.
 
-Why the explicit regression net: it would be very easy to "re-add"
-those columns to the state machine UPDATE in some future change
-("just stamp last_seen_at on every tick — what's the harm?"), and
-that change would silently re-couple stream-presence to detector
-ticks. These tests fail loudly the moment that happens.
+Why the explicit regression net: it would be very easy to "re-add" the
+online write to the state machine UPDATE in some future change ("just
+stamp it on every tick — what's the harm?"), and that change would
+silently re-couple stream-presence to detector ticks. These tests fail
+loudly the moment that happens.
+
+(The previously-tested `cameras.last_seen_at` column was dropped in
+`bb2ad6f refactor(cameras): drop last_seen_at column and writers` —
+presence freshness is now an in-memory signal, not a DB column.)
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 import pytest
@@ -23,6 +27,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.db.camera import Camera
 from src.services.detection.state_machine import apply_tick_update
 from test.conftest import mint_test_jwt
+
+from datetime import datetime, timezone
 
 
 _PATIENT_BODY = {
@@ -45,15 +51,12 @@ async def _insert_camera(
     *,
     patient_id: str,
     online: bool,
-    last_seen_at: datetime | None,
     state: str = "open",
     no_people_count: int = 0,
     close_threshold: int = 6,
 ) -> UUID:
-    """Insert a camera with a CALLER-CONTROLLED `online` and
-    `last_seen_at` so the test can verify the state machine doesn't
-    rewrite either one.
-    """
+    """Insert a camera with a CALLER-CONTROLLED `online` so the test can
+    verify the state machine doesn't rewrite it."""
     cid = uuid4()
     now = datetime.now(timezone.utc)
     await session.execute(
@@ -62,10 +65,10 @@ async def _insert_camera(
             INSERT INTO cameras (
                 id, patient_id, display_id, room, icon_name, online,
                 created_at, state, no_people_count, state_changed_at,
-                close_threshold, last_seen_at
+                close_threshold
             ) VALUES (
                 :id, :pid, 1, 'Living room', 'tv', :online,
-                :now, :state, :nc, :now, :ct, :lsa
+                :now, :state, :nc, :now, :ct
             )
             """
         ),
@@ -77,7 +80,6 @@ async def _insert_camera(
             "nc": no_people_count,
             "ct": close_threshold,
             "online": online,
-            "lsa": last_seen_at,
         },
     )
     await session.commit()
@@ -96,9 +98,7 @@ async def test_apply_tick_update_does_not_set_online_true(
     flip the column.
     """
     pid = await _setup_patient(client, auth_user)
-    cid = await _insert_camera(
-        session, patient_id=pid, online=False, last_seen_at=None,
-    )
+    cid = await _insert_camera(session, patient_id=pid, online=False)
 
     await apply_tick_update(
         session, camera_id=cid, people_present=True, motion_in_clip=False,
@@ -108,7 +108,6 @@ async def test_apply_tick_update_does_not_set_online_true(
     cam = await session.get(Camera, cid)
     assert cam is not None
     assert cam.online is False
-    assert cam.last_seen_at is None
     # State machine SHOULD still have transitioned (people_present
     # forces state='open' and no_people_count=0).
     assert cam.state == "open"
@@ -121,10 +120,7 @@ async def test_apply_tick_update_does_not_clear_online_true(
 ) -> None:
     """Seed `online=true`; run a tick; assert online stays true."""
     pid = await _setup_patient(client, auth_user)
-    seeded_last_seen = datetime.now(timezone.utc) - timedelta(seconds=5)
-    cid = await _insert_camera(
-        session, patient_id=pid, online=True, last_seen_at=seeded_last_seen,
-    )
+    cid = await _insert_camera(session, patient_id=pid, online=True)
 
     await apply_tick_update(
         session, camera_id=cid, people_present=False, motion_in_clip=False,
@@ -134,31 +130,6 @@ async def test_apply_tick_update_does_not_clear_online_true(
     cam = await session.get(Camera, cid)
     assert cam is not None
     assert cam.online is True
-    # `last_seen_at` must not have moved either way — state machine
-    # doesn't read or write it.
-    assert cam.last_seen_at is not None
-    assert abs((cam.last_seen_at - seeded_last_seen).total_seconds()) < 0.01
-
-
-@pytest.mark.asyncio
-async def test_apply_tick_update_does_not_set_last_seen_at_when_null(
-    client: AsyncClient, auth_user, session: AsyncSession,
-) -> None:
-    """Seed `last_seen_at=NULL`; run several ticks; assert it stays NULL."""
-    pid = await _setup_patient(client, auth_user)
-    cid = await _insert_camera(
-        session, patient_id=pid, online=True, last_seen_at=None,
-    )
-
-    for _ in range(3):
-        await apply_tick_update(
-            session, camera_id=cid, people_present=False, motion_in_clip=False,
-        )
-    await session.commit()
-
-    cam = await session.get(Camera, cid)
-    assert cam is not None
-    assert cam.last_seen_at is None
 
 
 @pytest.mark.asyncio
@@ -170,9 +141,7 @@ async def test_apply_tick_update_state_transition_works_with_online_false(
     the column-write split.
     """
     pid = await _setup_patient(client, auth_user)
-    cid = await _insert_camera(
-        session, patient_id=pid, online=False, last_seen_at=None,
-    )
+    cid = await _insert_camera(session, patient_id=pid, online=False)
 
     # Drive 6 (people=false) ticks to reach the close threshold.
     last = None
@@ -190,6 +159,5 @@ async def test_apply_tick_update_state_transition_works_with_online_false(
     cam = await session.get(Camera, cid)
     assert cam is not None
     assert cam.state == "closed"
-    # Stream-presence columns untouched throughout the full sequence.
+    # Stream-presence column untouched throughout the full sequence.
     assert cam.online is False
-    assert cam.last_seen_at is None

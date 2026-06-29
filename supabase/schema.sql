@@ -141,6 +141,21 @@ create table public.patients (
   -- alerts when enabled). JSON array of strings.
   email_alerts_enabled    boolean not null default false,
   email_alert_recipients  jsonb   not null default '[]'::jsonb,
+  -- Data-collection consent (research opt-in). `data_collection_enabled`
+  -- is the master switch to store short video+audio clips of this
+  -- patient for research, only when someone is present; default OFF
+  -- until the caregiver explicitly opts in. `data_collection_decided_at`
+  -- records WHEN the caregiver decided: NULL = never asked, which drives
+  -- the first-open consent banner (web + iOS). Both "Share" and "Not
+  -- now" stamp it so the banner never re-nags.
+  data_collection_enabled    boolean not null default false,
+  data_collection_decided_at timestamptz,
+  -- Privacy mode (dignity override). While ON it overrides data
+  -- collection (no clips stored), severs live video+audio to caregivers
+  -- at the SFU, and strips event clips from insights — detection + text
+  -- insights keep flowing. A live switch (no decided_at): it SUSPENDS
+  -- data_collection_enabled without mutating it. Enforced server-side.
+  privacy_mode_enabled       boolean not null default false,
   -- Bucket-relative key in `patient-photos` (e.g. "{patient_id}.jpg").
   -- NULL until the caregiver uploads an avatar; the roster + header
   -- fall back to initials while NULL. The signed URL is minted at
@@ -531,6 +546,10 @@ create table public.events (
   -- Read at iOS-fetch time by `GET /v1/events/{id}/clip-url`, which
   -- mints a short-lived Supabase Storage signed URL.
   clip_storage_key text,
+  -- True when the clip was intentionally not archived because the patient
+  -- was in privacy mode. Lets the apps render "No clip — Privacy mode"
+  -- instead of an endless "Generating clip…" for has_clip=false events.
+  clip_suppressed boolean not null default false,
   created_at    timestamptz not null default now()
 );
 

@@ -29,6 +29,7 @@ from src.schemas.patient import (
     UpdatePatientRequest,
 )
 from src.services import email, onboarding, storage
+from src.services.livekit_privacy import enforce_privacy_for_room
 
 router = APIRouter(prefix="/v1/patients", tags=["patient"])
 
@@ -131,6 +132,7 @@ async def patch_patient(
     auth: CaregiverAuth,
     body: UpdatePatientRequest,
     session: SessionDep,
+    settings: SettingsDep,
 ) -> PatientResponse:
     """Partial update.
 
@@ -150,6 +152,13 @@ async def patch_patient(
     fields = body.model_dump(exclude_unset=True)
     if "relation" in fields and fields["relation"] is not None:
         fields["relation"] = fields["relation"].value
+
+    # Data-collection consent: any time the caregiver sends the flag
+    # (Share=true or Not now=false), record WHEN they decided. A non-null
+    # decided_at is how the web + iOS apps know to stop showing the
+    # first-open consent banner. decided_at is never client-writable.
+    if "data_collection_enabled" in fields:
+        fields["data_collection_decided_at"] = datetime.now(timezone.utc)
 
     cascade_to: str | None = None
     if "cameras_paused" in fields:
@@ -185,6 +194,16 @@ async def patch_patient(
                 await pi_ingest_module.cancel_active_relay(cam.id)
 
     await session.commit()
+
+    # Privacy turned ON → instantly sever any caregiver ALREADY connected
+    # to this patient's LiveKit room. The committed flag already gates new
+    # token mints (api/livekit.py); this closes the window for live
+    # sessions still holding a pre-privacy token. Best-effort: the helper
+    # swallows LiveKit errors so the toggle always succeeds, and the bot +
+    # camera participants are left untouched so insights keep flowing.
+    if fields.get("privacy_mode_enabled") is True:
+        await enforce_privacy_for_room(settings, patient_id)
+
     return _to_response(p)
 
 

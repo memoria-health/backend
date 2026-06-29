@@ -241,6 +241,57 @@ async def test_archive_event_uploads_and_flips_has_clip(
 
 @_pytestmark_ffmpeg
 @pytest.mark.asyncio
+async def test_archive_event_skips_upload_under_privacy(
+    auth_user_factory, filled_buffers, monkeypatch,
+):
+    """Privacy mode strips the event clip. The archiver's re-check before
+    upload drops it: no storage POST, has_clip stays False. The text
+    event/insight (created upstream) is unaffected — only the video is
+    suppressed."""
+    sm = get_sessionmaker()
+    async with sm() as s:
+        event_id, patient_id = await _seed_event(s, auth_user_factory)
+        # Patient is in privacy mode by the time the clip would upload.
+        p = await s.get(Patient, patient_id)
+        assert p is not None
+        p.privacy_mode_enabled = True
+        await s.commit()
+
+    fake_httpx = _install_fake_httpx(monkeypatch)
+    frame_buffer, audio_buffer = filled_buffers
+    pre_mp4 = await _build_pre_event_mp4()
+    base = get_settings()
+    overrides = base.model_dump()
+    overrides["clip_post_event_wait_seconds"] = 0.05
+    settings = Settings(**overrides)
+
+    await archive_event(
+        event_id=event_id,
+        patient_id=patient_id,
+        pre_event_mp4=pre_mp4,
+        pre_end_captured_at=time.monotonic(),
+        frame_buffer=frame_buffer,
+        audio_buffer=audio_buffer,
+        sessionmaker=sm,
+        settings=settings,
+    )
+
+    # Privacy dropped the clip — no upload was ever attempted.
+    assert fake_httpx["captured"] == []
+
+    # Row stays without a clip (text insight already lives in the row),
+    # and is stamped clip_suppressed so the apps can say WHY (privacy flip
+    # happened DURING the post-roll, so it's stamped here, not at creation).
+    async with sm() as s:
+        row = await s.get(Event, event_id)
+    assert row is not None
+    assert row.has_clip is False
+    assert row.clip_storage_key is None
+    assert row.clip_suppressed is True
+
+
+@_pytestmark_ffmpeg
+@pytest.mark.asyncio
 async def test_archive_event_noops_when_post_frames_missing(
     auth_user_factory, monkeypatch,
 ):

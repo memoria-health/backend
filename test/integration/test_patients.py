@@ -496,8 +496,7 @@ async def test_under_18_seeds_child_detectors(
 ) -> None:
     """A patient under 18 gets the child preset set (fall / climbing /
     distress), not the older-adult agitation/wandering/medication set."""
-    uid, email = auth_user
-    headers = {"Authorization": f"Bearer {mint_test_jwt(uid, email)}"}
+    headers = await _provision(client, auth_user)
     pid = (
         await client.post(
             "/v1/patients",
@@ -520,8 +519,7 @@ async def test_adult_and_unknown_age_seed_adult_detectors(
     client: AsyncClient, auth_user
 ) -> None:
     """18+ and unknown-birthday patients both get the older-adult set."""
-    uid, email = auth_user
-    headers = {"Authorization": f"Bearer {mint_test_jwt(uid, email)}"}
+    headers = await _provision(client, auth_user)
 
     adult_pid = (
         await client.post(

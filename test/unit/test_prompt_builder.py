@@ -7,10 +7,11 @@ The builder appends caller-provided detectors after `BASE_PROMPT`,
 dedupes by identifier, raises on schema-field collisions, and keeps
 `description` as the first required field.
 
-Note: the legacy always-on `PEOPLE_PRESENT_SPEC` is no longer merged
-into the prompt/schema — Re-ID body tracking is the source of truth
-for presence and count. The constant still exists as an import so
-external callers don't break, but it contributes nothing when passed.
+Note: the always-on `PEOPLE_PRESENT_SPEC` IS merged into every
+prompt/schema — the LLM is the generic presence detector and
+`camera_ingest` reads `result.people_present` (with re-ID's face match
+as the POI override). A caller that also forwards the spec is deduped
+by identifier, so it still appears exactly once.
 """
 
 from __future__ import annotations
@@ -57,24 +58,25 @@ def _wandering_spec() -> DetectorSpec:
     )
 
 
-def test_people_present_is_no_longer_merged_into_prompt_or_schema() -> None:
-    """Re-ID is the source of truth for presence; the prompt no longer
-    asks the LLM to answer `people_present`/`people_count`. The
-    builder's output must NOT include those keys.
+def test_people_present_is_always_merged_into_prompt_and_schema() -> None:
+    """The always-on PEOPLE_PRESENT_SPEC is merged into every build: the
+    LLM is the generic presence detector (camera_ingest reads
+    `result.people_present`, with re-ID's face match as the POI override).
     """
     result = build_prompt_and_schema([_fall_spec()])
 
     assert result.prompt.startswith(BASE_PROMPT)
-    # The people_present prompt fragment must not appear.
-    assert PEOPLE_PRESENT_SPEC.prompt_fragment not in result.prompt
-    # The fall detector's fragments must still be present.
+    # The people_present prompt fragment is always present.
+    assert PEOPLE_PRESENT_SPEC.prompt_fragment in result.prompt
+    # The fall detector's fragments are present too.
     assert "fall_detected" in result.prompt
     assert "fall_confidence" in result.prompt
     assert "fall_reasoning" in result.prompt
 
-    # Schema contains description + fall_* ONLY — no people_*.
+    # Schema contains description + people_* + fall_*.
     assert set(result.schema_properties.keys()) == {
         "description",
+        "people_present", "people_count",
         "fall_detected", "fall_confidence", "fall_reasoning",
     }
     # Every property must be in required, and vice-versa.
@@ -85,11 +87,11 @@ def test_people_present_is_no_longer_merged_into_prompt_or_schema() -> None:
 
     # Type-match the inner field shapes.
     assert result.schema_properties["description"] == {"type": "string"}
+    assert result.schema_properties["people_present"] == {"type": "boolean"}
+    assert result.schema_properties["people_count"] == {"type": "number"}
     assert result.schema_properties["fall_detected"] == {"type": "boolean"}
     assert result.schema_properties["fall_confidence"] == {"type": "number"}
     assert result.schema_properties["fall_reasoning"] == {"type": "string"}
-    assert "people_present" not in result.schema_properties
-    assert "people_count" not in result.schema_properties
 
 
 def test_duplicate_detector_identifier_only_included_once() -> None:
@@ -102,6 +104,7 @@ def test_duplicate_detector_identifier_only_included_once() -> None:
 
     assert set(result.schema_properties.keys()) == {
         "description",
+        "people_present", "people_count",
         "fall_detected", "fall_confidence", "fall_reasoning",
     }
     assert set(result.schema_required) == set(result.schema_properties.keys())
@@ -145,32 +148,33 @@ def test_description_is_always_the_first_required_field() -> None:
     assert r1.schema_required[0] == "description"
 
 
-def test_empty_detector_list_produces_description_only_prompt() -> None:
-    """No per-patient detectors → minimal prompt + schema (just
-    BASE_PROMPT + description). The always-on people_present block is
-    gone, so there's nothing else.
+def test_empty_detector_list_still_includes_people_present() -> None:
+    """No per-patient detectors → BASE_PROMPT + description + the
+    always-on people_present block (nothing else).
     """
     result = build_prompt_and_schema([])
 
     assert result.prompt.startswith(BASE_PROMPT)
-    assert PEOPLE_PRESENT_SPEC.prompt_fragment not in result.prompt
+    assert PEOPLE_PRESENT_SPEC.prompt_fragment in result.prompt
 
-    assert set(result.schema_properties.keys()) == {"description"}
+    assert set(result.schema_properties.keys()) == {
+        "description", "people_present", "people_count",
+    }
     assert set(result.schema_required) == set(result.schema_properties.keys())
     assert result.schema_required[0] == "description"
 
 
-def test_caller_passing_people_present_explicitly_is_silently_dropped() -> None:
-    """A legacy caller that still forwards `PEOPLE_PRESENT_SPEC` must
-    NOT cause schema regrowth (the spec is dedupe-seeded, so its
-    fields don't get added). This preserves behavior for any importer
-    that still references the constant.
+def test_caller_passing_people_present_explicitly_is_deduped() -> None:
+    """A caller that also forwards `PEOPLE_PRESENT_SPEC` must NOT cause
+    schema regrowth or a duplicate-field error — it's dedupe-seeded, so
+    it still appears exactly once.
     """
     result = build_prompt_and_schema([PEOPLE_PRESENT_SPEC, _fall_spec()])
 
     assert set(result.schema_properties.keys()) == {
         "description",
+        "people_present", "people_count",
         "fall_detected", "fall_confidence", "fall_reasoning",
     }
-    # Fragment from the people_present spec must not appear at all.
-    assert result.prompt.count(PEOPLE_PRESENT_SPEC.prompt_fragment) == 0
+    # Always-on, but it appears EXACTLY once even when forwarded.
+    assert result.prompt.count(PEOPLE_PRESENT_SPEC.prompt_fragment) == 1
