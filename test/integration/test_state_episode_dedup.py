@@ -43,14 +43,15 @@ async def _add_state_detector(session: AsyncSession, patient_id) -> Detector:
 
 
 async def _add_prior_analysis(
-    session: AsyncSession, patient_id, camera_id, *, detected: bool, captured_at: datetime,
+    session: AsyncSession, patient_id, camera_id, *, detected: bool,
+    captured_at: datetime, confidence: float = 0.9,
 ) -> None:
     caregiver_id = (await session.get(Patient, patient_id)).caregiver_id
     session.add(
         Analysis(
             id=uuid4(), caregiver_id=caregiver_id, patient_id=patient_id,
             camera_id=camera_id, provider="gemini", description="x",
-            detector_fields={f"{_IDENT}_detected": detected, f"{_IDENT}_confidence": 0.9},
+            detector_fields={f"{_IDENT}_detected": detected, f"{_IDENT}_confidence": confidence},
             people_present=True, motion_in_clip=True, state_after="open",
             captured_at=captured_at, created_at=captured_at,
         )
@@ -103,6 +104,32 @@ async def test_ongoing_episode_is_suppressed(
     from sqlalchemy import select
     rows = (await session.execute(select(Event).where(Event.patient_id == patient_id))).scalars().all()
     assert len(rows) == 0
+
+
+@pytest.mark.asyncio
+async def test_subthreshold_prior_does_not_suppress_first_event(
+    client: AsyncClient, auth_user, session: AsyncSession,
+) -> None:
+    """A prior detected=true tick BELOW threshold (never fired) must NOT count
+    as an ongoing episode — the genuine first above-threshold event still fires.
+    """
+    patient_id, camera_id = await _setup_patient_with_camera(client, auth_user, session)
+    det = await _add_state_detector(session, patient_id)
+    now = datetime.now(timezone.utc)
+    # Prior tick within the gap: detected=true but confidence 0.4 < standard
+    # threshold 0.70, so it never promoted.
+    await _add_prior_analysis(
+        session, patient_id, camera_id, detected=True, confidence=0.4,
+        captured_at=now - timedelta(seconds=60),
+    )
+
+    result = await maybe_promote_analysis(
+        session, patient_id=patient_id, camera_id=camera_id,
+        occurred_at=now, description="now clearly watching tv", detector_fields=_FIELDS,
+    )
+    await session.commit()
+    assert len(result.fired) == 1, "a sub-threshold blip must not swallow the real first event"
+    assert result.fired[0].detector_id == det.id
 
 
 @pytest.mark.asyncio

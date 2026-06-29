@@ -11,7 +11,8 @@ These exercise the real DB firing path in `maybe_promote_analysis`.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 import pytest
 from httpx import AsyncClient
@@ -19,6 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.detector import Detector
+from src.db.event import Event
 from src.services.detection.event_promotion import (
     _promotion_spec_for,
     maybe_promote_analysis,
@@ -37,8 +39,8 @@ async def _two_firing_detectors(
             .order_by(Detector.created_at)
         )
     ).scalars().all()
-    reactive = [d for d in rows if d.is_on and d.shape != "scheduled"]
-    assert len(reactive) >= 2, "need ≥2 reactive presets to test overlap"
+    reactive = [d for d in rows if d.is_on and d.shape == "point_in_time"]
+    assert len(reactive) >= 2, "need ≥2 point_in_time presets to test overlap"
     return reactive[0], reactive[1]
 
 
@@ -90,6 +92,48 @@ async def test_two_detectors_one_clip_fires_only_the_model_pick(
         )
     ).scalars().all()
     assert len(events) == 1
+
+
+async def _add_prior_event(session, patient_id, camera_id, det, *, occurred_at) -> None:
+    session.add(
+        Event(
+            id=uuid4(), patient_id=patient_id, detector_id=det.id, camera_id=camera_id,
+            category=det.category, source=det.source, icon_name=det.icon_name,
+            title="prior", location="Test Room", occurred_at=occurred_at, has_clip=False,
+            clip_suppressed=False, narrative="prior", opened=False, reviewed=False,
+            review_choice=None, review_notes=None, reviewed_at=None, created_at=occurred_at,
+        )
+    )
+    await session.flush()
+
+
+@pytest.mark.asyncio
+async def test_deduped_winner_falls_back_to_next_distinct_candidate(
+    client: AsyncClient, auth_user, session: AsyncSession,
+) -> None:
+    """If the top pick is within its 30s dedup window (a repeat), the clip
+    still fires the next-best DISTINCT candidate rather than no event at all.
+    """
+    patient_id, camera_id = await _setup_patient_with_camera(client, auth_user, session)
+    det_a, det_b = await _two_firing_detectors(session, patient_id)
+    now = datetime.now(timezone.utc)
+    # det_a is the higher-confidence pick, but it already fired 10s ago.
+    await _add_prior_event(session, patient_id, camera_id, det_a, occurred_at=now - timedelta(seconds=10))
+
+    detector_fields = {
+        **_fields_for(det_a, 0.95),
+        **_fields_for(det_b, 0.80),
+        "primary_detection": "",
+        "identity_reid_ran": False,
+    }
+    result = await maybe_promote_analysis(
+        session, patient_id=patient_id, camera_id=camera_id,
+        occurred_at=now, description="top pick is a repeat", detector_fields=detector_fields,
+    )
+    await session.commit()
+    assert len(result.fired) == 1, "should still fire the distinct candidate"
+    assert result.fired[0].detector_id == det_b.id
+    assert det_a.identifier in result.skipped_for_dedup
 
 
 @pytest.mark.asyncio
