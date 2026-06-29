@@ -14,8 +14,8 @@ from filing three separate events.
 """
 
 import logging
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
@@ -131,6 +131,54 @@ _DEDUP_WINDOW = timedelta(seconds=30)
 class PromotionResult:
     fired: list[Event]
     skipped_for_dedup: list[str]   # detector identifiers
+    # Detectors that crossed threshold on this clip but lost the
+    # one-event-per-clip pick (the model's `primary_detection`, else the
+    # highest-confidence detection won). Surfaced for logging/observability.
+    skipped_for_primary: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _Candidate:
+    """A detector that crossed its firing threshold on one clip and is in
+    the running to be THE single event that clip yields.
+    """
+
+    identifier: str
+    confidence: float
+    category: str
+    detector: Any   # the ORM Detector row (None in pure unit tests)
+
+
+def _select_primary(
+    candidates: Sequence["_Candidate"], *, primary_hint: str | None
+) -> "_Candidate | None":
+    """Pick the single detection to fire for one clip.
+
+    Several detectors can legitimately be true for one action (a fall is
+    also a general emergency; agitation overlaps calling-for-help), which
+    used to file one event per matching detector. We now fire exactly one:
+
+      1. the model's `primary_detection` pick, IF it names a detector that
+         actually crossed threshold this clip (the model judges which
+         action/sound dominates — the closest-association ask);
+      2. otherwise the highest-confidence detection. Ties break toward
+         `safety` over `routine`, then identifier, for determinism.
+
+    Returns None when nothing crossed threshold.
+    """
+    if not candidates:
+        return None
+    hint = (primary_hint or "").strip()
+    if hint:
+        for c in candidates:
+            if c.identifier == hint:
+                return c
+
+    def _rank(c: "_Candidate") -> tuple[float, int, str]:
+        safety_first = 0 if c.category == "safety" else 1
+        return (-c.confidence, safety_first, c.identifier)
+
+    return min(candidates, key=_rank)
 
 
 async def maybe_promote_analysis(
@@ -177,9 +225,11 @@ async def maybe_promote_analysis(
     fired: list[Event] = []
     skipped: list[str] = []
 
-    # One unified firing path for EVERY detector (preset, library, custom):
-    # `<id>_detected` is true AND `<id>_confidence` clears the sensitivity-
-    # adjusted threshold. The caregiver's sensitivity picker sets the bar.
+    # Pass 1 — collect every detector that crosses its bar this clip
+    # (preset, library, custom share one path): `<id>_detected` is true AND
+    # `<id>_confidence` clears the sensitivity-adjusted threshold. The
+    # caregiver's sensitivity picker sets the bar.
+    candidates: list[_Candidate] = []
     for ident, det in detectors_by_id.items():
         if not det.is_on:
             continue
@@ -208,35 +258,66 @@ async def maybe_promote_analysis(
         if float(conf) < threshold:
             continue
 
-        if await _within_dedup_window(
-            session, patient_id=patient_id, detector_id=det.id, now=occurred_at,
-        ):
-            skipped.append(ident)
-            continue
-
-        fired.append(
-            await _insert_event(
-                session,
+        candidates.append(
+            _Candidate(
+                identifier=ident,
+                confidence=float(conf),
+                category=str(getattr(det.category, "value", det.category)),
                 detector=det,
-                patient=patient,
-                camera=cam,
-                occurred_at=occurred_at,
-                description=description,
             )
         )
 
-        # Fire-once: the moment a self-test promotes, disable its (single,
-        # per-patient) row so it can never fire again — on this camera or any
-        # other. The caller commits this session, persisting is_on=false; the
-        # next tick's registry query (is_on=true filter) drops it everywhere.
-        if ident in _FIRE_ONCE_KEYS:
-            det.is_on = False
-            _log.info(
-                "[event_promotion] fire-once detector %s (%s) disabled after "
-                "first fire for patient %s", det.id, ident, patient_id,
-            )
+    # Pass 2 — ONE event per clip. Overlapping detectors (fall + general
+    # emergency, agitation + calling-for-help) used to file one event each
+    # for the same clip; now we fire only the single best-fitting detection.
+    primary_hint = detector_fields.get("primary_detection")
+    winner = _select_primary(
+        candidates,
+        primary_hint=primary_hint if isinstance(primary_hint, str) else None,
+    )
+    suppressed = [c.identifier for c in candidates if c is not winner]
 
-    return PromotionResult(fired=fired, skipped_for_dedup=skipped)
+    if winner is not None:
+        det = winner.detector
+        if await _within_dedup_window(
+            session, patient_id=patient_id, detector_id=det.id, now=occurred_at,
+        ):
+            skipped.append(winner.identifier)
+        else:
+            fired.append(
+                await _insert_event(
+                    session,
+                    detector=det,
+                    patient=patient,
+                    camera=cam,
+                    occurred_at=occurred_at,
+                    description=description,
+                )
+            )
+            # Fire-once: the moment a self-test promotes, disable its (single,
+            # per-patient) row so it can never fire again — on this camera or
+            # any other. The caller commits this session, persisting
+            # is_on=false; the next tick's registry query (is_on=true filter)
+            # drops it everywhere.
+            if winner.identifier in _FIRE_ONCE_KEYS:
+                det.is_on = False
+                _log.info(
+                    "[event_promotion] fire-once detector %s (%s) disabled after "
+                    "first fire for patient %s", det.id, winner.identifier,
+                    patient_id,
+                )
+
+    if suppressed:
+        _log.info(
+            "[event_promotion] one-event-per-clip: winner=%s (hint=%r) "
+            "suppressed=%r for patient %s",
+            winner.identifier if winner else None,
+            primary_hint, suppressed, patient_id,
+        )
+
+    return PromotionResult(
+        fired=fired, skipped_for_dedup=skipped, skipped_for_primary=suppressed,
+    )
 
 
 def _is_truthy_bool(v: Any) -> bool:
