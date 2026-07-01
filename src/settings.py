@@ -239,9 +239,11 @@ class Settings(BaseSettings):
     # exceed this, the oldest harvested row is evicted (selfies are
     # never evicted).
     reid_gallery_cap: int = Field(ge=20, le=1000, default=200)
-    # Per-enrollment upload bounds. iOS captures 10-15 selfies; we
-    # cap at 20 so a buggy client can't flood the gallery in one shot.
-    reid_max_photos_per_enrollment: int = Field(ge=1, le=50, default=20)
+    # Per-enrollment upload bounds. The guided-capture iOS flow sweeps a
+    # full pose cone and auto-selects the best frame per direction, so it
+    # sends ~15-30 (frontal + up to 2 per dial arc). Cap at 40 for headroom
+    # while still stopping a buggy client from flooding the gallery.
+    reid_max_photos_per_enrollment: int = Field(ge=1, le=50, default=40)
     # InsightFace model bundle. `buffalo_l` is the production accuracy
     # tier (~280 MB); `buffalo_sc` is the lighter option (~40 MB) for
     # memory-constrained deploys. Override via env if Railway OOMs.
