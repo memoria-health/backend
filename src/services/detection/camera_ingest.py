@@ -268,9 +268,17 @@ class CameraIngest:
             )
             return
         except Exception as exc:
-            # Tick failures must NEVER kill the loop. Log
-            # and move on; next tick will get another shot.
-            log.exception("%s tick failed: %s", self._log_tag, exc)
+            # Tick failures must NEVER kill the loop. Log and move on; next
+            # tick will get another shot. Lead with a HIGH-SIGNAL one-liner so
+            # "why did no analysis show up?" is greppable without wading
+            # through the stack — a DB CheckViolation on a new provider/enum
+            # value (e.g. 'dashscope') otherwise hides at its very bottom.
+            reason = (str(exc).splitlines() or [""])[0] or type(exc).__name__
+            log.error(
+                "%s ⛔ NO ANALYSIS SAVED — %s: %s",
+                self._log_tag, type(exc).__name__, reason,
+            )
+            log.exception("%s tick failed (full traceback): %s", self._log_tag, exc)
             return
 
     async def _run_tick(self) -> None:
@@ -763,6 +771,15 @@ class CameraIngest:
                 detector_fields=result.detector_fields,
             )
             await session.commit()
+
+            # High-signal confirmation that a real analysis landed — grep
+            # "analysis SAVED" to watch live ticks; its absence (with no
+            # FAILED / skipped line) means the pipeline stalled somewhere.
+            log.info(
+                "%s ✅ analysis SAVED — provider=%s people_present=%s count=%s state=%s",
+                self._log_tag, used_provider, gate_people_present,
+                gate_people_count, state_after.state,
+            )
 
             # Fan APNs out after the events row is committed — a
             # rolled-back tick must not leave a phantom push trail.

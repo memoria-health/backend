@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.caregiver import Caregiver
 from src.services.detection.prompt import DetectorSpec
+from src.services.detection.providers.dashscope import dashscope_provider
 from src.services.detection.providers.gemini import gemini_provider
 from src.services.detection.providers.openai import openai_provider
 from src.services.detection.providers.openrouter import openrouter_provider
@@ -28,7 +29,7 @@ from src.settings import Settings
 
 log = logging.getLogger(__name__)
 
-_VALID = ("gemini", "openai", "openrouter")
+_VALID = ("gemini", "openai", "openrouter", "dashscope")
 
 # Chosen-first, then fallbacks — detection never goes dark if the primary
 # errors out.
@@ -38,6 +39,10 @@ _CHAINS: dict[str, tuple[str, ...]] = {
     "gemini": ("gemini", "openrouter"),
     "openai": ("openai", "openrouter"),
     "openrouter": ("openrouter", "gemini"),
+    # SANDBOX: Alibaba-direct Qwen3-VL (native video + fps) primary, OpenRouter
+    # fallback so detection never goes dark if DashScope errors or the model
+    # isn't activated on the account yet.
+    "dashscope": ("dashscope", "openrouter"),
 }
 
 # caregiver_id -> (provider, expiry_monotonic). Module-level so it survives
@@ -97,7 +102,11 @@ async def run_vlm(
                     patient_bbox=identity.patient_bbox,
                 )
             else:
-                fn = openai_provider if prov == "openai" else openrouter_provider
+                fn = {
+                    "openai": openai_provider,
+                    "openrouter": openrouter_provider,
+                    "dashscope": dashscope_provider,
+                }[prov]
                 result = await fn(
                     mp4=mp4, detectors=detectors, log_tag=log_tag, settings=settings,
                     patient_in_clip=identity.patient_in_clip,

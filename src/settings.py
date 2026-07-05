@@ -87,11 +87,33 @@ class Settings(BaseSettings):
     openrouter_model: str = Field(default="qwen/qwen3-vl-32b-instruct")
     openrouter_base_url: str = Field(default="https://openrouter.ai/api/v1")
 
+    # ── DashScope (Alibaba Model Studio — Qwen3-VL, NATIVE video+fps) ──
+    # SANDBOX: go direct to Alibaba instead of OpenRouter. The OpenAI-
+    # compatible endpoint accepts a real `video` content part with an `fps`
+    # field, so Qwen3-VL applies native temporal video understanding instead
+    # of a flat list of independent images. US (Virginia) region base URL;
+    # model ids are plain, e.g. "qwen3-vl-32b-instruct".
+    dashscope_api_key: str = Field(default="")
+    dashscope_model: str = Field(default="qwen3-vl-32b-instruct")
+    dashscope_base_url: str = Field(
+        default="https://dashscope-us.aliyuncs.com/compatible-mode/v1"
+    )
+    # Frames are sent as a video at this fps (sibling of the `video` array),
+    # extracted at this width (1920 = 1080p source) and JPEG quality (ffmpeg
+    # -q:v; 2 best .. 31 worst). Higher res/quality = more detail/specificity
+    # but more tokens + latency + cost — tune for the analysis you need.
+    dashscope_frames_fps: int = Field(ge=1, le=10, default=5)  # DashScope caps fps at 10
+    dashscope_frame_max_width: int = Field(ge=240, le=3840, default=854)  # 480p (16:9)
+    dashscope_jpeg_quality: int = Field(ge=2, le=31, default=3)
+    # Cap on how many frames we send (we sample at fps, then trim to this,
+    # keeping the most recent). 5fps × 11s = 55 (full 11s window, no blind spot).
+    dashscope_max_frames: int = Field(ge=1, le=768, default=55)
+
     # Per-account VLM routing: a caregiver may carry a `vlm_provider`
-    # override ("gemini" | "openai" | "openrouter"); when null/unset we
-    # fall back to this global default. So you can move individual
-    # families onto a different model without a deploy (just flip the
-    # caregivers column). See services/detection/vlm_routing.py.
+    # override ("gemini" | "openai" | "openrouter" | "dashscope"); when
+    # null/unset we fall back to this global default. So you can move
+    # individual families onto a different model without a deploy (just flip
+    # the caregivers column). See services/detection/vlm_routing.py.
     default_vlm_provider: str = Field(default="gemini")
 
     # ── LiveKit (Phase 0+) ──────────────────────────────────────
