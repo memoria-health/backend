@@ -33,9 +33,11 @@ _VALID = ("gemini", "openai", "openrouter")
 # Chosen-first, then fallbacks — detection never goes dark if the primary
 # errors out.
 _CHAINS: dict[str, tuple[str, ...]] = {
-    "gemini": ("gemini", "openai"),
-    "openai": ("openai", "gemini"),
-    "openrouter": ("openrouter", "gemini", "openai"),
+    # Sandbox cost guard: gemini falls back to Qwen (cheap), never to the
+    # expensive OpenAI, so a gemini 503/outage can't quietly run up an OpenAI bill.
+    "gemini": ("gemini", "openrouter"),
+    "openai": ("openai", "openrouter"),
+    "openrouter": ("openrouter", "gemini"),
 }
 
 # caregiver_id -> (provider, expiry_monotonic). Module-level so it survives

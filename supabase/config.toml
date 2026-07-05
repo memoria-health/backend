@@ -4,18 +4,18 @@
 #
 # Detailed reference: https://supabase.com/docs/guides/local-development/cli/config
 
-project_id = "memoria-db"
+project_id = "nemara-gw-sandbox"
 
 [api]
 enabled = true
-port = 54341          # wolf uses 54321
+port = 54351          # wolf uses 54321
 schemas = ["public", "graphql_public"]
 extra_search_path = ["public", "extensions"]
 max_rows = 1000
 
 [db]
-port = 54342          # wolf uses 54322
-shadow_port = 54340   # wolf uses 54320
+port = 54352          # wolf uses 54322
+shadow_port = 54350   # wolf uses 54320
 major_version = 17
 
 [db.pooler]
@@ -23,7 +23,7 @@ enabled = false
 
 [studio]
 enabled = true
-port = 54343          # wolf uses 54323
+port = 54353          # wolf uses 54323
 api_url = "http://127.0.0.1"
 
 [auth]
@@ -47,7 +47,7 @@ file_size_limit = "50MiB"
 
 [inbucket]
 enabled = true
-port = 54344          # wolf uses 54324
+port = 54354          # wolf uses 54324
 
 [db.seed]
 # Apply our single-file schema as part of `supabase db reset`. Per
@@ -55,3 +55,6 @@ port = 54344          # wolf uses 54324
 # edit schema.sql in place and rebuild.
 enabled = true
 sql_paths = ["./schema.sql", "./seed.sql"]
+
+[analytics]
+enabled = false
