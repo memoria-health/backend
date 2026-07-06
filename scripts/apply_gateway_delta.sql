@@ -31,19 +31,30 @@ ALTER TABLE public.cameras
     OR ((source_type = 'iphone'::text) AND (ingest_token_hash IS NULL))
   );
 
--- 4. gateways table — the roster's site-token auth: one stable token per
---    mini-PC, hashed, mapped to a patient. The gateway polls /gateway/roster
---    with this token; the roster returns that patient's source_type='gateway'
---    cameras. Matches the sandbox schema exactly.
+-- 4. gateways table — the roster's site-token auth. Each mini-PC has a UNIQUE
+--    token (generated on first boot) tied to a CAREGIVER at setup (by email, in
+--    the field — nothing baked in). The roster returns gateway cameras across
+--    ALL that caregiver's patients. patient_id kept nullable for back-compat.
 CREATE TABLE IF NOT EXISTS public.gateways (
-    id          uuid DEFAULT gen_random_uuid() NOT NULL,
-    patient_id  uuid NOT NULL,
-    token_hash  text NOT NULL,
-    created_at  timestamptz DEFAULT now(),
+    id           uuid DEFAULT gen_random_uuid() NOT NULL,
+    caregiver_id uuid,
+    patient_id   uuid,
+    token_hash   text NOT NULL,
+    created_at   timestamptz DEFAULT now(),
     last_seen_at timestamptz,
-    CONSTRAINT gateways_pkey PRIMARY KEY (id),
-    CONSTRAINT gateways_patient_id_fkey FOREIGN KEY (patient_id)
-        REFERENCES public.patients(id) ON DELETE CASCADE
+    CONSTRAINT gateways_pkey PRIMARY KEY (id)
 );
+-- bring an EXISTING gateways table up to the caregiver model (idempotent):
+ALTER TABLE public.gateways ADD COLUMN IF NOT EXISTS caregiver_id uuid;
+ALTER TABLE public.gateways ALTER COLUMN patient_id DROP NOT NULL;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                 WHERE conrelid = 'public.gateways'::regclass
+                   AND conname = 'gateways_caregiver_id_fkey') THEN
+    ALTER TABLE public.gateways
+      ADD CONSTRAINT gateways_caregiver_id_fkey
+      FOREIGN KEY (caregiver_id) REFERENCES public.caregivers(id) ON DELETE CASCADE;
+  END IF;
+END $$;
 
 COMMIT;

@@ -39,15 +39,18 @@ import logging
 import re
 from collections.abc import AsyncIterator
 
-from uuid import UUID
+from datetime import datetime, timezone
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
-from sqlalchemy import select, text
+from pydantic import BaseModel
+from sqlalchemy import func, select, text
 
 from src.api.deps import SessionDep, SettingsDep
 from src.db.camera import Camera
-from src.services.ingest.pi.auth import hash_ingest_token
+from src.repos import camera_detector_repo
+from src.services.ingest.pi.auth import hash_ingest_token, mint_ingest_token
 from src.services.ingest.pi.mjpeg_reader import parse_mjpeg
 from src.services.ingest.pi.relay_publisher import RelayConfig, RelayPublisher
 
@@ -349,29 +352,32 @@ async def gateway_roster(
         )
     digest = hash_ingest_token(presented)
     gw = (await session.execute(
-        text("SELECT id, patient_id FROM public.gateways WHERE token_hash = :d"),
+        text("SELECT id, caregiver_id FROM public.gateways WHERE token_hash = :d"),
         {"d": digest},
     )).first()
     if gw is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_gateway_token",
         )
-    gateway_id, patient_id = gw[0], gw[1]
+    gateway_id, caregiver_id = gw[0], gw[1]
     # Liveness: polling the roster IS the heartbeat (gateway + its cameras).
     await session.execute(
         text("UPDATE public.gateways SET last_seen_at = now() WHERE id = :id"),
         {"id": gateway_id},
     )
+    # A gateway box serves a CAREGIVER: run gateway cameras across ALL that
+    # caregiver's patients (a camera added for a caregiver lands under each).
+    _cam_where = ("WHERE patient_id IN "
+                  "(SELECT id FROM public.patients WHERE caregiver_id = :c) "
+                  "AND source_type = 'gateway'")
     await session.execute(
-        text("UPDATE public.cameras SET last_heartbeat_at = now() "
-             "WHERE patient_id = :p AND source_type = 'gateway'"),
-        {"p": patient_id},
+        text(f"UPDATE public.cameras SET last_heartbeat_at = now() {_cam_where}"),
+        {"c": caregiver_id},
     )
     rows = (await session.execute(
         text("SELECT id, livekit_identity, livekit_room, desired_state "
-             "FROM public.cameras WHERE patient_id = :p AND source_type = 'gateway' "
-             "ORDER BY created_at"),
-        {"p": patient_id},
+             f"FROM public.cameras {_cam_where} ORDER BY created_at"),
+        {"c": caregiver_id},
     )).all()
     await session.commit()
     return {"cameras": [
@@ -410,21 +416,22 @@ async def gateway_wait(
         )
     digest = hash_ingest_token(presented)
     gw = (await session.execute(
-        text("SELECT id, patient_id FROM public.gateways WHERE token_hash = :d"),
+        text("SELECT id, caregiver_id FROM public.gateways WHERE token_hash = :d"),
         {"d": digest},
     )).first()
     if gw is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_gateway_token",
         )
-    patient_id = gw[1]
+    caregiver_id = gw[1]
 
     async def snapshot():
         rows = (await session.execute(
             text("SELECT id, livekit_identity, livekit_room, desired_state "
-                 "FROM public.cameras WHERE patient_id = :p AND source_type = 'gateway' "
-                 "ORDER BY livekit_identity"),
-            {"p": patient_id},
+                 "FROM public.cameras WHERE patient_id IN "
+                 "(SELECT id FROM public.patients WHERE caregiver_id = :c) "
+                 "AND source_type = 'gateway' ORDER BY livekit_identity"),
+            {"c": caregiver_id},
         )).all()
         await session.commit()   # release the connection between checks
         cams = [{"camera_id": str(r[0]), "livekit_identity": r[1],
@@ -441,3 +448,130 @@ async def gateway_wait(
         elapsed += 0.4
     cams, fp = await snapshot()
     return {"changed": False, "fingerprint": fp}
+
+
+class GatewayProvisionRequest(BaseModel):
+    """Body for the email-only gateway provision (no caregiver password)."""
+    email: str
+    room: str = "Camera"
+    icon_name: str = "tv"
+
+
+@router.post(
+    "/gateway/provision-camera",
+    status_code=status.HTTP_201_CREATED,
+)
+async def gateway_provision_camera(
+    body: GatewayProvisionRequest,
+    session: SessionDep,
+    authorization: str = Header(default=""),
+) -> dict:
+    """Provision a gateway camera in the field with EMAIL ONLY — no password.
+
+    Tenets: a generic box, set up in a new home, phone-only, no password.
+      - Authorization: Bearer <box's UNIQUE token> (generated on first boot).
+      - body.email identifies the CAREGIVER (account) this box belongs to.
+    We tie this box's token -> that caregiver (public.gateways), then create the
+    camera under EVERY one of the caregiver's patients. The roster returns them
+    by caregiver. Nothing account-specific is baked into the image — the box
+    learns its account HERE, at setup.
+    """
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="missing_bearer_token",
+        )
+    box_token = authorization[len("bearer "):].strip()
+    if not box_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="empty_bearer_token",
+        )
+    cg = (await session.execute(
+        text("SELECT id FROM public.caregivers WHERE lower(email) = lower(:e)"),
+        {"e": body.email.strip()},
+    )).first()
+    if cg is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="caregiver_not_found",
+        )
+    caregiver_id = cg[0]
+    now = datetime.now(timezone.utc)
+
+    # tie THIS box's unique token to the caregiver (idempotent upsert per box)
+    token_hash = hash_ingest_token(box_token)
+    existing = (await session.execute(
+        text("SELECT id FROM public.gateways WHERE token_hash = :h"),
+        {"h": token_hash},
+    )).first()
+    if existing is None:
+        await session.execute(
+            text("INSERT INTO public.gateways (caregiver_id, token_hash, created_at) "
+                 "VALUES (:c, :h, :n)"),
+            {"c": caregiver_id, "h": token_hash, "n": now},
+        )
+    else:
+        await session.execute(
+            text("UPDATE public.gateways SET caregiver_id = :c WHERE token_hash = :h"),
+            {"c": caregiver_id, "h": token_hash},
+        )
+
+    patient_ids = [r[0] for r in (await session.execute(
+        text("SELECT id FROM public.patients WHERE caregiver_id = :c ORDER BY created_at"),
+        {"c": caregiver_id},
+    )).all()]
+    if not patient_ids:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="caregiver_has_no_patients",
+        )
+
+    cameras = []
+    for patient_id in patient_ids:
+        camera_id = uuid4()
+        livekit_identity = f"cam_{camera_id.hex[:8]}"
+        livekit_room = f"patient_{patient_id}"
+        next_display_id = (await session.execute(
+            select(func.coalesce(func.max(Camera.display_id), 0)).where(
+                Camera.patient_id == patient_id)
+        )).scalar_one() + 1
+        ingest_token_plaintext, ingest_token_hash = mint_ingest_token()
+        cam = Camera(
+            id=camera_id,
+            patient_id=patient_id,
+            display_id=next_display_id,
+            room=body.room,
+            icon_name=body.icon_name,
+            online=False,
+            created_at=now,
+            pairing_code=None,
+            pairing_expires_at=None,
+            api_key_hash=None,
+            livekit_identity=livekit_identity,
+            livekit_room=livekit_room,
+            state="open",
+            no_people_count=0,
+            state_changed_at=now,
+            close_threshold=6,
+            battery_percent=None,
+            desired_state="disconnected",
+            source_type="gateway",
+            pi_stream_url=None,
+            pi_audio_url=None,
+            ingest_token_hash=ingest_token_hash,
+            ingest_token_created_at=now,
+            app_present=True,
+        )
+        session.add(cam)
+        await session.flush()
+        await camera_detector_repo.assign_preset_detectors_of_patient_to_camera(
+            session, camera_id, patient_id,
+        )
+        cameras.append({
+            "patient_id": str(patient_id),
+            "camera_id": str(camera_id),
+            "livekit_identity": livekit_identity,
+            "livekit_room": livekit_room,
+            "ingest_token": ingest_token_plaintext,
+        })
+    await session.commit()
+    return {"caregiver_email": body.email, "provisioned": len(cameras),
+            "cameras": cameras}
