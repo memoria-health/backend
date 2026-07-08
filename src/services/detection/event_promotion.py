@@ -173,14 +173,19 @@ def _select_primary(
     if not candidates:
         return None
     hint = (primary_hint or "").strip()
-    if hint:
-        for c in candidates:
-            if c.identifier == hint:
-                return c
 
-    def _rank(c: "_Candidate") -> tuple[float, int, str]:
+    def _rank(c: "_Candidate") -> tuple[int, int, float, int, str]:
+        # Precedence, in order:
+        #   1. SEVERITY (higher wins) — so Choking beats Agitation regardless of
+        #      what the model or confidence say (if it's choking, we don't also
+        #      want the agitation alert on the same clip);
+        #   2. the model's own `primary_detection` pick — breaks ties WITHIN the
+        #      same severity (which action dominates);
+        #   3. confidence; 4. safety over routine; 5. identifier for determinism.
+        severity = catalog.severity_for(c.identifier)
+        is_hint = 0 if c.identifier == hint else 1
         safety_first = 0 if c.category == "safety" else 1
-        return (-c.confidence, safety_first, c.identifier)
+        return (-severity, is_hint, -c.confidence, safety_first, c.identifier)
 
     return min(candidates, key=_rank)
 

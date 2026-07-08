@@ -50,36 +50,40 @@ _FALL_PROMPT_FRAGMENT = (
 )
 
 _WANDERING_PROMPT_FRAGMENT = (
-    "wandering_detected: boolean. TRUE only if, within this 15-second clip, "
-    "you SEE a person walk through the RIGHT-SIDE doorway and LEAVE the room — "
-    "they were inside the room earlier in the clip, and by the end of the clip "
-    "they are no longer inside it. Only OUTBOUND exits through the right door count.\n"
+    "wandering_detected: boolean. TRUE ONLY if you SEE the ENTIRE person walk "
+    "COMPLETELY out of view through a doorway / door frame — they were fully "
+    "inside the room earlier in the clip, and by the END of the clip NO part of "
+    "them (body, head, arms, or legs) is visible ANYWHERE in the frame, they left "
+    "specifically by passing through a visible doorway or door frame, and they "
+    "have not returned. The WHOLE person must be entirely gone from view.\n"
     "\n"
-    "Set FALSE if any of:\n"
-    "  - The person exits through the LEFT-SIDE doorway. The left door leads "
-    "to another room inside the house and is NOT a wandering exit. Only the "
-    "right door counts.\n"
-    "  - The person was outside the room and walked IN. Entering doesn't "
-    "count, only leaving does.\n"
-    "  - The person only approaches the door, touches it, opens it, or looks "
-    "toward it, but does not actually walk through. Intent doesn't count.\n"
-    "  - The person walks out of camera frame in a direction that isn't a "
-    "clearly visible doorway (e.g. steps behind furniture or off to the side).\n"
-    "  - The person leaves and returns within the same 15-second clip.\n"
-    "  - No person is visible at any point.\n"
+    "Set FALSE if ANY of:\n"
+    "  - ANY part of the person is still visible in the frame — even if only "
+    "their body remains while their face/head has moved out of view, or only a "
+    "limb or partial figure is visible. If you can still see any part of them, "
+    "they have NOT left;\n"
+    "  - the person is only partially out, standing in the doorway, or halfway "
+    "through;\n"
+    "  - the person leaves by walking off the EDGE of the frame somewhere that is "
+    "NOT a clearly visible doorway/door frame (e.g. off to the side, behind "
+    "furniture) — it must be THROUGH a door frame to count;\n"
+    "  - the person was outside and walks IN — entering does not count, only "
+    "leaving does;\n"
+    "  - the person only approaches, touches, opens, or looks toward a door but "
+    "does not walk all the way through it;\n"
+    "  - the person leaves and returns within the same clip;\n"
+    "  - the person stays within the room — moving around inside is not "
+    "wandering;\n"
+    "  - no person is visible at any point.\n"
     "\n"
-    "It only counts when you literally see them, starting inside the room, "
-    "open / step through the RIGHT door and stay out. Exits via the left door "
-    "(internal room-to-room) are FALSE.\n"
-    "\n"
-    "wandering_confidence: number 0–1. 0 = no exit seen. 0.7+ = clearly "
-    "walked through the doorway and did not come back. Anything in between "
-    "for ambiguous cases.\n"
-    "wandering_reasoning: one short sentence describing exactly what you "
-    "observed — for example: 'person opened the front door and walked "
-    "through at 8s', 'person entered the room from outside, did not leave "
-    "(not wandering)', 'person approached the door but did not open it', "
-    "'no person visible'."
+    "wandering_confidence: number 0–1. 0 = person still visible / stayed inside / "
+    "left by a non-doorway edge. 0.3–0.6 = ambiguous (partly out, or unclear "
+    "whether they fully passed through a door frame). 0.7+ = the ENTIRE person "
+    "clearly walked out through a doorway and NO part of them remains visible.\n"
+    "wandering_reasoning: one short sentence — e.g. 'entire person walked out "
+    "through the doorway at 8s, no longer visible in frame', 'person's body still "
+    "visible in frame — has not left (not wandering)', 'person walked off the "
+    "side of the frame, not through a doorway', 'no person visible'."
 )
 
 _AGITATION_PROMPT_FRAGMENT = (
@@ -448,24 +452,28 @@ _CALLING_FOR_HELP_PROMPT_FRAGMENT = (
 )
 
 _CHOKING_PROMPT_FRAGMENT = (
-    "choking_detected: boolean. TRUE only if a person shows clear signs of "
-    "choking — hands clutched to the throat (the universal choking sign), "
-    "sudden inability to breathe or speak while eating, frantic distress with "
-    "the throat grabbed, or violent coughing / gagging with both hands at the "
-    "throat. The choking signs must be visible.\n"
+    "choking_detected: boolean. Reason HOLISTICALLY about the entire clip — the "
+    "person's posture, hand and arm movements, apparent breathing, facial "
+    "expression or distress, and the context (e.g. whether they are eating) — and "
+    "set TRUE if, taking everything together, there is a good chance the person "
+    "is choking. There is no fixed checklist of required signs; use your overall "
+    "judgment about whether this looks like a choking emergency.\n"
     "\n"
-    "Set FALSE if any of:\n"
-    "  - ordinary eating, drinking, talking, laughing, or a single normal "
-    "cough;\n"
-    "  - the person touches their throat / neck casually with no distress;\n"
-    "  - no person is visible, or the scene is too far / unclear to judge.\n"
+    "Camera note: this camera is mounted high and looks down at a steep angle, so "
+    "hands raised toward the throat can appear to be at the mouth or chest. Take "
+    "that into account rather than dismissing a possible throat grab.\n"
     "\n"
-    "choking_confidence: number 0–1. 0 = no choking. 0.3–0.6 = coughing or "
-    "throat-touching but not clearly choking. 0.7+ = clear choking signs (hands "
-    "at the throat plus evident distress / inability to breathe).\n"
-    "choking_reasoning: 1 short sentence (e.g. 'person clutched their throat "
-    "with both hands, unable to breathe, at 6s', 'coughed once while eating "
-    "then continued normally', 'no person visible')."
+    "Set FALSE if the person is clearly just eating, drinking, talking, laughing, "
+    "or sitting calmly with no sign of distress; or if no person is visible or "
+    "the scene is too far / unclear to judge.\n"
+    "\n"
+    "choking_confidence: number 0–1 for how likely the person is choking (0 = "
+    "clearly not, ~0.5 = plausible but uncertain, 0.9+ = very likely a choking "
+    "emergency).\n"
+    "choking_reasoning: 1 short sentence giving your overall judgment (e.g. "
+    "'hands at the throat, hunched and appears unable to breathe — likely "
+    "choking', 'eating calmly with no distress — not choking', 'no person "
+    "visible')."
 )
 
 _MEAL_EATEN_PROMPT_FRAGMENT = (
@@ -1038,3 +1046,47 @@ def promotion_rules() -> dict[str, tuple[str, str, float]]:
 
 def all_keys() -> Sequence[str]:
     return [e.key for e in CATALOG]
+
+
+# Within-tick precedence. When several detectors cross threshold on the SAME
+# clip, event_promotion fires the single HIGHEST-severity one and suppresses the
+# rest — so e.g. Choking wins over Agitation (if someone is choking, the caregiver
+# doesn't also need an agitation alert). Higher number = higher severity. Specific
+# life-threatening detectors outrank the generic catch-alls (emergency/distress),
+# which outrank routine. Custom/unknown detectors get _DEFAULT_SEVERITY.
+_DEFAULT_SEVERITY = 50
+_SEVERITY: dict[str, int] = {
+    "setup_test": 200,               # self-test — always wins during setup
+    # ── life-threatening, specific ──────────────────────────────────
+    "choking": 100,
+    "fire_smoke": 98,
+    "child_cord_entanglement": 97,
+    "fall": 95,
+    "child_head_impact": 93,
+    "calling_for_help": 88,
+    # ── generic catch-alls (below the specific critical ones) ───────
+    "distress": 82,
+    "emergency": 80,
+    "possible_intruder": 78,
+    # ── urgent safety ───────────────────────────────────────────────
+    "stove_left_on": 74,
+    "child_stairs": 73,
+    "child_hazard_reach": 70,
+    "climbing": 66,
+    "child_crib_exit": 65,
+    "env_hazard_glass": 62,
+    "agitation": 60,
+    "env_hazard_water": 56,
+    "wandering": 55,
+    "child_wandering": 55,
+    # ── routine ─────────────────────────────────────────────────────
+    "child_device_usage": 25,
+    "meal_eaten": 22,
+    "medication": 20,
+}
+
+
+def severity_for(identifier: str | None) -> int:
+    """Within-tick precedence weight for a detector (higher wins). Custom /
+    unknown detectors fall back to _DEFAULT_SEVERITY."""
+    return _SEVERITY.get(identifier or "", _DEFAULT_SEVERITY)
