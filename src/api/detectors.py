@@ -10,11 +10,13 @@ attempts.
 """
 
 import asyncio
+import base64
 import logging
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, HTTPException, status
+from pydantic import BaseModel
 from sqlalchemy import update
 
 from src.api.deps import CaregiverAuth, SessionDep, SettingsDep
@@ -33,6 +35,7 @@ from src.schemas.detector import (
     UpdateDetectorRequest,
 )
 from src.services.detection import catalog
+from src.services.detection.door_detection import detect_doors
 from src.services.detector_compiler import (
     compile_custom_detector,
     infer_detector_config,
@@ -42,6 +45,44 @@ from src.settings import Settings
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1", tags=["detector"])
+
+
+# ── Wandering exit-door picker ──────────────────────────────────────
+class DetectDoorsRequest(BaseModel):
+    image_base64: str
+
+
+class DoorBox(BaseModel):
+    box: list[float]   # [x, y, w, h] as fractions of the frame (0-1)
+    label: str
+
+
+class DetectDoorsResponse(BaseModel):
+    doors: list[DoorBox]
+
+
+@router.post(
+    "/detect-doors",
+    response_model=DetectDoorsResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def detect_doors_endpoint(
+    body: DetectDoorsRequest,
+    auth: CaregiverAuth,
+    settings: SettingsDep,
+) -> DetectDoorsResponse:
+    """One-shot: given a camera frame (base64 JPEG), return the doorways the app
+    highlights for the Wandering exit-door picker. The caregiver taps one (or
+    taps elsewhere to override); the choice is saved via `set-wandering-door`."""
+    try:
+        image = base64.b64decode(body.image_base64, validate=True)
+    except Exception:  # noqa: BLE001
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="invalid image_base64",
+        )
+    doors = await detect_doors(image, settings=settings)
+    return DetectDoorsResponse(doors=[DoorBox(**d) for d in doors])
 
 
 def _to_response(d: Detector) -> DetectorResponse:
