@@ -61,6 +61,17 @@ class DetectDoorsResponse(BaseModel):
     doors: list[DoorBox]
 
 
+class SetWanderingDoorRequest(BaseModel):
+    # The chosen exit door, normalized [x, y, w, h] (0-1). None only when
+    # no_exit_door is true.
+    box: list[float] | None = None
+    label: str | None = None
+    # "vlm" = tapped a highlighted box; "manual" = tap-override elsewhere.
+    source: str = "vlm"
+    # True => no door leads outside; the wandering detector is turned OFF.
+    no_exit_door: bool = False
+
+
 @router.post(
     "/detect-doors",
     response_model=DetectDoorsResponse,
@@ -83,6 +94,67 @@ async def detect_doors_endpoint(
         )
     doors = await detect_doors(image, settings=settings)
     return DetectDoorsResponse(doors=[DoorBox(**d) for d in doors])
+
+
+@router.post(
+    "/patients/{patient_id}/wandering-door",
+    response_model=DetectorResponse,
+)
+async def set_wandering_door(
+    patient_id: UUID,
+    body: SetWanderingDoorRequest,
+    auth: CaregiverAuth,
+    session: SessionDep,
+) -> DetectorResponse:
+    """Save the caregiver's exit-door choice for a patient's wandering detector.
+
+    Regenerates the wandering `prompt_fragment` so the per-tick VLM only counts
+    leaving THROUGH the chosen door as wandering. `no_exit_door` turns the
+    detector off (nowhere to wander to). 404 if the patient has no wandering
+    detector configured.
+    """
+    det = await detector_repo.find_by_patient_identifier(
+        session, patient_id, "wandering", caregiver_id=auth.id
+    )
+    if det is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="wandering_detector_not_found",
+        )
+
+    if body.no_exit_door:
+        # No door leads outside — record the choice and disable the detector.
+        fields = {
+            "door_config": {"no_exit_door": True},
+            "is_on": False,
+        }
+    else:
+        box = body.box or []
+        if len(box) != 4 or not all(
+            isinstance(v, (int, float)) and 0.0 <= v <= 1.0 for v in box
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="invalid door box — expected [x, y, w, h] in 0-1",
+            )
+        source = body.source if body.source in ("vlm", "manual") else "vlm"
+        door_config = {
+            "box": [float(v) for v in box],
+            "label": (body.label or "").strip(),
+            "source": source,
+            "no_exit_door": False,
+        }
+        fields = {
+            "door_config": door_config,
+            "prompt_fragment": catalog.build_wandering_fragment(door_config),
+            "is_on": True,
+        }
+
+    updated = await detector_repo.update_partial(
+        session, det.id, caregiver_id=auth.id, fields=fields
+    )
+    await session.commit()
+    return _to_response(updated)
 
 
 def _to_response(d: Detector) -> DetectorResponse:

@@ -86,6 +86,47 @@ _WANDERING_PROMPT_FRAGMENT = (
     "side of the frame, not through a doorway', 'no person visible'."
 )
 
+
+def _door_region_phrase(box: list[float]) -> str:
+    """Human region for a normalized [x, y, w, h] door box — e.g. 'upper left',
+    'center', 'lower right'. Used to describe the selected exit door to the VLM."""
+    cx, cy = box[0] + box[2] / 2, box[1] + box[3] / 2
+    horiz = "left" if cx < 0.34 else "right" if cx > 0.66 else "center"
+    vert = "upper" if cy < 0.34 else "lower" if cy > 0.66 else ""
+    if vert and horiz != "center":
+        return f"{vert} {horiz}"
+    if vert:  # center column
+        return f"{vert} center"
+    return horiz
+
+
+def build_wandering_fragment(door: dict | None) -> str:
+    """Return the wandering `prompt_fragment` specialized to the caregiver's
+    chosen exit door. `door` is the `door_config` payload (or None).
+
+    With a selected door, the per-tick VLM is told WHICH doorway is the exterior
+    exit so it only fires when the person leaves THROUGH that specific door —
+    leaving via an interior doorway (bathroom, bedroom) or a frame edge no longer
+    counts. With no door (None), falls back to the generic any-doorway fragment.
+    """
+    if not door or not door.get("box") or len(door.get("box") or []) != 4:
+        return _WANDERING_PROMPT_FRAGMENT
+    region = _door_region_phrase(door["box"])
+    label = str(door.get("label") or "").strip()
+    where = f"the {region} of the camera view"
+    if label:
+        where += f" (the {label})"
+    targeting = (
+        "THIS ROOM HAS ONE EXTERIOR EXIT DOOR — the ONLY doorway that counts as "
+        f"wandering. It is located in {where}. A person counts as wandering ONLY "
+        "if they walk COMPLETELY out of view THROUGH THAT specific exit doorway. "
+        "Leaving through any OTHER doorway (to a bathroom, bedroom, or closet), or "
+        "walking off a different edge of the frame, is NOT wandering — set FALSE "
+        "for those. Everything below still applies to that one exit door.\n\n"
+    )
+    return targeting + _WANDERING_PROMPT_FRAGMENT
+
+
 _AGITATION_PROMPT_FRAGMENT = (
     "agitation_detected: boolean. Prioritize PRECISION over recall: set "
     "TRUE only when there is CLEAR, OBVIOUS evidence of genuine "

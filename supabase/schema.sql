@@ -425,6 +425,14 @@ create table public.detectors (
   identifier      text,
   prompt_fragment text,
   schema_json     jsonb,
+  -- Wandering exit-door selection (only meaningful on the 'wandering'
+  -- detector). The caregiver's choice from the setup picker:
+  --   { "box": [x,y,w,h] (0-1) | null, "label": text,
+  --     "source": "vlm"|"manual", "no_exit_door": bool }
+  -- The wandering prompt_fragment is regenerated from this so the per-tick
+  -- VLM only counts leaving THROUGH that doorway as wandering. no_exit_door
+  -- => detector is turned off (nowhere to wander to).
+  door_config     jsonb,
   -- people_present is always_on=true (included even if is_on=false)
   -- because the state machine requires its output.
   always_on       boolean not null default false,

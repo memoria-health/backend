@@ -50,6 +50,14 @@ class Detector(Base):
     identifier: Mapped[str | None] = mapped_column(String(80), default=None)
     prompt_fragment: Mapped[str | None] = mapped_column(String, default=None)
     schema_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+
+    # ── Wandering exit-door selection ───────────────────────────────
+    # Only meaningful on the 'wandering' detector. The caregiver's choice
+    # from the setup picker: {box:[x,y,w,h]|null, label, source:'vlm'|'manual',
+    # no_exit_door: bool}. `prompt_fragment` is regenerated from this so the
+    # per-tick VLM only counts leaving THROUGH that doorway as wandering.
+    # no_exit_door=true turns the detector off (nowhere to wander to).
+    door_config: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
     always_on: Mapped[bool] = mapped_column(Boolean, default=False)
     is_builtin: Mapped[bool] = mapped_column(Boolean, default=True)
 

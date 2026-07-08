@@ -69,6 +69,28 @@ async def find_by_id(
     return result.scalar_one_or_none()
 
 
+async def find_by_patient_identifier(
+    session: AsyncSession,
+    patient_id: UUID,
+    identifier: str,
+    *,
+    caregiver_id: UUID,
+) -> Detector | None:
+    """Return the caregiver-owned patient's detector with this `identifier`
+    (e.g. 'wandering'), or None. There is at most one per patient — enforced by
+    the (patient_id, identifier) unique index."""
+    result = await session.execute(
+        select(Detector)
+        .join(Patient, Patient.id == Detector.patient_id)
+        .where(
+            Detector.patient_id == patient_id,
+            Detector.identifier == identifier,
+            Patient.caregiver_id == caregiver_id,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
 async def insert(session: AsyncSession, detector: Detector) -> Detector:
     """Insert a new detector. Caller owns FK validity + transaction."""
     session.add(detector)

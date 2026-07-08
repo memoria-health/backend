@@ -91,6 +91,9 @@ class DetectorResponse(BaseModel):
     schedule_config: ScheduleConfig | None = None
     # Null unless shape == 'state'; the rising-edge episode gap (seconds).
     episode_gap_seconds: int | None = None
+    # Wandering only: the caregiver's saved exit-door choice, so the picker can
+    # pre-highlight it. {box:[x,y,w,h]|null, label, source, no_exit_door}.
+    door_config: dict | None = None
     created_at: datetime
     updated_at: datetime
 
