@@ -149,15 +149,18 @@ async def detect_doors(image_jpeg: bytes, *, settings: Settings) -> list[dict]:
             else:
                 clusters.append({"items": [d], "calls": {ci}})
 
-    # Keep every cluster (union across calls) so we never blank the picker; the
-    # clustering itself collapses the per-call box jitter into one entry per door.
-    # A rare single-call hallucination is harmless — the caregiver ignores it or
-    # tap-overrides. Sort most-corroborated first, then by position; cap the list
-    # so a noisy frame can't flood the UI.
-    clusters.sort(
+    # Prefer doors corroborated by a MAJORITY of calls (>=2 of N). A real door
+    # recurs across calls; a one-off hallucination shows up once and is dropped —
+    # this is what stops over-counting (e.g. 3 boxes for 2 real doors). If the
+    # frame is hard and NOTHING reaches majority, fall back to the union so the
+    # picker never blanks. Cap so a noisy frame can't flood the UI.
+    need = 2 if len(per_call) >= 2 else 1
+    voted = [c for c in clusters if len(c["calls"]) >= need]
+    chosen = voted if voted else clusters
+    chosen.sort(
         key=lambda c: (-len(c["calls"]), round(c["items"][0]["box"][0], 2)))
     merged: list[dict] = []
-    for c in clusters[:6]:
+    for c in chosen[:6]:
         boxes = [it["box"] for it in c["items"]]
         rep = [sum(b[i] for b in boxes) / len(boxes) for i in range(4)]  # mean box
         merged.append({"box": rep, "label": c["items"][0]["label"]})

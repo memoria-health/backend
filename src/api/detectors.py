@@ -61,13 +61,17 @@ class DetectDoorsResponse(BaseModel):
     doors: list[DoorBox]
 
 
-class SetWanderingDoorRequest(BaseModel):
-    # The chosen exit door, normalized [x, y, w, h] (0-1). None only when
-    # no_exit_door is true.
-    box: list[float] | None = None
+class WanderingDoorInput(BaseModel):
+    # One chosen exit door, normalized [x, y, w, h] (0-1).
+    box: list[float]
     label: str | None = None
     # "vlm" = tapped a highlighted box; "manual" = tap-override elsewhere.
     source: str = "vlm"
+
+
+class SetWanderingDoorRequest(BaseModel):
+    # The chosen exit door(s). Empty only when no_exit_door is true.
+    doors: list[WanderingDoorInput] = []
     # True => no door leads outside; the wandering detector is turned OFF.
     no_exit_door: bool = False
 
@@ -125,28 +129,32 @@ async def set_wandering_door(
     if body.no_exit_door:
         # No door leads outside — record the choice and disable the detector.
         fields = {
-            "door_config": {"no_exit_door": True},
+            "door_config": {"doors": [], "no_exit_door": True},
             "is_on": False,
         }
     else:
-        box = body.box or []
-        if len(box) != 4 or not all(
-            isinstance(v, (int, float)) and 0.0 <= v <= 1.0 for v in box
-        ):
+        if not body.doors:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="invalid door box — expected [x, y, w, h] in 0-1",
+                detail="select at least one exit door, or set no_exit_door",
             )
-        source = body.source if body.source in ("vlm", "manual") else "vlm"
-        door_config = {
-            "box": [float(v) for v in box],
-            "label": (body.label or "").strip(),
-            "source": source,
-            "no_exit_door": False,
-        }
+        doors: list[dict] = []
+        for d in body.doors:
+            if len(d.box) != 4 or not all(
+                isinstance(v, (int, float)) and 0.0 <= v <= 1.0 for v in d.box
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="invalid door box — expected [x, y, w, h] in 0-1",
+                )
+            doors.append({
+                "box": [float(v) for v in d.box],
+                "label": (d.label or "").strip(),
+                "source": d.source if d.source in ("vlm", "manual") else "vlm",
+            })
         fields = {
-            "door_config": door_config,
-            "prompt_fragment": catalog.build_wandering_fragment(door_config),
+            "door_config": {"doors": doors, "no_exit_door": False},
+            "prompt_fragment": catalog.build_wandering_fragment(doors),
             "is_on": True,
         }
 

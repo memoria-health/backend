@@ -100,30 +100,51 @@ def _door_region_phrase(box: list[float]) -> str:
     return horiz
 
 
-def build_wandering_fragment(door: dict | None) -> str:
-    """Return the wandering `prompt_fragment` specialized to the caregiver's
-    chosen exit door. `door` is the `door_config` payload (or None).
-
-    With a selected door, the per-tick VLM is told WHICH doorway is the exterior
-    exit so it only fires when the person leaves THROUGH that specific door —
-    leaving via an interior doorway (bathroom, bedroom) or a frame edge no longer
-    counts. With no door (None), falls back to the generic any-doorway fragment.
-    """
-    if not door or not door.get("box") or len(door.get("box") or []) != 4:
-        return _WANDERING_PROMPT_FRAGMENT
+def _door_where_phrase(door: dict) -> str:
+    """'the upper right of the camera view (the far right hallway)' for one door."""
     region = _door_region_phrase(door["box"])
-    label = str(door.get("label") or "").strip()
     where = f"the {region} of the camera view"
+    label = str(door.get("label") or "").strip()
     if label:
         where += f" (the {label})"
-    targeting = (
-        "THIS ROOM HAS ONE EXTERIOR EXIT DOOR — the ONLY doorway that counts as "
-        f"wandering. It is located in {where}. A person counts as wandering ONLY "
-        "if they walk COMPLETELY out of view THROUGH THAT specific exit doorway. "
-        "Leaving through any OTHER doorway (to a bathroom, bedroom, or closet), or "
-        "walking off a different edge of the frame, is NOT wandering — set FALSE "
-        "for those. Everything below still applies to that one exit door.\n\n"
-    )
+    return where
+
+
+def build_wandering_fragment(doors: list[dict] | None) -> str:
+    """Return the wandering `prompt_fragment` specialized to the caregiver's
+    chosen exit door(s). `doors` is a list of `{box, label, ...}` (may be empty).
+
+    With selected doors, the per-tick VLM is told WHICH doorways are the exterior
+    exits so it only fires when the person leaves THROUGH one of them — leaving
+    via an interior doorway (bathroom, bedroom) or a frame edge no longer counts.
+    With no doors, falls back to the generic any-doorway fragment.
+    """
+    valid = [d for d in (doors or []) if len(d.get("box") or []) == 4]
+    if not valid:
+        return _WANDERING_PROMPT_FRAGMENT
+
+    if len(valid) == 1:
+        targeting = (
+            "THIS ROOM HAS ONE EXTERIOR EXIT DOOR — the ONLY doorway that counts "
+            f"as wandering. It is located in {_door_where_phrase(valid[0])}. A "
+            "person counts as wandering ONLY if they walk COMPLETELY out of view "
+            "THROUGH THAT specific exit doorway. Leaving through any OTHER doorway "
+            "(to a bathroom, bedroom, or closet), or walking off a different edge "
+            "of the frame, is NOT wandering — set FALSE for those. Everything "
+            "below still applies to that one exit door.\n\n"
+        )
+    else:
+        listed = "; ".join(
+            f"({i + 1}) {_door_where_phrase(d)}" for i, d in enumerate(valid))
+        targeting = (
+            f"THIS ROOM HAS {len(valid)} EXTERIOR EXIT DOORS — the ONLY doorways "
+            f"that count as wandering: {listed}. A person counts as wandering ONLY "
+            "if they walk COMPLETELY out of view THROUGH ONE of these specific exit "
+            "doorways. Leaving through any OTHER doorway (to a bathroom, bedroom, or "
+            "closet), or walking off a different edge of the frame, is NOT "
+            "wandering — set FALSE for those. Everything below still applies to "
+            "these exit doors.\n\n"
+        )
     return targeting + _WANDERING_PROMPT_FRAGMENT
 
 
