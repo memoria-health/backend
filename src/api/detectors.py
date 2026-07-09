@@ -17,10 +17,13 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from src.api.deps import CaregiverAuth, SessionDep, SettingsDep
+from src.db.camera import Camera
+from src.db.camera_detector import CameraDetector
 from src.db.detector import Detector
+from src.db.patient import Patient
 from src.db.session import get_sessionmaker
 from src.repos import camera_detector_repo, detector_repo, patient_repo
 from src.schemas.detector import (
@@ -72,8 +75,14 @@ class WanderingDoorInput(BaseModel):
 class SetWanderingDoorRequest(BaseModel):
     # The chosen exit door(s). Empty only when no_exit_door is true.
     doors: list[WanderingDoorInput] = []
-    # True => no door leads outside; the wandering detector is turned OFF.
+    # True => no door leads outside on THIS camera; wandering is skipped here.
     no_exit_door: bool = False
+
+
+class CameraWanderingDoor(BaseModel):
+    camera_id: UUID
+    # {doors:[...], no_exit_door} or null if this camera has no wandering config.
+    door_config: dict | None = None
 
 
 @router.post(
@@ -100,25 +109,68 @@ async def detect_doors_endpoint(
     return DetectDoorsResponse(doors=[DoorBox(**d) for d in doors])
 
 
+async def _owned_camera(
+    session: SessionDep, camera_id: UUID, *, caregiver_id: UUID,
+) -> Camera | None:
+    """Return the camera if the caregiver owns its patient, else None."""
+    result = await session.execute(
+        select(Camera)
+        .join(Patient, Patient.id == Camera.patient_id)
+        .where(Camera.id == camera_id, Patient.caregiver_id == caregiver_id)
+    )
+    return result.scalar_one_or_none()
+
+
+def _normalize_doors(body: SetWanderingDoorRequest) -> dict:
+    """Validate + shape the request into a `door_config` payload."""
+    if body.no_exit_door:
+        return {"doors": [], "no_exit_door": True}
+    if not body.doors:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="select at least one exit door, or set no_exit_door",
+        )
+    doors: list[dict] = []
+    for d in body.doors:
+        if len(d.box) != 4 or not all(
+            isinstance(v, (int, float)) and 0.0 <= v <= 1.0 for v in d.box
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="invalid door box — expected [x, y, w, h] in 0-1",
+            )
+        doors.append({
+            "box": [float(v) for v in d.box],
+            "label": (d.label or "").strip(),
+            "source": d.source if d.source in ("vlm", "manual") else "vlm",
+        })
+    return {"doors": doors, "no_exit_door": False}
+
+
 @router.post(
-    "/patients/{patient_id}/wandering-door",
-    response_model=DetectorResponse,
+    "/cameras/{camera_id}/wandering-door",
+    response_model=CameraWanderingDoor,
 )
-async def set_wandering_door(
-    patient_id: UUID,
+async def set_camera_wandering_door(
+    camera_id: UUID,
     body: SetWanderingDoorRequest,
     auth: CaregiverAuth,
     session: SessionDep,
-) -> DetectorResponse:
-    """Save the caregiver's exit-door choice for a patient's wandering detector.
-
-    Regenerates the wandering `prompt_fragment` so the per-tick VLM only counts
-    leaving THROUGH the chosen door as wandering. `no_exit_door` turns the
-    detector off (nowhere to wander to). 404 if the patient has no wandering
-    detector configured.
+) -> CameraWanderingDoor:
+    """Save the exit-door choice for a SPECIFIC camera (sensor). The exit door
+    is per-sensor — each camera sees a different scene — so it's stored on the
+    camera↔wandering-detector assignment and the runtime builds THIS camera's
+    wandering prompt from it. Setting doors also assigns wandering to the camera;
+    `no_exit_door` records that this camera watches no exit (wandering skipped
+    here). 404 if the patient has no wandering detector.
     """
+    cam = await _owned_camera(session, camera_id, caregiver_id=auth.id)
+    if cam is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="camera_not_found",
+        )
     det = await detector_repo.find_by_patient_identifier(
-        session, patient_id, "wandering", caregiver_id=auth.id
+        session, cam.patient_id, "wandering", caregiver_id=auth.id,
     )
     if det is None:
         raise HTTPException(
@@ -126,43 +178,60 @@ async def set_wandering_door(
             detail="wandering_detector_not_found",
         )
 
-    if body.no_exit_door:
-        # No door leads outside — record the choice and disable the detector.
-        fields = {
-            "door_config": {"doors": [], "no_exit_door": True},
-            "is_on": False,
-        }
-    else:
-        if not body.doors:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="select at least one exit door, or set no_exit_door",
-            )
-        doors: list[dict] = []
-        for d in body.doors:
-            if len(d.box) != 4 or not all(
-                isinstance(v, (int, float)) and 0.0 <= v <= 1.0 for v in d.box
-            ):
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail="invalid door box — expected [x, y, w, h] in 0-1",
-                )
-            doors.append({
-                "box": [float(v) for v in d.box],
-                "label": (d.label or "").strip(),
-                "source": d.source if d.source in ("vlm", "manual") else "vlm",
-            })
-        fields = {
-            "door_config": {"doors": doors, "no_exit_door": False},
-            "prompt_fragment": catalog.build_wandering_fragment(doors),
-            "is_on": True,
-        }
+    door_config = _normalize_doors(body)
 
-    updated = await detector_repo.update_partial(
-        session, det.id, caregiver_id=auth.id, fields=fields
+    # Upsert the assignment carrying this camera's door_config. Setting doors
+    # implicitly assigns wandering to the camera so it starts running here.
+    cd = await session.get(
+        CameraDetector, {"camera_id": camera_id, "detector_id": det.id},
     )
+    if cd is None:
+        cd = CameraDetector(
+            camera_id=camera_id,
+            detector_id=det.id,
+            created_at=datetime.now(timezone.utc),
+            door_config=door_config,
+        )
+        session.add(cd)
+    else:
+        cd.door_config = door_config
     await session.commit()
-    return _to_response(updated)
+    return CameraWanderingDoor(camera_id=camera_id, door_config=door_config)
+
+
+@router.get(
+    "/patients/{patient_id}/wandering-doors",
+    response_model=list[CameraWanderingDoor],
+)
+async def list_wandering_doors(
+    patient_id: UUID,
+    auth: CaregiverAuth,
+    session: SessionDep,
+) -> list[CameraWanderingDoor]:
+    """Per-camera wandering exit-door config for a patient — one entry per
+    camera that has a wandering assignment, so the app can show each sensor's
+    status. Cameras with no wandering config simply don't appear."""
+    patient = await patient_repo.find_by_id(
+        session, patient_id, caregiver_id=auth.id,
+    )
+    if patient is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="patient_not_found",
+        )
+    det = await detector_repo.find_by_patient_identifier(
+        session, patient_id, "wandering", caregiver_id=auth.id,
+    )
+    if det is None:
+        return []
+    result = await session.execute(
+        select(CameraDetector.camera_id, CameraDetector.door_config)
+        .join(Camera, Camera.id == CameraDetector.camera_id)
+        .where(Camera.patient_id == patient_id, CameraDetector.detector_id == det.id)
+    )
+    return [
+        CameraWanderingDoor(camera_id=cid, door_config=dc)
+        for cid, dc in result.all()
+    ]
 
 
 def _to_response(d: Detector) -> DetectorResponse:

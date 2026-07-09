@@ -476,6 +476,13 @@ create table public.cameras_detectors (
   camera_id   uuid not null references public.cameras(id)   on delete cascade,
   detector_id uuid not null references public.detectors(id) on delete cascade,
   created_at  timestamptz not null default now(),
+  -- Per-SENSOR wandering exit-door config (only the 'wandering' detector).
+  -- The exit door is per camera, so it lives here, not on the detector row:
+  --   { "doors": [{"box":[x,y,w,h],"label":..,"source":"vlm"|"manual"}],
+  --     "no_exit_door": bool }
+  -- Runtime builds THIS camera's wandering prompt from it; no_exit_door=true
+  -- skips wandering on this camera.
+  door_config jsonb,
   primary key (camera_id, detector_id)
 );
 

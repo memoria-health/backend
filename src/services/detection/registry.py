@@ -22,6 +22,7 @@ table.
 """
 
 from collections.abc import Sequence
+from dataclasses import replace
 from uuid import UUID
 
 from sqlalchemy import select
@@ -30,7 +31,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.db.camera import Camera
 from src.db.camera_detector import CameraDetector
 from src.db.detector import Detector
+from src.services.detection import catalog
 from src.services.detection.prompt import DetectorSpec, detector_spec_from_row
+
+# Detectors whose prompt is specialized per-camera by the caregiver's exit-door
+# selection (stored on cameras_detectors.door_config).
+_WANDERING_IDENTIFIERS = {"wandering", "child_wandering"}
 
 
 class CameraVanishedError(ValueError):
@@ -64,9 +70,10 @@ async def get_enabled_detectors_for_camera(
         )
 
     # Detectors assigned to THIS camera that are also enabled (is_on=true)
-    # and have a runtime contract (identifier non-NULL).
+    # and have a runtime contract (identifier non-NULL). `door_config` is the
+    # PER-CAMERA wandering exit-door config from the assignment.
     stmt = (
-        select(Detector)
+        select(Detector, CameraDetector.door_config)
         .join(CameraDetector, CameraDetector.detector_id == Detector.id)
         .where(
             CameraDetector.camera_id == camera_id,
@@ -74,5 +81,20 @@ async def get_enabled_detectors_for_camera(
             Detector.identifier.is_not(None),
         )
     )
-    rows = (await session.execute(stmt)).scalars().all()
-    return [detector_spec_from_row(r) for r in rows]
+    rows = (await session.execute(stmt)).all()
+
+    specs: list[DetectorSpec] = []
+    for det, door_config in rows:
+        spec = detector_spec_from_row(det)
+        # Wandering is specialized PER CAMERA: each sensor sees a different
+        # scene, so its exit-door prompt comes from this assignment's door_config
+        # — not the shared per-patient detector row.
+        if det.identifier in _WANDERING_IDENTIFIERS and door_config:
+            if door_config.get("no_exit_door"):
+                continue  # no door leads outside here — don't watch this camera
+            doors = door_config.get("doors") or []
+            if doors:
+                spec = replace(
+                    spec, prompt_fragment=catalog.build_wandering_fragment(doors))
+        specs.append(spec)
+    return specs

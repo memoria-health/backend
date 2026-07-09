@@ -18,3 +18,10 @@
 
 alter table public.detectors
   add column if not exists door_config jsonb;
+
+-- Per-SENSOR exit-door config. The exit door is per camera (each sensor sees a
+-- different scene), so the authoritative config lives on the assignment. The
+-- detectors.door_config above is legacy/per-patient and no longer used by the
+-- runtime — kept only so old rows still decode.
+alter table public.cameras_detectors
+  add column if not exists door_config jsonb;
