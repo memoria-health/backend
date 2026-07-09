@@ -85,20 +85,23 @@ async def get_enabled_detectors_for_camera(
 
     specs: list[DetectorSpec] = []
     for det, door_config in rows:
-        # Wandering is NOT active on a sensor until the caregiver sets its exit
-        # doors — each sensor sees a different scene, so a generic any-doorway
-        # prompt is meaningless. Skip it unless this assignment has >=1 door
-        # (unset / no_exit_door / empty => not watching here). Its prompt is then
-        # built PER CAMERA from those doors.
-        if det.identifier in _WANDERING_IDENTIFIERS:
-            doors = (door_config or {}).get("doors") or []
-            if not doors or (door_config or {}).get("no_exit_door"):
+        # Wandering is specialized PER SENSOR by the caregiver's exit-door choice.
+        if det.identifier in _WANDERING_IDENTIFIERS and door_config is not None:
+            # New-app assignment (only the exit-door picker ever writes a
+            # door_config). Active ONLY once >=1 door is set; unset / no_exit_door
+            # / empty => not watching this sensor.
+            doors = door_config.get("doors") or []
+            if not doors or door_config.get("no_exit_door"):
                 continue
-            spec = replace(
+            specs.append(replace(
                 detector_spec_from_row(det),
                 prompt_fragment=catalog.build_wandering_fragment(doors),
-            )
-        else:
-            spec = detector_spec_from_row(det)
-        specs.append(spec)
+            ))
+            continue
+        # Everything else — including LEGACY wandering assignments with a NULL
+        # door_config (created before this feature: old app / room-scope seeding)
+        # — keeps its stored prompt. This grandfathers existing prod wandering so
+        # it doesn't go dark during the app-rollout gap; a caregiver on the new
+        # app opts into per-sensor doors when they configure that sensor.
+        specs.append(detector_spec_from_row(det))
     return specs
