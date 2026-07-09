@@ -89,15 +89,36 @@ def _same_door(a: list[float], b: list[float]) -> bool:
     return ((acx - bcx) ** 2 + (acy - bcy) ** 2) ** 0.5 < _SAME_CENTER
 
 
-async def _detect_once(client: "genai.Client", image_jpeg: bytes) -> list[dict]:
+def _media_resolution(value: str) -> "genai_types.MediaResolution | None":
+    """Map the 'low'|'medium'|'high' setting to the Gemini enum (None = default)."""
+    v = (value or "").strip().lower()
+    if v == "low":
+        return genai_types.MediaResolution.MEDIA_RESOLUTION_LOW
+    if v == "medium":
+        return genai_types.MediaResolution.MEDIA_RESOLUTION_MEDIUM
+    if v == "high":
+        return genai_types.MediaResolution.MEDIA_RESOLUTION_HIGH
+    return None
+
+
+async def _detect_once(
+    client: "genai.Client",
+    image_jpeg: bytes,
+    media_resolution: "genai_types.MediaResolution | None" = None,
+) -> list[dict]:
     """One VLM call → parsed door list. Retries only on transient ServerError."""
     parts = [
         genai_types.Part(
             inline_data=genai_types.Blob(data=image_jpeg, mime_type="image/jpeg")),
         genai_types.Part(text=_DOOR_PROMPT),
     ]
-    config = genai_types.GenerateContentConfig(
-        response_mime_type="application/json", response_schema=_SCHEMA)
+    config_kwargs: dict = {
+        "response_mime_type": "application/json", "response_schema": _SCHEMA,
+    }
+    if media_resolution is not None:
+        # More token budget per frame → finer detail on small / distant doors.
+        config_kwargs["media_resolution"] = media_resolution
+    config = genai_types.GenerateContentConfig(**config_kwargs)
     last_err: Exception | None = None
     for attempt in range(3):
         try:
@@ -128,8 +149,9 @@ async def detect_doors(image_jpeg: bytes, *, settings: Settings) -> list[dict]:
     results (IoU-dedup) so a single unlucky empty response doesn't blank the
     picker. Raises only if EVERY call fails."""
     client = genai.Client(api_key=settings.gemini_api_key)
+    media_res = _media_resolution(settings.gemini_media_resolution)
     results = await asyncio.gather(
-        *(_detect_once(client, image_jpeg) for _ in range(_N_CALLS)),
+        *(_detect_once(client, image_jpeg, media_res) for _ in range(_N_CALLS)),
         return_exceptions=True,
     )
     per_call = [r for r in results if isinstance(r, list)]

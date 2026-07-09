@@ -66,8 +66,13 @@ class Settings(BaseSettings):
     # cut frames-per-call cost).
     gemini_model: str = Field(default="gemini-3.5-flash")
     gemini_video_fps: str = Field(default="4")
-    # 'low' | 'medium' | 'high' | '' (Gemini default). Lowercased at call.
-    gemini_media_resolution: str = Field(default="")
+    # Per-frame token budget Gemini spends on each image/video frame — the real
+    # "how much detail does the VLM see" dial (independent of the pixels we
+    # upload; Gemini downsamples to this budget either way). 'low' | 'medium' |
+    # 'high' | '' (Gemini default). Defaulted to 'high' for max detail on small/
+    # subtle detections (distant doors, hand positions, fine motion); costs more
+    # tokens/latency per frame — dial down per-account if needed. Lowercased at call.
+    gemini_media_resolution: str = Field(default="high")
 
     openai_api_key: str = Field(default="")
     openai_model: str = Field(default="gpt-5.4")
