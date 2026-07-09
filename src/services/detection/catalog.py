@@ -266,6 +266,42 @@ _MEDICATION_PROMPT_FRAGMENT = (
     "no separate hand-to-mouth placing gesture', 'no person visible')."
 )
 
+_SEIZURE_PROMPT_FRAGMENT = (
+    "seizure_detected: boolean. TRUE when the person is having a SEIZURE — "
+    "sudden, involuntary, RHYTHMIC convulsing: rapid repetitive jerking or "
+    "shaking of the arms, legs, and/or whole body, typically with the body "
+    "stiff and the person collapsed on the floor, slumped in a chair, or in "
+    "bed, and not moving purposefully or responding. The defining feature is "
+    "FAST, REPETITIVE shaking that stays IN PLACE — not movement that travels "
+    "somewhere.\n"
+    "\n"
+    "RED MOTION HIGHLIGHT (use it when present): the red tint marks where motion "
+    "is happening. A limb — especially the ARMS or hands — or the whole body "
+    "that stays RED across many frames while remaining in roughly the SAME "
+    "position is a STRONG seizure sign: that red-stuck-in-place pattern IS the "
+    "rapid shaking of a convulsion. The more of the body that is red-in-place, "
+    "and the more frames it persists, the higher your confidence. Red that "
+    "TRAVELS across the frame (walking, reaching, waving, gesturing) is ordinary "
+    "movement, NOT a seizure.\n"
+    "\n"
+    "Set FALSE if any of:\n"
+    "  - the movement is purposeful or travels across the frame (walking, "
+    "reaching, exercising, gesturing, fidgeting) rather than convulsing in "
+    "place;\n"
+    "  - the person is calmly still, sleeping, or moving normally;\n"
+    "  - the motion is brief or one-off, not sustained rhythmic shaking;\n"
+    "  - no person is visible, or it is too far / unclear to judge.\n"
+    "\n"
+    "seizure_confidence: number 0-1. 0 = no seizure. 0.3-0.6 = some repetitive "
+    "shaking but brief, partial, or partly obscured. 0.7+ = clear sustained "
+    "rhythmic convulsing (or a limb/body held RED-in-place across many frames "
+    "under the motion highlight).\n"
+    "seizure_reasoning: one short sentence — e.g. 'both arms stayed red and shook "
+    "rapidly in place through the clip while the person lay stiff on the floor — "
+    "convulsion', 'person walked across the room, the motion travelled — not a "
+    "seizure', 'no person visible'."
+)
+
 _CLIMBING_PROMPT_FRAGMENT = (
     "climbing_detected: boolean. TRUE if a child is climbing onto something "
     "they shouldn't — pulling up onto furniture (sofa back, table, kitchen "
@@ -850,6 +886,13 @@ CATALOG: tuple[CatalogEntry, ...] = (
         promotion_threshold=0.70,
     ),
     CatalogEntry(
+        key="seizure", name="Seizure", icon_name="bolt.heart",
+        description="Convulsive shaking — rhythmic, repetitive limb or whole-body jerking.",
+        category="safety", shape="point_in_time", cohort="both",
+        recommended=False, seeded=False, prompt_fragment=_SEIZURE_PROMPT_FRAGMENT,
+        promotion_threshold=0.65,
+    ),
+    CatalogEntry(
         key="wandering", name="Wandering", icon_name="door.left.hand.open",
         description="Main door opening — front entry only.",
         category="safety", shape="point_in_time", cohort="adult",
@@ -1126,6 +1169,7 @@ _SEVERITY: dict[str, int] = {
     "choking": 100,
     "fire_smoke": 98,
     "child_cord_entanglement": 97,
+    "seizure": 96,
     "fall": 95,
     "child_head_impact": 93,
     "calling_for_help": 88,
