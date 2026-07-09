@@ -57,13 +57,12 @@ _SCHEMA = genai_types.Schema(
 )
 
 
-# The VLM is non-deterministic on a single frame — one call may return 0 doors,
-# the next 3. For a setup picker, a MISS (highlight nothing) is the worst outcome:
-# the caregiver can always ignore an extra box or tap-override, but an empty
-# screen reads as broken. So we fire N calls concurrently and UNION their boxes,
-# deduping near-duplicates by IoU. Cost/latency is irrelevant here — it's a rare
-# one-shot setup action, not the per-tick detector path.
-_N_CALLS = 3
+# ONE call — fast. Door highlights are just an ASSIST (the caregiver taps to
+# place/confirm anyway), so speed beats the marginal recall of a multi-call
+# union. The app doesn't block the camera view on this; it detects in the
+# background and overlays dots when they arrive. The clustering below still
+# dedups any near-duplicate boxes within the single response.
+_N_CALLS = 1
 _SAME_IOU = 0.3       # boxes overlapping this much are the same door
 _SAME_CENTER = 0.08   # ...or whose centers are this close (handles box jitter)
 
