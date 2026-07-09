@@ -21,12 +21,21 @@ import numpy as np
 
 from src.services.detection.frame_buffer import FrameSnapshot
 
-_THRESH = 18          # per-pixel Y change (0-255) that counts as motion
+# Naive frame-differencing lights up EVERY high-contrast edge on a noisy /
+# compressed camera (the Tapo's sensor + codec noise makes static edges flicker).
+# So we: (1) Gaussian-blur first to kill that high-frequency edge noise, (2) use
+# a higher threshold, (3) morphological-open to drop speckle, and (4) keep only
+# large connected motion blobs (a moving limb is one big region; noise is
+# scattered specks). Validated on a real living-room clip: only the moving arms
+# tint, the static scene stays clean.
+_THRESH = 28          # blurred-luma change (0-255) that counts as motion
+_BLUR = 7             # Gaussian kernel (odd) — smooths out sensor/edge noise
+_MIN_AREA = 250       # drop motion blobs smaller than this (noise speckle)
 _Y_BOOST = 45         # brighten moved pixels so red shows even on dark areas
 _ALPHA = 0.6          # red-tint strength on the chroma planes
 _RED_U = 100          # Cb for red
 _RED_V = 240          # Cr for red
-_DILATE = np.ones((5, 5), np.uint8)
+_MORPH_K = np.ones((3, 3), np.uint8)
 
 
 def overlay_motion(frames: list[FrameSnapshot]) -> list[FrameSnapshot]:
@@ -47,17 +56,24 @@ def overlay_motion(frames: list[FrameSnapshot]) -> list[FrameSnapshot]:
             continue
         arr = np.frombuffer(f.data, dtype=np.uint8).copy()   # mutable
         y = arr[:ysize].reshape(h, w)
-        cur_y = y.astype(np.int16)                           # original luma (copy)
-        if prev_y is not None and prev_y.shape == cur_y.shape:
-            mask = (np.abs(cur_y - prev_y) > _THRESH).astype(np.uint8)
-            mask = cv2.dilate(mask, _DILATE, iterations=1).astype(bool)
+        y_blur = cv2.GaussianBlur(y, (_BLUR, _BLUR), 0)       # noise-suppressed luma
+        if prev_y is not None and prev_y.shape == y_blur.shape:
+            mask = (cv2.absdiff(y_blur, prev_y) > _THRESH).astype(np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, _MORPH_K, iterations=1)
+            # keep only large connected motion regions (a limb) — drops speckle.
+            n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+            big = np.nonzero(stats[:, cv2.CC_STAT_AREA] >= _MIN_AREA)[0]
+            big = big[big != 0]                              # exclude background
+            mask = (np.isin(labels, big) if big.size
+                    else np.zeros((h, w), dtype=bool))
+            mask = cv2.dilate(mask.astype(np.uint8), _MORPH_K, iterations=2).astype(bool)
             if mask.any():
-                y[mask] = np.minimum(255, cur_y[mask] + _Y_BOOST).astype(np.uint8)
+                y[mask] = np.minimum(255, y[mask].astype(np.int16) + _Y_BOOST).astype(np.uint8)
                 cmask = mask[::2, ::2]                        # -> chroma resolution
                 u = arr[ysize:ysize + csize].reshape(h // 2, w // 2)
                 v = arr[ysize + csize:].reshape(h // 2, w // 2)
                 u[cmask] = ((1 - _ALPHA) * u[cmask] + _ALPHA * _RED_U).astype(np.uint8)
                 v[cmask] = ((1 - _ALPHA) * v[cmask] + _ALPHA * _RED_V).astype(np.uint8)
-        prev_y = cur_y
+        prev_y = y_blur                                      # diff against clean blurred luma
         out.append(FrameSnapshot(w, h, bytes(arr), f.captured_at))
     return out
