@@ -28,9 +28,9 @@ from src.services.detection.frame_buffer import FrameSnapshot
 # large connected motion blobs (a moving limb is one big region; noise is
 # scattered specks). Validated on a real living-room clip: only the moving arms
 # tint, the static scene stays clean.
-_THRESH = 28          # blurred-luma change (0-255) that counts as motion
-_BLUR = 7             # Gaussian kernel (odd) — smooths out sensor/edge noise
-_MIN_AREA = 250       # drop motion blobs smaller than this (noise speckle)
+_THRESH = 16          # blurred-luma change (0-255) that counts as motion
+_BLUR = 5             # Gaussian kernel (odd) — smooths out sensor/edge noise
+_MIN_AREA = 60        # drop motion blobs smaller than this (noise speckle)
 _Y_BOOST = 45         # brighten moved pixels so red shows even on dark areas
 _ALPHA = 0.6          # red-tint strength on the chroma planes
 _RED_U = 100          # Cb for red
