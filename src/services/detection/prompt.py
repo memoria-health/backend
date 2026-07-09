@@ -81,7 +81,26 @@ class BuiltPrompt:
     schema_required: list[str]
 
 
-def build_prompt_and_schema(detectors: Sequence[DetectorSpec]) -> BuiltPrompt:
+# Prepended to the prompt (right after BASE_PROMPT) when the frame-diff motion
+# overlay is active, so the model knows what the red tint is. Without this,
+# detectors misread the red as blood / a real object.
+_MOTION_OVERLAY_NOTE = (
+    "MOTION HIGHLIGHT: a semi-transparent RED tint has been overlaid onto the "
+    "areas of each frame that MOVED since the previous frame. It marks MOTION "
+    "only — it is NOT blood, a light, or any real object, so never report the red "
+    "itself as an object or injury. Read it as a motion cue: more red = more "
+    "movement there. A body part that stays RED across many frames while staying "
+    "in roughly the SAME place (not travelling across the frame) means fast, "
+    "repetitive, LOCALIZED motion — a hand shaking or trembling, or a limb "
+    "convulsing. A red region that moves ACROSS the frame is ordinary movement "
+    "(walking, reaching, gesturing). Judge the actual behaviour from the "
+    "underlying scene; the tint only tells you where and how much motion is.\n\n"
+)
+
+
+def build_prompt_and_schema(
+    detectors: Sequence[DetectorSpec], *, motion_overlay: bool = False,
+) -> BuiltPrompt:
     """Assemble the final prompt + JSON-schema for the LLM call.
 
     `BASE_PROMPT` is always included; the caller-provided detectors
@@ -101,6 +120,8 @@ def build_prompt_and_schema(detectors: Sequence[DetectorSpec]) -> BuiltPrompt:
     the always-on merge.
     """
     parts: list[str] = [BASE_PROMPT]
+    if motion_overlay:
+        parts.append(_MOTION_OVERLAY_NOTE)
     schema_properties: dict[str, dict[str, str]] = {
         "description": {"type": "string"},
     }

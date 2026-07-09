@@ -41,6 +41,7 @@ from src.services.detection.audio_buffer import AudioBuffer
 from src.services.detection.event_promotion import maybe_promote_analysis
 from src.services.detection.frame_buffer import FrameBuffer
 from src.services.detection.motion_cache import MotionCache
+from src.services.detection.motion_overlay import overlay_motion
 from src.services.detection.mp4_remux import Mp4RemuxError, frames_to_mp4
 from src.services.detection.speech_filter import sanitize_speech_fields
 from src.services.detection.vlm_routing import resolve_vlm_provider, run_vlm
@@ -629,10 +630,35 @@ class CameraIngest:
             vlm_choice = await resolve_vlm_provider(
                 session, patient.caregiver_id, self._settings,
             )
+
+            # Optional motion overlay: tint moved regions red so the VLM can see
+            # small/sustained motion (tremor/shaking). Only the native-video
+            # (Gemini) path consumes this mp4 (the frame-sampled providers use
+            # Re-ID's clean frames), so only build it when the choice is gemini.
+            # Re-ID above ran on the CLEAN clip. Runs off the event loop; any
+            # failure falls back to the clean clip.
+            vlm_mp4 = mp4_bytes
+            if self._settings.motion_overlay_enabled and vlm_choice == "gemini":
+                try:
+                    tinted = await asyncio.to_thread(overlay_motion, window)
+                    vlm_mp4 = await frames_to_mp4(
+                        tinted,
+                        fps=self._settings.livekit_worker_target_fps,
+                        pcm=pcm if pcm else None,
+                        pcm_sample_rate=self.audio_buffer.sample_rate,
+                        pcm_num_channels=self.audio_buffer.num_channels,
+                    )
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "%s motion_overlay failed — using clean clip",
+                        self._log_tag,
+                    )
+                    vlm_mp4 = mp4_bytes
+
             try:
                 used_provider, result = await run_vlm(
                     choice=vlm_choice,
-                    mp4=mp4_bytes,
+                    mp4=vlm_mp4,
                     detectors=detectors,
                     identity=identity,
                     log_tag=self._log_tag,

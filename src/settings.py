@@ -74,6 +74,13 @@ class Settings(BaseSettings):
     # tokens/latency per frame — dial down per-account if needed. Lowercased at call.
     gemini_media_resolution: str = Field(default="high")
 
+    # EXPERIMENT: tint moved regions red on the VLM clip (frame-diff overlay) so
+    # the model can see small/sustained motion — a vibrating hand / tremor — that
+    # is invisible in raw sampled frames. Off by default; A/B via env. When ON,
+    # the prompt explains the tint (or detectors misread red as blood/objects).
+    # Applies to the native-video (Gemini) path only; Re-ID runs on the clean clip.
+    motion_overlay_enabled: bool = Field(default=False)
+
     openai_api_key: str = Field(default="")
     openai_model: str = Field(default="gpt-5.4")
     # Model used to COMPILE a detector's seeded prompt (one-off on Create).

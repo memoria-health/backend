@@ -95,7 +95,11 @@ async def gemini_provider(
                 f"NEMARA_GEMINI_VIDEO_FPS must be in [0, 24], got: {sample_fps}"
             )
 
-    built = build_prompt_and_schema(detectors)
+    # Gemini gets the native-video clip, which is the one the motion overlay is
+    # applied to — so its prompt explains the red tint. The frame-sampled
+    # providers use Re-ID's clean frames, so they leave this off.
+    built = build_prompt_and_schema(
+        detectors, motion_overlay=settings.motion_overlay_enabled)
     identity_addendum = build_identity_addendum(patient_in_clip)
     full_prompt = f"{built.prompt}\n\n{_SPEECH_PROMPT_FRAGMENT}{identity_addendum}"
     properties = {**built.schema_properties, **_SPEECH_FIELDS}
