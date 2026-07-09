@@ -85,16 +85,20 @@ async def get_enabled_detectors_for_camera(
 
     specs: list[DetectorSpec] = []
     for det, door_config in rows:
-        spec = detector_spec_from_row(det)
-        # Wandering is specialized PER CAMERA: each sensor sees a different
-        # scene, so its exit-door prompt comes from this assignment's door_config
-        # — not the shared per-patient detector row.
-        if det.identifier in _WANDERING_IDENTIFIERS and door_config:
-            if door_config.get("no_exit_door"):
-                continue  # no door leads outside here — don't watch this camera
-            doors = door_config.get("doors") or []
-            if doors:
-                spec = replace(
-                    spec, prompt_fragment=catalog.build_wandering_fragment(doors))
+        # Wandering is NOT active on a sensor until the caregiver sets its exit
+        # doors — each sensor sees a different scene, so a generic any-doorway
+        # prompt is meaningless. Skip it unless this assignment has >=1 door
+        # (unset / no_exit_door / empty => not watching here). Its prompt is then
+        # built PER CAMERA from those doors.
+        if det.identifier in _WANDERING_IDENTIFIERS:
+            doors = (door_config or {}).get("doors") or []
+            if not doors or (door_config or {}).get("no_exit_door"):
+                continue
+            spec = replace(
+                detector_spec_from_row(det),
+                prompt_fragment=catalog.build_wandering_fragment(doors),
+            )
+        else:
+            spec = detector_spec_from_row(det)
         specs.append(spec)
     return specs
