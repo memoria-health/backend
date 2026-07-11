@@ -537,20 +537,25 @@ class LiveKitRoomReconciler:
     async def _write_online_true(
         self, identity: str, camera_id: UUID, result: ReconcileResult,
     ) -> None:
+        # `prev` only chooses fresh-start (state reset) vs keep-state; it NO
+        # LONGER gates whether we write. Both writes are DB-guarded (WHERE
+        # online = false), so re-issuing every pass is a no-op once the row is
+        # online (no Realtime echo) and SELF-HEALS a row that drifted false
+        # under us — a gateway publisher never sends participant_left, so the
+        # flag could stick false while frames flow. Trusting the in-memory
+        # cache to skip the write was the "stuck offline" bug; the DB is the
+        # authority now, and rowcount tells us whether it actually flipped.
         prev = self._last_online_written.get(identity)
-        if prev is True:
-            # No-op; already online.
-            return
         fresh_start = prev is None or prev is False
         try:
             now = datetime.now(timezone.utc)
             async with self._sessionmaker() as session:
                 if fresh_start:
-                    await camera_presence.set_camera_online_fresh_start(
+                    flipped = await camera_presence.set_camera_online_fresh_start(
                         session, camera_id, now,
                     )
                 else:
-                    await camera_presence.set_camera_online_keep_state(
+                    flipped = await camera_presence.set_camera_online_keep_state(
                         session, camera_id,
                     )
                 await session.commit()
@@ -562,17 +567,21 @@ class LiveKitRoomReconciler:
             )
             return
         self._last_online_written[identity] = True
-        result.online_writes[identity] = True
+        if flipped:
+            result.online_writes[identity] = True
 
     async def _write_online_false(
         self, identity: str, camera_id: UUID, result: ReconcileResult,
     ) -> None:
-        if self._last_online_written.get(identity) is False:
-            # No-op; already offline.
-            return
+        # Guarded (WHERE online = true) → a DB no-op when already offline (no
+        # echo) and self-healing if the row drifted true. No in-memory
+        # short-circuit, so a cache that thinks we're already offline can't
+        # suppress a genuinely-needed write.
         try:
             async with self._sessionmaker() as session:
-                await camera_presence.set_camera_offline_by_id(session, camera_id)
+                flipped = await camera_presence.set_camera_offline_by_id(
+                    session, camera_id,
+                )
                 await session.commit()
         except Exception:
             log.exception(
@@ -582,4 +591,5 @@ class LiveKitRoomReconciler:
             )
             return
         self._last_online_written[identity] = False
-        result.online_writes[identity] = False
+        if flipped:
+            result.online_writes[identity] = False

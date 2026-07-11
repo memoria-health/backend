@@ -152,10 +152,18 @@ class _FakeRoomWorker:
 # ── Fake sessionmaker ───────────────────────────────────────────────
 
 
+class _FakeResult:
+    """Minimal stand-in for a SQLAlchemy CursorResult — only `.rowcount`,
+    which the reconciler reads to tell a real transition from a
+    self-healing no-op."""
+
+    def __init__(self, rowcount: int) -> None:
+        self.rowcount = rowcount
+
+
 class _FakeSession:
     def __init__(self, store: "_FakeDBStore") -> None:
         self._store = store
-        self._pending: tuple[str, dict] | None = None
 
     async def __aenter__(self) -> "_FakeSession":
         return self
@@ -163,28 +171,41 @@ class _FakeSession:
     async def __aexit__(self, *args) -> None:
         return None
 
-    async def execute(self, stmt, params: dict | None = None) -> None:
-        # Identify which SQL was run by string-match on the column-set
-        # keyword so the fake works against the three variants the
-        # reconciler issues without parsing actual SQL.
+    async def execute(self, stmt, params: dict | None = None) -> "_FakeResult":
+        # Emulate the guarded, idempotent UPDATEs `camera_presence` issues:
+        # each mutates the row ONLY when it would actually change `online`
+        # (the WHERE ... AND online = false / true guard), and reports
+        # rowcount so the reconciler can distinguish a real flip from a
+        # self-healing no-op. Identify the variant by the SET clause (not
+        # the whole SQL — the guarded WHERE now also mentions the opposite
+        # boolean). Applied at execute time to mirror real UPDATE rowcount
+        # semantics.
         sql = str(stmt)
-        self._pending = (sql, dict(params or {}))
-
-    async def commit(self) -> None:
-        if self._pending is None:
-            return
-        sql, params = self._pending
-        self._pending = None
+        params = dict(params or {})
         camera_id = params.get("camera_id")
         if camera_id is None:
-            return
+            return _FakeResult(0)
+        cur = bool((self._store.cameras.get(camera_id) or {}).get("online"))
         now = params.get("now")
-        if "online = true" in sql and "state = 'open'" in sql:
-            self._store.set_online(camera_id, True, fresh_start=True, now=now)
-        elif "online = true" in sql:
-            self._store.set_online(camera_id, True, fresh_start=False, now=now)
-        elif "online = false" in sql:
-            self._store.set_online(camera_id, False, fresh_start=False, now=None)
+        if "SET online = true" in sql and "state = 'open'" in sql:
+            if not cur:  # guarded false -> true + fresh-start reset
+                self._store.set_online(camera_id, True, fresh_start=True, now=now)
+                return _FakeResult(1)
+            return _FakeResult(0)
+        if "SET online = true" in sql:  # guarded false -> true, keep state
+            if not cur:
+                self._store.set_online(camera_id, True, fresh_start=False, now=now)
+                return _FakeResult(1)
+            return _FakeResult(0)
+        if "SET online = false" in sql:  # guarded true -> false
+            if cur:
+                self._store.set_online(camera_id, False, fresh_start=False, now=None)
+                return _FakeResult(1)
+            return _FakeResult(0)
+        return _FakeResult(0)
+
+    async def commit(self) -> None:
+        return None
 
 
 class _FakeDBStore:
@@ -643,6 +664,12 @@ async def test_reconciler_two_signal_present_in_rest_stale_frames_writes_offline
         room_worker=worker, room_service=svc, db_store=store,
         liveness_grace_s=30.0,
     )
+
+    # Seed the row online=true so the stale-frame pass has a real true->false
+    # transition to make. (The guarded offline UPDATE is a no-op on an
+    # already-offline row — the correct, echo-free behavior — so without a
+    # prior true there would be nothing to flip.)
+    store.cameras[cam_id] = {"online": True, "fresh_start_count": 0, "writes": 0}
 
     result = await rec.reconcile_once()
 

@@ -77,7 +77,10 @@ log = logging.getLogger(__name__)
 # no_people_count=0) gives a fresh camera session a clean evaluation;
 # without it a camera that previously closed after N no-people ticks
 # would inherit state='closed' across reconnects and the LLM would skip
-# almost every tick. Used on a false->true transition.
+# almost every tick. The `AND online = false` guard makes this idempotent:
+# the reconciler re-issues it every pass, so it is a DB no-op once the row
+# is online (no redundant Realtime echo) AND self-heals a row that drifted
+# false under a stale in-memory cache — the "stuck offline" bug.
 SET_ONLINE_TRUE_FRESH_START_SQL = text(
     """
     UPDATE public.cameras
@@ -85,54 +88,64 @@ SET_ONLINE_TRUE_FRESH_START_SQL = text(
         state = 'open',
         no_people_count = 0,
         state_changed_at = :now
-    WHERE id = :camera_id
+    WHERE id = :camera_id AND online = false
     """
 )
 
-# online=true WITHOUT touching the state machine. Used on subsequent
-# reconciler passes where the camera was already online so we don't
-# perturb a legitimately-closed state.
+# online=true WITHOUT the state-machine reset — the self-heal path for a
+# row that drifted false while we still believed it was online. Same
+# `AND online = false` guard: idempotent no-op once the row is online.
 SET_ONLINE_TRUE_KEEP_STATE_SQL = text(
     """
     UPDATE public.cameras
     SET online = true
-    WHERE id = :camera_id
+    WHERE id = :camera_id AND online = false
     """
 )
 
 # online=false by camera id. Used by the reconciler's absent/stale paths.
+# `AND online = true` guard: idempotent no-op once the row is offline.
 SET_ONLINE_FALSE_SQL = text(
     """
     UPDATE public.cameras
     SET online = false
-    WHERE id = :camera_id
+    WHERE id = :camera_id AND online = true
     """
 )
 
 
 async def set_camera_online_fresh_start(
     session: AsyncSession, camera_id: UUID, now: datetime,
-) -> None:
+) -> bool:
     """online=true + state-machine reset, within the caller's session.
-    Caller owns commit."""
-    await session.execute(
+    Returns True iff the row actually flipped (was offline). Caller owns
+    commit."""
+    res = await session.execute(
         SET_ONLINE_TRUE_FRESH_START_SQL, {"camera_id": camera_id, "now": now},
     )
+    return (res.rowcount or 0) > 0
 
 
 async def set_camera_online_keep_state(
     session: AsyncSession, camera_id: UUID,
-) -> None:
-    """online=true without touching the state machine. Caller owns commit."""
-    await session.execute(SET_ONLINE_TRUE_KEEP_STATE_SQL, {"camera_id": camera_id})
+) -> bool:
+    """online=true without the state reset. Returns True iff the row
+    actually flipped (was offline). Caller owns commit."""
+    res = await session.execute(
+        SET_ONLINE_TRUE_KEEP_STATE_SQL, {"camera_id": camera_id},
+    )
+    return (res.rowcount or 0) > 0
 
 
 async def set_camera_offline_by_id(
     session: AsyncSession, camera_id: UUID,
-) -> None:
-    """online=false by camera id, within the caller's session. Caller
-    owns commit."""
-    await session.execute(SET_ONLINE_FALSE_SQL, {"camera_id": camera_id})
+) -> bool:
+    """online=false by camera id, within the caller's session. Returns
+    True iff the row actually flipped (was online). Caller owns commit."""
+    res = await session.execute(
+        SET_ONLINE_FALSE_SQL, {"camera_id": camera_id},
+    )
+    return (res.rowcount or 0) > 0
 
 
 # ── Webhook / startup trigger points (own their own session) ──────────
