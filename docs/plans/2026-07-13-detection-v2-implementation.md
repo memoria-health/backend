@@ -40,7 +40,7 @@ The stronger model tiers and extra calls are paid for by not looking when there'
 
 # Part 2 — Build plan
 
-**Standing rules for every phase:** work on a feature branch, PR to main, never straight to main. DB delta SQL applied to prod BEFORE backend deploy. Run the full test suite before each commit; commit at every green step; remove stale tests in the same PR that obsoletes them. New behavior ships behind an env flag defaulting OFF until soak-verified.
+**Standing rules for every phase:** work on a feature branch, PR to main, never straight to main. DB delta SQL applied to prod BEFORE backend deploy. Run the full test suite before each commit; commit at every green step; remove stale tests in the same PR that obsoletes them. New behavior ships behind an env flag defaulting OFF until soak-verified. **After every task commit: an adjudicated review checkpoint** — independent finder briefed on intent + a full-context pass, over five lenses: correctness, efficiency (hot-path cost), memory, security, and goal adherence to the v2 design + Aryaman's locked decisions; findings are fixed, refuted with a stated reason, or escalated. At phase end: full-diff review + entire suite + exit criteria before the PR.
 
 **Phase granularity note:** P0 is specified to executable task detail below. P1–P2 are specified to task level. P3–P6 are milestone-scoped — each gets its own detailed TDD plan document at phase start (their internals depend on what P0–P2 actually look like when landed).
 
