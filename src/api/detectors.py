@@ -37,7 +37,7 @@ from src.schemas.detector import (
     ScheduleConfig,
     UpdateDetectorRequest,
 )
-from src.services.detection import catalog
+from src.services.detection import catalog, catalog_v2
 from src.services.detection.door_detection import detect_doors
 from src.services.detector_compiler import (
     compile_custom_detector,
@@ -384,6 +384,7 @@ async def add_detectors_from_library(
             always_on=False,
             is_builtin=True,
             schedule_config=None,
+            **catalog_v2.row_kwargs(e.key),
         )
         await detector_repo.insert(session, det)
         room = None if e.where_scope == "ALL ROOMS" else e.where_scope

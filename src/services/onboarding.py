@@ -32,7 +32,7 @@ from src.schemas.caregiver import (
     CreateCaregiverRequest,
     UpdateCaregiverRequest,
 )
-from src.services.detection import catalog
+from src.services.detection import catalog, catalog_v2
 
 _log = logging.getLogger(__name__)
 
@@ -155,6 +155,7 @@ async def seed_detectors_for_patient(
             schema_json=e.schema_json,
             always_on=False,
             is_builtin=True,
+            **catalog_v2.row_kwargs(e.key),
         )
         inserted.append(await detector_repo.insert(session, det))
     _log.info(

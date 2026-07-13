@@ -184,7 +184,16 @@ def _select_primary(
         #   2. the model's own `primary_detection` pick — breaks ties WITHIN the
         #      same severity (which action dominates);
         #   3. confidence; 4. safety over routine; 5. identifier for determinism.
-        severity = catalog.severity_for(c.identifier)
+        # v2: severity lives on the detector row (backfilled for built-ins,
+        # compiler-set for future customs); the catalog map is the fallback
+        # for NULL rows and detector-less unit fixtures. catalog_v2's import
+        # validation keeps row values and the map in lockstep until the map
+        # is retired.
+        row_severity = getattr(c.detector, "severity", None)
+        severity = (
+            row_severity if row_severity is not None
+            else catalog.severity_for(c.identifier)
+        )
         is_hint = 0 if c.identifier == hint else 1
         safety_first = 0 if c.category == "safety" else 1
         return (-severity, is_hint, -c.confidence, safety_first, c.identifier)

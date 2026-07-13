@@ -75,6 +75,19 @@ def test_safety_breaks_a_full_tie() -> None:
     assert _select_primary([routine, safety], primary_hint="") is safety
 
 
+def test_row_severity_overrides_the_catalog_map() -> None:
+    """v2: severity persisted on the detector row wins over the in-code
+    map; NULL rows (and detector-less fixtures) keep the map fallback."""
+    class _Row:
+        severity = 10   # demote fall far below the default-50 custom
+
+    demoted_fall = _Candidate(
+        identifier="fall", confidence=0.90, category="safety", detector=_Row(),
+    )
+    custom = _c("custom_aaa00000", 0.50)   # detector=None → map fallback (50)
+    assert _select_primary([demoted_fall, custom], primary_hint="") is custom
+
+
 def test_identifier_breaks_the_final_tie_deterministically() -> None:
     """Tier 5: two customs tied on severity, hint, confidence AND category
     (LLM confidences snap to round values) — alphabetically-first wins so
