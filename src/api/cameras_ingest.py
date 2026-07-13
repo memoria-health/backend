@@ -365,19 +365,24 @@ async def gateway_roster(
         text("UPDATE public.gateways SET last_seen_at = now() WHERE id = :id"),
         {"id": gateway_id},
     )
-    # A gateway box serves a CAREGIVER: run gateway cameras across ALL that
-    # caregiver's patients (a camera added for a caregiver lands under each).
+    # A gateway box serves a CAREGIVER, but each gateway camera is OWNED by
+    # a specific box (cameras.gateway_id). Return only THIS box's cameras,
+    # plus any not-yet-assigned (gateway_id IS NULL) rows as a transitional
+    # fallback until the ownership backfill/provision fills them in. This is
+    # what makes liveness per-box: the heartbeat below only stamps the
+    # cameras this box actually runs.
     _cam_where = ("WHERE patient_id IN "
                   "(SELECT id FROM public.patients WHERE caregiver_id = :c) "
-                  "AND source_type = 'gateway'")
+                  "AND source_type = 'gateway' "
+                  "AND (gateway_id = :gw OR gateway_id IS NULL)")
     await session.execute(
         text(f"UPDATE public.cameras SET last_heartbeat_at = now() {_cam_where}"),
-        {"c": caregiver_id},
+        {"c": caregiver_id, "gw": gateway_id},
     )
     rows = (await session.execute(
         text("SELECT id, livekit_identity, livekit_room, desired_state "
              f"FROM public.cameras {_cam_where} ORDER BY created_at"),
-        {"c": caregiver_id},
+        {"c": caregiver_id, "gw": gateway_id},
     )).all()
     await session.commit()
     return {"cameras": [
@@ -423,15 +428,17 @@ async def gateway_wait(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_gateway_token",
         )
-    caregiver_id = gw[1]
+    gateway_id, caregiver_id = gw[0], gw[1]
 
     async def snapshot():
         rows = (await session.execute(
             text("SELECT id, livekit_identity, livekit_room, desired_state "
                  "FROM public.cameras WHERE patient_id IN "
                  "(SELECT id FROM public.patients WHERE caregiver_id = :c) "
-                 "AND source_type = 'gateway' ORDER BY livekit_identity"),
-            {"c": caregiver_id},
+                 "AND source_type = 'gateway' "
+                 "AND (gateway_id = :gw OR gateway_id IS NULL) "
+                 "ORDER BY livekit_identity"),
+            {"c": caregiver_id, "gw": gateway_id},
         )).all()
         await session.commit()   # release the connection between checks
         cams = [{"camera_id": str(r[0]), "livekit_identity": r[1],
@@ -503,12 +510,13 @@ async def gateway_provision_camera(
         {"h": token_hash},
     )).first()
     if existing is None:
-        await session.execute(
+        gateway_id = (await session.execute(
             text("INSERT INTO public.gateways (caregiver_id, token_hash, created_at) "
-                 "VALUES (:c, :h, :n)"),
+                 "VALUES (:c, :h, :n) RETURNING id"),
             {"c": caregiver_id, "h": token_hash, "n": now},
-        )
+        )).scalar_one()
     else:
+        gateway_id = existing[0]
         await session.execute(
             text("UPDATE public.gateways SET caregiver_id = :c WHERE token_hash = :h"),
             {"c": caregiver_id, "h": token_hash},
@@ -554,6 +562,9 @@ async def gateway_provision_camera(
             battery_percent=None,
             desired_state="disconnected",
             source_type="gateway",
+            # Own this camera to THIS box, so the roster + heartbeat scope
+            # per-gateway (not fleet-wide across the caregiver's boxes).
+            gateway_id=gateway_id,
             pi_stream_url=None,
             pi_audio_url=None,
             ingest_token_hash=ingest_token_hash,

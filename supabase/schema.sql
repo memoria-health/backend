@@ -179,6 +179,24 @@ create trigger patients_set_updated_at
 -- phone then exchanges the code via POST /v1/cameras/pair, receiving a
 -- bcrypt-hashed long-lived `api_key` it uses for clip uploads and
 -- LiveKit token minting.
+-- ── gateways ─────────────────────────────────────────────────────
+-- One row per mini-PC gateway box (bridges LAN RTSP cameras into
+-- LiveKit as cam_* participants). Each box holds ONE stable site token;
+-- the backend hashes it and looks it up here to resolve the box ->
+-- caregiver, then serves that box's roster. `patient_id` is kept
+-- nullable for back-compat (the box binds to a CAREGIVER, and each of
+-- its cameras binds to a patient via cameras.gateway_id). Backend-
+-- internal (accessed by the service role via the gateway roster/
+-- provision endpoints); no RLS — mirrors apply_gateway_delta.sql.
+create table public.gateways (
+  id           uuid primary key default gen_random_uuid(),
+  caregiver_id uuid references public.caregivers(id) on delete cascade,
+  patient_id   uuid,
+  token_hash   text not null,
+  created_at   timestamptz default now(),
+  last_seen_at timestamptz
+);
+
 create table public.cameras (
   id                  uuid primary key default gen_random_uuid(),
   patient_id          uuid not null references public.patients(id) on delete cascade,
@@ -252,8 +270,12 @@ create table public.cameras (
   --   src/services/ingest/pi/ for the worker.
   -- Default 'iphone' makes this backwards-compatible with existing
   -- rows; no data migration required.
+  -- 'gateway': a LAN RTSP camera bridged by a mini-PC gateway box.
+  --   Provisioned via /v1/gateway/provision-camera; the box publishes
+  --   to LiveKit as a cam_* participant. Carries an ingest token like a
+  --   Pi and is owned by a specific box (gateway_id below).
   source_type         text not null default 'iphone'
-    check (source_type in ('iphone', 'pi')),
+    check (source_type in ('iphone', 'pi', 'gateway')),
   -- Vestigial: was the URL the backend pulled MJPEG from when Pis
   -- served their stream. Push refactor (Pi POSTs frames outbound)
   -- made it unused but column is kept nullable so historical /
@@ -287,13 +309,21 @@ create table public.cameras (
   -- sweeper never writes them and they stay true (a Pi has no app to
   -- close). See services/detection/presence_sweeper.py.
   app_present             boolean not null default true,
+  -- ── Gateway ownership + liveness ─────────────────────────────────
+  -- source_type='gateway' rows. The box's roster poll doubles as a
+  -- liveness heartbeat, stamped here. `gateway_id` is the specific box
+  -- that runs this camera (a caregiver may have several); the roster +
+  -- heartbeat scope by it so liveness is per-box and two boxes can't
+  -- both claim one camera. NULL for iphone/pi and not-yet-assigned rows.
+  last_heartbeat_at       timestamptz,
+  gateway_id              uuid references public.gateways(id) on delete set null,
   constraint cameras_pi_stream_url_length
     check (pi_stream_url is null or length(pi_stream_url) <= 2048),
   constraint cameras_pi_audio_url_length
     check (pi_audio_url is null or length(pi_audio_url) <= 2048),
   constraint cameras_ingest_token_required
     check (
-      (source_type = 'pi' and ingest_token_hash is not null)
+      (source_type in ('pi', 'gateway') and ingest_token_hash is not null)
       or (source_type = 'iphone' and ingest_token_hash is null)
     ),
   constraint cameras_ingest_token_hash_length
@@ -302,6 +332,7 @@ create table public.cameras (
 );
 
 create index cameras_patient_id_idx on public.cameras(patient_id);
+create index idx_cameras_gateway_id on public.cameras(gateway_id);
 
 -- Only one camera can hold a given pairing_code at a time (collision
 -- avoidance for the 10-min pairing window).
@@ -750,6 +781,23 @@ create policy cameras_owner on public.cameras
   ) with check (
     patient_id in (select id from public.patients where caregiver_id = auth.uid())
   );
+
+-- gateways is backend-internal: ONLY the postgres/service role (which
+-- bypasses RLS) touches it, via the gateway roster/provision endpoints. No
+-- client should ever reach it through PostgREST. So unlike the tenant
+-- tables here it gets RLS with NO policy — deny-all to anon/authenticated —
+-- plus a revoke of the default API grants as a second, independent lock.
+-- Without this the public anon key could read the (caregiver_id,
+-- token_hash) rows or forge/tamper with gateway rows.
+alter table public.gateways enable row level security;
+revoke all on public.gateways from anon, authenticated;
+
+-- pi_discoveries is likewise backend-internal (the Pi announce/provision
+-- flow). The app reads discoveries via the backend API, never the table
+-- directly, and there's no caregiver_id to scope by. It holds a plaintext
+-- one-shot ingest token (`pending_ingest_token`), so deny-all is essential.
+alter table public.pi_discoveries enable row level security;
+revoke all on public.pi_discoveries from anon, authenticated;
 
 alter table public.detectors enable row level security;
 create policy detectors_owner on public.detectors

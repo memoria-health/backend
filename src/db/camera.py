@@ -112,6 +112,17 @@ class Camera(Base):
         String(16), server_default=text("'iphone'"), default="iphone",
     )
 
+    # ── Owning gateway (multi-gateway fleets) ────────────────────────
+    # For source_type='gateway' rows: the specific gateway box that runs
+    # this camera. NULL for iphone/pi, and for gateway rows not yet
+    # assigned to a box. The roster + heartbeat scope by this so a
+    # caregiver with more than one box gets only its own cameras — giving
+    # per-box liveness and preventing two boxes from claiming one camera.
+    # Plain UUID column (no ORM ForeignKey: the DB-level FK lives in
+    # scripts/apply_gateway_ownership_delta.sql, and there is no Gateway
+    # ORM model to reference here).
+    gateway_id: Mapped[UUID | None] = mapped_column(default=None)
+
     # ── Pi MJPEG endpoint (vestigial) ────────────────────────────────
     # Was the URL the backend pulled MJPEG from in the pull-mode design.
     # Push refactor (Pi POSTs frames outbound to /v1/cameras/me/frames)

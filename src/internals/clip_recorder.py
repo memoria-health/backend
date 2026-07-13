@@ -39,8 +39,10 @@ from src.settings import Settings
 log = logging.getLogger(__name__)
 
 # The backend runs on the same laptop during collection, so it writes
-# the clip straight to disk — same folder the other clips land in.
-_OUT_DIR = Path.home() / "Desktop" / "agitation-clips"
+# the clip straight to disk. `eval-set/` is the general labeled eval
+# dataset (per-detector subfolders); recordings land in `_incoming/`
+# and get labeled + moved into a detector subfolder by hand.
+_OUT_DIR = Path.home() / "Desktop" / "eval-set" / "_incoming"
 _AUDIO_SAMPLE_RATE = 16_000
 _AUDIO_CHANNELS = 1
 # Give up if no frame arrives — the camera is closed / not publishing.

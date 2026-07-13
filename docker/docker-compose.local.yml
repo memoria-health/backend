@@ -30,6 +30,13 @@ services:
       # Re-ID off locally — the dev image skips the ML model bake.
       NEMARA_REID_ENABLED: "false"
       PORT: "8002"
+      # uvicorn --reload's watcher (watchfiles) does NOT receive inotify
+      # events across the macOS Docker bind-mount, so source edits were
+      # silently never reloaded — the running process kept executing stale
+      # code (a "fixed but still broken" landmine that repeatedly resurfaced
+      # the online/offline bug). Force polling so --reload actually fires,
+      # mirroring the web container's WATCHPACK/CHOKIDAR polling above.
+      WATCHFILES_FORCE_POLLING: "true"
     ports:
       - "8002:8002"
     # Lets the container resolve host.docker.internal on Linux too (Docker
