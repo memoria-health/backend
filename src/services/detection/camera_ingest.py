@@ -713,6 +713,12 @@ class CameraIngest:
             result.detector_fields["identity_confidence"] = round(identity.confidence, 4)
             result.detector_fields["identity_face_count"] = identity.face_count
 
+            # Token ledger (v2): per-call spend onto the analyses row when
+            # the provider reports it. Raw data for the cost governor.
+            if result.usage:
+                result.detector_fields["vlm_input_tokens"] = result.usage.get("input", 0)
+                result.detector_fields["vlm_output_tokens"] = result.usage.get("output", 0)
+
             # RAPID seizure call (v2 P0, flag-gated): dedicated flash-tier
             # overlay-crop call behind the churn pre-gate. Its `seizure_*`
             # fields merge into this tick's detector_fields, so promotion,

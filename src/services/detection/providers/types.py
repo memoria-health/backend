@@ -28,6 +28,9 @@ class ProviderResult:
     detector_fields: dict[str, Any]
     people_present: bool = False
     people_count: int = 0
+    # Per-call token spend {"input": n, "output": n} when the provider
+    # reports it — the cost ledger's raw data (detection v2). None = unknown.
+    usage: dict[str, int] | None = None
 
 
 class Provider(Protocol):

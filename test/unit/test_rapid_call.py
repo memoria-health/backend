@@ -52,13 +52,14 @@ def _spec(ident: str) -> DetectorSpec:
 
 
 class _FakeProvider:
-    def __init__(self, fields: dict):
+    def __init__(self, fields: dict, usage: dict | None = None):
         self.fields = fields
+        self.usage = usage
         self.calls: list[dict] = []
 
     async def __call__(self, **kwargs):
         self.calls.append(kwargs)
-        return SimpleNamespace(detector_fields=dict(self.fields))
+        return SimpleNamespace(detector_fields=dict(self.fields), usage=self.usage)
 
 
 def test_split_rapid_flag_off_is_identity() -> None:
@@ -125,7 +126,7 @@ async def test_fires_end_to_end_with_flash_settings() -> None:
         "seizure_reasoning": "sustained rhythmic shaking",
         "rapid_motion_description": "arms oscillating",
         "people_present": True,
-    })
+    }, usage={"input": 20900, "output": 310})
     out = await run_rapid_seizure(
         frames=_frames(flicker=True), per_person_boxes=[[(40, 20, 110, 100)]],
         settings=s, provider=fake, log_tag="t",
@@ -133,6 +134,8 @@ async def test_fires_end_to_end_with_flash_settings() -> None:
     assert out is not None
     assert out["seizure_detected"] is True
     assert "people_present" not in out
+    assert out["rapid_input_tokens"] == 20900   # ledger data rides along
+    assert out["rapid_output_tokens"] == 310
     assert len(fake.calls) == 1
     call = fake.calls[0]
     # The call runs on the RAPID recipe: flash-tier model, native fps,

@@ -41,7 +41,7 @@ _MAX_ARTIFACTS = 2
 
 # Only these field families may flow from the RAPID call into the tick's
 # detector_fields — everything else belongs to the main call.
-_KEEP_PREFIXES = ("seizure_", "rapid_motion_")
+_KEEP_PREFIXES = ("seizure_", "rapid_")
 
 
 RAPID_SEIZURE_PROMPT = """\
@@ -157,6 +157,7 @@ async def run_rapid_seizure(
     })
     specs = [RAPID_MOTION_SPEC, rapid_seizure_spec()]
     best: dict[str, Any] | None = None
+    in_tok = out_tok = 0
     for art in artifacts[:_MAX_ARTIFACTS]:
         try:
             res = await provider(
@@ -165,9 +166,17 @@ async def run_rapid_seizure(
         except Exception:  # noqa: BLE001 — one person's call failing must not
             log.exception("%s RAPID provider call failed", log_tag)
             continue
+        usage = getattr(res, "usage", None)
+        if usage:
+            in_tok += int(usage.get("input", 0))
+            out_tok += int(usage.get("output", 0))
         fields = filter_rapid_fields(res.detector_fields)
         if fields.get("seizure_detected"):
-            return fields
+            best = fields
+            break
         if best is None and fields:
             best = fields
+    if best is not None and (in_tok or out_tok):
+        best["rapid_input_tokens"] = in_tok
+        best["rapid_output_tokens"] = out_tok
     return best

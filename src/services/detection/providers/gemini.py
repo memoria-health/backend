@@ -146,6 +146,15 @@ async def gemini_provider(
     raw = (response.text or "").strip()
     if not raw:
         raise RuntimeError("gemini returned empty response")
-    return parse_and_validate(
+    res = parse_and_validate(
         raw, provider="gemini", required=required, properties=properties,
     )
+    meta = getattr(response, "usage_metadata", None)
+    if meta is not None:
+        import dataclasses
+
+        res = dataclasses.replace(res, usage={
+            "input": int(getattr(meta, "prompt_token_count", 0) or 0),
+            "output": int(getattr(meta, "candidates_token_count", 0) or 0),
+        })
+    return res
