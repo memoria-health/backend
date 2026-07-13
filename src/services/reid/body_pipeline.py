@@ -112,6 +112,11 @@ class _TrackState:
     bbox_series: list[tuple[int, tuple[float, float, float, float]]] = field(
         default_factory=list,
     )
+    # Tallest usable face seen on this track (SCRFD bbox height, px in
+    # extracted-frame space; det_score already above the quality gate).
+    # 0.0 = no usable face this clip. Feeds the v2 `face_valid(min_px)`
+    # signal — the FACE-bucket legibility floor + distance warning.
+    face_px_max: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -135,6 +140,10 @@ class TrackObservation:
     bbox_series: tuple[tuple[int, tuple[float, float, float, float]], ...]
     face_locked: bool
     pre_labeled: bool
+    # Tallest usable face on this track, px in extracted-frame space
+    # (0.0 = none). Scale by native_width/extracted_width before
+    # comparing against the ~300 px FACE-bucket floor.
+    face_px_max: float = 0.0
 
 
 @dataclass
@@ -376,6 +385,9 @@ class BodyReIDPipeline:
         # used by `_maybe_lock_other` to gate the OTHER decision so it
         # only fires after several genuine match failures.
         state.face_seen_attempts += 1
+        state.face_px_max = max(
+            state.face_px_max, float(best.bbox[3] - best.bbox[1]),
+        )
 
         match = reid_embeddings.topk_mean_cosine_match(best.embedding, self._gallery)
         threshold = reid_embeddings.effective_match_threshold(
@@ -554,6 +566,7 @@ class BodyReIDPipeline:
                 bbox_series=tuple(s.bbox_series),
                 face_locked=s.face_locked,
                 pre_labeled=s.pre_label is not None,
+                face_px_max=float(s.face_px_max),
             )
             for s in sorted(self._tracks.values(), key=lambda s: s.track_id)
         ]
