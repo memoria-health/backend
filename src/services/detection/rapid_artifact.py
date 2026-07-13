@@ -21,11 +21,14 @@ so this module stays testable without loading any model.
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Sequence
 
 from src.services.detection.frame_buffer import FrameSnapshot
 from src.services.detection.motion_overlay import overlay_motion
-from src.services.detection.mp4_remux import frames_to_mp4
+from src.services.detection.mp4_remux import Mp4RemuxError, frames_to_mp4
+
+log = logging.getLogger("nemara.detection.rapid")
 
 Box = tuple[float, float, float, float]  # x0, y0, x1, y1 in pixels
 
@@ -101,7 +104,11 @@ def crop_i420(
     if not frames:
         return []
     x0, y0, x1, y1 = box
-    ref_w, ref_h = frames[0].width, frames[0].height
+    # Reference = the MOST RECENT frame's shape (mp4_remux convention):
+    # WebRTC renegotiation can change resolution mid-window, and the last
+    # frame is the current publish state — anchoring on frame 0 would keep
+    # the stale minority and drop the live majority.
+    ref_w, ref_h = frames[-1].width, frames[-1].height
     cw, ch = x1 - x0, y1 - y0
     out: list[FrameSnapshot] = []
     for f in frames:
@@ -134,14 +141,19 @@ async def build_rapid_artifacts(
     if len(frames) < 2 or not per_person_boxes:
         return []
     tinted = await asyncio.to_thread(overlay_motion, list(frames))
-    frame_w, frame_h = frames[0].width, frames[0].height
+    frame_w, frame_h = frames[-1].width, frames[-1].height
     artifacts: list[bytes] = []
     for boxes in per_person_boxes:
         box = union_box(boxes, frame_w, frame_h)
         if box is None:
             continue
-        cropped = crop_i420(tinted, box)
+        cropped = await asyncio.to_thread(crop_i420, tinted, box)
         if len(cropped) < 2:
             continue
-        artifacts.append(await frames_to_mp4(cropped, fps=fps))
+        try:
+            artifacts.append(await frames_to_mp4(cropped, fps=fps))
+        except (Mp4RemuxError, ValueError) as exc:
+            # One person's encode failing must not drop the others'.
+            log.warning("rapid_artifact: encode failed, skipping person: %s", exc)
+            continue
     return artifacts

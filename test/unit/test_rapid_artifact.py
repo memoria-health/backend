@@ -78,12 +78,59 @@ def test_crop_i420_slices_all_three_planes() -> None:
 
 
 def test_crop_i420_skips_mismatched_shapes() -> None:
+    """Reference shape is the LAST frame (current publish state after a
+    renegotiation) — an odd-shaped frame at index 0 must be the one dropped,
+    not the majority."""
     good = _flicker_frames(n=2)
     odd = FrameSnapshot(width=40, height=30,
                         data=_i420(np.full((30, 40), 60, dtype=np.uint8)),
-                        captured_at=100.9)
-    out = crop_i420([good[0], odd, good[1]], (40, 20, 104, 84))
+                        captured_at=99.9)
+    out = crop_i420([odd, good[0], good[1]], (40, 20, 104, 84))
     assert len(out) == 2
+    out2 = crop_i420([good[0], odd, good[1]], (40, 20, 104, 84))
+    assert len(out2) == 2
+
+
+def test_union_box_exact_arithmetic_pin() -> None:
+    """One hand-computed case pinning pad→clamp→even order exactly:
+    box (20,20,60,60) in 160x120, pad 20% of 40 = 8 each side →
+    (12,12,68,68), already ≥ min_side 40, all even."""
+    assert union_box([(20, 20, 60, 60)], W, H, pad_ratio=0.2, min_side=40) == \
+        (12, 12, 68, 68)
+
+
+def test_union_box_corner_and_tiny_frame() -> None:
+    # Box in the far corner: min-side growth + slide keeps it inside.
+    box = union_box([(150, 112, 158, 118)], W, H, min_side=64)
+    assert box is not None
+    x0, y0, x1, y1 = box
+    assert x1 <= W and y1 <= H and x0 >= 0 and y0 >= 0
+    assert x1 - x0 >= 64 and y1 - y0 >= 64
+    # Frame smaller than min_side: saturates to the full frame, no crash.
+    tiny = union_box([(2, 2, 30, 20)], 40, 30, min_side=64)
+    assert tiny == (0, 0, 40, 30)
+
+
+async def test_encode_failure_skips_person_not_tick(monkeypatch) -> None:
+    """One person's ffmpeg failure must not discard the other's artifact."""
+    import src.services.detection.rapid_artifact as ra
+
+    calls = {"n": 0}
+
+    async def flaky(frames, *, fps, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ra.Mp4RemuxError("boom")
+        return b"\x00\x00\x00\x18ftypfake"
+
+    monkeypatch.setattr(ra, "frames_to_mp4", flaky)
+    arts = await build_rapid_artifacts(
+        _flicker_frames(n=8),
+        [[(50, 30, 100, 90)], [(0, 0, 40, 60)]],
+        fps=8,
+    )
+    assert len(arts) == 1
+    assert calls["n"] == 2
 
 
 def test_tint_survives_static_crop() -> None:
