@@ -142,6 +142,10 @@ async def _archive_one(
     # regardless of how long the asyncio runtime actually slept for.
     post_frames = frame_buffer.snapshot_last_seconds(
         wait_seconds, now=target_wall_time,
+        # Buffer may hold a higher native rate for the RAPID path; the
+        # incident clip stays at the historical cadence (matches the
+        # `fps=` passed to frames_to_mp4 below and the pre.mp4 rate).
+        at_fps=settings.livekit_worker_target_fps,
     )
     if not post_frames:
         log.warning(

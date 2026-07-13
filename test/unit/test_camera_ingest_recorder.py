@@ -36,6 +36,8 @@ def _settings() -> SimpleNamespace:
         livekit_worker_target_fps=4,
         clip_post_event_wait_seconds=15.0,
         frame_buffer_retention_seconds=17.0,
+        rapid_seizure_enabled=False,
+        rapid_fps=8,
     )
 
 

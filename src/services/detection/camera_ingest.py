@@ -135,9 +135,18 @@ class CameraIngest:
         # the 11s analysis window while the post-roll asked for 15s, so the
         # post snapshot lost its oldest ~4s → a visible jump at ~11s.)
         retention_seconds = settings.frame_buffer_retention_seconds
+        # RAPID path needs native-rate frames; when enabled the buffer holds
+        # `rapid_fps` and every legacy consumer decimates back down via
+        # `snapshot_last_seconds(at_fps=target_fps)` — same frames they saw
+        # before, plus in-between ones only the RAPID artifact reads.
+        buffer_fps = (
+            max(settings.rapid_fps, settings.livekit_worker_target_fps)
+            if settings.rapid_seizure_enabled
+            else settings.livekit_worker_target_fps
+        )
         self.frame_buffer = FrameBuffer(
             window_seconds=retention_seconds,
-            target_fps=settings.livekit_worker_target_fps,
+            target_fps=buffer_fps,
         )
         self.audio_buffer = AudioBuffer(
             window_seconds=retention_seconds,
@@ -477,8 +486,11 @@ class CameraIngest:
                 return
 
             # Build the MP4 from the buffered window (video + audio).
+            # at_fps: the buffer may retain a higher native rate for the
+            # RAPID path; the main call always sees target_fps.
             window = self.frame_buffer.snapshot_last_seconds(
                 self._settings.livekit_worker_window_seconds,
+                at_fps=self._settings.livekit_worker_target_fps,
             )
             if not window:
                 log.info(

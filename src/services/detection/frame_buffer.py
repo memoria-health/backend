@@ -105,15 +105,36 @@ class FrameBuffer:
         seconds: float,
         *,
         now: float | None = None,
+        at_fps: int | None = None,
     ) -> list[FrameSnapshot]:
         """Return frames with `captured_at >= now - seconds`, oldest
         first. `now` defaults to `time.monotonic()`; tests can pin it.
+
+        `at_fps` decimates the window to at most that rate using the
+        same min-gap rule as `push`. Exists for the RAPID path: the
+        buffer can retain a higher native rate (e.g. 8 fps) while the
+        main-call / clip consumers keep their historical rate by
+        passing `at_fps=target_fps`. `at_fps` at or above the buffer's
+        own rate is a no-op (the epsilon absorbs the exact-boundary
+        gap between accepted frames).
         """
         if seconds <= 0:
             return []
         ref = time.monotonic() if now is None else now
         cutoff = ref - seconds
-        return [f for f in self._frames if f.captured_at >= cutoff]
+        frames = [f for f in self._frames if f.captured_at >= cutoff]
+        if at_fps is None:
+            return frames
+        if at_fps <= 0:
+            raise ValueError(f"at_fps must be > 0, got {at_fps}")
+        min_gap = 1.0 / at_fps - 1e-6
+        out: list[FrameSnapshot] = []
+        last_kept = float("-inf")
+        for f in frames:
+            if f.captured_at - last_kept >= min_gap:
+                out.append(f)
+                last_kept = f.captured_at
+        return out
 
     def __len__(self) -> int:
         return len(self._frames)

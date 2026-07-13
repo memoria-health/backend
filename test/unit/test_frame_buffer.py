@@ -195,6 +195,43 @@ def test_old_window_sized_retention_drops_post_roll_head() -> None:
     assert gap >= (post_roll - window) - 1e-6  # ~4s gap, the seam jump
 
 
+def test_snapshot_at_fps_decimates_higher_rate_buffer() -> None:
+    """RAPID recipe support: the buffer holds 8 fps so the seizure path can
+    encode at native rate, while the main call decimates to 4 fps via
+    `at_fps`. Exactly every other frame survives, gaps >= 0.25s.
+    """
+    buf = FrameBuffer(window_seconds=15, target_fps=8)
+    for i in range(16):  # 2s of 8 fps (0.125s gaps — exact in binary float)
+        buf.push(width=16, height=16, data=_blob(), captured_at=100.0 + 0.125 * i)
+    full = buf.snapshot_last_seconds(15, now=101.875)
+    assert len(full) == 16
+    dec = buf.snapshot_last_seconds(15, now=101.875, at_fps=4)
+    assert [f.captured_at for f in dec] == pytest.approx(
+        [100.0 + 0.25 * i for i in range(8)]
+    )
+
+
+def test_snapshot_at_fps_matching_buffer_rate_is_identity() -> None:
+    """Passing at_fps equal to the buffer's own rate must be a no-op —
+    the call sites pass at_fps unconditionally, so the boundary gap
+    (exactly 1/fps between accepted frames) must survive decimation.
+    """
+    buf = FrameBuffer(window_seconds=15, target_fps=4)
+    for i in range(8):
+        buf.push(width=16, height=16, data=_blob(), captured_at=100.0 + 0.25 * i)
+    dec = buf.snapshot_last_seconds(15, now=101.75, at_fps=4)
+    assert len(dec) == 8
+
+
+def test_snapshot_at_fps_keeps_first_frame_and_rejects_nonpositive() -> None:
+    buf = FrameBuffer(window_seconds=15, target_fps=8)
+    buf.push(width=16, height=16, data=_blob(), captured_at=100.0)
+    dec = buf.snapshot_last_seconds(15, now=100.0, at_fps=1)
+    assert [f.captured_at for f in dec] == [100.0]
+    with pytest.raises(ValueError):
+        buf.snapshot_last_seconds(15, now=100.0, at_fps=0)
+
+
 def test_data_is_stored_as_is_not_referenced() -> None:
     """The buffer holds the exact bytes the caller passed in.
     Important because the SDK's frame.data memoryview is invalidated

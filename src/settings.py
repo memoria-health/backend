@@ -156,6 +156,18 @@ class Settings(BaseSettings):
     # motion heartbeats every ~5s; missing/stale → motion_in_clip=false.
     livekit_motion_state_ttl_seconds: int = Field(ge=5, le=60, default=15)
 
+    # ── RAPID seizure path (detection v2, P0) ────────────────────
+    # When ON, the seizure detector leaves the main (lite) call and runs as
+    # a dedicated person-cropped, motion-overlay-only, `rapid_fps` call on
+    # `rapid_model`, behind a cheap rapid-energy pre-gate. The frame buffer
+    # then retains `rapid_fps` natively; every other consumer decimates back
+    # to `livekit_worker_target_fps` via snapshot at_fps, so main-call cost
+    # and clip cadence are unchanged. Validated recipe (conv 8/10 R, 1/30 FP):
+    # docs/architecture/detection-architecture-v2.md §1.4.
+    rapid_seizure_enabled: bool = Field(default=False)
+    rapid_fps: int = Field(ge=2, le=15, default=8)
+    rapid_model: str = Field(default="gemini-3-flash-preview")
+
     # ── Memoria Sensor app-present heartbeat (iPhone sensors) ────
     # A live iPhone sensor polls /v1/cameras/me/desired-state every 1s
     # while its app is open. PresenceSweeper records that heartbeat
