@@ -20,14 +20,14 @@ Today a "detector" is a prompt fragment plus a threshold, and every enabled dete
 
 1. **What is it looking for?** — name, description, the prompt that steers precision vs recall. (Unchanged from today.)
 2. **Who is it about?** — `patient`, `anyone`, or `environment`. A fall matters no matter who falls. Medication tracking is about the patient only. A stove doesn't need a person at all.
-3. **When does it look?** — which cheap signals must be true before we spend a model call: someone present, that person actually moving, rapid-motion energy, a big-enough face, a scene change, a schedule window. None of these are new computations — each is arithmetic on data the tick already has (tracker boxes, the InsightFace face box, frame diffs, the existing when_scope) — the new part is only that detectors consult them before spending a call. Plus how often (every eligible tick, or sampled).
-4. **How does it look?** — one of seven fixed "perception buckets" (wide scene, person crop, micro crop, rapid-motion overlay, face crop, single-frame zone still, audio rider). Each bucket's frame rate / cropping / model tier was locked by measurement. Nobody — not caregivers, not the compiler — tunes these knobs per detector.
-5. **When does it speak?** — instantly (`point`, optionally double-checked before alerting), or after evidence accumulates in a time window (`state`: "M positive observations within T minutes", which also covers absence — "no meal by 2 PM" is just a count of zero at a deadline).
+3. **When does it look?** — which cheap signals must be true before we spend a model call: someone present (and who), ONE motion signal with two readouts (amount — gates action buckets; churn concentration — additionally gates RAPID), a big-enough face, a schedule window. All arithmetic on data the tick already has (tracker boxes, the InsightFace face box, one frame-diff pass) — the new part is only that detectors consult them before spending a call. Plus how often (every eligible tick, or sampled; snapshots simply ride motion ticks — they're too cheap to gate further).
+4. **How does it look?** — one of seven fixed "perception buckets": **SCENE** (whole room), **PERSON** (body-scale actions), **FINE-MOTION** (small repetitive movement), **RAPID** (convulsive shaking), **FACE** (facial actions), **SNAPSHOT** (one-frame object checks), **AUDIO** (rider). Each bucket's frame rate / cropping / model tier was locked by measurement. Nobody — not caregivers, not the compiler — tunes these knobs per detector.
+5. **When does it speak?** — instantly (`point`, optionally double-checked before alerting), or as a `state` with two independent dials: **entry** (on-sight for states true in one look — smoking, visitor present; a window of "M positive observations within T minutes" only when persistence is part of the claim's definition — watching TV, agitation) and **re-alert gap** (the existing episode hysteresis — one event per episode, never spam, regardless of entry speed). Absence is the same primitive — "no meal by 2 PM" is a count of zero at a deadline.
 6. **How does it reach you?** — the delivery machinery that already exists today (push, per-patient email gating, clip archival, privacy suppression), unchanged; plus exactly one new marker: the permanent distance-degradation notice for the fine-motion/small-object detector class.
 
 ## A day in the life
 
-- **Patient asleep, 2 AM.** Nobody is moving, so no video calls happen at all — the "motionless/in bed" state accrues for free from the absence of motion. The moment there IS motion (a fall out of bed, a convulsion, wandering), the gates open instantly and the right buckets run. Today, by contrast, the bedroom camera bills a full model call every 10 seconds all night.
+- **Patient asleep, 2 AM.** Nobody is moving, so no video calls happen at all — any state detector that counts no-motion evidence (if the caregiver has one enabled; none ships by default) accrues for free from the absence of motion. The moment there IS motion (a fall out of bed, a convulsion, wandering), the gates open instantly and the right buckets run. Today, by contrast, the bedroom camera bills a full model call every 10 seconds all night.
 - **A visitor is in the room, patient napping elsewhere.** Identity says "verified other person." Only detectors explicitly about others or the environment (intruder, fire/smoke, hazards) stay armed; everything else — including fall and choking — is about the patient and closes, exactly like today's whole-call skip but scoped per detector. When identity is merely *unsure* (face hidden, no enrollment), patient detectors keep running — suppression requires verified evidence, never uncertainty.
 - **Possible seizure.** Rapid-motion energy on the person's body trips a pre-gate; a dedicated 8 fps motion-overlay crop goes to the stronger model with an amplitude-forced prompt. Measured: 8/10 recall, 1/30 false positives — versus today's prompt that literally tells a motion-blind model to lean TRUE on any red patch.
 - **A caregiver writes a custom detector.** The compiler classifies it into the six dimensions, hard-rejects the physically impossible (eye flutter, fine tremor, ring-sized objects — measured zeros), and attaches a distance warning if it's in the degradation class.
@@ -50,7 +50,7 @@ The single worst live accuracy problem, fixed with the validated recipe, minimal
 
 **Design:** when the seizure detector is assigned and a crude rapid-energy pre-gate trips, run a **second, dedicated VLM call**: person-cropped, motion-overlay-only, 8 fps, `gemini-3-flash-preview`, with the neutral amplitude-forced prompt (ported from the validated experiment spec: any body position, "red tint alone is NEVER sufficient", stillness + fine trembling = shivering, not seizure). Seizure is removed from the main lite call while the flag is on. Everything downstream (promotion at 0.65, severity, push, clips) is unchanged.
 
-**Key mechanical prerequisite:** `FrameBuffer` currently downsamples to 4 fps at push (`frame_buffer.py:77-101`). Change: buffer retains 8 fps; the main-call encode path decimates to 4 fps by dropping alternate frames (overlay for RAPID is computed on native 8 fps frames BEFORE cropping — tint→crop order is load-bearing). WIDE token cost stays identical.
+**Key mechanical prerequisite:** `FrameBuffer` currently downsamples to 4 fps at push (`frame_buffer.py:77-101`). Change: buffer retains 8 fps; the main-call encode path decimates to 4 fps by dropping alternate frames (overlay for RAPID is computed on native 8 fps frames BEFORE cropping — tint→crop order is load-bearing). SCENE token cost stays identical.
 
 **Tasks (TDD, red→green→commit each):**
 
@@ -77,7 +77,7 @@ The single worst live accuracy problem, fixed with the validated recipe, minimal
 
 Branch: `feat/detection-v2-p1-schema`. Adds the six-dimension columns; nothing reads them yet except severity (pure-parity change), so risk is near-zero.
 
-1. Delta SQL `scripts/apply_detector_v2_delta.sql` (idempotent, per convention): `subject_scope`, `unknown_policy`, `bucket`, `evidence_unit`, `eventing` JSONB, `duty_cycle`, `severity`, `cooldown_seconds`, `degradation_warning`, `certification`; `shape` gains `point` value (backfill `point_in_time`→`point` deferred to P4 when `scheduled` dissolves).
+1. Delta SQL `scripts/apply_detector_v2_delta.sql` (idempotent, per convention): `subject_scope`, `unknown_policy`, `bucket`, `evidence_unit`, `eventing` JSONB, `duty_cycle`, `severity`, `cooldown_seconds`, `degradation_warning`; `shape` gains `point` value (backfill `point_in_time`→`point` deferred to P4 when `scheduled` dissolves).
 2. ORM + Pydantic mirrors; `CatalogEntry` gains the same fields; backfill all 24 built-ins per the §3 mapping table in the v2 doc; catalog validation extended (every entry must declare bucket/subject/eventing).
 3. Severity moves from `catalog._SEVERITY` onto rows; `event_promotion._select_primary` reads the row. Test: promotion parity fixture — identical inputs produce identical primary selection before/after.
 4. Onboarding seeding writes the new fields; `from-library` path too.
@@ -88,12 +88,12 @@ Branch: `feat/detection-v2-p2-signals`. Depends on the decided re-ID direction (
 
 1. Decouple body tracking from `reid_enabled`: the early-out at `inference.py:232-243` becomes attribution-only; YOLO+BoT-SORT runs every presence tick.
 2. `IdentityResult` gains the per-track list `[{track_id, label, bbox_series, confidence}]`; aggregate fields kept for compatibility.
-3. Backend signals module: `person_present`, `patient_present`, per-track `sustained_motion`, `rapid_energy` (graduates from P0), `face_valid(min_px)`, `motion_edge` — all computed from tracker output + frame diffs, unit-tested on recorded fixture windows. Phone SAD demoted to a hint; **gateway cameras get motion parity from this** (they currently depend on a client packet that gateways may not send).
+3. Backend signals module: `person_present`, `patient_present`, the unified `motion` signal per-track (amount + churn concentration; the P0 rapid_energy module graduates to per-track scoping), `face_valid(min_px)` — all from tracker output + one frame-diff pass, unit-tested on recorded fixture windows. Phone/gateway SAD packets demoted to a hint (both camera types publish them today).
 4. Signals logged per tick into analyses for observability; no behavior change yet (scheduler still P3). Camera open/close state machine now fed by backend presence.
 
 ## Phase 3 — Scheduler + packer  *(milestone; detailed plan at start)*
 
-Activation resolution as a pure function (the §1.2 subject truth table + gates + schedule + duty cycle — exhaustively table-tested), ≤3-detectors-per-call packing with the shared context slot, per-bucket artifact builders (WIDE/SLOW-CROP/MICRO/FACE/STILL zones), per-bucket tier routing, provider-capability constraints (audio and 8 fps require native-video providers). The old single-call assembly and the binary identity gate are deleted here. This is the largest phase and the point where the §1.2 visitor behavior goes live.
+Activation resolution as a pure function (the §1.2 subject truth table + gates + schedule + duty cycle — exhaustively table-tested), ≤3-detectors-per-call packing with the shared context slot, per-bucket artifact builders (SCENE/PERSON/FINE-MOTION/FACE/SNAPSHOT zones), per-bucket tier routing, provider-capability constraints (audio and 8 fps require native-video providers). The old single-call assembly and the binary identity gate are deleted here. This is the largest phase and the point where the §1.2 visitor behavior goes live.
 
 ## Phase 4 — Decision layer  *(milestone; detailed plan at start)*
 
@@ -101,9 +101,9 @@ The windowed-count state primitive (≥M evidence ticks in window T over `analys
 
 ## Phase 5 — Compiler v2  *(milestone; detailed plan at start)*
 
-Dimension classification, the feasibility hard-reject list with plain-language reasons, STILL admission criteria + plate-size prior, interaction reroute (arm-scale amplitude rule), degradation warnings at creation. The compiler currently has zero tests — this phase builds its golden-suite from scratch (reject-list table tests + classification goldens).
+Dimension classification, the feasibility hard-reject list with plain-language reasons, SNAPSHOT admission criteria + plate-size prior, interaction reroute (arm-scale amplitude rule), degradation warnings at creation. The compiler currently has zero tests — this phase builds its golden-suite from scratch (reject-list table tests + classification goldens).
 
-## Phase 6 — Reference detectors, certification, soak  *(milestone)*
+## Phase 6 — Reference detectors + soak  *(milestone)*
 
 One reference detector per bucket certified via the harness pattern (acted TP takes + nearest confounders, N=5, discrimination score), the cost ledger + budget governor live, then the **24-hour in-home soak** measuring real TP/FP per detector and $/day against the §6 model. Exit = go/no-go per detector + the degradation-warning copy for the apps.
 

@@ -30,7 +30,7 @@ Detector =
   3. ACTIVATION   when it runs         (gate expr × schedule × placement × duty_cycle)
   4. PERCEPTION   how it looks         (bucket → locked recipe: fps, channel, crop, tier)
   5. DECISION     how evidence→event   (evidence unit × eventing shape × threshold/severity)
-  6. DELIVERY     what the user gets   (notify, clip, privacy, warnings, certification)
+  6. DELIVERY     what the user gets   (notify, clip, privacy, warnings)
 ```
 
 The hierarchy matters: **subject and activation decide whether we look at all; perception decides how we look; decision decides when we speak; delivery decides how we say it.** Cost falls out of activation × perception. Accuracy falls out of perception × decision. Nothing else in the system gets to influence those outcomes.
@@ -68,15 +68,13 @@ Scope assignment is deliberately simple (Aryaman, 2026-07-13): **almost everythi
 |---|---|---|---|
 | `person_present` | tracker (+LLM people_present as confirmation) | camera state open/closed (state_machine.py) | per-track, backend-owned |
 | `patient_present` | attribution machine | aggregate patient_in_clip | per-track label |
-| `sustained_motion` | per-track box motion energy | **whole-frame phone SAD via data packet** (motion_cache.py:63-82, 15 s TTL) — gates only the `closed` state (camera_ingest.py:449) | person-scoped, from tracker deltas; gates action buckets every tick |
-| `rapid_energy` | high-frequency in-box change score | — | pre-gate for RAPID (the single biggest cost lever, §7) |
+| `motion` — ONE signal, TWO readouts (amount + churn concentration) | one frame-diff pass over track boxes (the rapid_energy module already computes both) | **whole-frame phone SAD via data packet** (motion_cache.py:63-82, 15 s TTL) — gates only the `closed` state (camera_ingest.py:449) | amount gates action buckets; churn concentration additionally pre-gates RAPID (the biggest cost lever, §7). SNAPSHOT checks simply ride motion ticks — too cheap (~$0.0001) to warrant their own gate (motion_edge concept cut, Aryaman 2026-07-13) |
 | `face_valid(min_px)` | InsightFace box size | — | gates FACE bucket; also drives the distance warning |
-| `motion_edge` | scene-change after activity | — | triggers STILL zone checks |
 | `no_person` | tracker | close_threshold streak | absence states count on it |
 
 The whole-frame phone SAD stays as a hint/fallback, but motion becomes **backend-owned and person-scoped** — this also fixes the current fragility that gateway (Tapo) cameras depend on a client-published motion packet, and that a TV or curtain holds the frame "in motion."
 
-**Critical inversion vs today:** today the `open` state runs the full call **every tick regardless of motion** (camera_ingest.py — motion only matters in `closed`). v2 runs action buckets only under `sustained_motion`. A sleeping patient generates near-zero VLM traffic while `motionless`/`in-bed` states accrue for free — and any nocturnal motion (seizure, wandering, fall) opens the gates instantly. Presence-without-motion runs only sampled states and FACE (a still person can lip-smack).
+**Critical inversion vs today:** today the `open` state runs the full call **every tick regardless of motion** (camera_ingest.py — motion only matters in `closed`). v2 runs action buckets only under `sustained_motion`. A sleeping patient generates near-zero VLM traffic while no-motion evidence accrues free for any state detector counting it (none ships by default — catalog stays at 24) — and any nocturnal motion (seizure, wandering, fall) opens the gates instantly. Presence-without-motion runs only sampled states and FACE (a still person can lip-smack).
 
 **Schedule:** structured windows replace the free-text `when_scope` string ("8 AM, 8 PM ±1H" → `{windows: [...], tz: caregiver.timezone}`; schedule_config JSONB already exists, detector.py:71). Absence deadlines ("no meal by 2 PM") are the same state primitive (§1.5), not a special shape.
 
@@ -90,17 +88,17 @@ A detector picks a **bucket**; every knob inside the bucket (fps, channel, crop,
 
 | Bucket | Frames | Channel | Crop | Tier | Gate default | Validated by |
 |---|---|---|---|---|---|---|
-| **WIDE** | 4 fps video | clean | full frame | lite | sustained_motion | prod + collar/medication program |
-| **SLOW-CROP** | 4 fps video | clean | person crop | lite | sustained_motion (patient track) | medication 100%R/0FP, collar 98% |
-| **MICRO** | 8 fps video | clean | person crop | flash | sustained_motion | fidgeting +30% (clean P8 beat overlay) |
+| **SCENE** | 4 fps video | clean | full frame | lite | sustained_motion | prod + collar/medication program |
+| **PERSON** | 4 fps video | clean | person crop | lite | sustained_motion (patient track) | medication 100%R/0FP, collar 98% |
+| **FINE-MOTION** | 8 fps video | clean | person crop | flash | sustained_motion | fidgeting +30% (clean P8 beat overlay) |
 | **RAPID** | 8 fps video | **overlay-only** | person crop (tint→crop order) | flash | rapid_energy pre-gate | convulsion 8/10R 1/30FP (+78%) |
 | **FACE** | 8 fps video | clean (overlay destroys it) | face crop, pad 2.0 | flash | presence + face_valid(≥300 px) | grimacing +51%; lip smacking distance-gated |
-| **STILL** | 1 frame | clean | **zone crops** | lite | motion_edge / scheduled | phone 10/10, remote FP 10→0, plate 9/10 |
+| **SNAPSHOT** | 1 frame | clean | **zone crops** | lite | rides motion ticks / scheduled | phone 10/10, remote FP 10→0, plate 9/10 |
 | **AUDIO** | rider | — | — | rides host call | host bucket's gate | VLM-native speech (no separate test needed) |
 
 Packaging laws baked into the artifact builders: one video per request (two parts silently collapse), never side-by-side (halves per-channel resolution), never temporal concat (re-injects resting prior; T8 7/10 < O8 10/10), tint on native pixels **before** cropping. AUDIO needs a native-video provider to carry signal — fallback to a frame-sampling provider is allowed (today's chain semantics keep), but the tick gets marked degraded in its analyses row so a silent audio detector isn't mistaken for a healthy one (frame-sampling providers receive no audio today, gemini.py:6-8).
 
-STILL admission criteria (strict): one frame *settles* it (not merely suggests), the state isn't instantaneous, subject above the plate-size floor at expected distance, and it survives ambiguity confounders. "Watching TV" fails (it's an inference from gaze+audio+duration → MICRO/WIDE + AUDIO). Stills are **point-in-time object detection** — nothing more.
+SNAPSHOT admission criteria (strict): one frame *settles* it (not merely suggests), the state isn't instantaneous, subject above the plate-size floor at expected distance, and it survives ambiguity confounders. "Watching TV" fails (it's an inference from gaze+audio+duration → FINE-MOTION/SCENE + AUDIO). Stills are **point-in-time object detection** — nothing more.
 
 ### 1.5 Decision — evidence units × two eventing primitives
 
@@ -109,7 +107,7 @@ STILL admission criteria (strict): one frame *settles* it (not merely suggests),
 **Eventing shapes — exactly two:**
 
 - **`point`** — fires on a qualifying verdict. Optional `confirm_k_of_n` re-check for high-severity/low-prior detectors (spend tokens on fires, which are rare — nearly free FP suppression). Today there is **no** confirmation anywhere; re-fire suppression is three-tier by shape: point = 30 s dedup only (event_promotion.py:128 — a persistent condition the model keeps reporting can re-fire ~every 30 s), state = per-detector rising-edge hysteresis (`episode_gap_seconds`, else 60 s safety / 300 s routine — :193-244, one event per episode), scheduled = fires only at its deadline via the scheduler, never reactively (:303-304).
-- **`state`** — one windowed-count primitive replacing today's threshold+rising-edge state logic: **enter when ≥ M evidence ticks within window T** (edge-triggered), exit via hysteresis gap (today's `episode_gap_seconds` ports directly). Dense M ≈ duration semantics with free dissent tolerance ("motionless > 5 min"); sparse M ≈ accumulation ("≥ 4 confusion instances this afternoon"); **absence = count == 0 at deadline** ("no meal by 2 PM"). Today's third shape `scheduled` disappears — it was always a schedule window (activation) plus absence semantics (decision).
+- **`state`** — one windowed-count primitive replacing today's threshold+rising-edge state logic: **enter when ≥ M evidence ticks within window T** (edge-triggered), exit via hysteresis gap (today's `episode_gap_seconds` ports directly). Dense M ≈ duration semantics with free dissent tolerance ("motionless > 5 min"); sparse M ≈ accumulation ("≥ 4 confusion instances this afternoon"); **absence = count == 0 at deadline** ("no meal by 2 PM"). Today's third shape `scheduled` disappears — it was always a schedule window (activation) plus absence semantics (decision). **Entry is a per-detector dial, independent of anti-spam:** states that are TRUE ON SIGHT (smoking, visitor present, collar off) get M=1–2 — they fire within a tick or two; a real window applies only when persistence is part of the claim's own definition (watching TV, agitation, motionless-too-long). Spam prevention never depends on entry speed — the episode gap alone guarantees one event per episode (prod agitation already behaves exactly this way: instant entry + rising-edge suppression). Both dials come from a small preset menu inferred from the description and shown in plain words on the review screen.
 
 Naming note: the duration shape keeps its existing name **state** (today's DB enum value ports as-is). Stills are point-in-time object detection — a perception-axis concept, unrelated to the state shape.
 
@@ -119,7 +117,7 @@ Kept from today's promotion machinery: sensitivity → threshold offsets (event_
 
 Ported: push/email fan-out, clip archival with privacy re-check, `clip_suppressed`, Realtime updates (camera_ingest.py:867-921, clip_archival.py). New per-detector fields:
 
-- `degradation_warning: none | distance_class` — perpetual in-app notice for FACE, MICRO-with-object, and small-object STILL detectors (Law 7). Set by compiler or catalog, surfaced by apps. (The only delivery addition; a shadow/certification tier was considered and cut as overkill — validation happens via the soak process, not a schema column.)
+- `degradation_warning: none | distance_class` — perpetual in-app notice for FACE, FINE-MOTION-with-object, and small-object SNAPSHOT detectors (Law 7). Set by compiler or catalog, surfaced by apps. (The only delivery addition; a shadow/certification tier was considered and cut as overkill — validation happens via the soak process, not a schema column.)
 - `cost_class` (derived) — surfaced to the household budget governor (§7).
 
 ---
@@ -147,27 +145,27 @@ Topology unchanged: one worker per patient room, N `CameraIngest` per worker (ro
 
 | Detector | Subject | Bucket | Eventing | Notes |
 |---|---|---|---|---|
-| fall | patient (lenient) | WIDE | point | k=1 — recall-critical |
+| fall | patient (lenient) | SCENE | point | k=1 — recall-critical |
 | **seizure** | patient (lenient) | **RAPID** | point | **P0 hotfix**: today lite+global-overlay+biased prompt (catalog.py:269-316) — the measured worst case |
-| emergency | patient (lenient) | WIDE | point | |
-| choking | patient (lenient) | SLOW-CROP | point | hands-to-throat is body-scale |
-| calling_for_help | patient (lenient) | AUDIO on WIDE | point | |
-| fire_smoke | environment | WIDE | point | smoke is large-scale + dynamic |
-| possible_intruder | anyone | WIDE | point | benefits from attribution context ("verified-other at 3 AM") |
-| wandering / child_wandering | patient | WIDE (door zones) | point | door_config ports as-is |
-| stove_left_on | environment | STILL (zone) | state absence-style | small-flame degradation warning |
-| env_hazard_glass / _water | environment | STILL (zone) | point | motion_edge triggered; size-floor warnings |
-| medication | patient | SLOW-CROP | point (absence state later) | schedule window; validated 100%R/0FP |
-| meal_eaten | patient | SLOW-CROP | point | |
-| agitation | patient | WIDE + AUDIO | state (sparse M-of-T) | replaces rising-edge episode logic |
-| climbing / distress (child) | patient (lenient) | WIDE (+AUDIO) | state (dense) | the child IS the patient |
-| child_crib_exit / _stairs / _hazard_reach / _head_impact / _cord_entanglement | patient (lenient) | WIDE (cord: SLOW-CROP) | point | cord = thin-object warning |
-| child_device_usage | patient (lenient) | SLOW-CROP | state (sparse) | routine |
-| setup_test | anyone | WIDE | point, fire_once | unchanged |
-| **general_fidgeting** (new) | patient | MICRO | state (sparse) | +30% validated; object-visibility warning |
+| emergency | patient (lenient) | SCENE | point | |
+| choking | patient (lenient) | PERSON | point | hands-to-throat is body-scale |
+| calling_for_help | patient (lenient) | AUDIO on SCENE | point | |
+| fire_smoke | environment | SCENE | point | smoke is large-scale + dynamic |
+| possible_intruder | anyone | SCENE | point | benefits from attribution context ("verified-other at 3 AM") |
+| wandering / child_wandering | patient | SCENE (door zones) | point | door_config ports as-is |
+| stove_left_on | environment | SNAPSHOT (zone) | state absence-style | small-flame degradation warning |
+| env_hazard_glass / _water | environment | SNAPSHOT (zone) | point | rides motion ticks; size-floor warnings |
+| medication | patient | PERSON | point (absence state later) | schedule window; validated 100%R/0FP |
+| meal_eaten | patient | PERSON | point | |
+| agitation | patient | SCENE + AUDIO | state (sparse M-of-T) | replaces rising-edge episode logic |
+| climbing / distress (child) | patient (lenient) | SCENE (+AUDIO) | state (dense) | the child IS the patient |
+| child_crib_exit / _stairs / _hazard_reach / _head_impact / _cord_entanglement | patient (lenient) | SCENE (cord: PERSON) | point | cord = thin-object warning |
+| child_device_usage | patient (lenient) | PERSON | state (sparse) | routine |
+| setup_test | anyone | SCENE | point, fire_once | unchanged |
+| **general_fidgeting** (new) | patient | FINE-MOTION | state (sparse) | +30% validated; object-visibility warning |
 | **facial_grimacing** (new) | patient | FACE | state (sparse) | +51% validated |
 | **lip_smacking** (new) | patient | FACE | state (sparse) | distance-gated ≥300 px face; warning |
-| **confusion / word-finding** (new) | patient | AUDIO+WIDE instances | state (sparse over instances) | never per-tick alerts |
+| **confusion / word-finding** (new) | patient | AUDIO+SCENE instances | state (sparse over instances) | never per-tick alerts |
 | **myoclonic jerks** (new) | patient | RAPID instances | state (sparse) | |
 | *refused forever* | — | — | — | eye flutter, fine tremor/shivering, ring-scale objects, fingertip manipulation, seated heel-taps (Law 6) |
 
@@ -195,7 +193,7 @@ Pipeline: classify → **feasibility gate** → prompt gen → certify.
 1. **Classify** (extends `infer_detector_config`): assign subject, bucket, evidence unit, eventing shape + params, gates/schedule — from the caregiver's plain English.
 2. **Feasibility gate (new, hard):**
    - HARD REJECT (Law 6 list) with a plain-language reason — no probing, no maybes.
-   - STILL admission criteria; below plate-size default rule ("objects smaller than a plate can be hard to detect from some distance away" is baked into the classifier prior).
+   - SNAPSHOT admission criteria; below plate-size default rule ("objects smaller than a plate can be hard to detect from some distance away" is baked into the classifier prior).
    - Interaction reroute: object too small for a still frame but donning/usage is arm-scale → recompile as motion detector (wristwear 30/30 vs ring-donning 7% — amplitude decides, and sub-arm-scale interaction is rejected too).
    - Distance class ⇒ attach `degradation_warning` + compiler notice at creation time.
 3. **Prompt gen** under the bucket's recipe constraints, stakes-biased as today, OpenAI-first/Gemini-fallback unchanged.
@@ -204,15 +202,15 @@ Pipeline: classify → **feasibility gate** → prompt gen → certify.
 
 ## 6. Cost model (corrected 2026-07-13)
 
-Per-call: WIDE/SLOW-CROP ≈ 13.2k tok lite ≈ $0.0014 · MICRO/RAPID/FACE ≈ 20.9k tok flash ≈ $0.0070 · STILL ≈ 1.1k/zone lite ≈ $0.0001. Profile: single occupant in their 70s, 2 cameras, ~1,300 person-scoped motion ticks/day, ~4,000 presence ticks/day.
+Per-call: SCENE/PERSON ≈ 13.2k tok lite ≈ $0.0014 · FINE-MOTION/RAPID/FACE ≈ 20.9k tok flash ≈ $0.0070 · SNAPSHOT ≈ 1.1k/zone lite ≈ $0.0001. Profile: single occupant in their 70s, 2 cameras, ~1,300 person-scoped motion ticks/day, ~4,000 presence ticks/day.
 
 | Scenario | $/day | $/month |
 |---|---|---|
 | Today's system (presence-driven: open state bills every tick incl. sleep; one lite call, all detectors) | ~$9 | **~$275** — and it's the broken one |
-| v2 naive (buckets ungated: RAPID+MICRO+FACE on every eligible tick, no sampling) | ~$33 | **~$1,000** — not shippable |
-| **v2 with the controls designed in** (motion-gated WIDE ×2-3 packed calls, rapid_energy pre-gate ~15%, states sampled 1/3–1/6, k-of-N only on fires) | ~$8–10 | **~$250–310** |
+| v2 naive (buckets ungated: RAPID+FINE-MOTION+FACE on every eligible tick, no sampling) | ~$33 | **~$1,000** — not shippable |
+| **v2 with the controls designed in** (motion-gated SCENE ×2-3 packed calls, rapid_energy pre-gate ~15%, states sampled 1/3–1/6, k-of-N only on fires) | ~$8–10 | **~$250–310** |
 
-The headline: **v2 costs the same as today while actually working** — the gates pay for the tier upgrades. The three load-bearing controls (rapid pre-gate, state sampling, motion-gated WIDE incl. night) are worth ~$700/mo/household; they are architecture, not tuning. Budget governor: per-household daily token ledger; degrade order = increase sampling interval on routine states → FACE → MICRO; **never** degrade safety points.
+The headline: **v2 costs the same as today while actually working** — the gates pay for the tier upgrades. The three load-bearing controls (rapid pre-gate, state sampling, motion-gated SCENE incl. night) are worth ~$700/mo/household; they are architecture, not tuning. Budget governor: per-household daily token ledger; degrade order = increase sampling interval on routine states → FACE → FINE-MOTION; **never** degrade safety points.
 
 ---
 
@@ -222,10 +220,10 @@ Test infrastructure first (identified gaps): a **central fake VLM provider** (sc
 
 - **P0 — Seizure hotfix** (immediate, small blast radius): seizure → RAPID recipe as a dedicated solo call behind a crude motion pre-check; neutral amplitude-forced prompt. Fixes the worst live FP/FN today. Tests: prompt snapshot, promotion path, FP regression fixtures from the eval set.
 - **P1 — Schema v2 + registry**: new columns + delta SQL; backfill all 24 built-ins per §3 table; severity onto rows; promotion reads row severity. Tests: migration idempotency, catalog validation, promotion parity.
-- **P2 — L0 signals**: always-on tracking decoupled from `reid_enabled` (existing decided branch direction); per-track surface into ingest; person-scoped motion + rapid_energy + face_valid + motion_edge; phone SAD demoted. Tests: signal unit tests on recorded fixtures; gateway-camera parity.
+- **P2 — L0 signals**: always-on tracking decoupled from `reid_enabled` (existing decided branch direction); per-track surface into ingest; the unified motion signal per-track (amount + churn concentration) + face_valid; phone SAD demoted. Tests: signal unit tests on recorded fixtures.
 - **P3 — Scheduler + packer**: activation resolution (subject table §1.2 as a pure function — heavily unit-tested truth table); ≤3 packing; per-bucket artifact builders (tint→crop order asserted); tier/provider routing with audio/8fps constraints. Tests: packer property tests, golden artifacts.
 - **P4 — Decision layer**: state windowed-count primitive over `analyses` (replaces rising-edge for states; `episode_gap_seconds` ports as exit hysteresis); absence deadlines; k-of-N confirm; per-detector cooldown; cross-call primary selection. Remove/replace: `test_state_episode_dedup`, `test_detector_inference_gap` (become state-primitive tests).
-- **P5 — Compiler v2**: feasibility gate + hard-reject list + warnings + shadow mode. Tests: reject-list table tests, classification goldens (compiler currently has zero tests).
-- **P6 — Reference detectors + certification + 24 h in-home soak** with the cost ledger running; soak measures TP/FP per bucket and $/day against §6.
+- **P5 — Compiler v2**: feasibility gate + hard-reject list + warnings. Tests: reject-list table tests, classification goldens (compiler currently has zero tests).
+- **P6 — Reference detectors + 24 h in-home soak** with the cost ledger running; soak measures TP/FP per bucket and $/day against §6.
 
 Stale-test watchlist (will intentionally flip): `test_camera_schema_source_type` XOR guards, `test_parse_validate` people_present-not-authoritative guards, any test assuming one-call-per-tick.
