@@ -45,17 +45,29 @@ from src.services.detection.motion_cache import MotionCache
 from src.services.detection.motion_overlay import overlay_motion
 from src.services.detection.mp4_remux import Mp4RemuxError, frames_to_mp4
 from src.services.detection.providers.gemini import gemini_provider
+from src.services.detection.providers.types import ProviderResult
 from src.services.detection.rapid_call import (
     run_rapid_seizure,
     scale_bbox_to_frame,
     split_rapid,
 )
+# v2 scheduler (P3) — the new architecture lives in scheduling/ (D1);
+# these imports + the flag branch in the tick body are the only
+# sanctioned coupling between the two.
+from src.services.detection.scheduling import (
+    ScheduledDetector,
+    pack_calls,
+    resolve_dims,
+    resolve_due,
+)
+from src.services.detection.scheduling.executor import run_scheduled_calls
 from src.services.detection.signals.tick_signals import compute_tick_signals
 from src.services.detection.speech_filter import sanitize_speech_fields
 from src.services.detection.vlm_routing import resolve_vlm_provider, run_vlm
 from src.services.detection.registry import (
     CameraVanishedError,
     get_enabled_detectors_for_camera,
+    get_enabled_loadout_for_camera,
 )
 from src.services.detection.state_machine import apply_tick_update
 from src.repos.face_embedding_repo import has_ready_enrollment
@@ -161,6 +173,9 @@ class CameraIngest:
         )
         self._lock = asyncio.Lock()
         self._tick_task: asyncio.Task[None] | None = None
+        # Monotonic per-camera tick counter — drives the scheduler's
+        # sampled duty cycle (v2 P3). Single-writer within the loop.
+        self._tick_counter = 0
         # Monotonic timestamp of the most recent frame pushed into
         # `frame_buffer` (set by RoomWorker._consume_video →
         # record_frame_arrival). Read by `LiveKitRoomReconciler` to
@@ -337,6 +352,7 @@ class CameraIngest:
 
     async def _run_tick_inner(self, decision: "_RecorderDecision") -> None:
         """One tick — mirrors `src/api/clips.py:ingest_clip` body."""
+        self._tick_counter += 1
         # Phone/gateway SAD packet, demoted to a HINT (v2 P2): backend-
         # owned motion (tick_signals over the buffered window) is now
         # the authoritative reading and `motion_in_clip` is the union
@@ -357,11 +373,27 @@ class CameraIngest:
         tick_mono = time.monotonic()
 
         async with self._sessionmaker() as session:
-            detectors = await get_enabled_detectors_for_camera(session, self.camera_id)
+            # v2 scheduler path (P3, flag-gated) needs each spec's row for
+            # the dimension columns; the legacy path needs only specs.
+            loadout: list = []
+            if self._settings.detection_v2_scheduler_enabled:
+                loadout = await get_enabled_loadout_for_camera(
+                    session, self.camera_id,
+                )
+                detectors = [spec for spec, _row in loadout]
+            else:
+                detectors = await get_enabled_detectors_for_camera(
+                    session, self.camera_id,
+                )
             # RAPID seizure path (v2 P0, flag-gated): seizure leaves the main
             # lite call and runs as its own flash-tier overlay-crop call
             # further down; `detectors` from here on is the main call's list.
             detectors, rapid_seizure_active = split_rapid(detectors, self._settings)
+            if loadout:
+                kept = {s.identifier for s in detectors}
+                loadout = [
+                    (s, row) for s, row in loadout if s.identifier in kept
+                ]
 
             # Closed-state short-circuit. Fetch the camera's CURRENT
             # state to decide whether to short-circuit the LLM. Also
@@ -791,21 +823,81 @@ class CameraIngest:
                     )
                     vlm_mp4 = mp4_bytes
 
-            try:
-                used_provider, result = await run_vlm(
-                    choice=vlm_choice,
-                    mp4=vlm_mp4,
-                    detectors=detectors,
+            if self._settings.detection_v2_scheduler_enabled:
+                # ── v2 path (P3): L1 due-set → L2 call plans → executor.
+                # The ONLY sanctioned coupling point with the new
+                # architecture (D1); everything downstream (speech
+                # sanitizer, RAPID lane, presence gate, analyses,
+                # promotion) consumes the merged result unchanged.
+                entries = [
+                    ScheduledDetector(spec=s, dims=resolve_dims(row))
+                    for s, row in loadout
+                ]
+                due_set = resolve_due(
+                    entries,
+                    signals=signals,
                     identity=identity,
-                    log_tag=self._log_tag,
                     settings=self._settings,
+                    tick_index=self._tick_counter,
                 )
-            except Exception:  # noqa: BLE001
-                log.error(
-                    "%s all VLM providers failed (choice=%s)",
-                    self._log_tag, vlm_choice,
+                plans = pack_calls(due_set, settings=self._settings)
+                log.info(
+                    "%s sched due=%d skipped=%d calls=%d crowd=%s",
+                    self._log_tag, len(due_set.due), len(due_set.skipped),
+                    len(plans), due_set.crowd_fallback,
                 )
-                return
+                try:
+                    sched = await run_scheduled_calls(
+                        plans,
+                        scene_mp4=vlm_mp4,
+                        window=window,
+                        pcm=pcm if pcm else None,
+                        pcm_sample_rate=self.audio_buffer.sample_rate,
+                        pcm_num_channels=self.audio_buffer.num_channels,
+                        identity=identity,
+                        settings=self._settings,
+                        vlm_choice=vlm_choice,
+                        run_main_vlm=run_vlm,
+                        flash_provider=gemini_provider,
+                        log_tag=self._log_tag,
+                    )
+                except Exception:  # noqa: BLE001
+                    log.error(
+                        "%s scheduler tick failed (choice=%s)",
+                        self._log_tag, vlm_choice,
+                    )
+                    return
+                used_provider = sched.provider
+                result = ProviderResult(
+                    description=sched.description,
+                    detector_fields=sched.detector_fields,
+                    people_present=sched.people_present,
+                    people_count=sched.people_count,
+                    usage=None,  # ledger keys come pre-summed in sched_fields
+                )
+                result.detector_fields.update(sched.sched_fields)
+                if due_set.skipped:
+                    result.detector_fields["sched_skipped"] = [
+                        f"{ident}:{reason}" for ident, reason in due_set.skipped
+                    ]
+                if due_set.crowd_fallback:
+                    result.detector_fields["sched_crowd_fallback"] = True
+            else:
+                try:
+                    used_provider, result = await run_vlm(
+                        choice=vlm_choice,
+                        mp4=vlm_mp4,
+                        detectors=detectors,
+                        identity=identity,
+                        log_tag=self._log_tag,
+                        settings=self._settings,
+                    )
+                except Exception:  # noqa: BLE001
+                    log.error(
+                        "%s all VLM providers failed (choice=%s)",
+                        self._log_tag, vlm_choice,
+                    )
+                    return
 
             # Deterministic guard on the model's speech fields: if the
             # actual PCM has no voiced speech (VAD), or the transcript is a
