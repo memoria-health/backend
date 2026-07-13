@@ -43,6 +43,8 @@ from src.services.detection.frame_buffer import FrameBuffer
 from src.services.detection.motion_cache import MotionCache
 from src.services.detection.motion_overlay import overlay_motion
 from src.services.detection.mp4_remux import Mp4RemuxError, frames_to_mp4
+from src.services.detection.providers.gemini import gemini_provider
+from src.services.detection.rapid_call import run_rapid_seizure, split_rapid
 from src.services.detection.speech_filter import sanitize_speech_fields
 from src.services.detection.vlm_routing import resolve_vlm_provider, run_vlm
 from src.services.detection.registry import (
@@ -334,6 +336,10 @@ class CameraIngest:
 
         async with self._sessionmaker() as session:
             detectors = await get_enabled_detectors_for_camera(session, self.camera_id)
+            # RAPID seizure path (v2 P0, flag-gated): seizure leaves the main
+            # lite call and runs as its own flash-tier overlay-crop call
+            # further down; `detectors` from here on is the main call's list.
+            detectors, rapid_seizure_active = split_rapid(detectors, self._settings)
 
             # Closed-state short-circuit. Fetch the camera's CURRENT
             # state to decide whether to short-circuit the LLM. Also
@@ -706,6 +712,42 @@ class CameraIngest:
             result.detector_fields["identity_patient_in_clip"] = identity.patient_in_clip
             result.detector_fields["identity_confidence"] = round(identity.confidence, 4)
             result.detector_fields["identity_face_count"] = identity.face_count
+
+            # RAPID seizure call (v2 P0, flag-gated): dedicated flash-tier
+            # overlay-crop call behind the churn pre-gate. Its `seizure_*`
+            # fields merge into this tick's detector_fields, so promotion,
+            # severity, dedup and clips downstream are untouched. Failures
+            # never break the tick.
+            if rapid_seizure_active:
+                try:
+                    native = self.frame_buffer.snapshot_last_seconds(
+                        self._settings.livekit_worker_window_seconds,
+                    )
+                    if native:
+                        fw = float(native[0].width)
+                        fh = float(native[0].height)
+                        boxes = (
+                            [[identity.patient_bbox]]
+                            if identity.patient_bbox is not None
+                            else [[(0.0, 0.0, fw, fh)]]
+                        )
+                        rapid_fields = await run_rapid_seizure(
+                            frames=native,
+                            per_person_boxes=boxes,
+                            settings=self._settings,
+                            provider=gemini_provider,
+                            log_tag=self._log_tag,
+                        )
+                        result.detector_fields["rapid_seizure_ran"] = (
+                            rapid_fields is not None
+                        )
+                        if rapid_fields:
+                            result.detector_fields.update(rapid_fields)
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "%s RAPID seizure call failed — tick continues",
+                        self._log_tag,
+                    )
 
             # Presence gate. The LLM is the GENERIC people detector — it's
             # looser / more sensitive than YOLO body tracking — and the re-ID
