@@ -264,12 +264,16 @@ async def test_post_zero_photos_returns_422(
 async def test_post_too_many_photos_rejected(
     client: AsyncClient, auth_user, monkeypatch,
 ) -> None:
-    """Default cap is 20. Submitting 21 should 400 before any
-    processing kicks off."""
+    """Submitting one photo over the per-enrollment cap should 400 before
+    any processing kicks off. Derived from settings so a cap change can't
+    strand this test (it previously hardcoded 21 against an old cap of 20)."""
+    from src.settings import get_settings
+
+    cap = get_settings().reid_max_photos_per_enrollment
     headers, pid = await _setup_patient(client, auth_user)
     files = [
         ("photos", (f"p{i}.jpg", _tiny_jpeg(i), "image/jpeg"))
-        for i in range(21)
+        for i in range(cap + 1)
     ]
     r = await client.post(
         f"/v1/patients/{pid}/face-embeddings",
