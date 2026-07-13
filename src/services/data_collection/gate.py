@@ -26,9 +26,10 @@ def should_collect(
     is evaluated here at decision time rather than by flipping
     ``data_collection_enabled``.
 
-    ``motion_in_clip`` may be ``None`` (the motion cache returns None
-    when a camera hasn't sent a recent heartbeat) — that gates closed.
-    Always returns a real ``bool``.
+    ``motion_in_clip`` is the tick's unified motion verdict (SAD hint
+    OR backend frame-diff since v2 P2). The ``None`` in the signature
+    is defensive back-compat — the tick always passes a real bool
+    today; falsy still gates closed. Always returns a real ``bool``.
     """
     if privacy_mode_enabled:
         return False

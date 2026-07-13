@@ -346,6 +346,9 @@ class CameraIngest:
         # longer lose motion gating entirely.
         sad_motion = self._motion_cache.get(self.camera_id)
         motion_in_clip = sad_motion
+        # Set iff this tick was woken out of the closed state by the
+        # backend motion pass (whole-frame env fraction that fired).
+        backend_wake_env: float | None = None
         captured_at = datetime.now(timezone.utc)
         # One monotonic anchor for EVERY buffer snapshot this tick takes —
         # the main window and the RAPID native window must be the same
@@ -491,7 +494,11 @@ class CameraIngest:
                     now=tick_mono,
                     at_fps=self._settings.livekit_worker_target_fps,
                 )
-                wake_sig = compute_tick_signals(
+                # Off the event loop like every other CPU stage — the
+                # window is anchored to tick_mono, so the await can't
+                # shift what it contains.
+                wake_sig = await asyncio.to_thread(
+                    compute_tick_signals,
                     wake_window,
                     tracks=None,  # no person mask → env_motion = whole frame
                     attribution_ran=False,
@@ -505,6 +512,11 @@ class CameraIngest:
                         "%s closed-state WAKE on backend motion %.4f",
                         self._log_tag, wake_sig.env_motion,
                     )
+                    # Stash the wake on whatever row this tick ends up
+                    # writing — otherwise a woken tick whose regional
+                    # floors then read low lands as motion_src="none"
+                    # with the wake visible only in logs.
+                    backend_wake_env = wake_sig.env_motion
                 else:
                     state_after = await apply_tick_update(
                         session,
@@ -600,7 +612,8 @@ class CameraIngest:
             # every analyses row, including suppression skips); the
             # only decisions riding on it in P2 are the unified
             # `motion_in_clip` below and the closed-state wake above.
-            signals = compute_tick_signals(
+            signals = await asyncio.to_thread(
+                compute_tick_signals,
                 window,
                 tracks=identity.tracks,
                 attribution_ran=identity.attribution_ran,
@@ -613,13 +626,25 @@ class CameraIngest:
             # motion_in_clip = SAD hint OR backend reading. This also
             # un-breaks gateway (Tapo) cameras, which never publish the
             # packet and therefore could never satisfy motion-gated
-            # paths (data collection) before.
-            motion_in_clip = sad_motion or backend_motion
+            # paths (data collection) before. A closed-state backend
+            # wake counts too: its whole-frame reading and the regional
+            # readings here use different denominators, and a woken
+            # tick must never record itself as motionless.
+            motion_in_clip = sad_motion or backend_motion or (
+                backend_wake_env is not None
+            )
             motion_src = (
                 "sad+backend" if sad_motion and backend_motion
                 else "sad" if sad_motion
-                else "backend" if backend_motion
+                else "backend" if backend_motion or backend_wake_env is not None
                 else "none"
+            )
+            wake_fields: dict = (
+                {} if backend_wake_env is None
+                else {
+                    "woke_by_backend": True,
+                    "wake_env_motion": round(backend_wake_env, 4),
+                }
             )
             log.info(
                 "%s signals motion_src=%s env=%.4f tracks=%d",
@@ -703,6 +728,7 @@ class CameraIngest:
                         "identity_has_only_verified_other_tracks":
                             identity.has_only_verified_other_tracks,
                         "motion_src": motion_src,
+                        **wake_fields,
                         **signals.stash_fields(),
                     }
                     await add_analysis(
@@ -811,6 +837,7 @@ class CameraIngest:
             # Layer-1 signals + unified motion verdict (v2 P2) — the
             # sig_* block is the soak's raw material for the P3 floors.
             result.detector_fields["motion_src"] = motion_src
+            result.detector_fields.update(wake_fields)
             result.detector_fields.update(signals.stash_fields())
 
             # Token ledger (v2): per-call spend onto the analyses row when

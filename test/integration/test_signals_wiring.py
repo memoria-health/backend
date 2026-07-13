@@ -30,6 +30,7 @@ from src.db.camera import Camera
 from src.db.session import get_sessionmaker
 from src.services.detection.camera_ingest import CameraIngest, _RecorderDecision
 from src.services.detection.motion_cache import MotionCache
+from src.services.reid.body_pipeline import TrackObservation
 from src.services.reid.inference import IdentityResult
 from src.settings import get_settings
 from test.fakes.fake_vlm import FakeVLM
@@ -155,11 +156,21 @@ async def test_presence_union_tracker_holds_room_open(
     patient_id, camera_id = await _setup_patient_with_camera(
         client, auth_user, session,
     )
+    # Real TrackObservations so sig_tracks (the list shape) round-trips
+    # Postgres JSONB in at least one test (T3/T4 review finding).
+    tracks = tuple(
+        TrackObservation(
+            track_id=tid, label="UNKNOWN", confidence=0.0,
+            bbox_series=((0, (10.0 * tid, 10.0, 10.0 * tid + 40.0, 90.0)),),
+            face_locked=False, pre_labeled=False,
+        )
+        for tid in (1, 2)
+    )
     identity = IdentityResult(
         reid_ran=True, patient_in_clip=False, confidence=0.0,
         best_frame_index=None, face_count=0,
         people_present_reid=True, people_count_reid=2,
-        attribution_ran=False, tracks=(), faces_enrolled=False,
+        attribution_ran=False, tracks=tracks, faces_enrolled=False,
     )
     main = FakeVLM(people_present=False, people_count=0)
     ingest = _make_ingest(
@@ -174,6 +185,8 @@ async def test_presence_union_tracker_holds_room_open(
     assert row.people_present is True
     assert row.detector_fields["people_count"] == 2
     assert row.detector_fields["people_present_src"] == "tracker_only"
+    # The track list survived the JSONB round-trip.
+    assert [t["id"] for t in row.detector_fields["sig_tracks"]] == [1, 2]
 
 
 @pytest.mark.asyncio
@@ -198,6 +211,11 @@ async def test_closed_camera_wakes_on_backend_motion_without_sad(
     assert len(main.calls) == 1, "backend motion must wake the closed camera"
     row = await _last_analysis(session, patient_id)
     assert row.provider != "skipped"
+    # The wake is stamped on the row (not just logs) and the tick can
+    # never record itself as motionless after being woken by motion.
+    assert row.detector_fields["woke_by_backend"] is True
+    assert row.detector_fields["wake_env_motion"] > 0
+    assert row.motion_in_clip is True
 
 
 @pytest.mark.asyncio

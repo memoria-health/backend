@@ -32,18 +32,21 @@ The "first LLM call verification" semantic falls out naturally:
                                 close_threshold. No false 7-call
                                 open window for a phantom wake-up.
 
-The motion signal lives entirely in `camera_ingest.py:219` as the
-"should we even call the LLM this tick?" gate. Once the LLM has
-been called, motion is irrelevant to the state transition. This
-module accepts `motion_in_clip` purely for logging in the
-analyses row; the SQL ignores it.
+The motion signal lives entirely in `camera_ingest.py` (the
+closed-state "should we even call the LLM this tick?" gate). Once
+the LLM has been called, motion is irrelevant to the state
+transition. This module accepts `motion_in_clip` purely for
+logging in the analyses row; the SQL ignores it. Since v2 P2 that
+value is the UNION of the phone/gateway SAD packet (now a hint)
+and the backend's own frame-diff reading (tick_signals) — so
+gateway cameras without SAD packets participate too.
 
-If false motion events become too frequent (noisy on-phone
-detector tripping on pets / curtains / lighting), the knob is
-`motionThreshold` in `NemaraCam/Camera/MotionDetector.swift`.
-Each false motion now costs one LLM call (the verification) —
-not the seven it cost under the previous "motion-auto-opens"
-rule.
+If false motion wake-ups become too frequent, the backend knob is
+`signals_motion_min_active_fraction` (settings.py); the on-phone
+SAD knob remains `motionThreshold` in
+`NemaraCam/Camera/MotionDetector.swift`. Each false wake costs one
+LLM call (the verification) — not the seven it cost under the
+previous "motion-auto-opens" rule.
 
 Persistent state lives on the `cameras` row (state, no_people_count,
 state_changed_at).

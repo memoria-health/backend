@@ -269,10 +269,12 @@ def compute_tick_signals(
             env_motion = float(int((active & outside).sum()) / n_outside)
 
     face_valid: bool | None = None
-    if tracks is not None and attribution_ran and extracted_w > 0:
-        # Only meaningful when face checks could run AND we can scale
-        # to native px. "Saw people, no usable face" reads as False
-        # (the FACE bucket genuinely can't work this tick), not None.
+    if tracks and attribution_ran and extracted_w > 0:
+        # Only meaningful when face checks could run, someone was
+        # actually in frame, AND we can scale to native px. "Saw
+        # people, no usable face" reads as False (the FACE bucket
+        # genuinely can't work this tick); an empty room stays None —
+        # there is no face question to answer.
         face_valid = face_px_native >= face_min_px
 
     return TickSignals(

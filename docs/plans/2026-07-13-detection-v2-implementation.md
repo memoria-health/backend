@@ -103,7 +103,7 @@ The windowed-count state primitive (≥M evidence ticks in window T over `analys
 
 ## Phase 5 — Compiler v2  *(milestone; detailed plan at start)*
 
-Dimension classification, the feasibility hard-reject list with plain-language reasons, SNAPSHOT admission criteria + plate-size prior, interaction reroute (arm-scale amplitude rule), degradation warnings at creation. The compiler currently has zero tests — this phase builds its golden-suite from scratch (reject-list table tests + classification goldens).
+Dimension classification, the feasibility hard-reject list with plain-language reasons, SNAPSHOT admission criteria + plate-size prior, interaction reroute (arm-scale amplitude rule), degradation warnings at creation. The compiler currently has zero tests — this phase builds its golden-suite from scratch (reject-list table tests + classification goldens). Also (P2 review carry-over): a **reserved-field-prefix check** at compile time — custom detectors must not declare schema fields named `sig_*`, `motion_src`, `people_present_src`, `identity_*`, `people_count`, `woke_by_backend`, `wake_env_motion`, `vlm_*_tokens`, `rapid_*` (backend-stamped keys silently win today; make the collision a loud compile reject instead).
 
 ## Phase 6 — Reference detectors + soak  *(milestone)*
 

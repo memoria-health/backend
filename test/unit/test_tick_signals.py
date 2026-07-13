@@ -197,6 +197,12 @@ def test_face_valid_scales_extracted_px_to_native() -> None:
         sample_width=_SAMPLE_WIDTH, face_min_px=60,
     )
     assert sig3.face_valid is None
+    # Empty room ⇒ no face question to answer ⇒ None, not False.
+    sig4 = compute_tick_signals(
+        _window(), tracks=(), attribution_ran=True,
+        sample_width=_SAMPLE_WIDTH, face_min_px=60,
+    )
+    assert sig4.face_valid is None
 
 
 # ─── Stash shape ─────────────────────────────────────────────────
@@ -212,6 +218,28 @@ def test_stash_fields_omits_unknowable_and_rounds() -> None:
     assert "sig_patient_present" not in d
     assert "sig_face_valid" not in d
     assert "sig_env_motion" in d and "sig_frames" in d
+
+
+def test_stash_fields_is_json_serializable_with_tracks() -> None:
+    """The stash feeds analyses.detector_fields (JSONB). A single
+    numpy scalar leaking through (np.float32 amount, np.bool_ verdict)
+    would pass every equality assert and then kill session.commit() in
+    prod — pin serializability on the richest shape: tracks + motion +
+    face_valid (T3/T4 review finding)."""
+    import json
+
+    tracks = (
+        _track(1, (40, 30, 90, 90), label="PATIENT", face_px_max=80.0),
+        _track(2, (100, 20, 150, 100)),
+    )
+    sig = compute_tick_signals(
+        _window(flicker_box=(50, 40, 80, 80)), tracks=tracks,
+        attribution_ran=True, sample_width=_SAMPLE_WIDTH, face_min_px=60,
+    )
+    d = sig.stash_fields()
+    encoded = json.dumps(d)   # raises TypeError on any numpy leak
+    assert "sig_tracks" in d and "sig_face_valid" in d
+    assert json.loads(encoded)["sig_patient_present"] is True
 
 
 def test_stash_fields_caps_track_list_at_eight() -> None:
