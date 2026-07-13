@@ -112,13 +112,13 @@ async def test_flag_on_tick_splits_calls_and_fires_seizure_event(
     )
     det = await _seed_seizure(session, patient_id, camera_id)
 
-    main = FakeVLM()
+    main = FakeVLM(usage={"input": 13200, "output": 250})
     rapid = FakeRapidProvider({
         "seizure_detected": True, "seizure_confidence": 0.9,
         "seizure_reasoning": "sustained rhythmic whole-body shaking",
         "rapid_motion_description": "high-amplitude oscillation",
         "people_present": True,   # must be filtered, never merged
-    })
+    }, usage={"input": 20900, "output": 300})
     ingest = await _make_ingest(camera_id, patient_id, monkeypatch,
                                 main=main, rapid=rapid)
     _push_frames(ingest, flicker=True)
@@ -140,6 +140,20 @@ async def test_flag_on_tick_splits_calls_and_fires_seizure_event(
     )).scalars().all()
     assert any(e.detector_id == det.id for e in events), \
         "seizure event must fire via the normal promotion path"
+
+    # Token ledger: both the main call's and the RAPID call's spend landed
+    # on the persisted analyses row.
+    from src.db.analysis import Analysis
+
+    rows = (await session.execute(
+        select(Analysis).where(Analysis.patient_id == patient_id)
+    )).scalars().all()
+    assert rows
+    fields = rows[-1].detector_fields
+    assert fields["vlm_input_tokens"] == 13200
+    assert fields["vlm_output_tokens"] == 250
+    assert fields["rapid_input_tokens"] == 20900
+    assert fields["rapid_output_tokens"] == 300
 
 
 @pytest.mark.asyncio

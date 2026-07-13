@@ -26,12 +26,14 @@ class FakeVLM:
         people_present: bool = True,
         people_count: int = 1,
         provider: str = "gemini",   # analyses.provider is check-constrained
+        usage: dict[str, int] | None = None,
     ) -> None:
         self.detector_fields = dict(detector_fields or {})
         self.description = description
         self.people_present = people_present
         self.people_count = people_count
         self.provider = provider
+        self.usage = usage
         self.calls: list[dict[str, Any]] = []
 
     async def __call__(self, **kwargs: Any) -> tuple[str, ProviderResult]:
@@ -41,18 +43,25 @@ class FakeVLM:
             detector_fields=dict(self.detector_fields),
             people_present=self.people_present,
             people_count=self.people_count,
+            usage=self.usage,
         )
 
 
 class FakeRapidProvider:
     """Stands in for `gemini_provider` on the RAPID path."""
 
-    def __init__(self, detector_fields: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        detector_fields: dict[str, Any] | None = None,
+        usage: dict[str, int] | None = None,
+    ) -> None:
         self.detector_fields = dict(detector_fields or {})
+        self.usage = usage
         self.calls: list[dict[str, Any]] = []
 
     async def __call__(self, **kwargs: Any) -> ProviderResult:
         self.calls.append(kwargs)
         return ProviderResult(
             description="rapid", detector_fields=dict(self.detector_fields),
+            usage=self.usage,
         )

@@ -41,16 +41,24 @@ from src.services.detection.frame_buffer import FrameSnapshot
 # Per-pixel |ΔY| above this counts as "active" in a pair-diff (post-blur).
 _DIFF_THRESHOLD = 20
 # A pixel is "persistent churn" when active in at least this ratio of diffs.
-_PERSIST_RATIO = 0.5
+# TUNED ON THE LABELED EVAL SET (2026-07-13, experiments/p0_gate_probe.py):
+# real convulsive motion sweeps limbs across pixels, so per-pixel persistence
+# is far below the synthetic-flicker ideal — at 0.5 both real convulsions
+# scored ~0 (gate never opened); at 0.15 they score 0.25-0.50 with clean
+# margin over the floors below.
+_PERSIST_RATIO = 0.15
 # Y planes wider than this are downscaled (INTER_AREA) before diffing.
 _DOWNSCALE_WIDTH = 160
 # Below this many frames the window can't establish rhythm at any fps.
 _MIN_FRAMES = 4
 
-# Gate floors — deliberately permissive (see module docstring); the
-# settings wiring passes overrides so they can be tuned without a deploy.
-MIN_SCORE_DEFAULT = 0.30
-MIN_ACTIVE_FRACTION_DEFAULT = 0.004
+# Gate floors — measured operating point (same probe): convulsions pass at
+# 2.5-7x margin (scores .25/.50, activity .17/.21); stillness, shivering
+# wisps and small transits stay closed; vigorous ordinary motion may open
+# the gate and is then rejected by the flash model (its measured 1/30 FP is
+# the second line of defense). Recall > savings: doubt opens the gate.
+MIN_SCORE_DEFAULT = 0.10
+MIN_ACTIVE_FRACTION_DEFAULT = 0.03
 
 
 @dataclass(frozen=True)
@@ -126,7 +134,11 @@ def rapid_energy(
     active_fraction = n_active / counts.size
     if n_active == 0:
         return RapidEnergy(score=0.0, active_fraction=0.0)
-    need = max(2, int(round(n_pairs * persist_ratio)))
+    # Floor of 3: with a low persist_ratio and a short window, a floor of 2
+    # would count a translating edge (each pixel active exactly twice —
+    # once entering, once leaving) as "persistent". Prod windows (~88
+    # frames) never hit the floor.
+    need = max(3, int(round(n_pairs * persist_ratio)))
     persistent = int((counts >= need).sum())
     return RapidEnergy(
         score=persistent / n_active, active_fraction=float(active_fraction)
