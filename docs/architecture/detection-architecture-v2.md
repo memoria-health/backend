@@ -56,7 +56,7 @@ Attribution comes from the existing per-track PATIENT/OTHER/UNKNOWN machine (bod
 | **Verified other(s) only** | ✅ | ✅ | ❌ |
 | No person | ✅ (+ absence states keep counting) | ❌ | ❌ |
 
-This is Aryaman's example encoded: a visitor alone in frame keeps fall/choking/intruder/fire armed and closes medication/agitation/fidgeting/meal. The suppression philosophy is unchanged from today's gate — suppress only on *verified* not-patient evidence, never on mere uncertainty.
+Scope assignment is deliberately simple (Aryaman, 2026-07-13): **almost everything is `patient` with `lenient` unknown-policy** — including fall, choking, seizure, emergency; the patient is who this product watches. `anyone` is reserved for detectors explicitly about other people (possible_intruder); `environment` for no-person detectors (fire/smoke, hazards, stove). Net behavioral delta vs today's whole-call skip: with a verified other alone in frame, intruder + environment detectors now keep running — nothing else changes. The suppression philosophy is unchanged from today's gate — suppress only on *verified* not-patient evidence, never on mere uncertainty.
 
 **Required plumbing change:** `IdentityResult` is aggregate-only today (inference.py:70-181 — one patient bbox, peak count, only-others flag; no track list). v2 exposes the per-track list `[{track_id, bbox_series, label, confidence}]` to the ingest so the scheduler can target crops and scope subjects per track. Body tracking must also run **always-on**, decoupled from `reid_enabled` (today `reid_enabled=false` kills ALL tracking — inference.py:232-233; the decided direction: tracking always on, FaceID attribution optional on top).
 
@@ -98,7 +98,7 @@ A detector picks a **bucket**; every knob inside the bucket (fps, channel, crop,
 | **STILL** | 1 frame | clean | **zone crops** | lite | motion_edge / scheduled | phone 10/10, remote FP 10→0, plate 9/10 |
 | **AUDIO** | rider | — | — | rides host call | host bucket's gate | VLM-native speech (no separate test needed) |
 
-Packaging laws baked into the artifact builders: one video per request (two parts silently collapse), never side-by-side (halves per-channel resolution), never temporal concat (re-injects resting prior; T8 7/10 < O8 10/10), tint on native pixels **before** cropping. AUDIO requires a native-video provider — the fallback chain must not silently route an audio-dependent call to a frame-sampling provider (today openrouter/dashscope receive no audio, gemini.py:6-8).
+Packaging laws baked into the artifact builders: one video per request (two parts silently collapse), never side-by-side (halves per-channel resolution), never temporal concat (re-injects resting prior; T8 7/10 < O8 10/10), tint on native pixels **before** cropping. AUDIO needs a native-video provider to carry signal — fallback to a frame-sampling provider is allowed (today's chain semantics keep), but the tick gets marked degraded in its analyses row so a silent audio detector isn't mistaken for a healthy one (frame-sampling providers receive no audio today, gemini.py:6-8).
 
 STILL admission criteria (strict): one frame *settles* it (not merely suggests), the state isn't instantaneous, subject above the plate-size floor at expected distance, and it survives ambiguity confounders. "Watching TV" fails (it's an inference from gaze+audio+duration → MICRO/WIDE + AUDIO). Stills are **point-in-time object detection** — nothing more.
 
@@ -119,8 +119,7 @@ Kept from today's promotion machinery: sensitivity → threshold offsets (event_
 
 Ported: push/email fan-out, clip archival with privacy re-check, `clip_suppressed`, Realtime updates (camera_ingest.py:867-921, clip_archival.py). New per-detector fields:
 
-- `degradation_warning: none | distance_class` — perpetual in-app notice for FACE, MICRO-with-object, and small-object STILL detectors (Law 7). Set by compiler or catalog, surfaced by apps.
-- `certification: validated | uncertified_custom | shadow` — customs can be armed in **shadow mode** (run + log, never notify) to measure their real FP rate before going live; the same machinery the 24 h soak uses.
+- `degradation_warning: none | distance_class` — perpetual in-app notice for FACE, MICRO-with-object, and small-object STILL detectors (Law 7). Set by compiler or catalog, surfaced by apps. (The only delivery addition; a shadow/certification tier was considered and cut as overkill — validation happens via the soak process, not a schema column.)
 - `cost_class` (derived) — surfaced to the household budget governor (§7).
 
 ---
@@ -148,11 +147,11 @@ Topology unchanged: one worker per patient room, N `CameraIngest` per worker (ro
 
 | Detector | Subject | Bucket | Eventing | Notes |
 |---|---|---|---|---|
-| fall | anyone | WIDE | point | k=1 — recall-critical |
-| **seizure** | anyone | **RAPID** | point | **P0 hotfix**: today lite+global-overlay+biased prompt (catalog.py:269-316) — the measured worst case |
-| emergency | anyone | WIDE | point | |
-| choking | anyone | SLOW-CROP | point | hands-to-throat is body-scale |
-| calling_for_help | anyone | AUDIO on WIDE | point | |
+| fall | patient (lenient) | WIDE | point | k=1 — recall-critical |
+| **seizure** | patient (lenient) | **RAPID** | point | **P0 hotfix**: today lite+global-overlay+biased prompt (catalog.py:269-316) — the measured worst case |
+| emergency | patient (lenient) | WIDE | point | |
+| choking | patient (lenient) | SLOW-CROP | point | hands-to-throat is body-scale |
+| calling_for_help | patient (lenient) | AUDIO on WIDE | point | |
 | fire_smoke | environment | WIDE | point | smoke is large-scale + dynamic |
 | possible_intruder | anyone | WIDE | point | benefits from attribution context ("verified-other at 3 AM") |
 | wandering / child_wandering | patient | WIDE (door zones) | point | door_config ports as-is |
@@ -161,9 +160,9 @@ Topology unchanged: one worker per patient room, N `CameraIngest` per worker (ro
 | medication | patient | SLOW-CROP | point (absence state later) | schedule window; validated 100%R/0FP |
 | meal_eaten | patient | SLOW-CROP | point | |
 | agitation | patient | WIDE + AUDIO | state (sparse M-of-T) | replaces rising-edge episode logic |
-| climbing / distress (child) | anyone | WIDE (+AUDIO) | state (dense) | |
-| child_crib_exit / _stairs / _hazard_reach / _head_impact / _cord_entanglement | anyone | WIDE (cord: SLOW-CROP) | point | cord = thin-object warning |
-| child_device_usage | anyone | SLOW-CROP | state (sparse) | routine |
+| climbing / distress (child) | patient (lenient) | WIDE (+AUDIO) | state (dense) | the child IS the patient |
+| child_crib_exit / _stairs / _hazard_reach / _head_impact / _cord_entanglement | patient (lenient) | WIDE (cord: SLOW-CROP) | point | cord = thin-object warning |
+| child_device_usage | patient (lenient) | SLOW-CROP | state (sparse) | routine |
 | setup_test | anyone | WIDE | point, fire_once | unchanged |
 | **general_fidgeting** (new) | patient | MICRO | state (sparse) | +30% validated; object-visibility warning |
 | **facial_grimacing** (new) | patient | FACE | state (sparse) | +51% validated |
@@ -179,7 +178,7 @@ Topology unchanged: one worker per patient room, N `CameraIngest` per worker (ro
 **PORT unchanged:** worker/room/ingest topology + FrameBuffer fork (room_worker.py:897-951); provider chains + per-caregiver `vlm_provider` (vlm_routing.py:36-79) with new bucket-capability constraints; promotion threshold/sensitivity machinery (event_promotion.py:93-113); primary-selection ranking (:156-190); event schema + push/email/clip/privacy (camera_ingest.py:867-921); `cameras_detectors` + door_config; seeding/library; compiler skeleton incl. stakes-based bias (detector_compiler.py:124-195); the attribution state machine (body_pipeline.py) and harvesting; data-collection recorder + privacy paths.
 
 **CHANGE:**
-- `detectors` table: + `subject_scope`, `unknown_policy`, `bucket`, `evidence_unit`, `eventing` JSONB (`{shape, k, n, M, T, absence_deadline}`), `duty_cycle`, `severity` (persisted), `cooldown_seconds`, `degradation_warning`, `certification`. `shape` enum collapses `point_in_time|state|scheduled` → `point|state`. Idempotent delta SQL per convention.
+- `detectors` table: + `subject_scope`, `unknown_policy`, `bucket`, `evidence_unit`, `eventing` JSONB (`{shape, k, n, M, T, absence_deadline}`), `duty_cycle`, `severity` (persisted), `cooldown_seconds`, `degradation_warning`. `shape` enum collapses `point_in_time|state|scheduled` → `point|state`. Idempotent delta SQL per convention.
 - Identity: expose per-track list from ReID to ingest; run tracking always-on regardless of `reid_enabled` (inference.py:232-233 early-out becomes attribution-only).
 - Motion: backend person-scoped signals from tracker; phone SAD demoted to hint.
 - Call assembly: `build_prompt_and_schema` gains a packer in front (≤3/call, per-bucket artifact builders); `motion_overlay_enabled` global flag dies — overlay becomes a RAPID recipe property (camera_ingest.py:641-656 moves into the RAPID artifact builder).
@@ -200,7 +199,6 @@ Pipeline: classify → **feasibility gate** → prompt gen → certify.
    - Interaction reroute: object too small for a still frame but donning/usage is arm-scale → recompile as motion detector (wristwear 30/30 vs ring-donning 7% — amplitude decides, and sub-arm-scale interaction is rejected too).
    - Distance class ⇒ attach `degradation_warning` + compiler notice at creation time.
 3. **Prompt gen** under the bucket's recipe constraints, stakes-biased as today, OpenAI-first/Gemini-fallback unchanged.
-4. **Certify**: customs default to `shadow` (optional) — armed only after the shadow window shows acceptable FP.
 
 ---
 

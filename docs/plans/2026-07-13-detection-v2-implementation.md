@@ -20,17 +20,17 @@ Today a "detector" is a prompt fragment plus a threshold, and every enabled dete
 
 1. **What is it looking for?** — name, description, the prompt that steers precision vs recall. (Unchanged from today.)
 2. **Who is it about?** — `patient`, `anyone`, or `environment`. A fall matters no matter who falls. Medication tracking is about the patient only. A stove doesn't need a person at all.
-3. **When does it look?** — which cheap signals must be true before we spend a model call: someone present, that person actually moving, rapid-motion energy, a big-enough face, a scene change, a schedule window. Plus how often (every eligible tick, or sampled).
+3. **When does it look?** — which cheap signals must be true before we spend a model call: someone present, that person actually moving, rapid-motion energy, a big-enough face, a scene change, a schedule window. None of these are new computations — each is arithmetic on data the tick already has (tracker boxes, the InsightFace face box, frame diffs, the existing when_scope) — the new part is only that detectors consult them before spending a call. Plus how often (every eligible tick, or sampled).
 4. **How does it look?** — one of seven fixed "perception buckets" (wide scene, person crop, micro crop, rapid-motion overlay, face crop, single-frame zone still, audio rider). Each bucket's frame rate / cropping / model tier was locked by measurement. Nobody — not caregivers, not the compiler — tunes these knobs per detector.
 5. **When does it speak?** — instantly (`point`, optionally double-checked before alerting), or after evidence accumulates in a time window (`state`: "M positive observations within T minutes", which also covers absence — "no meal by 2 PM" is just a count of zero at a deadline).
-6. **How does it reach you?** — push/email/clip policy, privacy behavior, and honesty markers: a permanent distance-degradation notice for the fine-motion/small-object class, and a certification level (validated built-in vs uncertified custom vs shadow mode).
+6. **How does it reach you?** — the delivery machinery that already exists today (push, per-patient email gating, clip archival, privacy suppression), unchanged; plus exactly one new marker: the permanent distance-degradation notice for the fine-motion/small-object detector class.
 
 ## A day in the life
 
 - **Patient asleep, 2 AM.** Nobody is moving, so no video calls happen at all — the "motionless/in bed" state accrues for free from the absence of motion. The moment there IS motion (a fall out of bed, a convulsion, wandering), the gates open instantly and the right buckets run. Today, by contrast, the bedroom camera bills a full model call every 10 seconds all night.
-- **A visitor is in the room, patient napping elsewhere.** Identity says "verified other person." Safety detectors (fall, choking, fire, intruder) stay armed for the visitor; patient-specific detectors (medication, agitation, fidgeting) close. Today the system skips *everything* in this situation.
+- **A visitor is in the room, patient napping elsewhere.** Identity says "verified other person." Only detectors explicitly about others or the environment (intruder, fire/smoke, hazards) stay armed; everything else — including fall and choking — is about the patient and closes, exactly like today's whole-call skip but scoped per detector. When identity is merely *unsure* (face hidden, no enrollment), patient detectors keep running — suppression requires verified evidence, never uncertainty.
 - **Possible seizure.** Rapid-motion energy on the person's body trips a pre-gate; a dedicated 8 fps motion-overlay crop goes to the stronger model with an amplitude-forced prompt. Measured: 8/10 recall, 1/30 false positives — versus today's prompt that literally tells a motion-blind model to lean TRUE on any red patch.
-- **A caregiver writes a custom detector.** The compiler classifies it into the six dimensions, hard-rejects the physically impossible (eye flutter, fine tremor, ring-sized objects — measured zeros), attaches a distance warning if it's in the degradation class, and can arm it in shadow mode first: it runs and logs for a day without notifying, so its real false-positive rate is known before it can wake anyone up.
+- **A caregiver writes a custom detector.** The compiler classifies it into the six dimensions, hard-rejects the physically impossible (eye flutter, fine tremor, ring-sized objects — measured zeros), and attaches a distance warning if it's in the degradation class.
 
 ## Why cost stays flat while accuracy jumps
 
@@ -101,7 +101,7 @@ The windowed-count state primitive (≥M evidence ticks in window T over `analys
 
 ## Phase 5 — Compiler v2  *(milestone; detailed plan at start)*
 
-Dimension classification, the feasibility hard-reject list with plain-language reasons, STILL admission criteria + plate-size prior, interaction reroute (arm-scale amplitude rule), degradation warnings at creation, shadow-mode certification. The compiler currently has zero tests — this phase builds its golden-suite from scratch (reject-list table tests + classification goldens).
+Dimension classification, the feasibility hard-reject list with plain-language reasons, STILL admission criteria + plate-size prior, interaction reroute (arm-scale amplitude rule), degradation warnings at creation. The compiler currently has zero tests — this phase builds its golden-suite from scratch (reject-list table tests + classification goldens).
 
 ## Phase 6 — Reference detectors, certification, soak  *(milestone)*
 
@@ -121,6 +121,6 @@ One reference detector per bucket certified via the harness pattern (acted TP ta
 
 - **P2 CPU budget:** always-on YOLO+BoT-SORT per presence tick on the Railway worker — profile early; mitigation is decimated tracking fps, which the signals tolerate.
 - **8 fps buffer memory:** doubles FrameBuffer frames (~17 s × 8 fps × N cameras) — measure; I420 frames are the dominant term.
-- **Provider constraints:** flash-tier buckets and audio calls must not silently fall back to frame-sampling providers; the packer must fail loud or degrade explicitly.
-- **Gateway motion parity** is a P2 deliverable — until then gateway cameras keep today's behavior.
+- **Provider fallback is allowed everywhere** — but a fallback that loses the signal (audio detectors on frame-sampling providers get no audio; RAPID on a frame-sampler loses the validated recipe) must mark the tick as degraded in the analyses row, so a silent detector isn't mistaken for a healthy one. One log line + one field, not machinery.
+- **Motion moves backend-side in P2** for person-scoping only (a TV must not hold the gate open). Both camera types already publish motion packets today (wall-phone app and gateway publisher.py alike); nothing about gateway behavior changes.
 - **Uncommitted working tree** (`feat/gateway-camera-ownership` carries experiment + doc changes, incl. a capture hook marked "remove before PR") must be untangled before P0 branches.
