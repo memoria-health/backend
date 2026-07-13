@@ -35,6 +35,23 @@ Detector =
 
 The hierarchy matters: **subject and activation decide whether we look at all; perception decides how we look; decision decides when we speak; delivery decides how we say it.** Cost falls out of activation × perception. Accuracy falls out of perception × decision. Nothing else in the system gets to influence those outcomes.
 
+**The organizing principle above all of it (Aryaman, 2026-07-13): detectors are NOT organized by instrument — they're organized by which EVIDENCE BRANCH of the scene feeds them.** A tick classifies the scene into three branches, per camera and per person:
+
+```
+ENVIRONMENT      evidence exists without any person: stove, door, fire,
+                 hazards, a NEW unknown track appearing (intruder).
+                 Evaluated every tick regardless of occupancy — driven by
+                 environment motion (change OUTSIDE person boxes) + schedule.
+PERSON-MOTION    a tracked person's in-box activity ≥ the floor: falls,
+                 seizure, wandering, medication, eating, fidgeting —
+                 anything evidenced by action. Per track, per subject.
+PERSON-STILL     a tracked person below the floor: facial actions (a still
+                 person can lip-smack), sleep/slump states, and the "still"
+                 evidence that duration states count.
+```
+
+The six buckets are the *instruments* each branch points at the scene; `needs_audio` is a property of the call, and the decision shapes (point/state) consume whatever the branches produce. Everything in §1.3-§1.5 hangs off this tree.
+
 ### 1.1 Semantics (ported unchanged)
 
 `identifier`, `name`, `icon_name`, `description`, `category` (safety|routine), `cohort`, `prompt_fragment`, `seeded/hidden/fire_once/recommended`, `is_builtin`, `custom_prompt`. All exist today (catalog.py:812-853, detector.py:25-86). The prompt_fragment remains the precision/recall dial (Law 5) — compile per stakes as today (detector_compiler.py:124-195).
@@ -69,8 +86,11 @@ Scope assignment is deliberately simple (Aryaman, 2026-07-13): **almost everythi
 | `person_present` | tracker (+LLM people_present as confirmation) | camera state open/closed (state_machine.py) | per-track, backend-owned |
 | `patient_present` | attribution machine | aggregate patient_in_clip | per-track label |
 | `motion` — ONE signal, TWO readouts (amount + churn concentration) | one frame-diff pass over track boxes (the rapid_energy module already computes both) | **whole-frame phone SAD via data packet** (motion_cache.py:63-82, 15 s TTL) — gates only the `closed` state (camera_ingest.py:449) | the AMOUNT readout gates every action bucket including RAPID (RAPID just uses a person-scoped activity floor — general motion, nothing rapid-specific; Aryaman 2026-07-13, backed by the eval probe: churn concentration overlapped too much between convulsions and vigorous negatives to earn a default floor, and any extra floor risks blocking a real seizure). Churn stays computed + logged as a soak-tuning dial. SNAPSHOT checks simply ride motion ticks — too cheap (~$0.0001) to warrant their own gate |
+| `env_motion` | change OUTSIDE all person boxes (same diff pass) | — (whole-frame SAD conflates person and environment) | drives the ENVIRONMENT branch: snapshot checks, new-track/entry attention — so a door opening or a burner lighting is never masked by a still person |
 | `face_valid(min_px)` | InsightFace box size | — | gates FACE bucket; also drives the distance warning |
 | `no_person` | tracker | close_threshold streak | absence states count on it |
+
+**Per-track semantics (multi-person):** every signal above is evaluated PER TRACK where it can be — each person carries their own motion amount, attribution, and face size; action buckets open for the tracks that are moving and target their crops; the subject filter applies per track. Scene-level lanes (SCENE instrument, environment checks) open if ANY qualifying track or env_motion demands them.
 
 The whole-frame phone SAD stays as a hint/fallback, but motion becomes **backend-owned and person-scoped** — this also fixes the current fragility that gateway (Tapo) cameras depend on a client-published motion packet, and that a TV or curtain holds the frame "in motion."
 
@@ -139,6 +159,8 @@ L4  DELIVERY    push/email/clip/privacy + cost ledger
 Topology unchanged: one worker per patient room, N `CameraIngest` per worker (room_worker.py:141), 10 s tick / 11 s window / FrameBuffer fork (settings.py:147-154). The tick engine keeps its skeleton; `_run_tick_inner`'s single-call body is replaced by L1→L3. The binary identity gate and the closed-state motion check dissolve into L1 (they become per-detector subject filtering and per-bucket gating). `ai_paused`/`disabled`/privacy short-circuits stay exactly where they are.
 
 **One shared context call** classifies the inactivity family when relevant (sleeping vs sitting vs watching TV — an inference, not a still) so N states don't each buy their own context.
+
+**Eventing is PATIENT-level, never camera-level (multi-camera correctness, Aryaman 2026-07-13):** state counters and absence deadlines live on the patient and pool evidence from EVERY camera in the household — a meal seen by the kitchen camera satisfies "no meal by 2 PM" no matter which camera's tick is evaluating; "motionless 30 min" cannot fire because one room is empty while the patient moves in another (no-person ticks contribute nothing — only patient-still evidence counts); absence fires only when NO camera produced evidence by the deadline. Today's code already points this way — episode suppression and event dedup both query by `patient_id` across cameras (event_promotion.py:210-244, :432-453) — v2 makes it the explicit contract for the windowed-count primitive. Camera assignment (`cameras_detectors`) scopes which cameras may CONTRIBUTE evidence to a detector, never where its counter lives.
 
 ---
 
