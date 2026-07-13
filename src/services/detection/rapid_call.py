@@ -117,6 +117,24 @@ def filter_rapid_fields(fields: Mapping[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in fields.items() if k.startswith(_KEEP_PREFIXES)}
 
 
+def scale_bbox_to_frame(
+    bbox: Box, frame_w: float, frame_h: float, *, sample_width: float
+) -> Box | None:
+    """Re-ID boxes are computed on frames extracted at
+    `max_width=sample_width` (frame_extraction scales to min(sample_width,
+    source_width), aspect preserved) — NOT on the native buffer frames.
+    Scale the box back into native pixel space; identical factor on both
+    axes. A no-op when the source was already narrower than sample_width.
+    Returns None on degenerate input."""
+    _ = frame_h  # aspect preserved — one factor serves both axes
+    ew = min(float(sample_width), float(frame_w))
+    if ew <= 0 or frame_w <= 0:
+        return None
+    s = float(frame_w) / ew
+    x0, y0, x1, y1 = bbox
+    return (x0 * s, y0 * s, x1 * s, y1 * s)
+
+
 async def run_rapid_seizure(
     *,
     frames: Sequence[FrameSnapshot],

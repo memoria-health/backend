@@ -20,6 +20,7 @@ from src.services.detection.rapid_call import (
     RAPID_SEIZURE_PROMPT,
     filter_rapid_fields,
     run_rapid_seizure,
+    scale_bbox_to_frame,
     split_rapid,
 )
 from src.settings import get_settings
@@ -103,6 +104,30 @@ def test_prompt_carries_the_load_bearing_constraints() -> None:
     assert "never sufficient" in p       # red tint alone can't fire it
     assert "shivering" in p              # the mutual confounder is named
     assert "any position" in p           # not predicated on lying down
+
+
+def test_scale_bbox_maps_reid_space_to_native_pixels() -> None:
+    """Re-ID boxes live in extracted-frame space (max_width=480). Applied
+    to a 1280-wide native frame they must scale by 1280/480; on a source
+    already narrower than the sample width they must pass through."""
+    scaled = scale_bbox_to_frame((120, 90, 240, 180), 1280, 720, sample_width=480)
+    assert scaled == pytest.approx((320.0, 240.0, 640.0, 480.0))
+    same = scale_bbox_to_frame((10, 10, 50, 50), 320, 240, sample_width=480)
+    assert same == pytest.approx((10.0, 10.0, 50.0, 50.0))
+    assert scale_bbox_to_frame((0, 0, 1, 1), 0, 0, sample_width=480) is None
+
+
+async def test_degenerate_boxes_return_none_without_spending() -> None:
+    """All-degenerate person boxes: the gate fails open to whole-frame, but
+    with no usable crop the call is skipped — never a malformed artifact."""
+    s = get_settings().model_copy(update={"rapid_seizure_enabled": True})
+    fake = _FakeProvider({"seizure_detected": True})
+    out = await run_rapid_seizure(
+        frames=_frames(flicker=True), per_person_boxes=[[]],
+        settings=s, provider=fake, log_tag="t",
+    )
+    assert out is None
+    assert fake.calls == []
 
 
 async def test_gate_closed_short_circuits_before_any_call() -> None:

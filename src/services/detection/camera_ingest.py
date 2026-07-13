@@ -27,6 +27,7 @@ once Phase 2 ships — the deleted HTTP route can no longer touch it.
 from __future__ import annotations
 
 import asyncio
+import time
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -44,7 +45,11 @@ from src.services.detection.motion_cache import MotionCache
 from src.services.detection.motion_overlay import overlay_motion
 from src.services.detection.mp4_remux import Mp4RemuxError, frames_to_mp4
 from src.services.detection.providers.gemini import gemini_provider
-from src.services.detection.rapid_call import run_rapid_seizure, split_rapid
+from src.services.detection.rapid_call import (
+    run_rapid_seizure,
+    scale_bbox_to_frame,
+    split_rapid,
+)
 from src.services.detection.speech_filter import sanitize_speech_fields
 from src.services.detection.vlm_routing import resolve_vlm_provider, run_vlm
 from src.services.detection.registry import (
@@ -333,6 +338,11 @@ class CameraIngest:
         """One tick — mirrors `src/api/clips.py:ingest_clip` body."""
         motion_in_clip = self._motion_cache.get(self.camera_id)
         captured_at = datetime.now(timezone.utc)
+        # One monotonic anchor for EVERY buffer snapshot this tick takes —
+        # the main window and the RAPID native window must be the same
+        # slice of time even though seconds of VLM latency separate the
+        # calls that read them.
+        tick_mono = time.monotonic()
 
         async with self._sessionmaker() as session:
             detectors = await get_enabled_detectors_for_camera(session, self.camera_id)
@@ -496,6 +506,7 @@ class CameraIngest:
             # RAPID path; the main call always sees target_fps.
             window = self.frame_buffer.snapshot_last_seconds(
                 self._settings.livekit_worker_window_seconds,
+                now=tick_mono,
                 at_fps=self._settings.livekit_worker_target_fps,
             )
             if not window:
@@ -728,13 +739,26 @@ class CameraIngest:
                 try:
                     native = self.frame_buffer.snapshot_last_seconds(
                         self._settings.livekit_worker_window_seconds,
+                        now=tick_mono,
                     )
                     if native:
-                        fw = float(native[0].width)
-                        fh = float(native[0].height)
-                        boxes = (
-                            [[identity.patient_bbox]]
+                        fw = float(native[-1].width)
+                        fh = float(native[-1].height)
+                        # patient_bbox lives in Re-ID's extracted-frame
+                        # space (max_width=reid_inference_sample_width),
+                        # NOT native pixels — scale it up or the crop
+                        # misses the patient entirely.
+                        scaled = (
+                            scale_bbox_to_frame(
+                                identity.patient_bbox, fw, fh,
+                                sample_width=self._settings.reid_inference_sample_width,
+                            )
                             if identity.patient_bbox is not None
+                            else None
+                        )
+                        boxes = (
+                            [[scaled]]
+                            if scaled is not None
                             else [[(0.0, 0.0, fw, fh)]]
                         )
                         rapid_fields = await run_rapid_seizure(
