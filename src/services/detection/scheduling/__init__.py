@@ -19,6 +19,7 @@ exhaustively unit-testable.
 """
 
 from src.services.detection.scheduling.dims import EffectiveDims, resolve_dims
+from src.services.detection.scheduling.packer import CallPlan, pack_calls
 from src.services.detection.scheduling.scheduler import (
     DueDetector,
     DueSet,
@@ -27,10 +28,12 @@ from src.services.detection.scheduling.scheduler import (
 )
 
 __all__ = [
+    "CallPlan",
     "DueDetector",
     "DueSet",
     "EffectiveDims",
     "ScheduledDetector",
+    "pack_calls",
     "resolve_dims",
     "resolve_due",
 ]
