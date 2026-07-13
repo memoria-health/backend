@@ -1,0 +1,293 @@
+"""Unit truth table for the L1 scheduler (detection v2 P3 T0).
+
+`resolve_due` is the ONE generic function evaluated per detector row —
+these tests pin the whole decision surface: branch gates, the fixed
+subject rule (fail-open; suppression only on verified absence),
+per-person crop targets (D3), crowd hardening, duty cycles, and the
+parity contract (default dials ⇒ every non-scheduled detector due on
+every tick).
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+from src.services.detection.prompt import DetectorSpec
+from src.services.detection.scheduling.dims import EffectiveDims
+from src.services.detection.scheduling.scheduler import (
+    ScheduledDetector,
+    resolve_due,
+)
+from src.services.detection.signals.tick_signals import TickSignals, TrackMotion
+from src.services.reid.body_pipeline import TrackObservation
+from src.services.reid.inference import IdentityResult
+
+
+def _settings(**over) -> SimpleNamespace:
+    base = dict(
+        scheduler_person_motion_floor=0.0,
+        scheduler_env_motion_floor=0.0,
+        scheduler_person_requires_track=False,
+        scheduler_sample_every_k=1,
+        scheduler_crowd_fallback_tracks=4,
+    )
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def _entry(
+    ident: str = "fall",
+    *,
+    branch: str = "person_motion",
+    subject: str = "patient",
+    bucket: str = "scene",
+    duty: str = "every_eligible_tick",
+    shape: str = "point_in_time",
+) -> ScheduledDetector:
+    return ScheduledDetector(
+        spec=DetectorSpec(
+            identifier=ident, name=ident, prompt_fragment="frag",
+            schema_fields={},
+        ),
+        dims=EffectiveDims(
+            evidence_branch=branch, subject_scope=subject, bucket=bucket,
+            duty_cycle=duty, needs_audio=False, severity=50, shape=shape,
+            dims_source="row",
+        ),
+    )
+
+
+def _track(tid: int, label: str = "UNKNOWN") -> TrackObservation:
+    return TrackObservation(
+        track_id=tid, label=label, confidence=0.0,
+        bbox_series=((0, (10.0, 10.0, 50.0, 90.0)),),
+        face_locked=False, pre_labeled=False,
+    )
+
+
+def _identity(
+    tracks,
+    *,
+    attribution_ran: bool = False,
+    patient_in_clip: bool = False,
+    only_other: bool = False,
+) -> IdentityResult:
+    return IdentityResult(
+        reid_ran=tracks is not None, patient_in_clip=patient_in_clip,
+        confidence=0.0, best_frame_index=None, face_count=0,
+        attribution_ran=attribution_ran, tracks=tracks,
+        has_only_verified_other_tracks=only_other,
+        faces_enrolled=attribution_ran,
+    )
+
+
+def _signals(*, env: float = 0.0, amounts: dict[int, float] | None = None) -> TickSignals:
+    return TickSignals(
+        person_present=None, people_count=None, patient_present=None,
+        track_motion=tuple(
+            TrackMotion(track_id=tid, label="UNKNOWN", amount=a, churn=0.0)
+            for tid, a in (amounts or {}).items()
+        ),
+        env_motion=env, face_valid=None, frames_used=12,
+    )
+
+
+def _due_idents(ds) -> list[str]:
+    return [d.spec.identifier for d in ds.due]
+
+
+def _skip_reasons(ds) -> dict[str, str]:
+    return dict(ds.skipped)
+
+
+# ─── Parity contract (D2) ────────────────────────────────────────
+
+
+def test_parity_defaults_everything_due_even_with_reid_down() -> None:
+    entries = [
+        _entry("fall"),
+        _entry("stove_left_on", branch="environment", subject="environment",
+               bucket="snapshot", duty="sampled"),
+        _entry("medication", bucket="person"),
+    ]
+    ds = resolve_due(
+        entries, signals=_signals(), identity=_identity(None),
+        settings=_settings(), tick_index=7,
+    )
+    assert _due_idents(ds) == ["fall", "stove_left_on", "medication"]
+    assert ds.skipped == ()
+    # No boxes anywhere ⇒ every artifact is scene-level.
+    assert all(d.target_track_ids is None for d in ds.due)
+
+
+def test_parity_empty_room_still_runs_person_detectors() -> None:
+    ds = resolve_due(
+        [_entry("fall")], signals=_signals(), identity=_identity(()),
+        settings=_settings(), tick_index=0,
+    )
+    assert _due_idents(ds) == ["fall"]
+
+
+# ─── Scheduled shape stays on its own runtime ────────────────────
+
+
+def test_scheduled_shape_and_duty_are_skipped() -> None:
+    entries = [
+        _entry("meal_check", shape="scheduled"),
+        _entry("night_check", duty="scheduled_only"),
+    ]
+    ds = resolve_due(
+        entries, signals=_signals(), identity=_identity(None),
+        settings=_settings(), tick_index=0,
+    )
+    assert ds.due == ()
+    assert _skip_reasons(ds) == {
+        "meal_check": "scheduled_runtime",
+        "night_check": "scheduled_runtime",
+    }
+
+
+# ─── Duty cycle sampling ─────────────────────────────────────────
+
+
+def test_sampled_duty_runs_every_kth_tick() -> None:
+    e = [_entry("agitation", duty="sampled")]
+    s = _settings(scheduler_sample_every_k=3)
+    results = [
+        bool(resolve_due(e, signals=_signals(), identity=_identity(None),
+                         settings=s, tick_index=i).due)
+        for i in range(6)
+    ]
+    assert results == [True, False, False, True, False, False]
+
+
+# ─── Branch gates ────────────────────────────────────────────────
+
+
+def test_env_floor_gates_environment_branch_only() -> None:
+    entries = [
+        _entry("stove_left_on", branch="environment", subject="environment",
+               bucket="snapshot"),
+        _entry("fall"),
+    ]
+    ds = resolve_due(
+        entries, signals=_signals(env=0.01),
+        identity=_identity(None),
+        settings=_settings(scheduler_env_motion_floor=0.05), tick_index=0,
+    )
+    assert _due_idents(ds) == ["fall"]
+    assert _skip_reasons(ds)["stove_left_on"] == "env_floor"
+
+
+def test_requires_track_skips_person_branch_in_verified_empty_room() -> None:
+    ds = resolve_due(
+        [_entry("fall")], signals=_signals(), identity=_identity(()),
+        settings=_settings(scheduler_person_requires_track=True), tick_index=0,
+    )
+    assert ds.due == ()
+    assert _skip_reasons(ds)["fall"] == "no_person"
+
+
+def test_motion_floor_selects_moving_tracks_person_still_ignores_it() -> None:
+    tracks = (_track(1), _track(2))
+    signals = _signals(amounts={1: 0.01, 2: 0.30})
+    settings = _settings(
+        scheduler_person_motion_floor=0.05,
+        scheduler_person_requires_track=True,
+    )
+    moving = resolve_due(
+        [_entry("medication", bucket="person")], signals=signals,
+        identity=_identity(tracks), settings=settings, tick_index=0,
+    )
+    (d,) = moving.due
+    assert d.target_track_ids == (2,)   # only the moving track qualifies
+    still = resolve_due(
+        [_entry("device", branch="person_still", bucket="person",
+                subject="anyone")],
+        signals=signals, identity=_identity(tracks), settings=settings,
+        tick_index=0,
+    )
+    (d2,) = still.due
+    assert d2.target_track_ids == (1, 2)  # presence-only branch
+
+
+# ─── Subject rule (fixed; fail-open) ─────────────────────────────
+
+
+def test_patient_scoped_suppressed_only_on_verified_absence() -> None:
+    tracks = (_track(1, "OTHER"), _track(2, "OTHER"))
+    ds = resolve_due(
+        [_entry("fall"), _entry("possible_intruder", subject="anyone")],
+        signals=_signals(),
+        identity=_identity(tracks, attribution_ran=True, only_other=True),
+        settings=_settings(), tick_index=0,
+    )
+    # Patient-scoped suppressed; anyone-scoped still runs (locked
+    # decision: intruder/environment run for verified others).
+    assert _due_idents(ds) == ["possible_intruder"]
+    assert _skip_reasons(ds)["fall"] == "verified_not_patient"
+
+
+def test_no_attribution_never_suppresses_patient_scope() -> None:
+    tracks = (_track(1, "OTHER"),)   # poisoned label, attribution OFF
+    ds = resolve_due(
+        [_entry("fall")], signals=_signals(),
+        identity=_identity(tracks, attribution_ran=False, only_other=True),
+        settings=_settings(), tick_index=0,
+    )
+    assert _due_idents(ds) == ["fall"]
+
+
+def test_patient_targets_prefer_patient_track_and_drop_verified_others() -> None:
+    tracks = (_track(1, "PATIENT"), _track(2, "OTHER"), _track(3))
+    ds = resolve_due(
+        [_entry("medication", bucket="person")], signals=_signals(),
+        identity=_identity(tracks, attribution_ran=True, patient_in_clip=True),
+        settings=_settings(), tick_index=0,
+    )
+    (d,) = ds.due
+    assert d.target_track_ids == (1,)   # locked patient track only
+
+    no_lock = (_track(2, "OTHER"), _track(3))
+    ds2 = resolve_due(
+        [_entry("medication", bucket="person")], signals=_signals(),
+        identity=_identity(no_lock, attribution_ran=True),
+        settings=_settings(), tick_index=0,
+    )
+    (d2,) = ds2.due
+    assert d2.target_track_ids == (3,)  # UNKNOWN kept, verified OTHER dropped
+
+
+def test_anyone_scope_targets_every_track_per_person() -> None:
+    tracks = (_track(1), _track(2), _track(3))
+    ds = resolve_due(
+        [_entry("possible_intruder", subject="anyone", bucket="person")],
+        signals=_signals(), identity=_identity(tracks),
+        settings=_settings(), tick_index=0,
+    )
+    (d,) = ds.due
+    assert d.target_track_ids == (1, 2, 3)   # one crop call per person (D3)
+
+
+# ─── Crowd hardening (D3) ────────────────────────────────────────
+
+
+def test_crowd_fallback_drops_all_crops() -> None:
+    tracks = tuple(_track(i) for i in range(1, 7))   # 6 > 4
+    ds = resolve_due(
+        [_entry("medication", bucket="person"), _entry("fall")],
+        signals=_signals(), identity=_identity(tracks),
+        settings=_settings(), tick_index=0,
+    )
+    assert ds.crowd_fallback is True
+    assert all(d.target_track_ids is None for d in ds.due)
+    assert len(ds.due) == 2   # everything still runs — full-scene
+
+
+def test_scene_bucket_never_gets_track_targets() -> None:
+    ds = resolve_due(
+        [_entry("fall", bucket="scene")], signals=_signals(),
+        identity=_identity((_track(1),)), settings=_settings(), tick_index=0,
+    )
+    (d,) = ds.due
+    assert d.target_track_ids is None

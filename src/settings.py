@@ -179,6 +179,30 @@ class Settings(BaseSettings):
     # Soak dial: sig_env_motion is stashed on every analyses row.
     signals_motion_min_active_fraction: float = Field(ge=0.0, le=1.0, default=0.02)
 
+    # ── Detection v2 scheduler + packer (P3) ─────────────────────
+    # Master flag: OFF = today's single-call tick, byte-for-byte. ON =
+    # L1 scheduler → L2 packer path (per-bucket calls). Landed parity-
+    # first (D2, Aryaman 2026-07-13): with the dials below at their
+    # defaults, flag-on runs the SAME detectors as flag-off — only the
+    # packing changes. The cost inversion (action buckets only under
+    # motion) is a post-soak settings change, never a code change.
+    detection_v2_scheduler_enabled: bool = Field(default=False)
+    # Per-track motion floor for the person_motion branch gate.
+    # 0.0 = parity (any present track qualifies).
+    scheduler_person_motion_floor: float = Field(ge=0.0, le=1.0, default=0.0)
+    # env_motion floor for the environment branch gate. 0.0 = parity.
+    scheduler_env_motion_floor: float = Field(ge=0.0, le=1.0, default=0.0)
+    # When True, person-branch detectors are skipped on ticks where the
+    # tracker positively saw nobody (and, with a raised motion floor,
+    # when no track clears it). False = parity: person detectors run
+    # regardless, exactly like today's monolithic call.
+    scheduler_person_requires_track: bool = Field(default=False)
+    # duty_cycle='sampled' detectors run every k-th tick. 1 = parity.
+    scheduler_sample_every_k: int = Field(ge=1, le=60, default=1)
+    # Crowd hardening (D3): more than this many concurrent tracks ⇒ no
+    # per-person crops this tick — every detector runs full-scene.
+    scheduler_crowd_fallback_tracks: int = Field(ge=1, le=16, default=4)
+
     # ── Memoria Sensor app-present heartbeat (iPhone sensors) ────
     # A live iPhone sensor polls /v1/cameras/me/desired-state every 1s
     # while its app is open. PresenceSweeper records that heartbeat

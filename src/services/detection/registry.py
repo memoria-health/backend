@@ -63,6 +63,22 @@ async def get_enabled_detectors_for_camera(
     but at the moment only `people_present` is `always_on`, and it's
     not a DB row, so in practice the join-only filter is sufficient.
     """
+    return [spec for spec, _row in await get_enabled_loadout_for_camera(
+        session, camera_id,
+    )]
+
+
+async def get_enabled_loadout_for_camera(
+    session: AsyncSession, camera_id: UUID,
+) -> list[tuple[DetectorSpec, Detector]]:
+    """Same filtering + per-camera specialization as
+    `get_enabled_detectors_for_camera`, but returns each spec PAIRED
+    with its `Detector` row. The detection-v2 scheduler
+    (`scheduling/`) needs the row's dimension columns
+    (evidence_branch / subject_scope / bucket / duty_cycle / shape …)
+    alongside the compiled spec; keeping one query + one wandering
+    specialization here means the two paths can never drift.
+    """
     cam = await session.get(Camera, camera_id)
     if cam is None:
         raise CameraVanishedError(
@@ -83,7 +99,7 @@ async def get_enabled_detectors_for_camera(
     )
     rows = (await session.execute(stmt)).all()
 
-    specs: list[DetectorSpec] = []
+    loadout: list[tuple[DetectorSpec, Detector]] = []
     for det, door_config in rows:
         # Wandering is specialized PER SENSOR by the caregiver's exit-door choice.
         if det.identifier in _WANDERING_IDENTIFIERS and door_config is not None:
@@ -93,9 +109,12 @@ async def get_enabled_detectors_for_camera(
             doors = door_config.get("doors") or []
             if not doors or door_config.get("no_exit_door"):
                 continue
-            specs.append(replace(
-                detector_spec_from_row(det),
-                prompt_fragment=catalog.build_wandering_fragment(doors),
+            loadout.append((
+                replace(
+                    detector_spec_from_row(det),
+                    prompt_fragment=catalog.build_wandering_fragment(doors),
+                ),
+                det,
             ))
             continue
         # Everything else — including LEGACY wandering assignments with a NULL
@@ -103,5 +122,5 @@ async def get_enabled_detectors_for_camera(
         # — keeps its stored prompt. This grandfathers existing prod wandering so
         # it doesn't go dark during the app-rollout gap; a caregiver on the new
         # app opts into per-sensor doors when they configure that sensor.
-        specs.append(detector_spec_from_row(det))
-    return specs
+        loadout.append((detector_spec_from_row(det), det))
+    return loadout

@@ -95,6 +95,15 @@ Branch: `feat/detection-v2-p2-signals`. Depends on the decided re-ID direction (
 
 ## Phase 3 — Scheduler + packer  *(milestone; detailed plan at start)*
 
+**Locked decisions (Aryaman, 2026-07-13):**
+- **D1 — flag + file separation:** everything behind `detection_v2_scheduler_enabled=False`; flag off = today's tick byte-for-byte. New architecture lives in ITS OWN files (`src/services/detection/scheduling/`), never interleaved with the old path — camera_ingest gets only a thin flag branch.
+- **D2 — parity first:** flag-on initially runs the same detectors as today, just re-packed per bucket (floors/duty dials default permissive: person floor 0.0, env floor 0.0, sample k=1, presence not required). Cost inversion = settings tightening after soak, not code. No new detectors in P3 — bucketing the existing set only.
+- **D3 — per-person crops:** person-specific detectors get ONE CROP CALL PER QUALIFYING TRACK (not a union box). Crowd hardening: more than `scheduler_crowd_fallback_tracks` (default 4) tracks ⇒ no crops at all, every detector runs full-scene that tick.
+- **D4 — packing caps:** the wide/SCENE call is UNCAPPED (load it up — today's parity; overrides the ≤3 law for the wide-lite call specifically, per Aryaman). Fine-grained crop buckets (PERSON / FINE-MOTION / RAPID / FACE) hold the measured ≤3 cap, severity-ordered fill.
+- Wake backoff remains rejected (see P2 status); the P0 RAPID lane stays its own validated path in P3 — the packer does not absorb it yet.
+
+**Task list:** T0 scheduler (`scheduling/scheduler.py` — pure due-set resolution: subject truth table with the fixed fail-open rule, branch gates, duty cycle, crowd fallback; exhaustive unit truth table) · T1 packer (`scheduling/packer.py` — due set → call plans: bucket grouping, per-track calls for crop buckets, uncapped SCENE, needs_audio → native-video constraint) · T2 per-bucket artifact builders (generalize rapid_artifact: person/face crops, snapshot still, tint→crop order asserted) · T3 tick wiring behind the flag (call executor, per-call token ledger, degraded-tick marker on audio-losing fallback) · T4 integration parity + packing tests · T5 docs + phase review. Scheduled-shape detectors keep their existing separate runtime until P4 dissolves them; the shared inactivity-context call is deliberately punted to P4 (it serves the state primitive).
+
 Activation resolution as a pure function (the §1.2 subject truth table + gates + schedule + duty cycle — exhaustively table-tested), ≤3-detectors-per-call packing with the shared context slot, per-bucket artifact builders (SCENE/PERSON/FINE-MOTION/FACE/SNAPSHOT zones), per-bucket tier routing, provider-capability constraints (audio and 8 fps require native-video providers). The old single-call assembly and the binary identity gate are deleted here. This is the largest phase and the point where the §1.2 visitor behavior goes live.
 
 ## Phase 4 — Decision layer  *(milestone; detailed plan at start)*
