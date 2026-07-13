@@ -232,6 +232,29 @@ def test_snapshot_at_fps_keeps_first_frame_and_rejects_nonpositive() -> None:
         buf.snapshot_last_seconds(15, now=100.0, at_fps=0)
 
 
+def test_rapid_seam_stays_contiguous_with_decimated_reads() -> None:
+    """The flag-ON production scenario: buffer retains 8 fps while BOTH the
+    pre-window (camera_ingest) and post-roll (clip_archival) reads decimate
+    to 4 fps via at_fps. The seam anchor is the DECIMATED pre list's last
+    frame (camera_ingest reads window[-1].captured_at) and the post snapshot
+    must stay contiguous with it. Guards the refactor hazard of anchoring on
+    the buffer's raw last-push timestamp instead — that would reintroduce
+    the seam gap under decimation.
+    """
+    fps_native, fps_read, window, post_roll = 8, 4, 11.0, 15.0
+    buf = FrameBuffer(window_seconds=17.0, target_fps=fps_native)
+    _push_pre_then_post_roll(buf, window=window, post_roll=post_roll, fps=fps_native)
+
+    pre = buf.snapshot_last_seconds(window, now=window, at_fps=fps_read)
+    assert pre, "pre window must not be empty"
+    pre_end = pre[-1].captured_at
+    post = buf.snapshot_last_seconds(
+        post_roll, now=pre_end + post_roll, at_fps=fps_read
+    )
+    assert post, "post-roll snapshot must not be empty"
+    assert post[0].captured_at - pre_end <= 1.0 / fps_read + 1e-9
+
+
 def test_data_is_stored_as_is_not_referenced() -> None:
     """The buffer holds the exact bytes the caller passed in.
     Important because the SDK's frame.data memoryview is invalidated

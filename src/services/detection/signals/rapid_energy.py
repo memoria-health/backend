@@ -65,7 +65,10 @@ def _prepared_y(
     frame: FrameSnapshot, region: tuple[int, int, int, int] | None
 ) -> np.ndarray | None:
     """Y plane → optional region crop → downscale → denoise blur.
-    Returns None when the clamped region is empty."""
+    Returns None when the clamped region is empty or the frame data is
+    truncated (malformed frames must be skipped, never raise per-tick)."""
+    if len(frame.data) < frame.width * frame.height:
+        return None
     y = np.frombuffer(
         frame.data, dtype=np.uint8, count=frame.width * frame.height
     ).reshape(frame.height, frame.width)

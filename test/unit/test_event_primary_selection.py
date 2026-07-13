@@ -73,3 +73,12 @@ def test_safety_breaks_a_full_tie() -> None:
     routine = _c("custom_tvwatch0", 0.80, category="routine")
     safety = _c("custom_nearfall", 0.80, category="safety")
     assert _select_primary([routine, safety], primary_hint="") is safety
+
+
+def test_identifier_breaks_the_final_tie_deterministically() -> None:
+    """Tier 5: two customs tied on severity, hint, confidence AND category
+    (LLM confidences snap to round values) — alphabetically-first wins so
+    the pick is deterministic across ticks."""
+    a = _c("custom_aaa00000", 0.80)
+    b = _c("custom_bbb00000", 0.80)
+    assert _select_primary([b, a], primary_hint="") is a

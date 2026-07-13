@@ -115,3 +115,58 @@ def test_region_scopes_the_signal() -> None:
 
 def test_too_few_frames_is_never_rapid() -> None:
     assert rapid_gate(_flicker_frames(n=3)) is False
+
+
+def _i420_sized(y: np.ndarray) -> bytes:
+    h, w = y.shape
+    uv = np.full((h // 2) * (w // 2) * 2, 128, dtype=np.uint8)
+    return y.tobytes() + uv.tobytes()
+
+
+def test_downscale_path_preserves_discrimination() -> None:
+    """Real camera frames exceed the 160px downscale width — the resize
+    branch must run and keep the in-place-flicker signal intact."""
+    w, h = 320, 240
+    frames = []
+    for i in range(12):
+        p = np.full((h, w), 60, dtype=np.uint8)
+        p[80:144, 120:184] = 180 if i % 2 else 60
+        frames.append(
+            FrameSnapshot(
+                width=w, height=h, data=_i420_sized(p), captured_at=100.0 + i / 8
+            )
+        )
+    e = rapid_energy(frames)
+    assert e.score > 0.6
+    assert rapid_gate(frames) is True
+
+
+def test_mixed_resolution_frames_are_filtered_not_fatal() -> None:
+    """A publisher renegotiation mid-window injects odd-shaped frames; the
+    dominant-shape filter must drop them without changing the verdict."""
+    frames = _flicker_frames()
+    odd = np.full((30, 40), 60, dtype=np.uint8)
+    frames.insert(
+        3, FrameSnapshot(width=40, height=30, data=_i420_sized(odd), captured_at=100.9)
+    )
+    assert rapid_energy(frames).score == pytest.approx(
+        rapid_energy(_flicker_frames()).score
+    )
+    assert rapid_gate(frames) is True
+
+
+def test_corrupt_short_frame_data_is_skipped_not_fatal() -> None:
+    """Truncated frame bytes (right shape, short data) must be excluded,
+    never raise; an all-corrupt window scores zero."""
+    frames = _flicker_frames()
+    frames.insert(
+        2, FrameSnapshot(width=W, height=H, data=b"\x00" * 10, captured_at=100.6)
+    )
+    assert rapid_gate(frames) is True
+    all_bad = [
+        FrameSnapshot(width=W, height=H, data=b"", captured_at=100.0 + i)
+        for i in range(6)
+    ]
+    e = rapid_energy(all_bad)
+    assert e.score == 0.0
+    assert rapid_gate(all_bad) is False
