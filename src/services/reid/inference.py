@@ -66,17 +66,31 @@ from src.settings import Settings
 
 log = logging.getLogger(__name__)
 
+# Stand-in gallery for attribution-less ticks (reid_enabled off, or no
+# ready enrollment). Shape matches the real (N, 512) stacked matrix so
+# the pipeline's `gallery.size > 0` check is the single source of truth
+# for "can face-match this tick."
+_EMPTY_GALLERY = np.empty((0, 512), dtype=np.float32)
+
 
 @dataclass(frozen=True)
 class IdentityResult:
     """Per-tick identity decision for a single patient.
 
-    `reid_ran`: True iff the pipeline executed and produced a verdict.
-    False on timeout, crash, feature disabled, or no enrollment yet.
-    The upstream gate in `camera_ingest` keys off this: when False,
-    it bypasses identity-based suppression. Load-bearing safety
-    invariant: a Re-ID infrastructure failure must NEVER silence the
-    detector pipeline.
+    `reid_ran`: True iff the tracking pipeline executed and produced a
+    verdict. False on timeout or crash ONLY — since v2 (P2) body
+    tracking always runs; `reid_enabled` and enrollment gate face
+    ATTRIBUTION, not tracking. The upstream gate in `camera_ingest`
+    keys off this: when False, it bypasses identity-based suppression.
+    Load-bearing safety invariant: a Re-ID infrastructure failure must
+    NEVER silence the detector pipeline.
+
+    `attribution_ran`: True iff the pipeline ran WITH a usable face
+    gallery (reid_enabled AND ≥1 ready enrollment) — i.e. identity
+    labels (PATIENT / OTHER / pre-labels) were even possible this
+    tick. The suppression gate additionally requires this: a tick
+    where attribution could not run must never suppress the LLM, no
+    matter what the track labels claim.
 
     `patient_in_clip`: True iff at least one BoT-SORT track was
     locked as PATIENT during this tick. Only meaningful when
@@ -115,6 +129,7 @@ class IdentityResult:
     patient_bbox: tuple[float, float, float, float] | None = None
     people_present_reid: bool = False
     people_count_reid: int = 0
+    attribution_ran: bool = False
     # True iff num_tracks > 0 AND every track in the clip ended labeled
     # OTHER (face seen + match failed enough times to be confidently
     # non-patient). Drives the camera_ingest gate's "skip LLM when
@@ -124,13 +139,12 @@ class IdentityResult:
     # or when no tracks at all.
     has_only_verified_other_tracks: bool = False
 
-    # True iff this patient has at least one enrolled face embedding
-    # (non-empty gallery). Drives the camera_ingest presence gate:
-    #   faces_enrolled=True  -> trust YOLO/re-ID for open/close
-    #   faces_enrolled=False -> fall back to the LLM's people_present
-    #                           verdict (and the YOLO pipeline is skipped
-    #                           entirely for these patients to save CPU).
-    # Independent of reid_ran: a patient with faces enrolled whose tick
+    # True iff attribution was ELIGIBLE this tick: reid_enabled AND at
+    # least one ready face embedding (non-empty gallery). Drives the
+    # camera_ingest presence-source branch. NOTE the v2 semantic shift:
+    # with reid_enabled=False this reads False even if embeddings exist
+    # in the DB — "enrolled" here means "the gallery was actually in
+    # play." Independent of reid_ran: an eligible patient whose tick
     # timed out has faces_enrolled=True but reid_ran=False.
     faces_enrolled: bool = False
 
@@ -176,6 +190,7 @@ class IdentityResult:
             sample_fps=None,
             people_present_reid=False,
             people_count_reid=0,
+            attribution_ran=False,
             has_only_verified_other_tracks=False,
             faces_enrolled=faces_enrolled,
         )
@@ -222,28 +237,37 @@ class ReIDInference:
         mp4_bytes: bytes,
         patient_id: UUID,
     ) -> IdentityResult:
-        """Run Re-ID on a tick clip. Returns the empty result on
-        timeout, infrastructure error, or no-enrollment.
+        """Run body tracking (+ optional face attribution) on a tick
+        clip. Returns the empty result on timeout or infra error.
+
+        v2 (P2): body tracking ALWAYS runs — presence, motion scoping,
+        and the subject filter all hang off tracks, so neither the
+        `reid_enabled` flag nor a missing enrollment kills the pipeline
+        anymore. The two gate ATTRIBUTION only: face matching happens
+        iff `reid_enabled` AND the patient has a non-empty ready
+        gallery; otherwise the pipeline runs gallery-less (tracks stay
+        UNKNOWN, presence/count still populate).
 
         Hard timeout is `settings.reid_timeout_seconds`. The full body
         pipeline is heavier than the face-only path; calibrate that
         setting accordingly.
         """
-        if not self._settings.reid_enabled:
-            return IdentityResult.empty(faces_enrolled=False)
-        # Determine enrollment up front (the gallery is cached) so the
-        # verdict is known even if the pipeline below times out, and so we
-        # can SKIP the whole YOLO/re-ID pipeline for patients with no
-        # enrolled faces — for them, presence falls back to the LLM's
-        # people_present verdict (see camera_ingest gate). This is the
-        # CPU saver: re-ID only runs for patients who actually enrolled.
-        gallery = await self._get_gallery(patient_id)
-        faces_enrolled = gallery is not None and len(gallery) > 0
-        if not faces_enrolled:
-            return IdentityResult.empty(faces_enrolled=False)
+        # The gallery is fetched (cached, TTL) only when the flag is
+        # on — with the flag off we don't touch the DB and simply run
+        # attribution-less. Eligibility is decided up front so the
+        # verdict is right even if the pipeline below times out.
+        if self._settings.reid_enabled:
+            gallery = await self._get_gallery(patient_id)
+        else:
+            gallery = _EMPTY_GALLERY
+        faces_enrolled = gallery is not None and gallery.size > 0
         try:
             return await asyncio.wait_for(
-                self._label_clip_inner(mp4_bytes=mp4_bytes, patient_id=patient_id),
+                self._label_clip_inner(
+                    mp4_bytes=mp4_bytes,
+                    patient_id=patient_id,
+                    gallery=gallery if faces_enrolled else _EMPTY_GALLERY,
+                ),
                 timeout=self._settings.reid_timeout_seconds,
             )
         except asyncio.TimeoutError:
@@ -251,27 +275,29 @@ class ReIDInference:
                 "reid.label_clip.timeout patient=%s timeout=%.1fs",
                 patient_id, self._settings.reid_timeout_seconds,
             )
-            return IdentityResult.empty(faces_enrolled=True)
+            return IdentityResult.empty(faces_enrolled=faces_enrolled)
         except Exception as exc:
             log.exception(
                 "reid.label_clip.error patient=%s err=%s", patient_id, exc,
             )
-            return IdentityResult.empty(faces_enrolled=True)
+            return IdentityResult.empty(faces_enrolled=faces_enrolled)
 
     async def _label_clip_inner(
         self,
         *,
         mp4_bytes: bytes,
         patient_id: UUID,
+        gallery: np.ndarray,
     ) -> IdentityResult:
-        # Empty gallery (no enrollment yet) is no longer a hard stop:
-        # body tracking still runs and populates
+        # `gallery` is the caller-resolved attribution gallery — empty
+        # array when attribution is ineligible this tick (flag off or
+        # no enrollment). Body tracking runs either way and populates
         # `people_present_reid`/`people_count_reid` so the state
         # machine can close the camera when nobody is in frame, even
         # before the caregiver enrolls a patient face. `patient_in_clip`
-        # stays False on this path because identity matching needs a
-        # gallery.
-        gallery = await self._get_gallery(patient_id)
+        # stays False on the gallery-less path because identity
+        # matching needs a gallery.
+        faces_enrolled = gallery.size > 0
 
         sample_fps = self._settings.reid_inference_sample_fps
         sample_width = self._settings.reid_inference_sample_width
@@ -283,10 +309,10 @@ class ReIDInference:
             )
         except RuntimeError as exc:
             log.warning("reid.frame_extract_failed err=%s", exc)
-            return IdentityResult.empty(faces_enrolled=True)
+            return IdentityResult.empty(faces_enrolled=faces_enrolled)
 
         if not frames:
-            return IdentityResult.empty(faces_enrolled=True)
+            return IdentityResult.empty(faces_enrolled=faces_enrolled)
 
         # The whole pipeline (decode + YOLO + BoT-SORT + face checks +
         # state machine) is sync work — hop into a thread once so the
@@ -327,6 +353,13 @@ class ReIDInference:
 
         s = self._settings
 
+        # Attribution eligibility for this run. Gallery-less ⇒ face
+        # checks are skipped inside the pipeline (`_has_gallery`), and
+        # everything downstream that exists only to produce or consume
+        # identity labels (body-gallery pre-match, harvests) is skipped
+        # here — no OSNet inference for lookups that can't match.
+        attribution = gallery is not None and gallery.size > 0
+
         # Cross-clip body gallery pre-match callback. Body pipeline
         # calls this once per new track. Extract OSNet body embedding
         # and match against the day's gallery for this patient. Sync
@@ -334,7 +367,8 @@ class ReIDInference:
         # threading.Lock.
         pre_match_cb = None
         if (
-            self._body_gallery is not None
+            attribution
+            and self._body_gallery is not None
             and self._settings.reid_body_gallery_enabled
         ):
             gallery_ref = self._body_gallery
@@ -433,7 +467,11 @@ class ReIDInference:
         #   - OTHER tracks that were face-locked this clip (Path C)
         # The `face_locked` flag distinguishes "earned this clip's
         # verdict via face match" from "trusted a gallery pre-label."
-        if self._body_gallery is not None and self._settings.reid_body_gallery_enabled:
+        if (
+            attribution
+            and self._body_gallery is not None
+            and self._settings.reid_body_gallery_enabled
+        ):
             for state in pipeline._tracks.values():
                 if not state.face_locked:
                     continue
@@ -488,8 +526,9 @@ class ReIDInference:
             sample_fps=sample_fps,
             people_present_reid=pipeline.num_tracks > 0,
             people_count_reid=pipeline.max_concurrent_tracks,
+            attribution_ran=attribution,
             has_only_verified_other_tracks=pipeline.has_only_verified_other_tracks,
-            faces_enrolled=True,
+            faces_enrolled=attribution,
         )
         yolo_stats = pipeline.yolo_stats
         log.info(

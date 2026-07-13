@@ -568,7 +568,10 @@ class CameraIngest:
             # in that case, same as we do for `reid_ran=False`.
             #
             # Safety contract preserved on every axis:
-            #   reid_ran=False (timeout/crash/no-enrollment) -> bypass
+            #   reid_ran=False (timeout/crash) -> bypass
+            #   attribution_ran=False (reid_enabled off / no enrollment
+            #     — tracking ran but identity labels were impossible,
+            #     v2 always-on tracking) -> bypass
             #   face_count=0 (no faces seen) -> bypass
             #   face_count>0, patient_in_clip=False -> suppress
             #   patient_in_clip=True -> run with patient marked
@@ -600,6 +603,7 @@ class CameraIngest:
             # anything else.
             if (
                 identity.reid_ran
+                and identity.attribution_ran
                 and not identity.patient_in_clip
                 and (identity.face_count > 0 or identity.has_only_verified_other_tracks)
             ):

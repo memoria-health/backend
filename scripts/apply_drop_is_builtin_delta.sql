@@ -1,8 +1,10 @@
--- Detection v2 (P2): drops detectors.is_builtin. The column was 100%
--- redundant with `source` — every source='preset' row carried true and
--- every source='custom' row carried false, and nothing needed them to
--- diverge. All code now keys catalog membership on source = 'preset'
--- (the P1 backfill WHERE in apply_detector_v2_delta.sql included).
+-- Detection v2 (P2): drops detectors.is_builtin. Redundant with
+-- `source`: every write path set preset⇔true / custom⇔false (one early
+-- window let customs default to true — harmless, nothing ever READ the
+-- column), and no code needed the two to diverge. All code now keys
+-- catalog membership on source = 'preset' (the P1 backfill WHERE in
+-- apply_detector_v2_delta.sql included; that WHERE also gates on
+-- built-in identifiers, so the swap selects the identical row set).
 --
 -- ⚠ ORDERING — OPPOSITE of the usual DB-before-deploy rule: this delta
 -- is DESTRUCTIVE, so it must run AFTER deploying a backend that no

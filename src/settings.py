@@ -250,10 +250,12 @@ class Settings(BaseSettings):
     data_collection_max_concurrent: int = Field(ge=1, le=128, default=8)
 
     # ── Re-ID (Phase 1+) ────────────────────────────────────────
-    # Feature flag: when False, the enrollment API still accepts
-    # photos but the inference pipeline does NOT consult the gallery
-    # at tick time. Lets us roll the schema + API out without flipping
-    # the detector behavior until we're ready.
+    # Gates face ATTRIBUTION only (detection v2, P2): when False, the
+    # enrollment API still accepts photos but tick-time inference never
+    # consults the gallery — tracks stay unlabeled and the identity
+    # gate can't suppress anything. Body tracking (YOLO + BoT-SORT)
+    # runs UNCONDITIONALLY either way — presence, motion scoping, and
+    # the subject filter all hang off tracks, so no flag may kill it.
     reid_enabled: bool = Field(default=False)
     # Hard timeout for the per-tick Re-ID call. If exceeded, the tick
     # proceeds with no identity_map and detectors fire identity-agnostic
