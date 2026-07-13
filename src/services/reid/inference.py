@@ -60,6 +60,7 @@ from src.services.reid.body_pipeline import (
     LABEL_PATIENT,
     BodyReIDPipeline,
     PipelineConfig,
+    TrackObservation,
 )
 from src.services.reid.cross_clip_body_gallery import CrossClipBodyGallery
 from src.settings import Settings
@@ -130,6 +131,13 @@ class IdentityResult:
     people_present_reid: bool = False
     people_count_reid: int = 0
     attribution_ran: bool = False
+    # Per-track observations for the clip (v2 P2): one TrackObservation
+    # per BoT-SORT track — label, confidence, and the full (frame_idx,
+    # bbox) series in extracted-frame pixel space. The signals layer
+    # scopes motion per track and masks env-motion with these; the
+    # aggregate fields above stay for existing consumers. None iff the
+    # pipeline didn't run (timeout/crash); empty tuple = ran, no people.
+    tracks: tuple["TrackObservation", ...] | None = None
     # True iff num_tracks > 0 AND every track in the clip ended labeled
     # OTHER (face seen + match failed enough times to be confidently
     # non-patient). Drives the camera_ingest gate's "skip LLM when
@@ -191,6 +199,7 @@ class IdentityResult:
             people_present_reid=False,
             people_count_reid=0,
             attribution_ran=False,
+            tracks=None,
             has_only_verified_other_tracks=False,
             faces_enrolled=faces_enrolled,
         )
@@ -527,6 +536,7 @@ class ReIDInference:
             people_present_reid=pipeline.num_tracks > 0,
             people_count_reid=pipeline.max_concurrent_tracks,
             attribution_ran=attribution,
+            tracks=tuple(pipeline.track_observations()),
             has_only_verified_other_tracks=pipeline.has_only_verified_other_tracks,
             faces_enrolled=attribution,
         )

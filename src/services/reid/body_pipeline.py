@@ -103,6 +103,38 @@ class _TrackState:
     # do NOT count as face-locked — they should keep face-checking so
     # this clip's actual face evidence can override the gallery match.
     face_locked: bool = False
+    # Every (frame_idx, body bbox) this track was reported at, in
+    # temporal order — the raw material for the v2 signals layer
+    # (per-track motion scoping, env-motion masks, crop targets).
+    # Pixel space of the frames fed to process_frame (the Re-ID
+    # extracted-frame space, NOT native camera resolution). ~75 frames
+    # × 4 floats per track per clip — negligible memory.
+    bbox_series: list[tuple[int, tuple[float, float, float, float]]] = field(
+        default_factory=list,
+    )
+
+
+@dataclass(frozen=True)
+class TrackObservation:
+    """Consumer-facing snapshot of one track after a clip run — the
+    per-track unit the v2 detection layers work in (per-track motion,
+    subject filtering, crop targeting). Immutable; built once by
+    `track_observations()` when the clip is done.
+
+    `label` is LABEL_PATIENT / LABEL_OTHER / LABEL_UNKNOWN.
+    `confidence` is the face-match score for PATIENT locks, 0.0
+    otherwise. `pre_labeled` means the label came from the cross-clip
+    body gallery rather than (only) this clip's face evidence.
+    `bbox_series` coordinates are in extracted-frame pixel space —
+    scale with `rapid_call.scale_bbox_to_frame` before touching native
+    buffer frames.
+    """
+    track_id: int
+    label: str
+    confidence: float
+    bbox_series: tuple[tuple[int, tuple[float, float, float, float]], ...]
+    face_locked: bool
+    pre_labeled: bool
 
 
 @dataclass
@@ -239,6 +271,7 @@ class BodyReIDPipeline:
             state = self._tracks.setdefault(tid, _TrackState(track_id=tid))
             bbox = (float(x1), float(y1), float(x2), float(y2))
             state.last_seen_bbox = bbox
+            state.bbox_series.append((frame_idx, bbox))
             seen_this_frame[tid] = bbox
 
             # Per-track best-frame tracking for the cross-clip body
@@ -507,3 +540,20 @@ class BodyReIDPipeline:
         if not self._tracks:
             return False
         return all(s.label == LABEL_OTHER for s in self._tracks.values())
+
+    def track_observations(self) -> list[TrackObservation]:
+        """Immutable per-track summaries for the clip, sorted by
+        track_id. Includes every track BoT-SORT ever assigned this
+        clip — callers that only care about substantial tracks can
+        filter on len(bbox_series). Empty list when no tracks."""
+        return [
+            TrackObservation(
+                track_id=s.track_id,
+                label=s.label,
+                confidence=float(s.confidence),
+                bbox_series=tuple(s.bbox_series),
+                face_locked=s.face_locked,
+                pre_labeled=s.pre_label is not None,
+            )
+            for s in sorted(self._tracks.values(), key=lambda s: s.track_id)
+        ]
