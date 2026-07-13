@@ -68,7 +68,7 @@ Scope assignment is deliberately simple (Aryaman, 2026-07-13): **almost everythi
 |---|---|---|---|
 | `person_present` | tracker (+LLM people_present as confirmation) | camera state open/closed (state_machine.py) | per-track, backend-owned |
 | `patient_present` | attribution machine | aggregate patient_in_clip | per-track label |
-| `motion` — ONE signal, TWO readouts (amount + churn concentration) | one frame-diff pass over track boxes (the rapid_energy module already computes both) | **whole-frame phone SAD via data packet** (motion_cache.py:63-82, 15 s TTL) — gates only the `closed` state (camera_ingest.py:449) | amount gates action buckets; churn concentration additionally pre-gates RAPID (the biggest cost lever, §7). SNAPSHOT checks simply ride motion ticks — too cheap (~$0.0001) to warrant their own gate (motion_edge concept cut, Aryaman 2026-07-13) |
+| `motion` — ONE signal, TWO readouts (amount + churn concentration) | one frame-diff pass over track boxes (the rapid_energy module already computes both) | **whole-frame phone SAD via data packet** (motion_cache.py:63-82, 15 s TTL) — gates only the `closed` state (camera_ingest.py:449) | the AMOUNT readout gates every action bucket including RAPID (RAPID just uses a person-scoped activity floor — general motion, nothing rapid-specific; Aryaman 2026-07-13, backed by the eval probe: churn concentration overlapped too much between convulsions and vigorous negatives to earn a default floor, and any extra floor risks blocking a real seizure). Churn stays computed + logged as a soak-tuning dial. SNAPSHOT checks simply ride motion ticks — too cheap (~$0.0001) to warrant their own gate |
 | `face_valid(min_px)` | InsightFace box size | — | gates FACE bucket; also drives the distance warning |
 | `no_person` | tracker | close_threshold streak | absence states count on it |
 
@@ -82,7 +82,7 @@ The whole-frame phone SAD stays as a hint/fallback, but motion becomes **backend
 
 **Duty cycle (NEW, the cost dial):** `every_eligible_tick` (safety points) | `sampled_1_of_k` (states — windowed counting tolerates sparse evidence by design) | `edge_only` (stills). Cost class is derived, never hand-set: bucket tier × duty cycle.
 
-### 1.4 Perception — seven locked buckets
+### 1.4 Perception — six locked buckets (+ a needs_audio flag)
 
 A detector picks a **bucket**; every knob inside the bucket (fps, channel, crop, model tier, media res) is fixed by measurement and not exposed — not to caregivers, not to the compiler, not per-call.
 
@@ -91,14 +91,15 @@ A detector picks a **bucket**; every knob inside the bucket (fps, channel, crop,
 | **SCENE** | 4 fps video | clean | full frame | lite | sustained_motion | prod + collar/medication program |
 | **PERSON** | 4 fps video | clean | person crop | lite | sustained_motion (patient track) | medication 100%R/0FP, collar 98% |
 | **FINE-MOTION** | 8 fps video | clean | person crop | flash | sustained_motion | fidgeting +30% (clean P8 beat overlay) |
-| **RAPID** | 8 fps video | **overlay-only** | person crop (tint→crop order) | flash | rapid_energy pre-gate | convulsion 8/10R 1/30FP (+78%) |
+| **RAPID** | 8 fps video | **overlay-only** | person crop (tint→crop order) | flash | person motion ≥ activity floor | convulsion 8/10R 1/30FP (+78%) |
 | **FACE** | 8 fps video | clean (overlay destroys it) | face crop, pad 2.0 | flash | presence + face_valid(≥300 px) | grimacing +51%; lip smacking distance-gated |
 | **SNAPSHOT** | 1 frame | clean | **zone crops** | lite | rides motion ticks / scheduled | phone 10/10, remote FP 10→0, plate 9/10 |
-| **AUDIO** | rider | — | — | rides host call | host bucket's gate | VLM-native speech (no separate test needed) |
 
-Packaging laws baked into the artifact builders: one video per request (two parts silently collapse), never side-by-side (halves per-channel resolution), never temporal concat (re-injects resting prior; T8 7/10 < O8 10/10), tint on native pixels **before** cropping. AUDIO needs a native-video provider to carry signal — fallback to a frame-sampling provider is allowed (today's chain semantics keep), but the tick gets marked degraded in its analyses row so a silent audio detector isn't mistaken for a healthy one (frame-sampling providers receive no audio today, gemini.py:6-8).
+**Audio is NOT a bucket** (Aryaman, 2026-07-13): the MP4 already carries the audio track on the native-video path — sound inherently rides whatever video call runs. A detector whose evidence is primarily sound (calling_for_help, verbal confusion cues) simply carries **`needs_audio: true`** — a packing constraint, not a perception shape: the packer must place it in a native-video call, and a fallback that loses audio marks the tick degraded (frame-sampling providers receive no audio today, gemini.py:6-8; fallback stays allowed, today's chain semantics keep).
 
-SNAPSHOT admission criteria (strict): one frame *settles* it (not merely suggests), the state isn't instantaneous, subject above the plate-size floor at expected distance, and it survives ambiguity confounders. "Watching TV" fails (it's an inference from gaze+audio+duration → FINE-MOTION/SCENE + AUDIO). Stills are **point-in-time object detection** — nothing more.
+Packaging laws baked into the artifact builders: one video per request (two parts silently collapse), never side-by-side (halves per-channel resolution), never temporal concat (re-injects resting prior; T8 7/10 < O8 10/10), tint on native pixels **before** cropping.
+
+SNAPSHOT admission criteria (strict): one frame *settles* it (not merely suggests), the state isn't instantaneous, subject above the plate-size floor at expected distance, and it survives ambiguity confounders. "Watching TV" fails (it's an inference from gaze+audio+duration → FINE-MOTION/SCENE with needs_audio). Stills are **point-in-time object detection** — nothing more.
 
 ### 1.5 Decision — evidence units × two eventing primitives
 
@@ -149,7 +150,7 @@ Topology unchanged: one worker per patient room, N `CameraIngest` per worker (ro
 | **seizure** | patient (lenient) | **RAPID** | point | **P0 hotfix**: today lite+global-overlay+biased prompt (catalog.py:269-316) — the measured worst case |
 | emergency | patient (lenient) | SCENE | point | |
 | choking | patient (lenient) | PERSON | point | hands-to-throat is body-scale |
-| calling_for_help | patient (lenient) | AUDIO on SCENE | point | |
+| calling_for_help | patient (lenient) | SCENE (needs_audio) | point | |
 | fire_smoke | environment | SCENE | point | smoke is large-scale + dynamic |
 | possible_intruder | anyone | SCENE | point | benefits from attribution context ("verified-other at 3 AM") |
 | wandering / child_wandering | patient | SCENE (door zones) | point | door_config ports as-is |
@@ -157,15 +158,15 @@ Topology unchanged: one worker per patient room, N `CameraIngest` per worker (ro
 | env_hazard_glass / _water | environment | SNAPSHOT (zone) | point | rides motion ticks; size-floor warnings |
 | medication | patient | PERSON | point (absence state later) | schedule window; validated 100%R/0FP |
 | meal_eaten | patient | PERSON | point | |
-| agitation | patient | SCENE + AUDIO | state (sparse M-of-T) | replaces rising-edge episode logic |
-| climbing / distress (child) | patient (lenient) | SCENE (+AUDIO) | state (dense) | the child IS the patient |
+| agitation | patient | SCENE (needs_audio) | state (sparse M-of-T) | replaces rising-edge episode logic |
+| climbing / distress (child) | patient (lenient) | SCENE (needs_audio) | state (dense) | the child IS the patient |
 | child_crib_exit / _stairs / _hazard_reach / _head_impact / _cord_entanglement | patient (lenient) | SCENE (cord: PERSON) | point | cord = thin-object warning |
 | child_device_usage | patient (lenient) | PERSON | state (sparse) | routine |
 | setup_test | anyone | SCENE | point, fire_once | unchanged |
 | **general_fidgeting** (new) | patient | FINE-MOTION | state (sparse) | +30% validated; object-visibility warning |
 | **facial_grimacing** (new) | patient | FACE | state (sparse) | +51% validated |
 | **lip_smacking** (new) | patient | FACE | state (sparse) | distance-gated ≥300 px face; warning |
-| **confusion / word-finding** (new) | patient | AUDIO+SCENE instances | state (sparse over instances) | never per-tick alerts |
+| **confusion / word-finding** (new) | patient | SCENE instances (needs_audio) | state (sparse over instances) | never per-tick alerts |
 | **myoclonic jerks** (new) | patient | RAPID instances | state (sparse) | |
 | *refused forever* | — | — | — | eye flutter, fine tremor/shivering, ring-scale objects, fingertip manipulation, seated heel-taps (Law 6) |
 

@@ -52,12 +52,16 @@ _DOWNSCALE_WIDTH = 160
 # Below this many frames the window can't establish rhythm at any fps.
 _MIN_FRAMES = 4
 
-# Gate floors — measured operating point (same probe): convulsions pass at
-# 2.5-7x margin (scores .25/.50, activity .17/.21); stillness, shivering
-# wisps and small transits stay closed; vigorous ordinary motion may open
-# the gate and is then rejected by the flash model (its measured 1/30 FP is
-# the second line of defense). Recall > savings: doubt opens the gate.
-MIN_SCORE_DEFAULT = 0.10
+# Gate = GENERAL person-scoped motion amount (Aryaman, 2026-07-13): the
+# probe showed the activity floor does nearly all the rejection work on
+# real footage (stillness, shivering wisps, small transits), while churn
+# concentration overlaps heavily between convulsions (.25/.50) and
+# vigorous negatives (.04-.46) — too specific to earn a default floor,
+# and any extra floor risks the one unacceptable failure (blocking a real
+# seizure). The score is still computed in the same pass and logged as a
+# tuning dial; the soak decides whether it ever earns a floor again.
+# Convulsions pass the activity floor at 5-7x margin (.17/.21 vs .03).
+MIN_SCORE_DEFAULT = 0.0   # churn floor disabled — score is observability
 MIN_ACTIVE_FRACTION_DEFAULT = 0.03
 
 

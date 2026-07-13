@@ -31,7 +31,11 @@ from src.services.detection.rapid_artifact import (
     build_rapid_artifacts,
     union_box,
 )
-from src.services.detection.signals.rapid_energy import rapid_gate
+from src.services.detection.signals.rapid_energy import (
+    MIN_ACTIVE_FRACTION_DEFAULT,
+    MIN_SCORE_DEFAULT,
+    rapid_energy,
+)
 from src.settings import Settings
 
 log = logging.getLogger("nemara.detection.rapid")
@@ -150,16 +154,23 @@ async def run_rapid_seizure(
         return None
     fw, fh = frames[0].width, frames[0].height
 
-    # Churn pre-gate, scoped per person when boxes exist (fail-open to the
-    # whole frame if none of them yields a usable region).
+    # Pre-gate = general person-scoped motion amount (churn score rides
+    # along as a logged dial, floor disabled by default). Fail-open to the
+    # whole frame if no box yields a usable region.
     regions = [union_box(b, fw, fh) for b in per_person_boxes]
     regions = [r for r in regions if r is not None]
-    gated = (
-        any(rapid_gate(frames, region=r) for r in regions)
+    energies = (
+        [rapid_energy(frames, region=r) for r in regions]
         if regions
-        else rapid_gate(frames)
+        else [rapid_energy(frames)]
     )
-    if not gated:
+    gate_af = max(e.active_fraction for e in energies)
+    gate_score = max(e.score for e in energies)
+    if not any(
+        e.active_fraction >= MIN_ACTIVE_FRACTION_DEFAULT
+        and e.score >= MIN_SCORE_DEFAULT
+        for e in energies
+    ):
         return None
 
     artifacts = await build_rapid_artifacts(
@@ -205,7 +216,13 @@ async def run_rapid_seizure(
         raise RuntimeError(
             f"all {attempted} RAPID provider call(s) failed with the gate open"
         )
-    if best is not None and (in_tok or out_tok):
-        best["rapid_input_tokens"] = in_tok
-        best["rapid_output_tokens"] = out_tok
+    if best is not None:
+        # Gate readouts ride along for soak tuning (was the churn score
+        # ever worth a floor? what does the activity distribution look
+        # like on real ticks?).
+        best["rapid_gate_active_fraction"] = round(gate_af, 4)
+        best["rapid_gate_score"] = round(gate_score, 3)
+        if in_tok or out_tok:
+            best["rapid_input_tokens"] = in_tok
+            best["rapid_output_tokens"] = out_tok
     return best
