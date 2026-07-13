@@ -84,7 +84,14 @@ def resolve_dims(row: "Detector") -> EffectiveDims:
             bucket=catalog_dims.bucket,
             duty_cycle=catalog_dims.duty_cycle,
             needs_audio=catalog_dims.needs_audio,
-            severity=catalog_dims.severity,
+            # Row severity wins even on the catalog branch — same
+            # precedence event promotion uses (row value preferred,
+            # catalog fallback), so the packer's severity-ordered fill
+            # can never disagree with primary selection.
+            severity=(
+                row.severity if row.severity is not None
+                else catalog_dims.severity
+            ),
             shape=row.shape,
             dims_source="catalog",
         )

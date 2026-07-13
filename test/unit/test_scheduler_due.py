@@ -81,14 +81,19 @@ def _identity(
     )
 
 
-def _signals(*, env: float = 0.0, amounts: dict[int, float] | None = None) -> TickSignals:
+def _signals(
+    *,
+    env: float = 0.0,
+    amounts: dict[int, float] | None = None,
+    frames_used: int = 12,
+) -> TickSignals:
     return TickSignals(
         person_present=None, people_count=None, patient_present=None,
         track_motion=tuple(
             TrackMotion(track_id=tid, label="UNKNOWN", amount=a, churn=0.0)
             for tid, a in (amounts or {}).items()
         ),
-        env_motion=env, face_valid=None, frames_used=12,
+        env_motion=env, face_valid=None, frames_used=frames_used,
     )
 
 
@@ -288,6 +293,57 @@ def test_scene_bucket_never_gets_track_targets() -> None:
     ds = resolve_due(
         [_entry("fall", bucket="scene")], signals=_signals(),
         identity=_identity((_track(1),)), settings=_settings(), tick_index=0,
+    )
+    (d,) = ds.due
+    assert d.target_track_ids is None
+
+
+# ─── Fail-open guarantees (T0 review F1/F3) ──────────────────────
+
+
+def test_tracker_outage_fails_open_even_with_requires_track() -> None:
+    """THE dial-path safety invariant: tracks=None means the tracker
+    crashed/timed out — never a verified empty room. requires_track
+    must not silence person detectors on an outage."""
+    ds = resolve_due(
+        [_entry("fall")], signals=_signals(), identity=_identity(None),
+        settings=_settings(scheduler_person_requires_track=True), tick_index=0,
+    )
+    assert _due_idents(ds) == ["fall"]
+
+
+def test_unmeasurable_window_fails_open_past_raised_floors() -> None:
+    """frames_used < 4 ⇒ tick_signals returned zeros, not readings.
+    Raised floors must treat that as 'unknowable', not 'still' —
+    otherwise a truncated window gates seizure/fall off."""
+    tracks = (_track(1),)
+    settings = _settings(
+        scheduler_person_motion_floor=0.10,
+        scheduler_env_motion_floor=0.10,
+        scheduler_person_requires_track=True,
+    )
+    ds = resolve_due(
+        [
+            _entry("fall", bucket="person"),
+            _entry("fire_smoke", branch="environment", subject="environment"),
+        ],
+        signals=_signals(frames_used=0),   # zeros are absence-of-data
+        identity=_identity(tracks), settings=settings, tick_index=0,
+    )
+    assert _due_idents(ds) == ["fall", "fire_smoke"]
+    (fall, _) = ds.due
+    assert fall.target_track_ids == (1,)   # every track fails open
+
+
+def test_emptied_patient_targets_fall_open_to_scene() -> None:
+    """All qualifying tracks verified-OTHER but the room is NOT
+    verified patient-free (an UNKNOWN could be off-frame): detector
+    stays due, degraded to the full scene."""
+    tracks = (_track(2, "OTHER"),)
+    ds = resolve_due(
+        [_entry("medication", bucket="person")], signals=_signals(),
+        identity=_identity(tracks, attribution_ran=True, only_other=False),
+        settings=_settings(), tick_index=0,
     )
     (d,) = ds.due
     assert d.target_track_ids is None

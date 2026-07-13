@@ -83,6 +83,13 @@ def resolve_due(
     n_tracks = len(tracks) if tracks else 0
     crowd = tracks is not None and n_tracks > settings.scheduler_crowd_fallback_tracks
 
+    # A window too short to measure (frames_used < 4 ⇒ tick_signals
+    # returned zeros, not readings) must FAIL OPEN: motion floors are
+    # treated as satisfied. Otherwise a truncated/renegotiating window
+    # reads as "still" and — once the post-soak dials are raised — a
+    # measurement failure would gate seizure/fall off (T0 review F1).
+    measurement_ok = signals.frames_used >= 4
+
     amount_by_track = {tm.track_id: tm.amount for tm in signals.track_motion}
     patient_ids = {
         t.track_id for t in (tracks or ()) if t.label == LABEL_PATIENT
@@ -109,12 +116,26 @@ def resolve_due(
             skipped.append((ident, "sampled_off_tick"))
             continue
 
-        # ── ENVIRONMENT branch: no person needed, attribution
-        # irrelevant, gated only by env change (parity floor 0.0
-        # never skips). With no tracks, env_motion is whole-frame —
+        # Verified-absence suppression is a SUBJECT rule, so it is
+        # evaluated before the branch dispatch — an (unlikely)
+        # patient-scoped environment-branch detector must suppress
+        # like any other patient-scoped one (T0 review F4; spec §1.2
+        # keys suppression on subject alone).
+        if (
+            d.subject_scope == "patient"
+            and identity.attribution_ran
+            and identity.has_only_verified_other_tracks
+            and not identity.patient_in_clip
+        ):
+            skipped.append((ident, "verified_not_patient"))
+            continue
+
+        # ── ENVIRONMENT branch: no person needed, gated only by env
+        # change (parity floor 0.0 never skips; unmeasurable windows
+        # fail open). With no tracks, env_motion is whole-frame —
         # still the right reading for this branch.
         if d.evidence_branch == "environment":
-            if signals.env_motion < settings.scheduler_env_motion_floor:
+            if measurement_ok and signals.env_motion < settings.scheduler_env_motion_floor:
                 skipped.append((ident, "env_floor"))
                 continue
             due.append(DueDetector(spec=entry.spec, dims=d, target_track_ids=None))
@@ -133,28 +154,24 @@ def resolve_due(
         # is the whole point of that branch).
         qualifying: list[int] | None = None
         if tracks:
-            if d.evidence_branch == "person_motion":
+            if d.evidence_branch == "person_motion" and measurement_ok:
                 floor = settings.scheduler_person_motion_floor
                 qualifying = [
                     t.track_id for t in tracks
                     if amount_by_track.get(t.track_id, 0.0) >= floor
                 ]
             else:
+                # person_still is presence-only; person_motion on an
+                # unmeasurable window fails open to every track.
                 qualifying = [t.track_id for t in tracks]
             if not qualifying and settings.scheduler_person_requires_track:
                 skipped.append((ident, "below_motion_floor"))
                 continue
 
-        # Subject filter — the fixed rule. Suppression only on
-        # verified-absence; target filtering only removes
-        # verified-OTHER tracks, never UNKNOWN ones.
+        # Target filtering — the per-track flavor of the fixed rule:
+        # verified-OTHER tracks are never patient targets, UNKNOWN
+        # tracks always are (suppression itself already ran above).
         if d.subject_scope == "patient" and identity.attribution_ran:
-            if (
-                identity.has_only_verified_other_tracks
-                and not identity.patient_in_clip
-            ):
-                skipped.append((ident, "verified_not_patient"))
-                continue
             if qualifying:
                 if patient_ids:
                     qualifying = [t for t in qualifying if t in patient_ids]
