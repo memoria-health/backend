@@ -1,0 +1,96 @@
+"""Unit: person-crop artifact builder (detection v2 P3 T2).
+
+The crop GEOMETRY (pad/min-side/clamp/plane-slicing) is already pinned
+by the P0 rapid_artifact tests — these tests pin what's new: the
+extracted→native scaling seam, the None fallbacks, and one real
+end-to-end remux.
+"""
+
+from __future__ import annotations
+
+import shutil
+import time
+
+import numpy as np
+import pytest
+
+import src.services.detection.scheduling.artifacts as artifacts
+from src.services.detection.frame_buffer import FrameSnapshot
+from src.services.detection.scheduling.artifacts import (
+    build_person_crop_mp4,
+    person_crop_box,
+)
+from src.services.reid.body_pipeline import TrackObservation
+
+W, H = 160, 120
+
+
+def _frame(t: float) -> FrameSnapshot:
+    y = np.full((H, W), 60, dtype=np.uint8)
+    uv = np.full((H // 2) * (W // 2) * 2, 128, dtype=np.uint8)
+    return FrameSnapshot(
+        width=W, height=H, data=y.tobytes() + uv.tobytes(), captured_at=t,
+    )
+
+
+def _window(n: int = 8) -> list[FrameSnapshot]:
+    t0 = time.monotonic() - n / 4.0
+    return [_frame(t0 + i / 4.0) for i in range(n)]
+
+
+def _track(series) -> TrackObservation:
+    return TrackObservation(
+        track_id=1, label="UNKNOWN", confidence=0.0,
+        bbox_series=tuple(series), face_locked=False, pre_labeled=False,
+    )
+
+
+def test_box_scales_extracted_space_to_native() -> None:
+    # Boxes recorded on 80px-wide extracted frames; native is 160 ⇒ ×2.
+    track = _track([(0, (10.0, 10.0, 30.0, 50.0)), (1, (12.0, 10.0, 32.0, 50.0))])
+    box = person_crop_box(_window(), track=track, sample_width=80)
+    assert box is not None
+    x0, y0, x1, y1 = box
+    # Union in native px is (20,20,64,100) + 20% pad, min-side 64,
+    # even-aligned — bounds prove the ×2 scaling happened (an unscaled
+    # box would sit left of x=35).
+    assert x1 > 60 and y1 > 90
+    assert x0 % 2 == 0 and y0 % 2 == 0 and x1 % 2 == 0 and y1 % 2 == 0
+    assert 0 <= x0 < x1 <= W and 0 <= y0 < y1 <= H
+
+
+def test_no_boxes_or_empty_window_yield_none() -> None:
+    assert person_crop_box([], track=_track([(0, (1, 1, 9, 9))]), sample_width=480) is None
+    assert person_crop_box(_window(), track=_track([]), sample_width=480) is None
+
+
+@pytest.mark.asyncio
+async def test_builder_returns_none_when_no_crop(monkeypatch) -> None:
+    out = await build_person_crop_mp4(
+        _window(), track=_track([]), sample_width=480, fps=4,
+    )
+    assert out is None
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.asyncio
+async def test_builder_produces_playable_mp4() -> None:
+    track = _track([(i, (20.0, 20.0, 100.0, 100.0)) for i in range(8)])
+    out = await build_person_crop_mp4(
+        _window(), track=track, sample_width=480, fps=4,
+    )
+    assert out is not None and len(out) > 200
+    assert b"ftyp" in out[:64]
+
+
+@pytest.mark.asyncio
+async def test_remux_failure_degrades_to_none(monkeypatch) -> None:
+    async def boom(*a, **k):
+        raise artifacts.Mp4RemuxError("no frames")
+
+    monkeypatch.setattr(artifacts, "frames_to_mp4", boom)
+    track = _track([(0, (20.0, 20.0, 100.0, 100.0))])
+    out = await build_person_crop_mp4(
+        _window(), track=track, sample_width=480, fps=4,
+    )
+    assert out is None

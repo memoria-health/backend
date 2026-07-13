@@ -110,12 +110,15 @@ def test_rapid_member_rides_the_wide_call_when_p0_lane_off() -> None:
     assert set(_idents(plan)) == {"fall", "seizure"}
 
 
-def test_snapshot_packs_as_single_frame_lite_capped() -> None:
+def test_snapshot_rides_the_wide_call_until_zones_exist() -> None:
+    """Full-frame stills measurably FAIL object checks (spec §1.4);
+    the zone-crop frame call arrives with per-camera zones in P6.
+    Until then snapshot members pack into the wide video call."""
     dets = [_due(f"z{i}", bucket="snapshot", severity=i) for i in range(4)]
-    plans = _pack(*dets)
-    assert len(plans) == 2                          # 3 + 1 (cap holds)
-    assert all(p.frames == "frame" and p.fps == 1 for p in plans)
-    assert all(p.tier == "lite" for p in plans)
+    plans = _pack(_due("fall", bucket="scene"), *dets)
+    (plan,) = plans
+    assert plan.frames == "video" and plan.crop == "full"
+    assert len(plan.detectors) == 5
 
 
 def test_needs_audio_propagates_to_the_call() -> None:

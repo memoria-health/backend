@@ -87,16 +87,24 @@ def _group_key(
     # them (flag off) — ride the wide call, exactly like today.
     if bucket == "rapid":
         return _SCENE_KEY
+    # SNAPSHOT rides the wide call until per-camera zone configs exist
+    # (P6): the still recipe was validated with ZONE CROPS; a full-
+    # frame still measurably FAILS object checks (phone-vs-remote 100%
+    # FP, plate 0/10 — spec §1.4), so packing one would be strictly
+    # worse than today. When zones land, this becomes a zone-crop
+    # frame call.
+    if bucket == "snapshot":
+        return _SCENE_KEY
     if bucket not in _RECIPES:
         return _SCENE_KEY  # unknown bucket: never brick a tick — go wide
     frames, fps, channel, tier, crop = _RECIPES[bucket]
     if target is None:
         # Degraded (no box): full-frame. PERSON's degraded recipe is
-        # byte-identical to SCENE ⇒ same group. SNAPSHOT without zone
-        # config is a full-frame still. Others keep their fps/tier.
+        # byte-identical to SCENE ⇒ same group. FINE-MOTION / FACE
+        # keep their fps/tier in their own full-frame call.
         if bucket == "person":
             return _SCENE_KEY
-        crop = "full" if bucket != "snapshot" else "zone"
+        crop = "full"
     return (frames, fps, channel, tier, crop, target)
 
 
