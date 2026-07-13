@@ -168,6 +168,17 @@ class Settings(BaseSettings):
     rapid_fps: int = Field(ge=2, le=15, default=8)
     rapid_model: str = Field(default="gemini-3-flash-preview")
 
+    # ── Layer-1 signals (detection v2, P2) ───────────────────────
+    # Backend-owned motion floor: minimum active-pixel fraction on the
+    # tick_signals full-frame diff map for a window to count as "in
+    # motion". Unifies `motion_in_clip` (SAD packet is a hint OR'd with
+    # this reading) and the closed-state wake, so gateway cameras that
+    # never publish SAD packets still get motion gating. Whole-frame
+    # scale — deliberately below the person-scoped RAPID floor (0.03);
+    # the map's blur + diff threshold already reject sensor noise.
+    # Soak dial: sig_env_motion is stashed on every analyses row.
+    signals_motion_min_active_fraction: float = Field(ge=0.0, le=1.0, default=0.02)
+
     # ── Memoria Sensor app-present heartbeat (iPhone sensors) ────
     # A live iPhone sensor polls /v1/cameras/me/desired-state every 1s
     # while its app is open. PresenceSweeper records that heartbeat

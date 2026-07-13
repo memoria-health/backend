@@ -50,6 +50,7 @@ from src.services.detection.rapid_call import (
     scale_bbox_to_frame,
     split_rapid,
 )
+from src.services.detection.signals.tick_signals import compute_tick_signals
 from src.services.detection.speech_filter import sanitize_speech_fields
 from src.services.detection.vlm_routing import resolve_vlm_provider, run_vlm
 from src.services.detection.registry import (
@@ -336,7 +337,15 @@ class CameraIngest:
 
     async def _run_tick_inner(self, decision: "_RecorderDecision") -> None:
         """One tick — mirrors `src/api/clips.py:ingest_clip` body."""
-        motion_in_clip = self._motion_cache.get(self.camera_id)
+        # Phone/gateway SAD packet, demoted to a HINT (v2 P2): backend-
+        # owned motion (tick_signals over the buffered window) is now
+        # the authoritative reading and `motion_in_clip` is the union
+        # of the two — computed after the signals pass below. The hint
+        # still matters: it's free, it survives windows with no usable
+        # frames, and gateway (Tapo) cameras that never publish it no
+        # longer lose motion gating entirely.
+        sad_motion = self._motion_cache.get(self.camera_id)
+        motion_in_clip = sad_motion
         captured_at = datetime.now(timezone.utc)
         # One monotonic anchor for EVERY buffer snapshot this tick takes —
         # the main window and the RAPID native window must be the same
@@ -471,35 +480,64 @@ class CameraIngest:
                 )
                 return
 
-            if cam.state == "closed" and not motion_in_clip:
-                state_after = await apply_tick_update(
-                    session,
-                    camera_id=self.camera_id,
-                    people_present=False,
-                    motion_in_clip=False,
+            if cam.state == "closed" and not sad_motion:
+                # No SAD hint — but SAD is only a hint now (and gateway
+                # cameras never send one). Backend-owned wake: one cheap
+                # whole-frame diff pass over the window; pixels moving
+                # above the floor run the full tick exactly as a SAD
+                # packet would have. Below it, keep skipping.
+                wake_window = self.frame_buffer.snapshot_last_seconds(
+                    self._settings.livekit_worker_window_seconds,
+                    now=tick_mono,
+                    at_fps=self._settings.livekit_worker_target_fps,
                 )
-                synthetic_fields = {
-                    "people_present": False,
-                    "skipped_reason": "camera_closed",
-                }
-                await add_analysis(
-                    session,
-                    camera_id=self.camera_id,
-                    provider="skipped",
-                    description="(idle — camera closed, no people detected; LLM skipped)",
-                    detector_fields=synthetic_fields,
-                    people_present=False,
-                    people_count=0,
-                    motion_in_clip=False,
-                    state_after=state_after.state,
-                    captured_at=captured_at,
+                wake_sig = compute_tick_signals(
+                    wake_window,
+                    tracks=None,  # no person mask → env_motion = whole frame
+                    attribution_ran=False,
+                    sample_width=self._settings.reid_inference_sample_width,
                 )
-                await session.commit()
-                log.info(
-                    "%s SKIP closed-state, no motion — counter=%s/%s",
-                    self._log_tag, state_after.no_people_count, state_after.close_threshold,
-                )
-                return
+                if (
+                    wake_sig.env_motion
+                    >= self._settings.signals_motion_min_active_fraction
+                ):
+                    log.info(
+                        "%s closed-state WAKE on backend motion %.4f",
+                        self._log_tag, wake_sig.env_motion,
+                    )
+                else:
+                    state_after = await apply_tick_update(
+                        session,
+                        camera_id=self.camera_id,
+                        people_present=False,
+                        motion_in_clip=False,
+                    )
+                    synthetic_fields = {
+                        "people_present": False,
+                        "skipped_reason": "camera_closed",
+                        "motion_src": "none",
+                        **wake_sig.stash_fields(),
+                    }
+                    await add_analysis(
+                        session,
+                        camera_id=self.camera_id,
+                        provider="skipped",
+                        description="(idle — camera closed, no people detected; LLM skipped)",
+                        detector_fields=synthetic_fields,
+                        people_present=False,
+                        people_count=0,
+                        motion_in_clip=False,
+                        state_after=state_after.state,
+                        captured_at=captured_at,
+                    )
+                    await session.commit()
+                    log.info(
+                        "%s SKIP closed-state, no motion (sad=none backend=%.4f) "
+                        "— counter=%s/%s",
+                        self._log_tag, wake_sig.env_motion,
+                        state_after.no_people_count, state_after.close_threshold,
+                    )
+                    return
 
             # Build the MP4 from the buffered window (video + audio).
             # at_fps: the buffer may retain a higher native rate for the
@@ -553,6 +591,40 @@ class CameraIngest:
                 identity.patient_in_clip,
                 identity.confidence,
                 identity.face_count,
+            )
+
+            # Layer-1 signals (v2 P2): one diff pass over the SAME
+            # window the main call sees, scoped by the tick's tracks —
+            # per-track motion, env_motion outside person boxes,
+            # presence, face_valid. Observability-first (stashed on
+            # every analyses row, including suppression skips); the
+            # only decisions riding on it in P2 are the unified
+            # `motion_in_clip` below and the closed-state wake above.
+            signals = compute_tick_signals(
+                window,
+                tracks=identity.tracks,
+                attribution_ran=identity.attribution_ran,
+                sample_width=self._settings.reid_inference_sample_width,
+            )
+            motion_floor = self._settings.signals_motion_min_active_fraction
+            backend_motion = signals.env_motion >= motion_floor or any(
+                t.amount >= motion_floor for t in signals.track_motion
+            )
+            # motion_in_clip = SAD hint OR backend reading. This also
+            # un-breaks gateway (Tapo) cameras, which never publish the
+            # packet and therefore could never satisfy motion-gated
+            # paths (data collection) before.
+            motion_in_clip = sad_motion or backend_motion
+            motion_src = (
+                "sad+backend" if sad_motion and backend_motion
+                else "sad" if sad_motion
+                else "backend" if backend_motion
+                else "none"
+            )
+            log.info(
+                "%s signals motion_src=%s env=%.4f tracks=%d",
+                self._log_tag, motion_src, signals.env_motion,
+                len(signals.track_motion),
             )
 
             # Upstream identity gate. When Re-ID has POSITIVE evidence
@@ -624,11 +696,14 @@ class CameraIngest:
                         "people_present": True,
                         "skipped_reason": "identity_not_patient",
                         "identity_reid_ran": True,
+                        "identity_attribution_ran": identity.attribution_ran,
                         "identity_patient_in_clip": False,
                         "identity_confidence": round(identity.confidence, 4),
                         "identity_face_count": identity.face_count,
                         "identity_has_only_verified_other_tracks":
                             identity.has_only_verified_other_tracks,
+                        "motion_src": motion_src,
+                        **signals.stash_fields(),
                     }
                     await add_analysis(
                         session,
@@ -733,6 +808,10 @@ class CameraIngest:
             result.detector_fields["identity_patient_in_clip"] = identity.patient_in_clip
             result.detector_fields["identity_confidence"] = round(identity.confidence, 4)
             result.detector_fields["identity_face_count"] = identity.face_count
+            # Layer-1 signals + unified motion verdict (v2 P2) — the
+            # sig_* block is the soak's raw material for the P3 floors.
+            result.detector_fields["motion_src"] = motion_src
+            result.detector_fields.update(signals.stash_fields())
 
             # Token ledger (v2): per-call spend onto the analyses row when
             # the provider reports it. Raw data for the cost governor.
@@ -793,46 +872,49 @@ class CameraIngest:
                         self._log_tag,
                     )
 
-            # Presence gate. The LLM is the GENERIC people detector — it's
-            # looser / more sensitive than YOLO body tracking — and the re-ID
-            # FACE match (the patient / POI) is the override. `people_present`
-            # comes from the LLM's always-on prompt block (PEOPLE_PRESENT_SPEC
-            # in prompt.py).
+            # Presence gate (v2 P2: state machine fed by backend presence).
+            # UNION semantics — a person is present if the LLM says so OR
+            # the tracker holds any body track OR the face matcher locked
+            # the patient (POI). `people_present` comes from the LLM's
+            # always-on prompt block (PEOPLE_PRESENT_SPEC in prompt.py).
             #
-            #   • faces NOT enrolled -> presence is purely the LLM (no POI).
-            #   • faces enrolled + re-ID ran -> presence = LLM OR patient-matched.
-            #     A matched patient (POI) is present even if the LLM disagrees;
-            #     otherwise trust the LLM (so an LLM-yes / YOLO-no tick reads as
-            #     "person"). YOLO body COUNT no longer gates presence — only its
-            #     face match (the POI) does.
-            #   • faces enrolled + re-ID infra failure (timeout/crash) ->
-            #     conservatively keep the camera open so an outage doesn't
-            #     silently stop monitoring.
-            if not identity.faces_enrolled:
-                gate_people_present = bool(result.people_present)
-                gate_people_count = result.people_count
-                present_src = "llm_no_enrollment"
-            elif identity.reid_ran:
+            # Why union, per source:
+            #   • Tracker ADDS presence it can see (face turned away,
+            #     occluded, motion-blurred — the LLM misses some of
+            #     these). With always-on tracking this now covers
+            #     unenrolled patients too — the old faces_enrolled
+            #     branch is gone. Deliberate reversal of the earlier
+            #     "YOLO body count doesn't gate presence" rule, per the
+            #     v2 spec (§1.3 person_present: tracker + LLM as
+            #     confirmation). Known cost: a TV screen YOLO tracks as
+            #     a person can hold a room open — soak watchlist item;
+            #     P3's motion gating makes an open idle room cheap.
+            #   • Union means the tracker can only ever ADD presence,
+            #     never deny it — the empty-room lesson stands: when
+            #     re-ID didn't run (timeout/crash), the LLM alone
+            #     decides, and nothing hard-forces "person" (that bug
+            #     once kept empty rooms occupied forever).
+            if identity.reid_ran:
+                tracker_present = identity.people_present_reid
                 gate_people_present = bool(
-                    result.people_present or identity.patient_in_clip
+                    result.people_present
+                    or identity.patient_in_clip
+                    or tracker_present
                 )
                 gate_people_count = max(
                     result.people_count, identity.people_count_reid
                 )
-                present_src = (
-                    "reid_poi" if identity.patient_in_clip else "llm_enrolled"
-                )
+                if identity.patient_in_clip:
+                    present_src = "reid_poi"
+                elif tracker_present and result.people_present:
+                    present_src = "llm+tracker"
+                elif tracker_present:
+                    present_src = "tracker_only"
+                elif result.people_present:
+                    present_src = "llm_only"
+                else:
+                    present_src = "none"
             else:
-                # Re-ID didn't run this tick — either no bodies to match (an
-                # empty room, the common case) or an infra timeout/crash.
-                # Defer to the LLM rather than forcing "person": the LLM still
-                # ran and is a reliable presence signal, so a room it
-                # confidently calls empty closes normally after the no-people
-                # streak. Re-ID only OVERRIDES to "person" when it positively
-                # matches the POI (the elif branch above); it must never
-                # invent presence the LLM denies. (Previously this hard-forced
-                # people_present=True, which kept an empty room "occupied"
-                # forever and overrode a clear LLM "no person".)
                 gate_people_present = bool(result.people_present)
                 gate_people_count = result.people_count
                 present_src = "reid_unavailable_llm"
