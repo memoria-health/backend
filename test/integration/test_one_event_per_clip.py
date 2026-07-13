@@ -31,17 +31,48 @@ from test.integration.test_reid_safety_invariant import _setup_patient_with_came
 async def _two_firing_detectors(
     session: AsyncSession, patient_id,
 ) -> tuple[Detector, Detector]:
-    """Two of the patient's auto-seeded, reactive (non-scheduled) detectors."""
-    rows = (
-        await session.execute(
-            select(Detector)
-            .where(Detector.patient_id == patient_id)
-            .order_by(Detector.created_at)
+    """Two EQUAL-SEVERITY custom detectors. Severity is ranking tier 1 in
+    `_select_primary` (choking beats agitation no matter what the model or
+    confidence say), so the hint/confidence tiers this file tests are only
+    reachable between detectors of the same severity — catalog presets all
+    differ, customs share the default. Tier-1 itself is covered by
+    test/unit/test_event_primary_selection.py.
+    """
+    from datetime import datetime, timezone
+    from uuid import uuid4
+
+    now = datetime.now(timezone.utc)
+    dets = []
+    for ident in ("custom_ovlap_a0", "custom_ovlap_b0"):
+        det = Detector(
+            id=uuid4(),
+            created_at=now,
+            updated_at=now,
+            patient_id=patient_id,
+            name=f"Custom {ident[-2:]}",
+            icon_name="sparkles",
+            description="overlap test detector",
+            category="safety",
+            source="custom",
+            shape="point_in_time",
+            where_scope="ALL ROOMS",
+            when_scope="ALWAYS",
+            sensitivity="standard",
+            is_on=True,
+            custom_prompt="overlap test",
+            identifier=ident,
+            prompt_fragment="overlap test fragment",
+            schema_json={
+                f"{ident}_detected": {"type": "boolean"},
+                f"{ident}_confidence": {"type": "number"},
+                f"{ident}_reasoning": {"type": "string"},
+            },
+            is_builtin=False,
         )
-    ).scalars().all()
-    reactive = [d for d in rows if d.is_on and d.shape == "point_in_time"]
-    assert len(reactive) >= 2, "need ≥2 point_in_time presets to test overlap"
-    return reactive[0], reactive[1]
+        session.add(det)
+        dets.append(det)
+    await session.commit()
+    return dets[0], dets[1]
 
 
 def _fields_for(det: Detector, confidence: float) -> dict:
