@@ -437,6 +437,24 @@ create table public.detectors (
   -- because the state machine requires its output.
   always_on       boolean not null default false,
   is_builtin      boolean not null default true,
+  -- ── Detection v2 dimensions ────────────────────────────────────────
+  -- Spec: docs/architecture/detection-architecture-v2.md. Python source of
+  -- truth for built-in values: src/services/detection/catalog_v2.py (keep
+  -- the backfill block in scripts/apply_detector_v2_delta.sql in sync).
+  -- NULL = not yet classified (pre-backfill rows / legacy customs).
+  -- Nothing before P3 reads these except severity (promotion prefers the
+  -- row value, falls back to the in-code catalog map when NULL).
+  evidence_branch text check (evidence_branch in ('environment', 'person_motion', 'person_still')),
+  subject_scope   text check (subject_scope in ('patient', 'anyone', 'environment')),
+  unknown_policy  text check (unknown_policy in ('lenient', 'strict')),
+  bucket          text check (bucket in ('scene', 'person', 'fine_motion', 'rapid', 'face', 'snapshot')),
+  needs_audio     boolean not null default false,
+  evidence_unit   text check (evidence_unit in ('verdict', 'instance', 'sample')),
+  eventing        jsonb,    -- {shape, k, n, M, T, absence_deadline}
+  duty_cycle      text check (duty_cycle in ('every_eligible_tick', 'sampled', 'scheduled_only')),
+  severity        integer,  -- within-tick precedence; moves out of catalog._SEVERITY
+  cooldown_seconds integer, -- per-detector re-fire spacing for point shapes
+  degradation_warning text check (degradation_warning in ('none', 'distance_class')),
   created_at      timestamptz not null default now(),
   updated_at      timestamptz not null default now()
 );

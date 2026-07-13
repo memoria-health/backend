@@ -84,3 +84,21 @@ class Detector(Base):
     # detector was evaluated (whether or not it fired). Internal; not
     # exposed in DetectorResponse. NULL = never evaluated.
     last_scheduled_eval_date: Mapped[date | None] = mapped_column(Date, default=None)
+
+    # ── Detection v2 dimensions ─────────────────────────────────────
+    # Spec: docs/architecture/detection-architecture-v2.md. Python source
+    # of truth for built-in values: src/services/detection/catalog_v2.py.
+    # NULL = not yet classified (pre-backfill rows / legacy customs).
+    # Nothing before P3 reads these except `severity` (event promotion
+    # prefers the row value, falls back to the catalog map when NULL).
+    evidence_branch: Mapped[str | None] = mapped_column(String(20), default=None)
+    subject_scope: Mapped[str | None] = mapped_column(String(20), default=None)
+    unknown_policy: Mapped[str | None] = mapped_column(String(10), default=None)
+    bucket: Mapped[str | None] = mapped_column(String(20), default=None)
+    needs_audio: Mapped[bool] = mapped_column(Boolean, default=False)
+    evidence_unit: Mapped[str | None] = mapped_column(String(10), default=None)
+    eventing: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    duty_cycle: Mapped[str | None] = mapped_column(String(25), default=None)
+    severity: Mapped[int | None] = mapped_column(Integer, default=None)
+    cooldown_seconds: Mapped[int | None] = mapped_column(Integer, default=None)
+    degradation_warning: Mapped[str | None] = mapped_column(String(20), default=None)
