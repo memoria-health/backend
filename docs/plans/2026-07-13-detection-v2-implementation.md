@@ -84,6 +84,8 @@ Branch: `feat/detection-v2-p1-schema`. Adds the six-dimension columns; nothing r
 
 ## Phase 2 — Layer-0/1 signals  *(~4–5 days)*
 
+**Status (2026-07-13): BUILT** — landed on `feat/gateway-camera-ownership` (continuing the active branch per Aryaman, not the planned p2 branch name). Commits: d285dfe (`is_builtin` dropped — Aryaman-directed cleanup; its drop delta runs AFTER backend deploy, inverse of DB-first, see script header) · e48abc5 + c4685e9 (item 1 + review fixes) · b84d61d (item 2) · 2385f5b (item 3 — built as `signals/tick_signals.py`, one full-frame diff map at 320 px; the P0 rapid gate keeps its own eval-tuned crop-first measurement until the soak proves the map can replace it) · 942e5fa (item 4 — plus the two prescribed behavior changes: closed-state backend wake and presence union; new dial `signals_motion_min_active_fraction=0.02`). Deviation from item 3's letter: signal unit tests use synthetic windows, not recorded fixtures.
+
 Branch: `feat/detection-v2-p2-signals`. Depends on the decided re-ID direction (tracking always-on, FaceID attribution optional — see memory/branch notes).
 
 1. Decouple body tracking from `reid_enabled`: the early-out at `inference.py:232-243` becomes attribution-only; YOLO+BoT-SORT runs every presence tick.
