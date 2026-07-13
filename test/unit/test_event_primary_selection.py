@@ -2,12 +2,17 @@
 
 When several detectors cross their firing threshold on a single clip
 (e.g. a fall AND a general-emergency, or agitation AND calling-for-help),
-only ONE event should fire. `_select_primary` decides which:
+only ONE event should fire. `_select_primary` ranks, in order:
 
-  1. the model's explicit `primary_detection` pick, when it names a
-     detector that actually crossed threshold this clip;
-  2. else the highest-confidence detection (safety beats routine on a tie,
-     then identifier for determinism).
+  1. catalog SEVERITY (higher wins) — choking beats agitation no matter
+     what the model hint or confidence say;
+  2. the model's explicit `primary_detection` pick, breaking ties WITHIN
+     the same severity, when it names a detector that actually crossed
+     threshold this clip;
+  3. confidence; 4. safety over routine; 5. identifier for determinism.
+
+Identifiers not in the catalog severity map (all customs) share the
+default severity, so tiers 2-5 are exercised with custom_* identifiers.
 """
 
 from __future__ import annotations
@@ -32,23 +37,39 @@ def test_single_candidate_wins_regardless_of_hint() -> None:
     assert _select_primary([c], primary_hint="something_else") is c
 
 
-def test_model_hint_wins_over_higher_confidence() -> None:
+def test_severity_beats_confidence_and_hint() -> None:
+    """fall (severity 95) outranks emergency (80) even when emergency is
+    more confident AND the model names emergency as dominant — the
+    catalog's stakes ordering is the top tier, deliberately.
+    """
     fall = _c("fall", 0.72)
-    emergency = _c("general_emergency", 0.91)
-    # emergency is more confident, but the model named fall as dominant.
-    assert _select_primary([fall, emergency], primary_hint="fall") is fall
+    emergency = _c("emergency", 0.91)
+    assert _select_primary([fall, emergency], primary_hint="") is fall
+    assert _select_primary([fall, emergency], primary_hint="emergency") is fall
+
+
+def test_model_hint_breaks_ties_within_equal_severity() -> None:
+    """Two customs share the default severity; the model's pick decides,
+    overriding higher confidence.
+    """
+    pacing = _c("custom_pacing00", 0.72)
+    shouting = _c("custom_shout000", 0.91)
+    assert _select_primary([pacing, shouting], primary_hint="custom_pacing00") is pacing
 
 
 def test_falls_back_to_highest_confidence_without_a_usable_hint() -> None:
-    fall = _c("fall", 0.72)
-    emergency = _c("general_emergency", 0.91)
-    assert _select_primary([fall, emergency], primary_hint="") is emergency
+    pacing = _c("custom_pacing00", 0.72)
+    shouting = _c("custom_shout000", 0.91)
+    assert _select_primary([pacing, shouting], primary_hint="") is shouting
     # A stale/unknown hint that names no candidate is ignored, not honored.
-    assert _select_primary([fall, emergency], primary_hint="wandering") is emergency
-    assert _select_primary([fall, emergency], primary_hint=None) is emergency
+    assert _select_primary([pacing, shouting], primary_hint="wandering") is shouting
+    assert _select_primary([pacing, shouting], primary_hint=None) is shouting
 
 
-def test_safety_breaks_a_confidence_tie() -> None:
-    routine = _c("watching_tv", 0.80, category="routine")
-    safety = _c("fall", 0.80, category="safety")
+def test_safety_breaks_a_full_tie() -> None:
+    """Equal (default) severity, equal confidence, no hint → safety wins
+    over routine.
+    """
+    routine = _c("custom_tvwatch0", 0.80, category="routine")
+    safety = _c("custom_nearfall", 0.80, category="safety")
     assert _select_primary([routine, safety], primary_hint="") is safety

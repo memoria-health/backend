@@ -162,10 +162,12 @@ def _select_primary(
     also a general emergency; agitation overlaps calling-for-help), which
     used to file one event per matching detector. We now fire exactly one:
 
-      1. the model's `primary_detection` pick, IF it names a detector that
-         actually crossed threshold this clip (the model judges which
-         action/sound dominates — the closest-association ask);
-      2. otherwise the highest-confidence detection. Ties break toward
+      1. catalog SEVERITY (higher wins) — if it's choking we don't also
+         want the agitation alert on the same clip;
+      2. the model's `primary_detection` pick, breaking ties WITHIN the
+         same severity, IF it names a detector that actually crossed
+         threshold this clip (the model judges which action dominates);
+      3. otherwise the highest-confidence detection. Ties break toward
          `safety` over `routine`, then identifier, for determinism.
 
     Returns None when nothing crossed threshold.
