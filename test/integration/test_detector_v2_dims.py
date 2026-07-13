@@ -32,7 +32,6 @@ async def test_seeded_presets_carry_v2_dims(
         assert r.bucket == dims.bucket, r.identifier
         assert r.evidence_branch == dims.evidence_branch, r.identifier
         assert r.subject_scope == dims.subject_scope, r.identifier
-        assert r.unknown_policy == dims.unknown_policy, r.identifier
         assert r.needs_audio == dims.needs_audio, r.identifier
         assert r.evidence_unit == dims.evidence_unit, r.identifier
         assert r.duty_cycle == dims.duty_cycle, r.identifier

@@ -12,9 +12,9 @@
 --
 -- Column meanings (spec: docs/architecture/detection-architecture-v2.md):
 --   evidence_branch     which scene branch feeds this detector evidence
---   subject_scope       who it is about; unknown_policy = behavior while
---                       attribution is unresolved (suppress only on
---                       VERIFIED other, never on uncertainty)
+--   subject_scope       who it is about (while attribution is unresolved the
+--                       RULE is fixed, not configurable: run — suppress only
+--                       on VERIFIED not-patient evidence)
 --   bucket              perception instrument (locked recipe)
 --   needs_audio         must land in a call that carries sound
 --   evidence_unit       verdict | instance | sample
@@ -27,7 +27,6 @@
 alter table public.detectors
   add column if not exists evidence_branch text,
   add column if not exists subject_scope text,
-  add column if not exists unknown_policy text,
   add column if not exists bucket text,
   add column if not exists needs_audio boolean not null default false,
   add column if not exists evidence_unit text,
@@ -45,11 +44,6 @@ exception when duplicate_object then null; end $$;
 do $$ begin
   alter table public.detectors add constraint detectors_subject_scope_check
     check (subject_scope in ('patient', 'anyone', 'environment'));
-exception when duplicate_object then null; end $$;
-
-do $$ begin
-  alter table public.detectors add constraint detectors_unknown_policy_check
-    check (unknown_policy in ('lenient', 'strict'));
 exception when duplicate_object then null; end $$;
 
 do $$ begin
@@ -78,7 +72,6 @@ exception when duplicate_object then null; end $$;
 update public.detectors as d
 set evidence_branch     = v.branch,
     subject_scope       = v.subject,
-    unknown_policy      = 'lenient',
     bucket              = v.bucket,
     needs_audio         = v.needs_audio,
     evidence_unit       = v.unit,
@@ -114,4 +107,19 @@ from (values
 ) as v(identifier, branch, subject, bucket, needs_audio, unit, duty, severity, warn)
 where d.identifier = v.identifier
   and d.is_builtin = true
-  and d.severity is distinct from v.severity;  -- re-runnable, no-op when current
+  -- Re-run guard covers EVERY column this UPDATE sets (review finding: a
+  -- severity-only guard would silently skip future non-severity edits on
+  -- an already-migrated DB). No-op when all values are current.
+  and (
+       d.evidence_branch     is distinct from v.branch
+    or d.subject_scope       is distinct from v.subject
+    or d.bucket              is distinct from v.bucket
+    or d.needs_audio         is distinct from v.needs_audio
+    or d.evidence_unit       is distinct from v.unit
+    or d.duty_cycle          is distinct from v.duty
+    or d.severity            is distinct from v.severity
+    or d.degradation_warning is distinct from v.warn
+  );
+-- NOTE on the constraint blocks above: `duplicate_object` no-ops mean a
+-- future change to a CHECK's legal-value list needs a NEW constraint name
+-- (drop old + add new) — re-running the same name keeps the old body.

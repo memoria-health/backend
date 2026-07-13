@@ -26,7 +26,7 @@ A detector is a point in a six-dimensional space. Today's `Detector` row (src/db
 ```
 Detector =
   1. SEMANTICS    what it means        (identifier, name, prompt_fragment, category, cohort)
-  2. SUBJECT      who it is about      (patient | anyone | environment, unknown_policy)
+  2. SUBJECT      who it is about      (patient | anyone | environment)
   3. ACTIVATION   when it runs         (gate expr × schedule × placement × duty_cycle)
   4. PERCEPTION   how it looks         (bucket → locked recipe: fps, channel, crop, tier)
   5. DECISION     how evidence→event   (evidence unit × eventing shape × threshold/severity)
@@ -62,8 +62,11 @@ The six buckets are the *instruments* each branch points at the scene; `needs_au
 
 ```
 subject_scope: patient | anyone | environment
-unknown_policy: lenient (default) | strict
 ```
+
+While attribution is unresolved the rule is FIXED, not per-detector
+configuration (unknown_policy column cut, Aryaman 2026-07-13): run —
+suppress only on VERIFIED not-patient evidence, never on uncertainty.
 
 Attribution comes from the existing per-track PATIENT/OTHER/UNKNOWN machine (body_pipeline.py:35-37, face-lock after 2 hits :364-377, OTHER after 5 verified failures :383-406, never demote PATIENT :391-397). What changes is **who consumes it**: today it feeds one binary whole-call gate (camera_ingest.py:572-620 — patient absent + only-verified-others ⇒ skip the entire LLM call). In v2 the same signal filters **per detector**:
 
@@ -71,11 +74,11 @@ Attribution comes from the existing per-track PATIENT/OTHER/UNKNOWN machine (bod
 |---|---|---|---|
 | Patient present (locked) | ✅ | ✅ | ✅ |
 | Unknown person, no enrollment | ✅ | ✅ | ✅ (identity-agnostic fallback — today's behavior) |
-| Unknown person, enrollment exists, unresolved | ✅ | ✅ | ✅ if `lenient` (suppress only on positive evidence), ❌ if `strict` |
+| Unknown person, enrollment exists, unresolved | ✅ | ✅ | ✅ (suppress only on positive evidence) |
 | **Verified other(s) only** | ✅ | ✅ | ❌ |
 | No person | ✅ (+ absence states keep counting) | ❌ | ❌ |
 
-Scope assignment is deliberately simple (Aryaman, 2026-07-13): **almost everything is `patient` with `lenient` unknown-policy** — including fall, choking, seizure, emergency; the patient is who this product watches. `anyone` is reserved for detectors explicitly about other people (possible_intruder); `environment` for no-person detectors (fire/smoke, hazards, stove). Net behavioral delta vs today's whole-call skip: with a verified other alone in frame, intruder + environment detectors now keep running — nothing else changes. The suppression philosophy is unchanged from today's gate — suppress only on *verified* not-patient evidence, never on mere uncertainty.
+Scope assignment is deliberately simple (Aryaman, 2026-07-13): **almost everything is `patient`** — including fall, choking, seizure, emergency; the patient is who this product watches. `anyone` is reserved for detectors explicitly about other people (possible_intruder); `environment` for no-person detectors (fire/smoke, hazards, stove). Net behavioral delta vs today's whole-call skip: with a verified other alone in frame, intruder + environment detectors now keep running — nothing else changes. The suppression philosophy is unchanged from today's gate — suppress only on *verified* not-patient evidence, never on mere uncertainty.
 
 **Required plumbing change:** `IdentityResult` is aggregate-only today (inference.py:70-181 — one patient bbox, peak count, only-others flag; no track list). v2 exposes the per-track list `[{track_id, bbox_series, label, confidence}]` to the ingest so the scheduler can target crops and scope subjects per track. Body tracking must also run **always-on**, decoupled from `reid_enabled` (today `reid_enabled=false` kills ALL tracking — inference.py:232-233; the decided direction: tracking always on, FaceID attribution optional on top).
 
@@ -170,11 +173,11 @@ Topology unchanged: one worker per patient room, N `CameraIngest` per worker (ro
 
 | Detector | Subject | Bucket | Eventing | Notes |
 |---|---|---|---|---|
-| fall | patient (lenient) | SCENE | point | k=1 — recall-critical |
-| **seizure** | patient (lenient) | **RAPID** | point | **P0 hotfix**: today lite+global-overlay+biased prompt (catalog.py:269-316) — the measured worst case |
-| emergency | patient (lenient) | SCENE | point | |
-| choking | patient (lenient) | PERSON | point | hands-to-throat is body-scale |
-| calling_for_help | patient (lenient) | SCENE (needs_audio) | point | |
+| fall | patient | SCENE | point | k=1 — recall-critical |
+| **seizure** | patient | **RAPID** | point | **P0 hotfix**: today lite+global-overlay+biased prompt (catalog.py:269-316) — the measured worst case |
+| emergency | patient | SCENE | point | |
+| choking | patient | PERSON | point | hands-to-throat is body-scale |
+| calling_for_help | patient | SCENE (needs_audio) | point | |
 | fire_smoke | environment | SCENE | point | smoke is large-scale + dynamic |
 | possible_intruder | anyone | SCENE | point | evidence = visible concealment (mask), per its existing prompt — never "unenrolled person" (only the patient is enrolled); attribution is context at most |
 | wandering / child_wandering | patient | SCENE (door zones) | point | door_config ports as-is |
@@ -183,9 +186,9 @@ Topology unchanged: one worker per patient room, N `CameraIngest` per worker (ro
 | medication | patient | PERSON | point (absence state later) | schedule window; validated 100%R/0FP |
 | meal_eaten | patient | PERSON | point | |
 | agitation | patient | SCENE (needs_audio) | state (sparse M-of-T) | replaces rising-edge episode logic |
-| climbing / distress (child) | patient (lenient) | SCENE (needs_audio) | state (dense) | the child IS the patient |
-| child_crib_exit / _stairs / _hazard_reach / _head_impact / _cord_entanglement | patient (lenient) | SCENE (cord: PERSON) | point | cord = thin-object warning |
-| child_device_usage | patient (lenient) | PERSON | state (sparse) | routine |
+| climbing / distress (child) | patient | SCENE (needs_audio) | state (dense) | the child IS the patient |
+| child_crib_exit / _stairs / _hazard_reach / _head_impact / _cord_entanglement | patient | SCENE (cord: PERSON) | point | cord = thin-object warning |
+| child_device_usage | patient | PERSON | state (sparse) | routine |
 | setup_test | anyone | SCENE | point, fire_once | unchanged |
 | **general_fidgeting** (new) | patient | FINE-MOTION | state (sparse) | +30% validated; object-visibility warning |
 | **facial_grimacing** (new) | patient | FACE | state (sparse) | +51% validated |
@@ -201,7 +204,7 @@ Topology unchanged: one worker per patient room, N `CameraIngest` per worker (ro
 **PORT unchanged:** worker/room/ingest topology + FrameBuffer fork (room_worker.py:897-951); provider chains + per-caregiver `vlm_provider` (vlm_routing.py:36-79) with new bucket-capability constraints; promotion threshold/sensitivity machinery (event_promotion.py:93-113); primary-selection ranking (:156-190); event schema + push/email/clip/privacy (camera_ingest.py:867-921); `cameras_detectors` + door_config; seeding/library; compiler skeleton incl. stakes-based bias (detector_compiler.py:124-195); the attribution state machine (body_pipeline.py) and harvesting; data-collection recorder + privacy paths.
 
 **CHANGE:**
-- `detectors` table: + `subject_scope`, `unknown_policy`, `evidence_branch` (environment|person_motion|person_still — the top-level taxonomy), `bucket`, `needs_audio`, `evidence_unit`, `eventing` JSONB (`{shape, k, n, M, T, absence_deadline}`), `duty_cycle`, `severity` (persisted), `cooldown_seconds`, `degradation_warning`. `shape` enum collapses `point_in_time|state|scheduled` → `point|state`. Idempotent delta SQL per convention.
+- `detectors` table: + `subject_scope`, `evidence_branch` (environment|person_motion|person_still — the top-level taxonomy), `bucket`, `needs_audio`, `evidence_unit`, `eventing` JSONB (`{shape, k, n, M, T, absence_deadline}`), `duty_cycle`, `severity` (persisted), `cooldown_seconds`, `degradation_warning`. `shape` enum collapses `point_in_time|state|scheduled` → `point|state`. Idempotent delta SQL per convention.
 - Identity: expose per-track list from ReID to ingest; run tracking always-on regardless of `reid_enabled` (inference.py:232-233 early-out becomes attribution-only).
 - Motion: backend person-scoped signals from tracker; phone SAD demoted to hint.
 - Call assembly: `build_prompt_and_schema` gains a packer in front (≤3/call, per-bucket artifact builders); `motion_overlay_enabled` global flag dies — overlay becomes a RAPID recipe property (camera_ingest.py:641-656 moves into the RAPID artifact builder).

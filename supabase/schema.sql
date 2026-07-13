@@ -477,7 +477,6 @@ create table public.detectors (
   -- row value, falls back to the in-code catalog map when NULL).
   evidence_branch text check (evidence_branch in ('environment', 'person_motion', 'person_still')),
   subject_scope   text check (subject_scope in ('patient', 'anyone', 'environment')),
-  unknown_policy  text check (unknown_policy in ('lenient', 'strict')),
   bucket          text check (bucket in ('scene', 'person', 'fine_motion', 'rapid', 'face', 'snapshot')),
   needs_audio     boolean not null default false,
   evidence_unit   text check (evidence_unit in ('verdict', 'instance', 'sample')),

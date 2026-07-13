@@ -21,7 +21,6 @@ from src.services.detection import catalog
 
 EVIDENCE_BRANCHES = ("environment", "person_motion", "person_still")
 SUBJECT_SCOPES = ("patient", "anyone", "environment")
-UNKNOWN_POLICIES = ("lenient", "strict")
 BUCKETS = ("scene", "person", "fine_motion", "rapid", "face", "snapshot")
 EVIDENCE_UNITS = ("verdict", "instance", "sample")
 DUTY_CYCLES = ("every_eligible_tick", "sampled", "scheduled_only")
@@ -37,7 +36,6 @@ class DetectorDims:
     subject_scope: str
     bucket: str
     severity: int
-    unknown_policy: str = "lenient"
     needs_audio: bool = False
     evidence_unit: str = "verdict"
     duty_cycle: str = "every_eligible_tick"
@@ -124,7 +122,6 @@ def _validate() -> None:
         for value, legal in (
             (d.evidence_branch, EVIDENCE_BRANCHES),
             (d.subject_scope, SUBJECT_SCOPES),
-            (d.unknown_policy, UNKNOWN_POLICIES),
             (d.bucket, BUCKETS),
             (d.evidence_unit, EVIDENCE_UNITS),
             (d.duty_cycle, DUTY_CYCLES),

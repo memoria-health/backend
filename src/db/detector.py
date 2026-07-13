@@ -93,7 +93,6 @@ class Detector(Base):
     # prefers the row value, falls back to the catalog map when NULL).
     evidence_branch: Mapped[str | None] = mapped_column(String(20), default=None)
     subject_scope: Mapped[str | None] = mapped_column(String(20), default=None)
-    unknown_policy: Mapped[str | None] = mapped_column(String(10), default=None)
     bucket: Mapped[str | None] = mapped_column(String(20), default=None)
     needs_audio: Mapped[bool] = mapped_column(Boolean, default=False)
     evidence_unit: Mapped[str | None] = mapped_column(String(10), default=None)
