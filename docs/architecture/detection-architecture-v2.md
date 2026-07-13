@@ -39,9 +39,9 @@ The hierarchy matters: **subject and activation decide whether we look at all; p
 
 ```
 ENVIRONMENT      evidence exists without any person: stove, door, fire,
-                 hazards, a NEW unknown track appearing (intruder).
-                 Evaluated every tick regardless of occupancy — driven by
-                 environment motion (change OUTSIDE person boxes) + schedule.
+                 hazards. Evaluated every tick regardless of occupancy —
+                 driven by environment motion (change OUTSIDE person
+                 boxes) + schedule.
 PERSON-MOTION    a tracked person's in-box activity ≥ the floor: falls,
                  seizure, wandering, medication, eating, fidgeting —
                  anything evidenced by action. Per track, per subject.
@@ -51,6 +51,8 @@ PERSON-STILL     a tracked person below the floor: facial actions (a still
 ```
 
 The six buckets are the *instruments* each branch points at the scene; `needs_audio` is a property of the call, and the decision shapes (point/state) consume whatever the branches produce. Everything in §1.3-§1.5 hangs off this tree.
+
+**Intruder is NOT an identity inference (Aryaman, 2026-07-13):** only the patient is face-enrolled, so every visitor/relative/aide is "unknown" — an unknown track can never be the trigger. `possible_intruder` is video-evidenced concealment (mask/covered face — exactly what its catalog prompt already says, catalog.py:1026-1032), living on the person branches with subject=anyone; attribution state is at most CONTEXT passed to the model, never the verdict.
 
 ### 1.1 Semantics (ported unchanged)
 
@@ -174,7 +176,7 @@ Topology unchanged: one worker per patient room, N `CameraIngest` per worker (ro
 | choking | patient (lenient) | PERSON | point | hands-to-throat is body-scale |
 | calling_for_help | patient (lenient) | SCENE (needs_audio) | point | |
 | fire_smoke | environment | SCENE | point | smoke is large-scale + dynamic |
-| possible_intruder | anyone | SCENE | point | benefits from attribution context ("verified-other at 3 AM") |
+| possible_intruder | anyone | SCENE | point | evidence = visible concealment (mask), per its existing prompt — never "unenrolled person" (only the patient is enrolled); attribution is context at most |
 | wandering / child_wandering | patient | SCENE (door zones) | point | door_config ports as-is |
 | stove_left_on | environment | SNAPSHOT (zone) | state absence-style | small-flame degradation warning |
 | env_hazard_glass / _water | environment | SNAPSHOT (zone) | point | rides motion ticks; size-floor warnings |
@@ -199,7 +201,7 @@ Topology unchanged: one worker per patient room, N `CameraIngest` per worker (ro
 **PORT unchanged:** worker/room/ingest topology + FrameBuffer fork (room_worker.py:897-951); provider chains + per-caregiver `vlm_provider` (vlm_routing.py:36-79) with new bucket-capability constraints; promotion threshold/sensitivity machinery (event_promotion.py:93-113); primary-selection ranking (:156-190); event schema + push/email/clip/privacy (camera_ingest.py:867-921); `cameras_detectors` + door_config; seeding/library; compiler skeleton incl. stakes-based bias (detector_compiler.py:124-195); the attribution state machine (body_pipeline.py) and harvesting; data-collection recorder + privacy paths.
 
 **CHANGE:**
-- `detectors` table: + `subject_scope`, `unknown_policy`, `bucket`, `evidence_unit`, `eventing` JSONB (`{shape, k, n, M, T, absence_deadline}`), `duty_cycle`, `severity` (persisted), `cooldown_seconds`, `degradation_warning`. `shape` enum collapses `point_in_time|state|scheduled` → `point|state`. Idempotent delta SQL per convention.
+- `detectors` table: + `subject_scope`, `unknown_policy`, `evidence_branch` (environment|person_motion|person_still — the top-level taxonomy), `bucket`, `needs_audio`, `evidence_unit`, `eventing` JSONB (`{shape, k, n, M, T, absence_deadline}`), `duty_cycle`, `severity` (persisted), `cooldown_seconds`, `degradation_warning`. `shape` enum collapses `point_in_time|state|scheduled` → `point|state`. Idempotent delta SQL per convention.
 - Identity: expose per-track list from ReID to ingest; run tracking always-on regardless of `reid_enabled` (inference.py:232-233 early-out becomes attribution-only).
 - Motion: backend person-scoped signals from tracker; phone SAD demoted to hint.
 - Call assembly: `build_prompt_and_schema` gains a packer in front (≤3/call, per-bucket artifact builders); `motion_overlay_enabled` global flag dies — overlay becomes a RAPID recipe property (camera_ingest.py:641-656 moves into the RAPID artifact builder).
