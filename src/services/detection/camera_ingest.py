@@ -774,6 +774,10 @@ class CameraIngest:
                         if rapid_fields:
                             result.detector_fields.update(rapid_fields)
                 except Exception:  # noqa: BLE001
+                    # Degraded-tick marker: seizure coverage was WANTED this
+                    # tick and did not run — distinguishable in analyses
+                    # from "gate closed" (ran=False) and "ran clean".
+                    result.detector_fields["rapid_seizure_error"] = True
                     log.exception(
                         "%s RAPID seizure call failed — tick continues",
                         self._log_tag,

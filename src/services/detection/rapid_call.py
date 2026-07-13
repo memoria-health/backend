@@ -176,11 +176,14 @@ async def run_rapid_seizure(
     specs = [RAPID_MOTION_SPEC, rapid_seizure_spec()]
     best: dict[str, Any] | None = None
     in_tok = out_tok = 0
+    attempted = succeeded = 0
     for art in artifacts[:_MAX_ARTIFACTS]:
+        attempted += 1
         try:
             res = await provider(
                 mp4=art, detectors=specs, log_tag=log_tag, settings=rapid_settings
             )
+            succeeded += 1
         except Exception:  # noqa: BLE001 — one person's call failing must not
             log.exception("%s RAPID provider call failed", log_tag)
             continue
@@ -194,6 +197,14 @@ async def run_rapid_seizure(
             break
         if best is None and fields:
             best = fields
+    if attempted and not succeeded:
+        # The gate OPENED — this tick genuinely wanted seizure coverage —
+        # and every provider call failed (e.g. a model 503 storm). While
+        # the flag is on, seizure lives ONLY here, so this must surface as
+        # a degraded tick, not dissolve into "gate closed".
+        raise RuntimeError(
+            f"all {attempted} RAPID provider call(s) failed with the gate open"
+        )
     if best is not None and (in_tok or out_tok):
         best["rapid_input_tokens"] = in_tok
         best["rapid_output_tokens"] = out_tok

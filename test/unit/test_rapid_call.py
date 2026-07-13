@@ -117,6 +117,25 @@ def test_scale_bbox_maps_reid_space_to_native_pixels() -> None:
     assert scale_bbox_to_frame((0, 0, 1, 1), 0, 0, sample_width=480) is None
 
 
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+async def test_total_provider_failure_raises_for_degraded_marker() -> None:
+    """Gate open + every provider call failing (503 storm) must RAISE so the
+    tick stamps rapid_seizure_error — silent loss of the only seizure
+    coverage is the one unacceptable outcome."""
+    s = get_settings().model_copy(update={"rapid_seizure_enabled": True})
+
+    class _AlwaysDown:
+        async def __call__(self, **kwargs):
+            raise RuntimeError("503")
+
+    with pytest.raises(RuntimeError, match="RAPID provider"):
+        await run_rapid_seizure(
+            frames=_frames(flicker=True),
+            per_person_boxes=[[(40, 20, 110, 100)]],
+            settings=s, provider=_AlwaysDown(), log_tag="t",
+        )
+
+
 async def test_degenerate_boxes_return_none_without_spending() -> None:
     """All-degenerate person boxes: the gate fails open to whole-frame, but
     with no usable crop the call is skipped — never a malformed artifact."""
