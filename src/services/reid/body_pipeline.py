@@ -545,9 +545,14 @@ class BodyReIDPipeline:
 
         Used by the camera_ingest identity gate to SKIP the LLM call
         when we have positive evidence that everyone in frame is not
-        the patient. Safe because OTHER under the new label semantic
-        is earned only via face match failure on at least
-        `face_checks_for_other` verified attempts — never speculative.
+        the patient. OTHER is earned via face match failure on at
+        least `face_checks_for_other` verified attempts — OR inherited
+        from a cross-clip body-gallery pre-label (which itself
+        originated in some earlier clip's face evidence). The pre-label
+        path means this CAN be true with zero in-clip face evidence
+        (face_count=0); trusting it is a deliberate cross-clip-identity
+        decision, and the gate additionally requires attribution_ran so
+        a tick that couldn't attribute never suppresses.
         """
         if not self._tracks:
             return False

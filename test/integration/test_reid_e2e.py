@@ -254,8 +254,10 @@ async def test_tick_writes_identity_into_analyses(
 
     patient_id, headers = await _caregiver_setup(client, auth_user)
 
-    # Enroll one selfie so the gallery isn't empty (label_clip
-    # short-circuits to empty() before pipeline if gallery is empty).
+    # Enroll one selfie so the gallery is non-empty and this run
+    # exercises the ATTRIBUTION path (v2: an empty gallery no longer
+    # short-circuits label_clip — tracking always runs; enrollment
+    # only decides whether face matching happens).
     files = [("photos", ("a.jpg", _TINY_JPEG, "image/jpeg"))]
     await client.post(
         f"/v1/patients/{patient_id}/face-embeddings",

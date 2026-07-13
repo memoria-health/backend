@@ -107,13 +107,27 @@ async def run_vlm(
                     "openrouter": openrouter_provider,
                     "dashscope": dashscope_provider,
                 }[prov]
+                # Frame reuse only when attribution ran: with always-on
+                # tracking (v2 P2) extracted_frames now populate on
+                # every successful tick, but Re-ID samples at 5 fps vs
+                # these providers' configured 4 — reusing for the
+                # attribution-less population would silently send ~25%
+                # more image tokens (and its per_frame_bboxes are all
+                # None, so the reuse's bbox-alignment benefit is moot).
+                # Attribution-less ticks keep their own extraction at
+                # the provider's own fps — the pre-P2 cost profile.
+                reuse = identity.attribution_ran
                 result = await fn(
                     mp4=mp4, detectors=detectors, log_tag=log_tag, settings=settings,
                     patient_in_clip=identity.patient_in_clip,
                     patient_bbox=identity.patient_bbox,
-                    pre_extracted_frames=identity.extracted_frames,
-                    per_frame_bboxes=identity.per_frame_bboxes,
-                    sample_fps=identity.sample_fps,
+                    pre_extracted_frames=(
+                        identity.extracted_frames if reuse else None
+                    ),
+                    per_frame_bboxes=(
+                        identity.per_frame_bboxes if reuse else None
+                    ),
+                    sample_fps=identity.sample_fps if reuse else None,
                 )
             return prov, result
         except Exception as e:  # noqa: BLE001

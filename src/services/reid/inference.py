@@ -68,10 +68,10 @@ from src.settings import Settings
 log = logging.getLogger(__name__)
 
 # Stand-in gallery for attribution-less ticks (reid_enabled off, or no
-# ready enrollment). Shape matches the real (N, 512) stacked matrix so
-# the pipeline's `gallery.size > 0` check is the single source of truth
-# for "can face-match this tick."
-_EMPTY_GALLERY = np.empty((0, 512), dtype=np.float32)
+# ready enrollment). Shape matches the real (N, EMBEDDING_DIM) stacked
+# matrix so the pipeline's `gallery.size > 0` check is the single
+# source of truth for "can face-match this tick."
+_EMPTY_GALLERY = np.empty((0, reid_embeddings.EMBEDDING_DIM), dtype=np.float32)
 
 
 @dataclass(frozen=True)
@@ -156,11 +156,13 @@ class IdentityResult:
     # timed out has faces_enrolled=True but reid_ran=False.
     faces_enrolled: bool = False
 
-    # Frames the Re-ID pipeline already decoded + sampled. The LLM
-    # provider reuses these instead of running its own ffmpeg
-    # extract_frames pass (the OpenAI fps/width settings match Re-ID's
-    # sampling: 5 fps, 480px). None when Re-ID didn't run (disabled,
-    # no enrollment, timeout, error).
+    # Frames the Re-ID pipeline already decoded + sampled (5 fps,
+    # ≤480px). The frame-sampling LLM providers reuse these instead of
+    # running their own ffmpeg extract — but ONLY on attribution ticks
+    # (vlm_routing gates on attribution_ran: Re-ID's 5 fps exceeds the
+    # providers' configured 4, and the reuse would silently inflate
+    # image tokens for the always-on-tracking population whose bboxes
+    # are all None anyway). None when the pipeline didn't run.
     extracted_frames: list[ExtractedFrame] | None = None
 
     # One body bbox per entry in `extracted_frames`, in the same pixel
@@ -429,7 +431,17 @@ class ReIDInference:
         # Cache decoded BGR frames during the process loop so the
         # cross-clip gallery harvest step at the end can grab the
         # specific best-frame for each verified track without
-        # re-decoding. Held only for the duration of this thread.
+        # re-decoding. Held only for the duration of this thread — and
+        # ONLY when that harvest can actually run: with always-on
+        # tracking (v2 P2) this loop executes for every camera every
+        # tick, and ~55 retained BGR frames ≈ 15-20 MB per concurrent
+        # attribution-less tick would be provably dead weight (T1
+        # review finding). Index alignment is preserved via None slots.
+        keep_decoded = (
+            attribution
+            and self._body_gallery is not None
+            and self._settings.reid_body_gallery_enabled
+        )
         decoded_frames: list[np.ndarray | None] = []
         for frame_idx, frame in enumerate(frames):
             try:
@@ -447,7 +459,7 @@ class ReIDInference:
                 continue
             result = pipeline.process_frame(img, frame_idx)
             per_frame_bboxes.append(result.patient_bbox)
-            decoded_frames.append(img)
+            decoded_frames.append(img if keep_decoded else None)
 
         # Adaptive learning: hand the best face embedding we saw back
         # to the async caller, which will run the harvester + cache

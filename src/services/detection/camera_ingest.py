@@ -545,9 +545,11 @@ class CameraIngest:
                 log.exception("%s reid.label_clip crashed", self._log_tag)
                 identity = IdentityResult.empty()
             log.info(
-                "%s reid reid_ran=%s patient_in_clip=%s confidence=%.3f face_count=%d",
+                "%s reid reid_ran=%s attribution_ran=%s patient_in_clip=%s "
+                "confidence=%.3f face_count=%d",
                 self._log_tag,
                 identity.reid_ran,
+                identity.attribution_ran,
                 identity.patient_in_clip,
                 identity.confidence,
                 identity.face_count,
@@ -724,6 +726,10 @@ class CameraIngest:
             # tells event_promotion whether to apply identity
             # suppression at all (False = bypass, identity-agnostic).
             result.detector_fields["identity_reid_ran"] = identity.reid_ran
+            # v2 P2: reid_ran alone no longer distinguishes "attribution
+            # ran, no match" from a tracking-only tick (flag off / no
+            # enrollment) — persist both so analyses rows stay debuggable.
+            result.detector_fields["identity_attribution_ran"] = identity.attribution_ran
             result.detector_fields["identity_patient_in_clip"] = identity.patient_in_clip
             result.detector_fields["identity_confidence"] = round(identity.confidence, 4)
             result.detector_fields["identity_face_count"] = identity.face_count
