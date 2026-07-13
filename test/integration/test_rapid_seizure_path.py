@@ -71,7 +71,7 @@ async def _seed_seizure(session: AsyncSession, patient_id, camera_id) -> Detecto
         where_scope=entry.where_scope, when_scope=entry.when_scope,
         sensitivity="standard", is_on=True, custom_prompt=None,
         identifier=entry.key, prompt_fragment=entry.prompt_fragment,
-        schema_json=entry.schema_json, is_builtin=True,
+        schema_json=entry.schema_json,
     )
     session.add(det)
     await session.flush()

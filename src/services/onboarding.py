@@ -154,7 +154,6 @@ async def seed_detectors_for_patient(
             prompt_fragment=e.prompt_fragment,
             schema_json=e.schema_json,
             always_on=False,
-            is_builtin=True,
             **catalog_v2.row_kwargs(e.key),
         )
         inserted.append(await detector_repo.insert(session, det))

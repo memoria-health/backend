@@ -56,7 +56,7 @@ The six buckets are the *instruments* each branch points at the scene; `needs_au
 
 ### 1.1 Semantics (ported unchanged)
 
-`identifier`, `name`, `icon_name`, `description`, `category` (safety|routine), `cohort`, `prompt_fragment`, `seeded/hidden/fire_once/recommended`, `is_builtin`, `custom_prompt`. All exist today (catalog.py:812-853, detector.py:25-86). The prompt_fragment remains the precision/recall dial (Law 5) — compile per stakes as today (detector_compiler.py:124-195).
+`identifier`, `name`, `icon_name`, `description`, `category` (safety|routine), `cohort`, `prompt_fragment`, `seeded/hidden/fire_once/recommended`, `custom_prompt`. All exist today (`is_builtin` was dropped in P2 — redundant with `source='preset'`) (catalog.py:812-853, detector.py:25-86). The prompt_fragment remains the precision/recall dial (Law 5) — compile per stakes as today (detector_compiler.py:124-195).
 
 ### 1.2 Subject — NEW dimension (answers "visitor is present — what runs?")
 

@@ -67,7 +67,6 @@ async def _two_firing_detectors(
                 f"{ident}_confidence": {"type": "number"},
                 f"{ident}_reasoning": {"type": "string"},
             },
-            is_builtin=False,
         )
         session.add(det)
         dets.append(det)

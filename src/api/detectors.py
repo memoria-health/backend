@@ -382,7 +382,6 @@ async def add_detectors_from_library(
             prompt_fragment=e.prompt_fragment,
             schema_json=e.schema_json,
             always_on=False,
-            is_builtin=True,
             schedule_config=None,
             **catalog_v2.row_kwargs(e.key),
         )
@@ -508,7 +507,6 @@ async def create_detector(
         prompt_fragment=None,
         schema_json=None,
         always_on=False,
-        is_builtin=False,
         # Null for reactive; the evaluation window for `scheduled`.
         schedule_config=(
             body.schedule_config.model_dump() if body.schedule_config else None

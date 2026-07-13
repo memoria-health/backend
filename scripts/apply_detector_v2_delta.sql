@@ -106,7 +106,7 @@ from (values
   ('setup_test',           'person_motion',  'anyone',      'scene',      false, 'verdict', 'every_eligible_tick', 200,  'none')
 ) as v(identifier, branch, subject, bucket, needs_audio, unit, duty, severity, warn)
 where d.identifier = v.identifier
-  and d.is_builtin = true
+  and d.source = 'preset'
   -- Re-run guard covers EVERY column this UPDATE sets (review finding: a
   -- severity-only guard would silently skip future non-severity edits on
   -- an already-migrated DB). No-op when all values are current.

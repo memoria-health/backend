@@ -413,7 +413,7 @@ create index pi_discoveries_unclaimed_idx
 -- custom (created by the caregiver via POST /v1/patients/{id}/detectors).
 --
 -- The "runtime contract" columns (identifier, prompt_fragment,
--- schema_json, always_on, is_builtin) feed the detector pipeline. The
+-- schema_json, always_on) feed the detector pipeline. The
 -- prompt fragments are duplicated across patients (one row per
 -- patient × detector) — at the current scale (small N), a bulk UPDATE
 -- to retune a prompt is cheap and avoids a parallel "definitions"
@@ -467,7 +467,9 @@ create table public.detectors (
   -- people_present is always_on=true (included even if is_on=false)
   -- because the state machine requires its output.
   always_on       boolean not null default false,
-  is_builtin      boolean not null default true,
+  -- (is_builtin was dropped 2026-07-13 — it was 100% redundant with
+  -- source: every 'preset' row was true, every 'custom' row false.
+  -- Catalog membership checks key on source = 'preset'.)
   -- ── Detection v2 dimensions ────────────────────────────────────────
   -- Spec: docs/architecture/detection-architecture-v2.md. Python source of
   -- truth for built-in values: src/services/detection/catalog_v2.py (keep

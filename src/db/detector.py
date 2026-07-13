@@ -59,7 +59,6 @@ class Detector(Base):
     # no_exit_door=true turns the detector off (nowhere to wander to).
     door_config: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
     always_on: Mapped[bool] = mapped_column(Boolean, default=False)
-    is_builtin: Mapped[bool] = mapped_column(Boolean, default=True)
 
     # ── Scheduled ("absence") detectors ─────────────────────────────
     # Null for reactive (point_in_time / state) detectors. When shape

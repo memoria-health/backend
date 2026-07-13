@@ -35,7 +35,7 @@ async def _add_state_detector(session: AsyncSession, patient_id) -> Detector:
         shape="state", where_scope="ALL ROOMS", when_scope="ALWAYS",
         sensitivity="standard", is_on=True, created_at=now, updated_at=now,
         identifier=_IDENT, prompt_fragment=None, schema_json=None,
-        always_on=False, is_builtin=False, episode_gap_seconds=_GAP,
+        always_on=False, episode_gap_seconds=_GAP,
     )
     session.add(det)
     await session.flush()
