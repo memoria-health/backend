@@ -129,6 +129,8 @@ Activation resolution as a pure function (the §1.2 subject truth table + gates 
 | 7 | `scheduled` shape value + `last_scheduled_eval_date` | state primitive absence | ledger row 2 done + shape migration |
 | 8 | `instance` value in `evidence_unit` CHECK | collapsed into `sample` | next constraint-name rotation |
 
+**Status (2026-07-13): BUILT** (flag off; same branch; commit 122f2f5). Windowed-count entry implemented as a COUNT-CROSSING edge — semantic found during testing: for M>1 the legacy activity rising-edge misreads accumulation evidence as "ongoing" (an M=3 state could never fire), so crossing replaces it; saturated window = ongoing (anti-spam), drained window re-arms, M=1/NULL keeps the legacy edge byte-for-byte. k-of-N per Aryaman (N extra solo calls on the winning artifact, <k ⇒ suppressed pre-promotion, sched_confirm ledger; needs both flags). Per-detector cooldown live flag-on (NULL=30s parity). Absence runner counts via the shared qualifying_tick_count flag-on (threshold=None = legacy semantics). Deferred to P5/P6: eventing configs on real detectors (nothing carries config yet by design), scheduled-shape dissolution (Ledger 7), phase-staggered sampling.
+
 
 The windowed-count state primitive (≥M evidence ticks in window T over `analyses`; `episode_gap_seconds` becomes exit hysteresis), absence deadlines (dissolving the `scheduled` shape into schedule-window + absence-state), k-of-N confirm for configured point detectors, per-detector `cooldown_seconds` (fixes point detectors re-firing every 30 s during persistent conditions), cross-call primary selection per tick. Replaces `test_state_episode_dedup` / `test_detector_inference_gap` with state-primitive tests.
 
