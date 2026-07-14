@@ -122,6 +122,9 @@ async def test_open_tick_stashes_signals_and_motion_src(
     assert "sig_env_motion" in f and "sig_frames" in f
     assert "sig_person_present" not in f          # tracking didn't run
     assert row.motion_in_clip is True             # the hint carries it
+    # Flag-off rows must carry NO scheduler keys — pins that the tick
+    # actually took the legacy branch (T3/T4 review test gap).
+    assert not any(k.startswith("sched_") for k in f)
 
 
 @pytest.mark.asyncio

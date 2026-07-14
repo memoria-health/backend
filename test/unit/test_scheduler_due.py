@@ -133,10 +133,14 @@ def test_parity_empty_room_still_runs_person_detectors() -> None:
     assert _due_idents(ds) == ["fall"]
 
 
-# ─── Scheduled shape stays on its own runtime ────────────────────
+# ─── Scheduled shape: evidence still collected per tick ──────────
 
 
-def test_scheduled_shape_and_duty_are_skipped() -> None:
+def test_scheduled_shape_stays_due_only_scheduled_only_duty_skips() -> None:
+    """The absence runner only QUERIES analyses for `<id>_detected`
+    fields — the per-tick calls are its evidence stream. A scheduled-
+    shape detector must keep riding calls or absence events fire
+    falsely (T3/T4 review F3)."""
     entries = [
         _entry("meal_check", shape="scheduled"),
         _entry("night_check", duty="scheduled_only"),
@@ -145,11 +149,8 @@ def test_scheduled_shape_and_duty_are_skipped() -> None:
         entries, signals=_signals(), identity=_identity(None),
         settings=_settings(), tick_index=0,
     )
-    assert ds.due == ()
-    assert _skip_reasons(ds) == {
-        "meal_check": "scheduled_runtime",
-        "night_check": "scheduled_runtime",
-    }
+    assert _due_idents(ds) == ["meal_check"]
+    assert _skip_reasons(ds) == {"night_check": "scheduled_only_duty"}
 
 
 # ─── Duty cycle sampling ─────────────────────────────────────────

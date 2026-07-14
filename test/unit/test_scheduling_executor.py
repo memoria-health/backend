@@ -63,7 +63,10 @@ def _identity(track_ids=()) -> IdentityResult:
 
 
 def _settings() -> SimpleNamespace:
-    return SimpleNamespace(reid_inference_sample_width=480)
+    return SimpleNamespace(
+        reid_inference_sample_width=480,
+        livekit_worker_target_fps=4,
+    )
 
 
 class _ScriptedVLM:

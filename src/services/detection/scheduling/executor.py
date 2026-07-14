@@ -39,7 +39,7 @@ per call for the soak's cost accounting.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Awaitable, Callable, Sequence
 
 from src.services.detection.providers.types import ProviderResult
@@ -107,6 +107,7 @@ async def run_scheduled_calls(
     call_ledger: list[dict] = []
     call_errors: list[str] = []
     degraded_audio = False
+    degraded_fps = False
     degraded_calls = 0
     total_in = 0
     total_out = 0
@@ -119,6 +120,15 @@ async def run_scheduled_calls(
         idents = [s.identifier for s in specs]
 
         # ── Artifact ─────────────────────────────────────────────
+        # The window is snapshotted at the tick's target fps; a recipe
+        # asking for more (flash 8 fps) would remux time-compressed
+        # video, so the fps is clamped to what the frames really are
+        # and the tick marked (T3/T4 review F5). Unreachable for the
+        # default catalog; matters the day a P5 custom lands in
+        # fine_motion before native-rate plumbing exists.
+        artifact_fps = min(plan.fps, settings.livekit_worker_target_fps)
+        if artifact_fps < plan.fps:
+            degraded_fps = True
         mp4 = scene_mp4
         degraded_this_call = False
         if plan.crop == "person" and plan.target_track_id is not None:
@@ -129,7 +139,7 @@ async def run_scheduled_calls(
                     window,
                     track=track,
                     sample_width=settings.reid_inference_sample_width,
-                    fps=plan.fps,
+                    fps=artifact_fps,
                     pcm=pcm if plan.needs_audio else None,
                     pcm_sample_rate=pcm_sample_rate,
                     pcm_num_channels=pcm_num_channels,
@@ -153,7 +163,7 @@ async def run_scheduled_calls(
             if plan.tier == "flash":
                 flash_settings = settings.model_copy(update={
                     "gemini_model": settings.rapid_model,
-                    "gemini_video_fps": str(plan.fps),
+                    "gemini_video_fps": str(artifact_fps),
                 })
                 result = await flash_provider(
                     mp4=mp4, detectors=specs, log_tag=log_tag,
@@ -163,9 +173,27 @@ async def run_scheduled_calls(
                 )
                 used_provider = "gemini"
             else:
+                # Crop artifacts must actually be LOOKED AT: run_vlm's
+                # frame-reuse hands frame-sampling providers Re-ID's
+                # extraction of the ORIGINAL full clip, which would
+                # silently replace the crop we just built (T3/T4
+                # review F2). A reuse-disabled identity surrogate
+                # forces those providers to decode the passed mp4;
+                # patient_bbox is dropped too — full-frame coords are
+                # meaningless on a crop. Scene / degraded-to-scene
+                # calls keep the real identity (parity).
+                call_identity = identity
+                if mp4 is not scene_mp4:
+                    call_identity = replace(
+                        identity,
+                        extracted_frames=None,
+                        per_frame_bboxes=None,
+                        sample_fps=None,
+                        patient_bbox=None,
+                    )
                 used_provider, result = await run_main_vlm(
                     choice=vlm_choice,
-                    mp4=mp4, detectors=specs, identity=identity,
+                    mp4=mp4, detectors=specs, identity=call_identity,
                     log_tag=log_tag, settings=settings,
                 )
         except Exception as exc:  # noqa: BLE001 — per-call isolation
@@ -214,9 +242,13 @@ async def run_scheduled_calls(
                 best_by_ident[ident] = (score, group)
 
     if scene_result is None:
-        # Packer always emits a scene call for the current catalog; if
-        # a future loadout is crop-only, the first crop answer anchors
-        # the row rather than failing the tick.
+        # The packer GUARANTEES a scene plan on every tick (empty-
+        # detector wide call when nothing else needs the wide look —
+        # the always-on people_present block still drives the presence
+        # machine, exactly like flag-off with all detectors toggled
+        # off). Reaching here therefore means the scene call itself
+        # failed — which the loop already re-raises — or a packer
+        # regression. Fail the tick like today.
         raise RuntimeError("scheduler tick produced no scene call result")
 
     for _, group in best_by_ident.values():
@@ -236,6 +268,8 @@ async def run_scheduled_calls(
         sched_fields["sched_call_errors"] = call_errors
     if degraded_audio:
         sched_fields["sched_degraded_audio"] = True
+    if degraded_fps:
+        sched_fields["sched_degraded_fps"] = True
     if degraded_calls:
         sched_fields["sched_degraded_artifacts"] = degraded_calls
 

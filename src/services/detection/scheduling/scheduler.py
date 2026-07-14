@@ -8,9 +8,12 @@ customs scale: once the P5 compiler fills a custom's columns, the
 scheduler cannot tell it from a built-in.
 
 Parity contract (D2, Aryaman 2026-07-13): at default settings (floors
-0.0, sample k=1, presence not required) every non-scheduled enabled
-detector is due on every tick — identical coverage to today's
-monolithic call. The cost inversion is a settings change at soak.
+0.0, sample k=1, presence not required) every enabled detector is due
+on every tick — scheduled shapes included (the absence runner feeds on
+their per-tick fields); only the scheduled_only duty cycle (unused
+before P4) and verified-absence suppression can skip. Identical
+coverage to today's monolithic call. The cost inversion is a settings
+change at soak.
 
 Subject rule (FIXED, not configurable — spec §1.2): run unless there
 is POSITIVE verified evidence the patient is absent. Suppression of a
@@ -105,11 +108,16 @@ def resolve_due(
         d = entry.dims
         ident = entry.spec.identifier
 
-        # Scheduled-shape detectors keep their existing separate
-        # runtime (the 60 s scheduler loop) until P4 dissolves the
-        # shape; running them per-tick too would double-fire.
-        if d.shape == "scheduled" or d.duty_cycle == "scheduled_only":
-            skipped.append((ident, "scheduled_runtime"))
+        # Scheduled-shape ("absence") detectors STAY in the per-tick
+        # due set: the 60 s absence runner never runs them — it only
+        # QUERIES analyses for the `<id>_detected` fields the per-tick
+        # calls produce, so skipping them here would starve its
+        # evidence stream and fire false absence events (T3/T4 review
+        # F3). They are promotion-inert per tick, so no double-fire.
+        # Only the explicit scheduled_only duty cycle opts out of
+        # per-tick collection (nothing uses it before P4).
+        if d.duty_cycle == "scheduled_only":
+            skipped.append((ident, "scheduled_only_duty"))
             continue
 
         if d.duty_cycle == "sampled" and tick_index % settings.scheduler_sample_every_k:

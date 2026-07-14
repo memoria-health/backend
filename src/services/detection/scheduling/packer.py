@@ -112,14 +112,32 @@ def pack_calls(due_set: "DueSet", *, settings: "Settings") -> tuple[CallPlan, ..
     """Pack the due set into call plans. Deterministic: groups ordered
     scene-first then by max severity; members severity-desc; overflow
     chunks split severity-first so the highest-stakes detectors ride
-    the first call of a group."""
-    groups: dict[tuple, list["DueDetector"]] = {}
+    the first call of a group.
+
+    INVARIANT: a scene call is ALWAYS emitted, even with zero scene
+    members — the always-on people_present block makes an empty-
+    detector wide call meaningful (it drives the presence state
+    machine), which is exactly what flag-off does when every detector
+    is toggled off. The executor anchors the tick's shared block on it
+    (T3/T4 review F1)."""
+    groups: dict[tuple, list["DueDetector"]] = {_SCENE_KEY: []}
+    seen: dict[tuple, set[str]] = {_SCENE_KEY: set()}
     for d in due_set.due:
         targets: tuple[int | None, ...] = (
             d.target_track_ids if d.target_track_ids else (None,)
         )
         for target in targets:
-            groups.setdefault(_group_key(d, target), []).append(d)
+            key = _group_key(d, target)
+            members = groups.setdefault(key, [])
+            idents = seen.setdefault(key, set())
+            # A multi-target detector whose targets all collapse to
+            # the same group (rapid/snapshot → scene) must appear in
+            # that call exactly once (T3/T4 review F4 — the ledger
+            # must not list phantom members).
+            if d.spec.identifier in idents:
+                continue
+            idents.add(d.spec.identifier)
+            members.append(d)
 
     plans: list[CallPlan] = []
     for key, members in groups.items():

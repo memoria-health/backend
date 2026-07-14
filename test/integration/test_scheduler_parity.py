@@ -158,6 +158,34 @@ async def test_flag_on_no_tracks_is_one_wide_call_with_event_parity(
 
 
 @pytest.mark.asyncio
+async def test_flag_on_no_assigned_detectors_still_writes_presence_row(
+    client: AsyncClient, auth_user, session: AsyncSession, monkeypatch,
+) -> None:
+    """F1 regression pin: a camera with nothing assigned must behave
+    like flag-off — one empty-detector wide call whose people_present
+    answer drives the state machine and lands a row, never a dropped
+    tick."""
+    patient_id, camera_id = await _setup_patient_with_camera(
+        client, auth_user, session,
+    )
+    main = FakeVLM()
+    ingest = _make_ingest(
+        camera_id, patient_id, monkeypatch,
+        identity=IdentityResult.empty(), main=main,
+    )
+    _push_frames(ingest)
+
+    await ingest._run_tick_inner(_RecorderDecision())
+
+    assert len(main.calls) == 1
+    assert main.calls[0]["detectors"] == []
+    row = await _last_analysis(session, patient_id)
+    assert row.provider != "skipped"
+    assert row.people_present is True
+    assert len(row.detector_fields["sched_calls"]) == 1
+
+
+@pytest.mark.asyncio
 async def test_flag_on_with_track_splits_person_crop_call_and_merges(
     client: AsyncClient, auth_user, session: AsyncSession, monkeypatch,
 ) -> None:

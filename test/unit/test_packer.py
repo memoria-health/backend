@@ -66,18 +66,20 @@ def test_crop_bucket_caps_at_three_severity_first() -> None:
         for i, sev in enumerate([10, 90, 40, 70])
     ]
     plans = _pack(*dets)
-    assert len(plans) == 2
-    assert _idents(plans[0]) == ["p1", "p3", "p2"]   # 90, 70, 40
-    assert _idents(plans[1]) == ["p0"]               # 10 overflows
-    assert all(p.target_track_id == 7 for p in plans)
+    assert len(plans) == 3                           # guaranteed scene + 2 chunks
+    assert _idents(plans[0]) == []                   # the always-emitted scene anchor
+    assert _idents(plans[1]) == ["p1", "p3", "p2"]   # 90, 70, 40
+    assert _idents(plans[2]) == ["p0"]               # 10 overflows
+    assert all(p.target_track_id == 7 for p in plans[1:])
 
 
 def test_one_call_per_person_never_a_union(monkeypatch=None) -> None:
     d = _due("medication", bucket="person", targets=(1, 2))
     plans = _pack(d)
-    assert len(plans) == 2
-    assert sorted(p.target_track_id for p in plans) == [1, 2]
-    assert all(_idents(p) == ["medication"] for p in plans)
+    assert len(plans) == 3                            # scene anchor + 2 crop calls
+    crops = [p for p in plans if p.crop == "person"]
+    assert sorted(p.target_track_id for p in crops) == [1, 2]
+    assert all(_idents(p) == ["medication"] for p in crops)
 
 
 def test_degraded_person_merges_into_scene_call() -> None:
@@ -134,7 +136,8 @@ def test_needs_audio_propagates_to_the_call() -> None:
 
 
 def test_face_bucket_recipe() -> None:
-    (plan,) = _pack(_due("grimace", bucket="face", targets=(2,)))
+    plans = _pack(_due("grimace", bucket="face", targets=(2,)))
+    (plan,) = [p for p in plans if p.crop == "face"]
     assert (plan.frames, plan.fps, plan.channel, plan.tier, plan.crop) == (
         "video", 8, "clean", "flash", "face",
     )
@@ -150,3 +153,34 @@ def test_deterministic_ordering_scene_first_then_severity() -> None:
     assert _idents(plans[0]) == ["fall"]
     assert _idents(plans[1]) == ["hi_person"]
     assert _idents(plans[2]) == ["low_face"]
+
+
+# ─── F1/F4 review pins ───────────────────────────────────────────
+
+
+def test_scene_call_is_always_emitted_even_with_nothing_due() -> None:
+    """The presence machine needs the wide look every tick — an empty
+    due set still packs one empty-detector scene call, exactly like
+    flag-off with every detector toggled off (T3/T4 review F1)."""
+    (plan,) = _pack()
+    assert plan.crop == "full" and plan.fps == 4 and plan.tier == "lite"
+    assert plan.detectors == ()
+    assert plan.needs_audio is False
+
+
+def test_crop_only_loadout_still_gets_the_scene_anchor() -> None:
+    plans = _pack(_due("medication", bucket="person", targets=(1,)))
+    assert len(plans) == 2
+    assert plans[0].crop == "full" and plans[0].detectors == ()
+    assert plans[1].crop == "person"
+
+
+def test_multi_target_scene_collapse_lists_the_member_once() -> None:
+    """A rapid/snapshot member fanning out per target must not appear
+    twice in the wide call's ledger (T3/T4 review F4)."""
+    plans = _pack(
+        _due("fall", bucket="scene"),
+        _due("seizure", bucket="rapid", targets=(1, 2), severity=96),
+    )
+    (plan,) = plans
+    assert _idents(plan).count("seizure") == 1
