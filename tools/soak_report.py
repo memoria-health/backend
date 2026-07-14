@@ -107,10 +107,14 @@ async def run(hours: float) -> None:
         c["out"] += int(f.get("vlm_output_tokens", 0))
 
     print(f"# Soak report — last {hours:g}h — {len(rows)} rows, {len(events)} events\n")
-    tot_in = tot_out = 0
+    tot_in = tot_out = rapid_in = rapid_out = 0
     for cam, c in sorted(per_cam.items()):
-        tot_in += c["in"] + c["rapid_in"]
-        tot_out += c["out"] + c["rapid_out"]
+        # vlm_* row totals already INCLUDE overlay-call spend (executor
+        # sums every call) — rapid_* is a view into them, not an addend.
+        tot_in += c["in"]
+        tot_out += c["out"]
+        rapid_in += c["rapid_in"]
+        rapid_out += c["rapid_out"]
         print(f"## camera {cam}")
         print(f"  ticks={c['ticks']}  skips={dict(c['skips'])}")
         print(f"  motion_src={dict(c['motion_src'])}  backend_wakes={c['wakes']}")
@@ -125,12 +129,14 @@ async def run(hours: float) -> None:
                   f"  confirm={dict(c['confirm'])}")
         print(f"  tokens in={c['in']}(+{c['rapid_in']} rapid) out={c['out']}(+{c['rapid_out']})\n")
 
-    # Cost at lite prices for the main path + flash for rapid — an
-    # UPPER-ish bound; per-call tier split lives in sched_calls if you
-    # need it exact.
+    # Tier-split pricing: overlay (flash) tokens at flash rates, the
+    # rest at lite. Confirm votes on flash artifacts land in the lite
+    # remainder — a slight floor when k-of-N is configured.
     cost = (
-        tot_in / 1e6 * _PRICE_IN_PER_M["lite"]
-        + tot_out / 1e6 * _PRICE_OUT_PER_M["lite"]
+        (tot_in - rapid_in) / 1e6 * _PRICE_IN_PER_M["lite"]
+        + (tot_out - rapid_out) / 1e6 * _PRICE_OUT_PER_M["lite"]
+        + rapid_in / 1e6 * _PRICE_IN_PER_M["flash"]
+        + rapid_out / 1e6 * _PRICE_OUT_PER_M["flash"]
     )
     day = cost * (24 / hours)
     print(f"TOTAL tokens in={tot_in} out={tot_out} ≈ ${cost:.3f} "

@@ -31,8 +31,12 @@ from src.db.event import Event
 from src.db.session import get_sessionmaker
 from src.settings import get_settings
 
-_PRICE_IN = 0.10 / 1e6
-_PRICE_OUT = 0.40 / 1e6
+# $/token by tier (2026-07 list). The scheduler's per-call ledger
+# encodes the tier inside each plan key, so sched rows price EXACTLY;
+# tokens outside the ledger (legacy rows, confirm votes) price as lite
+# — a slight floor, never an overstatement... except flash confirms,
+# noted in the report.
+_PRICE = {"lite": (0.10 / 1e6, 0.40 / 1e6), "flash": (0.30 / 1e6, 2.50 / 1e6)}
 
 app = FastAPI()
 _SINCE: datetime = datetime.now(timezone.utc)
@@ -58,6 +62,8 @@ async def data() -> JSONResponse:
     cams: dict[str, dict] = {}
     ticks = []
     tot_in = tot_out = 0
+    cost = 0.0
+    flash_tok = 0
     for r in rows:                       # newest → oldest
         f = r.detector_fields or {}
         cam = str(r.camera_id)[:8]
@@ -76,8 +82,25 @@ async def data() -> JSONResponse:
         c["errors"] += len(f.get("sched_call_errors") or ())
         for _, cf in (f.get("sched_confirm") or {}).items():
             c["confirm"]["pass" if cf.get("passed") else "SUPPRESSED"] += 1
-        tot_in += int(f.get("vlm_input_tokens", 0))
-        tot_out += int(f.get("vlm_output_tokens", 0))
+        row_in = int(f.get("vlm_input_tokens", 0))
+        row_out = int(f.get("vlm_output_tokens", 0))
+        tot_in += row_in
+        tot_out += row_out
+        led_in = led_out = 0
+        for c2 in (f.get("sched_calls") or ()):
+            ci = int(c2.get("input_tokens", 0))
+            co = int(c2.get("output_tokens", 0))
+            tier = "flash" if ":flash:" in str(c2.get("key", "")) else "lite"
+            pin, pout = _PRICE[tier]
+            cost += ci * pin + co * pout
+            led_in += ci
+            led_out += co
+            if tier == "flash":
+                flash_tok += ci + co
+        # Tokens outside the per-call ledger (legacy rows, confirm
+        # votes): price as lite.
+        pin, pout = _PRICE["lite"]
+        cost += max(0, row_in - led_in) * pin + max(0, row_out - led_out) * pout
 
         tracks = f.get("sig_tracks") or []
         amounts = [float(t.get("amount", 0.0)) for t in tracks]
@@ -116,7 +139,6 @@ async def data() -> JSONResponse:
                     {"cam": camdir.name, "name": p.name} for p in reversed(newest)
                 ]
 
-    cost = tot_in * _PRICE_IN + tot_out * _PRICE_OUT
     hours = max((datetime.now(timezone.utc) - _SINCE).total_seconds() / 3600, 1e-6)
     return JSONResponse({
         "now": datetime.now(timezone.utc).strftime("%H:%M:%S"),
@@ -137,7 +159,7 @@ async def data() -> JSONResponse:
             for ev, ident in events
         ],
         "totals": {
-            "in": tot_in, "out": tot_out,
+            "in": tot_in, "out": tot_out, "flash_tokens": flash_tok,
             "cost": round(cost, 4), "day_pace": round(cost / hours * 24, 2),
         },
         "frames": frames[:6],
