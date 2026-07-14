@@ -39,6 +39,7 @@ from src.schemas.detector import (
 )
 from src.services.detection import catalog, catalog_v2
 from src.services.detection.door_detection import detect_doors
+from src.services.detection.scheduling import compiler_v2
 from src.services.detector_compiler import (
     compile_custom_detector,
     infer_detector_config,
@@ -419,6 +420,14 @@ async def infer_detector(
     Auth-only (no patient scope) — inference touches no patient data,
     just the caregiver's text.
     """
+    # v2 P5: measured-zero asks are refused HERE, before any LLM spend,
+    # with the plain-language reason the UI shows verbatim.
+    reason = compiler_v2.reject_reason(body.name or "", body.prompt)
+    if reason is not None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "detector_rejected", "reason": reason},
+        )
     try:
         inferred = await infer_detector_config(
             name=body.name, prompt=body.prompt, settings=settings,
@@ -452,6 +461,15 @@ async def create_detector(
     session: SessionDep,
     settings: SettingsDep,
 ) -> DetectorResponse:
+    reject = compiler_v2.reject_reason(body.name, body.custom_prompt or "")
+    if reject is not None:
+        # v2 P5 hard-reject: never create a row for a detector that
+        # measured zero — the caregiver gets the honest reason instead
+        # of an alert they can't trust.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "detector_rejected", "reason": reject},
+        )
     """Create a custom detector. **Returns immediately**; compile runs
     in the background.
 
@@ -545,6 +563,7 @@ async def create_detector(
             description=body.description,
             user_text=body.custom_prompt,
             scheduled=body.shape == DetectorShape.scheduled,
+            shape=body.shape.value,
             category=det.category,
             settings=settings,
         )
@@ -560,6 +579,7 @@ async def _compile_and_update_detector(
     description: str,
     user_text: str,
     scheduled: bool,
+    shape: str,
     category: str,
     settings: Settings,
 ) -> None:
@@ -584,6 +604,21 @@ async def _compile_and_update_detector(
         )
         return
 
+    try:
+        # Reserved-key guard (loud compile failure beats the silent
+        # backend-wins overwrite at merge time) + v2 dims so the
+        # scheduler treats this custom exactly like a built-in.
+        compiler_v2.validate_schema_fields(compiled.schema_json)
+        dims = compiler_v2.classify_custom_dims(
+            name=name, user_text=user_text, shape=shape, category=category,
+        )
+    except compiler_v2.DetectorRejected as e:
+        log.error(
+            "detector_compile_background.rejected detector_id=%s reason=%s",
+            detector_id, e.reason,
+        )
+        return
+
     # Write back. Use a fresh session — the request's session is closed.
     sessionmaker = get_sessionmaker()
     async with sessionmaker() as session:
@@ -595,6 +630,7 @@ async def _compile_and_update_detector(
                 prompt_fragment=compiled.prompt_fragment,
                 schema_json=compiled.schema_json,
                 updated_at=datetime.now(timezone.utc),
+                **dims,
             )
         )
         await session.commit()
