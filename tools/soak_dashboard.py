@@ -201,6 +201,12 @@ _PAGE = """<!doctype html><html><head><meta charset="utf-8">
   .mut{color:var(--mut)}.ok{color:var(--ok)}.warn{color:var(--warn)}.crit{color:var(--crit)}
   .num{font-variant-numeric:tabular-nums}
   .cams{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px}
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  th{font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--mut);
+     text-align:left;font-weight:600;padding:3px 8px 5px 0;border-bottom:1px solid var(--line)}
+  td{padding:4px 8px 4px 0;border-bottom:1px solid var(--line);vertical-align:top}
+  tr:last-child td{border-bottom:none}
+  .tblwrap{overflow-x:auto}
   .logwin{background:var(--logbg);border:1px solid var(--line);border-radius:6px;
     max-height:440px;overflow-y:auto;font:11.5px/1.65 ui-monospace,Menlo,monospace}
   .lr{display:flex;gap:9px;padding:2px 9px;white-space:nowrap}
@@ -219,10 +225,43 @@ _PAGE = """<!doctype html><html><head><meta charset="utf-8">
   <span class="chip num" id="pace"></span>
 </header>
 <div class="card"><h2>Cameras</h2><div class="cams" id="cams"></div></div>
+<div class="card"><h2>Test plan — in order; each step earns trust for the next</h2>
+<div class="tblwrap"><table>
+<tr><th>#</th><th>Do</th><th>Expect</th></tr>
+<tr><td>1</td><td>Un-pause both cams, say "go"</td><td>ticks flip to analyzed · exactly one scene call · no events</td></tr>
+<tr><td>2</td><td>Walk into view</td><td>tracks=1 on the tick line · evidence photo with an UNKNOWN box</td></tr>
+<tr><td>3</td><td>Enroll, then face the camera</td><td>box flips to PATIENT *face — identity chain proven</td></tr>
+<tr><td>4</td><td>One fall (lie down abruptly)</td><td>ONE fall event on the phone — full pipeline works</td></tr>
+<tr><td>5</td><td>Stay lying a while</td><td>no second fall event — anti-spam holds</td></tr>
+<tr><td>6</td><td>Shake hard ~20 s · later, jumping jacks</td><td>shake → convulsion fires (overlay call + gate in log) · jacks → NOTHING</td></tr>
+<tr><td>7</td><td>Pill-take gesture</td><td>medication fires · its zoomed call visible in the log</td></tr>
+<tr><td>8</td><td>Glance at TV 2 min · later, watch 20 min straight</td><td>glance: nothing · full watch: ONE alert around minute 15</td></tr>
+<tr><td>9</td><td>Drink water on camera before 5:45 pm · skip stretching</td><td>Water check silent · ~6:50 pm stretching absence alert with coverage %</td></tr>
+<tr><td>10</td><td>Passive: TV on in empty room ~40 min · fan in closed bedroom</td><td>ZERO events — this is the false-alarm + cost dataset</td></tr>
+<tr><td>11</td><td>Burner on, walk away 10 min</td><td>stove alert</td></tr>
+<tr><td>12</td><td>Privacy on 15 min (ideally mid-recording)</td><td>ticks continue · no clips · in-flight recording dies un-uploaded</td></tr>
+</table></div>
+<p class="mut" style="font-size:12px;margin:8px 0 0">Steps 1–4 are the "system is alive" gate. Narrate takes in chat ("fall, now") — Claude timestamps <span class="mono">soak_truth.csv</span>; evening scoring: <span class="mono">soak_report.py --hours 4 --truth soak_truth.csv</span></p>
+</div>
 <div class="card"><h2>Identity evidence — latest</h2>
   <div class="frames" id="frames"><span class="mut">no frames yet</span></div></div>
 <div class="card"><h2>Events</h2><div id="events" class="mono mut">none yet</div></div>
 <div class="card"><h2>Tick log — newest first</h2><div class="logwin" id="log"></div></div>
+<div class="card"><h2>Compiler acceptance — ran Jul 14 (pure-rules half; pinned by 22 unit goldens)</h2>
+<div class="tblwrap"><table>
+<tr><th>Ask</th><th>Routed to</th><th>Extras</th></tr>
+<tr><td>watching tv &gt;15 min</td><td>still-person · zoom · sampled</td><td>entry 5×-in-15min</td></tr>
+<tr><td>stove left on</td><td>room · snapshot</td><td>on sight</td></tr>
+<tr><td>dad leaves through the front door</td><td>PERSON, not door</td><td>exit-verb routing ✓</td></tr>
+<tr><td>visitor knocks / stranger enters</td><td>anyone</td><td>✓</td></tr>
+<tr><td>calls out for help</td><td>patient</td><td>audio: yes ✓</td></tr>
+<tr><td>picking at fingers &gt;10 min</td><td>person · wide view</td><td>distance warning · entry 3×-in-5min</td></tr>
+<tr><td>door left open 15 min</td><td>room · snapshot</td><td></td></tr>
+<tr><td>sleeping over an hour</td><td>still-person · sampled</td><td>entry 8×-in-30min</td></tr>
+<tr><td>pacing at night</td><td>person · every tick (safety)</td><td>✓</td></tr>
+</table></div>
+<p class="mut" style="font-size:12px;margin:8px 0 0">Refusals: eye-twitch / shivering / wearing-a-ring rejected with plain-language reasons · "violent shaking, <i>not just</i> shivering" and the medical bracelet correctly accepted (false-reject class: zero) · reserved field names refused loudly. Notes: "10 minutes" sits between presets and snaps to the sooner one (alerts earlier); fingertip fidgeting rides the wide view with a warning — conservative until soak data justifies the zoom reroute.</p>
+</div>
 <script>
 const $=id=>document.getElementById(id);
 function esc(s){return String(s??"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]))}
