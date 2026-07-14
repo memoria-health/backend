@@ -461,15 +461,6 @@ async def create_detector(
     session: SessionDep,
     settings: SettingsDep,
 ) -> DetectorResponse:
-    reject = compiler_v2.reject_reason(body.name, body.custom_prompt or "")
-    if reject is not None:
-        # v2 P5 hard-reject: never create a row for a detector that
-        # measured zero — the caregiver gets the honest reason instead
-        # of an alert they can't trust.
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={"code": "detector_rejected", "reason": reject},
-        )
     """Create a custom detector. **Returns immediately**; compile runs
     in the background.
 
@@ -492,6 +483,15 @@ async def create_detector(
     per camera via `/cameras/[id]`. Preset detectors (auto-seeded on
     patient create) still run on all cameras by default.
     """
+    reject = compiler_v2.reject_reason(body.name, body.custom_prompt or "")
+    if reject is not None:
+        # v2 P5 hard-reject: never create a row for a detector that
+        # measured zero — the caregiver gets the honest reason instead
+        # of an alert they can't trust.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "detector_rejected", "reason": reject},
+        )
     # 404 if the parent patient isn't owned by the caller — never leak
     # patient existence.
     patient = await patient_repo.find_by_id(session, patient_id, caregiver_id=auth.id)
