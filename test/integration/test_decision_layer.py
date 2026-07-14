@@ -184,3 +184,70 @@ async def test_per_detector_cooldown_replaces_global_dedup_flag_on(
     )
     await session.commit()
     assert b.fired == [] and ident2 in b.skipped_for_dedup
+
+
+@pytest.mark.asyncio
+async def test_saturated_window_is_ongoing_never_refires(
+    client: AsyncClient, auth_user, session: AsyncSession,
+) -> None:
+    """THE anti-spam arm (P4 review finding 4): once the window holds
+    ≥M qualifying ticks, further qualifying ticks are ONGOING — a long
+    episode must not refire even after the cooldown/dedup window has
+    lapsed."""
+    patient_id, camera_id = await _setup_patient_with_camera(
+        client, auth_user, session,
+    )
+    ident = "custom_longwatch"
+    await _add_detector(
+        session, patient_id, ident,
+        eventing={"entry": {"m": 3, "t_seconds": 600}},
+    )
+    await session.commit()
+    now = datetime.now(timezone.utc)
+
+    for age in (120, 90, 60):   # 3 qualifying ticks: window saturated
+        await _seed_tick(session, camera_id, ident, now - timedelta(seconds=age))
+
+    # Crossing already happened earlier in the episode; this tick (and
+    # any later one while the window stays saturated) is ongoing —
+    # even though NO event exists within any dedup window.
+    later = await maybe_promote_analysis(
+        session, patient_id=patient_id, camera_id=camera_id,
+        occurred_at=now + timedelta(seconds=45), description="still going",
+        detector_fields=_fields(ident), settings=_V2,
+    )
+    await session.commit()
+    assert later.fired == []
+    assert ident in later.skipped_ongoing
+
+
+@pytest.mark.asyncio
+async def test_repeat_inside_row_cooldown_is_still_deduped(
+    client: AsyncClient, auth_user, session: AsyncSession,
+) -> None:
+    """A v2 bug disabling dedup entirely must not pass: a repeat
+    INSIDE the row's cooldown is squashed (P4 review test gap)."""
+    patient_id, camera_id = await _setup_patient_with_camera(
+        client, auth_user, session,
+    )
+    ident = "custom_fastfire"
+    await _add_detector(
+        session, patient_id, ident, shape="point_in_time",
+        cooldown_seconds=20,
+    )
+    await session.commit()
+    t0 = datetime.now(timezone.utc)
+    first = await maybe_promote_analysis(
+        session, patient_id=patient_id, camera_id=camera_id,
+        occurred_at=t0, description="one",
+        detector_fields=_fields(ident), settings=_V2,
+    )
+    await session.commit()
+    assert len(first.fired) == 1
+    inside = await maybe_promote_analysis(
+        session, patient_id=patient_id, camera_id=camera_id,
+        occurred_at=t0 + timedelta(seconds=10), description="two",
+        detector_fields=_fields(ident), settings=_V2,
+    )
+    await session.commit()
+    assert inside.fired == [] and ident in inside.skipped_for_dedup

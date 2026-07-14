@@ -360,7 +360,6 @@ async def maybe_promote_analysis(
         # session ("watching TV") collapses to one event instead of one per
         # tick. point_in_time detectors are unaffected (momentary events).
         if det.shape == "state":
-            gap = _episode_gap_for(det)
             cfg = parse_eventing(det.eventing) if v2_decisions else None
             if cfg is not None and cfg.entry_m > 1:
                 # v2 (P4) M>1: the count-crossing edge REPLACES the
@@ -392,7 +391,9 @@ async def maybe_promote_analysis(
                 detected_field=detected_field,
                 conf_field=conf_field,
                 threshold=threshold,
-                since=occurred_at - timedelta(seconds=gap),
+                since=occurred_at - timedelta(
+                    seconds=_episode_gap_for(det),
+                ),
                 before=occurred_at,
             ):
                 # M=1 (or flag off): today's on-sight rising edge,

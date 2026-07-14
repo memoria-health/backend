@@ -70,11 +70,32 @@ def parse_eventing(raw: object) -> EventingConfig:
     confirm = raw.get("confirm")
     m = max(1, _pos_int(entry, "m", 1))
     t = _pos_int(entry, "t_seconds", 0)
+    if m > 1 and t <= 0:
+        # Half-formed window (M without T): with a ~10s tick cadence a
+        # 0-second window can never accumulate M ticks — the detector
+        # would be silently dead. Degrade to parity (on-sight), per the
+        # module contract: malformed config = today's behavior, never
+        # detection loss (P4 review finding 1).
+        m, t = 1, 0
     k = _pos_int(confirm, "k", 0)
     n = _pos_int(confirm, "n", 0)
     if k > n:
         k = n = 0  # unsatisfiable config — treat as no confirm
     return EventingConfig(entry_m=m, entry_t_seconds=t, confirm_k=k, confirm_n=n)
+
+
+def detection_keys_for(identifier: str) -> tuple[str, str]:
+    """(detected_field, confidence_field) for a detector — from the
+    catalog for built-ins (medication's field is `medication_taken`,
+    not `medication_detected`), else the standard naming. The confirm
+    gate/votes/suppression must use THIS, never string formatting
+    (P4 review finding 2)."""
+    from src.services.detection import catalog
+
+    entry = catalog.by_key(identifier) if identifier else None
+    if entry is not None:
+        return entry.detected_key, entry.confidence_key
+    return f"{identifier}_detected", f"{identifier}_confidence"
 
 
 def cooldown_seconds_for(detector, default_seconds: int) -> int:

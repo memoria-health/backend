@@ -38,6 +38,16 @@ def test_parse_m_floor_is_one() -> None:
     assert parse_eventing({"entry": {"m": 0}}).entry_m == 1
 
 
+def test_parse_m_without_window_degrades_to_parity() -> None:
+    """M>1 with no/zero T can never accumulate at tick cadence — the
+    detector would be silently dead. Must degrade to on-sight (P4
+    review finding 1), never to detection loss."""
+    cfg = parse_eventing({"entry": {"m": 3}})
+    assert cfg.entry_m == 1 and cfg.entry_t_seconds == 0
+    cfg2 = parse_eventing({"entry": {"m": 3, "t_seconds": 0}})
+    assert cfg2.entry_m == 1
+
+
 def test_cooldown_row_wins_null_and_zero_fall_back() -> None:
     assert cooldown_seconds_for(SimpleNamespace(cooldown_seconds=5), 30) == 5
     assert cooldown_seconds_for(SimpleNamespace(cooldown_seconds=None), 30) == 30

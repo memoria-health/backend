@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING, Awaitable, Callable, Sequence
 
 from src.services.detection.providers.types import ProviderResult
 from src.services.detection.scheduling.artifacts import build_person_crop_mp4
+from src.services.detection.scheduling.decision import detection_keys_for
 from src.services.detection.scheduling.packer import CallPlan
 
 if TYPE_CHECKING:
@@ -274,15 +275,23 @@ async def run_scheduled_calls(
     if getattr(settings, "detection_v2_decision_enabled", False):
         for ident, (due, artifact, plan) in winning_call.items():
             k, n = due.dims.confirm_k, due.dims.confirm_n
-            if n <= 0 or not merged_fields.get(f"{ident}_detected"):
+            detected_key, _conf_key = detection_keys_for(ident)
+            if n <= 0 or not merged_fields.get(detected_key):
                 continue
             votes = 0
             spend_in = spend_out = 0
             for i in range(n):
                 try:
                     if plan.tier == "flash":
+                        # Votes must see what the original call saw —
+                        # same model AND same fps (P4 review finding 3:
+                        # a 4fps vote on an 8fps rapid artifact is a
+                        # systematically blind re-check).
                         fs = settings.model_copy(update={
                             "gemini_model": settings.rapid_model,
+                            "gemini_video_fps": str(min(
+                                plan.fps, settings.livekit_worker_target_fps,
+                            )),
                         })
                         res = await flash_provider(
                             mp4=artifact, detectors=[due.spec],
@@ -311,7 +320,7 @@ async def run_scheduled_calls(
                 u = res.usage or {}
                 spend_in += int(u.get("input", 0))
                 spend_out += int(u.get("output", 0))
-                if bool(res.detector_fields.get(f"{ident}_detected")):
+                if bool(res.detector_fields.get(detected_key)):
                     votes += 1
             total_in += spend_in
             total_out += spend_out
@@ -321,7 +330,7 @@ async def run_scheduled_calls(
                 "input_tokens": spend_in, "output_tokens": spend_out,
             }
             if not passed:
-                merged_fields[f"{ident}_detected"] = False
+                merged_fields[detected_key] = False
                 merged_fields[f"{ident}_confirm_suppressed"] = True
                 log.info(
                     "%s confirm SUPPRESSED %s (%d/%d needed %d)",
