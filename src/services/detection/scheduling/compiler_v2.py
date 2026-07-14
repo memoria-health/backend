@@ -51,8 +51,8 @@ _HARD_REJECTS: tuple[tuple[re.Pattern, re.Pattern | None, str], ...] = (
         _SEIZURE_SCALE,
         "Fine tremors and shivering move less than a pixel at the "
         "camera's distance and frame rate — our testing showed they "
-        "cannot be told apart from normal stillness. A seizure-scale "
-        "movement IS detectable (see the Seizure detector).",
+        "cannot be told apart from normal stillness. A convulsion-scale "
+        "movement IS detectable (see the Convulsion detector).",
     ),
     (
         # ring/earring only — a bracelet is wrist-scale, NOT a measured

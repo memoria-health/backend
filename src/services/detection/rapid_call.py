@@ -27,21 +27,21 @@ from src.services.detection.prompt import DetectorSpec
 from src.services.detection.rapid_artifact import Box
 
 RAPID_SEIZURE_PROMPT = """\
-SEIZURE (convulsive shaking) — this clip is a MOTION-OVERLAY channel: regions
+CONVULSION (convulsive shaking) — this clip is a MOTION-OVERLAY channel: regions
 that changed between frames are tinted bright red on the video. The tint shows
 WHERE motion happened, never WHAT it is — red tint alone is NEVER sufficient
-evidence of a seizure.
+evidence of a convulsion.
 
 Judge only what the body is doing, in ANY position (lying, sitting, standing,
 slumped on a couch or the floor):
 
-- A convulsive seizure shows SUSTAINED, RHYTHMIC, INVOLUNTARY shaking with
+- A convulsion shows SUSTAINED, RHYTHMIC, INVOLUNTARY shaking with
   visible amplitude — limbs or torso visibly displacing back and forth,
   continuing across the clip.
 - A person holding still whose outline carries only faint red wisps or fine
-  trembling is shivering or a resting tremor — NOT a seizure.
+  trembling is shivering or a resting tremor — NOT a convulsion.
 - Steady red outlines from walking, gesturing, typing, stretching, exercise,
-  screen flicker, or camera noise are ordinary motion — NOT a seizure.
+  screen flicker, or camera noise are ordinary motion — NOT a convulsion.
 
 Set seizure_detected=true only when amplitude AND rhythm AND involuntary
 character are all visible in the motion itself."""
@@ -71,7 +71,7 @@ def rapid_seizure_spec() -> DetectorSpec:
     the same `seizure_*` field trio) as the catalog row, different prompt."""
     return DetectorSpec(
         identifier="seizure",
-        name="Seizure",
+        name="Convulsion",
         prompt_fragment=RAPID_SEIZURE_PROMPT,
         schema_fields={
             "seizure_detected": {"type": "boolean"},

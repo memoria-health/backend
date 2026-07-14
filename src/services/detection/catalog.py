@@ -899,7 +899,7 @@ CATALOG: tuple[CatalogEntry, ...] = (
         promotion_threshold=0.70,
     ),
     CatalogEntry(
-        key="seizure", name="Seizure", icon_name="bolt.heart",
+        key="seizure", name="Convulsion", icon_name="bolt.heart",
         description="Convulsive shaking — rhythmic, repetitive limb or whole-body jerking.",
         category="safety", shape="point_in_time", cohort="both",
         recommended=False, seeded=False, prompt_fragment=_SEIZURE_PROMPT_FRAGMENT,
