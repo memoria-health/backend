@@ -110,6 +110,26 @@ Activation resolution as a pure function (the §1.2 subject truth table + gates 
 
 ## Phase 4 — Decision layer  *(milestone; detailed plan at start)*
 
+**Locked decisions (Aryaman, 2026-07-13):**
+- **A — `instance` evidence unit REMOVED.** Two units only: `verdict` and `sample`. Jerks/confusion cues are samples feeding a state detector — "first detected" is the state's entry edge, not a separate concept. (The `evidence_unit` CHECK keeps the legal value for old rows; nothing produces it.)
+- **B — k-of-N = N EXTRA CALLS ON THE SAME CLIP.** On a qualifying point-shape fire with `eventing.confirm` configured: run N re-check calls against the SAME artifact (solo prompt, same bucket recipe/tier), event passes iff ≥k confirm; votes + spend stashed. No built-in gets confirm config by default (parity; per-detector enablement is a soak decision).
+- **C — PARALLEL SYSTEMS, ONE OWNER PER FLAG STATE.** Everything P4 builds runs beside the existing decision logic behind `detection_v2_decision_enabled=False`. Flag off ⇒ legacy owns firing, new primitive inert. Flag on ⇒ new primitive owns, legacy inert (never both — no double events). Every replaced component goes in the Cleanup Ledger below and is deleted only after the local soak proves v2.
+- Eventing JSONB shape (column exists since P1, all NULL today): `{"entry": {"m": M, "t_seconds": T}, "confirm": {"k": K, "n": N}}` — NULL/absent ⇒ parity defaults (state: M=1 on-sight entry + episode-gap exit, exactly today's rising edge; point: no confirm).
+
+## Cleanup Ledger (delete only after the v2 soak proves out; Aryaman-directed)
+
+| # | Component to remove | Replaced by | Safe to delete when |
+|---|---|---|---|
+| 1 | Legacy single-call tick body (camera_ingest flag-off branch) | scheduling/ scheduler→packer→executor | scheduler flag proven on in prod |
+| 2 | Standalone absence runner (`src/services/scheduling/scheduler.py`) | windowed-count absence (count==0 at deadline) | decision flag proven + one clean absence cycle |
+| 3 | Legacy state rising-edge block in event_promotion | windowed-count entry primitive | decision flag proven |
+| 4 | Global 30s `_DEDUP_WINDOW` | per-detector `cooldown_seconds` (row) | decision flag proven |
+| 5 | `split_rapid` + standalone P0 rapid lane | packer's RAPID bucket call | scheduler flag proven + rapid recipe re-validated through packer |
+| 6 | `rapid_energy` standalone gate | tick_signals map reduction | soak shows map ≈ gate on eval clips |
+| 7 | `scheduled` shape value + `last_scheduled_eval_date` | state primitive absence | ledger row 2 done + shape migration |
+| 8 | `instance` value in `evidence_unit` CHECK | collapsed into `sample` | next constraint-name rotation |
+
+
 The windowed-count state primitive (≥M evidence ticks in window T over `analyses`; `episode_gap_seconds` becomes exit hysteresis), absence deadlines (dissolving the `scheduled` shape into schedule-window + absence-state), k-of-N confirm for configured point detectors, per-detector `cooldown_seconds` (fixes point detectors re-firing every 30 s during persistent conditions), cross-call primary selection per tick. Replaces `test_state_episode_dedup` / `test_detector_inference_gap` with state-primitive tests.
 
 ## Phase 5 — Compiler v2  *(milestone; detailed plan at start)*
