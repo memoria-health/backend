@@ -140,6 +140,16 @@ Dimension classification, the feasibility hard-reject list with plain-language r
 
 ## Phase 6 — Reference detectors + soak  *(milestone)*
 
+**Soak runbook (written at P5 close; the soak is Aryaman's day of local testing before any merge):**
+1. Local stack up; apply nothing (all deltas already on the local DB).
+2. Flip flags in `.env`: `NEMARA_DETECTION_V2_SCHEDULER_ENABLED=true`, `NEMARA_DETECTION_V2_DECISION_ENABLED=true`, optionally `NEMARA_RAPID_SEIZURE_ENABLED=true` (recreate the backend container — hot-reload lies).
+3. Live normally for the day; poke the watchlist cases deliberately: TV on in an empty room (presence union cost), fan/curtain in a closed room (perpetual wake), a visitor while the patient naps (verified-other suppression), a fake "took pills" in front of the camera (person-crop call), a custom "watching TV for more than 15 minutes" detector (M-of-T entry).
+4. `uv run python tools/soak_report.py` — per-camera tick/skip/motion/presence histograms, sig_* percentiles (the P3 floor dials come from these), sched call counts + degraded markers + confirm outcomes, token spend → $/day, events per detector.
+5. Flag-on gate = the four P4 review follow-ups are DONE (fixed in 34d8289) + soak numbers acceptable: wake count sane, tracker_only presence share sane on known-empty rooms, $/day ≤ target, zero sched_call_errors storms.
+6. After the soak: floors move via settings only (person floor ≥ p90 idle amount; env floor ≥ p90 idle env; sample k for routine states); Cleanup Ledger rows retire one at a time, each its own PR.
+
+**P6 code-side status (2026-07-13):** soak_report.py shipped; reference-detector candidates (motionless/in-bed, fidgeting-class, FACE bucket members) remain Aryaman-gated — no new built-ins without his explicit call (locked decision), and face/zone artifact builders land with the data they need.
+
 One reference detector per bucket certified via the harness pattern (acted TP takes + nearest confounders, N=5, discrimination score), the cost ledger + budget governor live, then the **24-hour in-home soak** measuring real TP/FP per detector and $/day against the §6 model. Exit = go/no-go per detector + the degradation-warning copy for the apps.
 
 ---
