@@ -13,10 +13,16 @@ fabricated UUID without the auth user existing first.
 
 `cleanup_auth_users` deletes everything those factories created at the
 end of each test so isolation holds.
+
+Outbound email is disabled for the entire suite (see the env override
+below the imports): the developer `.env` carries the production Resend
+key, and without the override every feedback/support happy-path test
+sends a real email to the founders.
 """
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import AsyncIterator
 from uuid import UUID, uuid4
@@ -31,6 +37,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.db.session import get_engine, get_sessionmaker
 from src.main import create_app
 from src.settings import get_settings
+
+# Real env vars beat the `.env` file in pydantic-settings, and
+# `get_settings()` builds a fresh Settings per call — so blanking the
+# key here disarms every email path (they all no-op on an empty key)
+# for the whole suite. Tests that exercise email behavior monkeypatch
+# the sender explicitly.
+os.environ["NEMARA_RESEND_API_KEY"] = ""
 
 
 @pytest_asyncio.fixture(autouse=True)
