@@ -84,6 +84,13 @@ async def run(hours: float) -> None:
             c["amounts"].append(float(t.get("amount", 0.0)))
         if "sched_calls" in f:
             c["calls"][len(f["sched_calls"])] += 1
+            for call in f["sched_calls"]:
+                # RAPID spend since Ledger row 5: overlay-channel calls
+                # inside the scheduler ledger (the standalone lane's
+                # rapid_*_tokens row fields are gone).
+                if "overlay" in str(call.get("key", "")):
+                    c["rapid_in"] += int(call.get("input_tokens", 0))
+                    c["rapid_out"] += int(call.get("output_tokens", 0))
         for k in ("sched_degraded_audio", "sched_degraded_fps"):
             if f.get(k):
                 c["degraded"][k] += 1
@@ -92,8 +99,6 @@ async def run(hours: float) -> None:
             c["confirm"]["passed" if cf.get("passed") else "suppressed"] += 1
         c["in"] += int(f.get("vlm_input_tokens", 0))
         c["out"] += int(f.get("vlm_output_tokens", 0))
-        c["rapid_in"] += int(f.get("rapid_input_tokens", 0))
-        c["rapid_out"] += int(f.get("rapid_output_tokens", 0))
 
     print(f"# Soak report — last {hours:g}h — {len(rows)} rows, {len(events)} events\n")
     tot_in = tot_out = 0

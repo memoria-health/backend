@@ -17,10 +17,11 @@ Packing rules (D3/D4, Aryaman 2026-07-13):
     to SCENE (4 fps / clean / lite / full frame), so it merges into
     the scene call rather than buying its own; FINE-MOTION and FACE
     keep their own full-frame call (8 fps / flash — not mergeable).
-  - bucket=rapid members pack as SCENE: when the P0 rapid flag is ON,
-    split_rapid removes them before the scheduler ever sees them (the
-    validated solo lane owns them); when it's OFF, riding the wide
-    lite call is exactly today's behavior — parity, not regression.
+  - bucket=rapid is a first-class crop bucket (Ledger row 5, Aryaman
+    2026-07-14 — the P0 standalone lane is retired): per-person
+    overlay/flash calls at rapid fps. With no target (no boxes, crowd
+    fallback) it keeps its own full-frame OVERLAY call — the P0 lane's
+    no-box fallback — never a clean-clip ride.
   - needs_audio: if ANY member needs audio the CALL needs audio — the
     executor must land it on a native-video provider or mark the tick
     degraded.
@@ -83,10 +84,6 @@ def _group_key(
 ) -> tuple[str, int, str, str, str, int | None]:
     """Final recipe group for one (detector, target) pairing."""
     bucket = d.dims.bucket
-    # Rapid members reaching the packer mean the P0 lane isn't running
-    # them (flag off) — ride the wide call, exactly like today.
-    if bucket == "rapid":
-        return _SCENE_KEY
     # SNAPSHOT rides the wide call until per-camera zone configs exist
     # (P6): the still recipe was validated with ZONE CROPS; a full-
     # frame still measurably FAILS object checks (phone-vs-remote 100%
@@ -100,8 +97,9 @@ def _group_key(
     frames, fps, channel, tier, crop = _RECIPES[bucket]
     if target is None:
         # Degraded (no box): full-frame. PERSON's degraded recipe is
-        # byte-identical to SCENE ⇒ same group. FINE-MOTION / FACE
-        # keep their fps/tier in their own full-frame call.
+        # byte-identical to SCENE ⇒ same group. FINE-MOTION / RAPID /
+        # FACE keep their fps/channel/tier in their own full-frame call
+        # (RAPID full-frame = the P0 lane's exact no-box fallback).
         if bucket == "person":
             return _SCENE_KEY
         crop = "full"

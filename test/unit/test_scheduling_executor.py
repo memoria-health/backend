@@ -10,9 +10,11 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 import src.services.detection.scheduling.executor as ex
+from src.services.detection.frame_buffer import FrameSnapshot
 from src.services.detection.providers.types import ProviderResult
 from src.services.detection.prompt import DetectorSpec
 from src.services.detection.scheduling.dims import EffectiveDims
@@ -64,14 +66,25 @@ def _identity(track_ids=()) -> IdentityResult:
     )
 
 
+class _NS(SimpleNamespace):
+    """Settings stub that supports the executor's model_copy(update=…)
+    (used by the flash/overlay paths)."""
+
+    def model_copy(self, update=None):
+        d = dict(self.__dict__)
+        d.update(update or {})
+        return _NS(**d)
+
+
 def _settings(**over) -> SimpleNamespace:
     base = dict(
         reid_inference_sample_width=480,
         livekit_worker_target_fps=4,
         detection_v2_decision_enabled=False,
+        rapid_model="flash-model",
     )
     base.update(over)
-    return SimpleNamespace(**base)
+    return _NS(**base)
 
 
 class _ScriptedVLM:
@@ -96,17 +109,19 @@ class _ScriptedVLM:
 
 
 async def _run(plans, vlm, *, identity=None, monkeypatch=None, crop=b"crop",
-               settings=None):
+               settings=None, flash=None, window=None,
+               native_window=None, native_fps=None):
     if monkeypatch is not None:
         async def fake_crop(*a, **k):
             return crop
         monkeypatch.setattr(ex, "build_person_crop_mp4", fake_crop)
     return await ex.run_scheduled_calls(
-        plans, scene_mp4=b"scene", window=[object()], pcm=None,
+        plans, scene_mp4=b"scene", window=window or [object()], pcm=None,
         pcm_sample_rate=None, pcm_num_channels=None,
+        native_window=native_window, native_fps=native_fps,
         identity=identity or _identity(), settings=settings or _settings(),
         vlm_choice="gemini", run_main_vlm=vlm,
-        flash_provider=None, log_tag="t",
+        flash_provider=flash, log_tag="t",
     )
 
 
@@ -249,3 +264,175 @@ async def test_confirm_passes_and_never_runs_without_flag_or_fire(monkeypatch) -
     )
     assert len(vlm3.calls) == 1
     assert "sched_confirm" not in out3.sched_fields
+
+
+# ─── overlay / RAPID as a regular bucket call (Ledger row 5) ──────
+
+
+def _i420_frames(n: int = 12, *, flicker: bool, w: int = 160, h: int = 120):
+    """Synthetic native-rate window: the flicker block sits INSIDE the
+    _identity() track box so the region-scoped gate sees it."""
+    out = []
+    for i in range(n):
+        y = np.full((h, w), 60, dtype=np.uint8)
+        if flicker:
+            y[40:70, 12:48] = 190 if i % 2 else 60
+        uv = np.full((h // 2) * (w // 2) * 2, 128, dtype=np.uint8)
+        out.append(FrameSnapshot(
+            width=w, height=h, data=y.tobytes() + uv.tobytes(),
+            captured_at=100.0 + i / 8,
+        ))
+    return out
+
+
+class _FlashRecorder:
+    def __init__(self, fields, usage=None):
+        self.fields, self.usage, self.calls = dict(fields), usage, []
+
+    async def __call__(self, **kw):
+        self.calls.append(kw)
+        return ProviderResult(
+            description="rapid", detector_fields=dict(self.fields),
+            usage=self.usage,
+        )
+
+
+async def _fake_tint(frames):
+    return list(frames)
+
+
+async def _fake_overlay_mp4(*a, **k):
+    return b"ovl"
+
+
+@pytest.mark.asyncio
+async def test_overlay_gate_closed_never_spends() -> None:
+    """Still native frames: the rapid-energy gate short-circuits before
+    tint/artifact/provider — the P0 lane's cost lever, kept verbatim —
+    and the gate readouts still land on the row for soak tuning."""
+    plans = _plans(_due("seizure", bucket="rapid", targets=None, severity=96))
+    vlm = _ScriptedVLM([("gemini", {"people_present": True}, None)])
+    flash = _FlashRecorder({"seizure_detected": True})
+    out = await _run(
+        plans, vlm, flash=flash,
+        native_window=_i420_frames(flicker=False), native_fps=8,
+    )
+    assert flash.calls == []
+    assert "seizure_detected" not in out.detector_fields
+    gate_entries = [c for c in out.sched_fields["sched_calls"] if c.get("gate")]
+    assert gate_entries and gate_entries[0]["gate"] == "closed"
+    assert "rapid_gate_active_fraction" in out.detector_fields
+
+
+@pytest.mark.asyncio
+async def test_overlay_call_runs_the_validated_recipe(monkeypatch) -> None:
+    plans = _plans(
+        _due("fall"),
+        _due("seizure", bucket="rapid", targets=(1,), severity=96),
+    )
+    vlm = _ScriptedVLM([
+        ("gemini", {"fall_detected": False}, {"input": 10, "output": 1}),
+    ])
+    monkeypatch.setattr(ex, "tint_window", _fake_tint)
+    monkeypatch.setattr(ex, "build_overlay_crop_mp4", _fake_overlay_mp4)
+    flash = _FlashRecorder({
+        "seizure_detected": True, "seizure_confidence": 0.9,
+        "rapid_motion_description": "high-amplitude oscillation",
+        "people_present": True,   # not a member key — must never merge
+    }, usage={"input": 200, "output": 20})
+    out = await _run(
+        plans, vlm, flash=flash, identity=_identity((1,)),
+        native_window=_i420_frames(flicker=True), native_fps=8,
+    )
+    assert len(flash.calls) == 1
+    call = flash.calls[0]
+    assert call["mp4"] == b"ovl"
+    assert call["settings"].gemini_model == "flash-model"
+    assert call["settings"].gemini_video_fps == "8"
+    assert call["settings"].motion_overlay_enabled is True
+    idents = [d.identifier for d in call["detectors"]]
+    assert idents == ["rapid_motion", "seizure"]
+    # The seizure member runs its OVERLAY prompt variant, not the row's.
+    assert "MOTION-OVERLAY" in call["detectors"][1].prompt_fragment
+    assert out.detector_fields["seizure_detected"] is True
+    assert (
+        out.detector_fields["rapid_motion_description"]
+        == "high-amplitude oscillation"
+    )
+    assert out.detector_fields["rapid_gate_active_fraction"] > 0
+    assert out.sched_fields["vlm_input_tokens"] == 210   # scene + overlay
+    assert out.people_present is True                    # scene's, not rapid's
+
+
+@pytest.mark.asyncio
+async def test_overlay_artifact_failure_recorded_never_clean_judged(
+    monkeypatch,
+) -> None:
+    plans = _plans(_due("seizure", bucket="rapid", targets=None, severity=96))
+    vlm = _ScriptedVLM([("gemini", {}, None)])
+
+    async def _no_mp4(*a, **k):
+        return None
+
+    monkeypatch.setattr(ex, "tint_window", _fake_tint)
+    monkeypatch.setattr(ex, "build_overlay_crop_mp4", _no_mp4)
+    flash = _FlashRecorder({"seizure_detected": True})
+    out = await _run(
+        plans, vlm, flash=flash,
+        native_window=_i420_frames(flicker=True), native_fps=8,
+    )
+    assert flash.calls == []
+    assert out.sched_fields["sched_degraded_artifacts"] == 1
+    assert any(
+        c.get("gate") == "artifact_failed"
+        for c in out.sched_fields["sched_calls"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_overlay_without_native_window_clamps_and_marks(
+    monkeypatch,
+) -> None:
+    """Transition tick (buffer just retargeted / restart): no native
+    window yet — the overlay plan runs on the decimated window at its
+    real rate and the tick is marked degraded, never skipped."""
+    plans = _plans(_due("seizure", bucket="rapid", targets=None, severity=96))
+    vlm = _ScriptedVLM([("gemini", {}, None)])
+    monkeypatch.setattr(ex, "tint_window", _fake_tint)
+    monkeypatch.setattr(ex, "build_overlay_crop_mp4", _fake_overlay_mp4)
+    flash = _FlashRecorder({"seizure_detected": False})
+    out = await _run(
+        plans, vlm, flash=flash, window=_i420_frames(flicker=True),
+    )
+    assert out.sched_fields["sched_degraded_fps"] is True
+    assert flash.calls
+    assert flash.calls[0]["settings"].gemini_video_fps == "4"
+
+
+@pytest.mark.asyncio
+async def test_overlay_confirm_votes_carry_recipe(monkeypatch) -> None:
+    """k-of-N votes on an overlay fire re-check the SAME artifact at the
+    SAME fps with the SAME prompt variant + tint note (P4 finding 3,
+    extended to overlay)."""
+    plans = _plans(
+        _due("seizure", bucket="rapid", targets=None, severity=96,
+             confirm=(2, 2)),
+    )
+    vlm = _ScriptedVLM([("gemini", {}, None)])
+    monkeypatch.setattr(ex, "tint_window", _fake_tint)
+    monkeypatch.setattr(ex, "build_overlay_crop_mp4", _fake_overlay_mp4)
+    flash = _FlashRecorder({"seizure_detected": True, "seizure_confidence": 0.9})
+    out = await _run(
+        plans, vlm, flash=flash,
+        native_window=_i420_frames(flicker=True), native_fps=8,
+        settings=_settings(detection_v2_decision_enabled=True),
+    )
+    assert len(flash.calls) == 3          # fire + 2 votes
+    for vote in flash.calls[1:]:
+        assert vote["mp4"] == b"ovl"
+        assert vote["settings"].gemini_video_fps == "8"
+        assert vote["settings"].motion_overlay_enabled is True
+        assert [d.identifier for d in vote["detectors"]] == ["seizure"]
+        assert "MOTION-OVERLAY" in vote["detectors"][0].prompt_fragment
+    assert out.detector_fields["seizure_detected"] is True
+    assert out.sched_fields["sched_confirm"]["seizure"]["passed"] is True

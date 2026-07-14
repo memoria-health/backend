@@ -43,9 +43,20 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Awaitable, Callable, Sequence
 
 from src.services.detection.providers.types import ProviderResult
-from src.services.detection.scheduling.artifacts import build_person_crop_mp4
+from src.services.detection.rapid_call import RAPID_MOTION_SPEC, rapid_seizure_spec
+from src.services.detection.scheduling.artifacts import (
+    build_overlay_crop_mp4,
+    build_person_crop_mp4,
+    person_crop_box,
+    tint_window,
+)
 from src.services.detection.scheduling.decision import detection_keys_for
 from src.services.detection.scheduling.packer import CallPlan
+from src.services.detection.signals.rapid_energy import (
+    MIN_ACTIVE_FRACTION_DEFAULT,
+    MIN_SCORE_DEFAULT,
+    rapid_energy,
+)
 
 if TYPE_CHECKING:
     from src.services.detection.frame_buffer import FrameSnapshot
@@ -56,6 +67,14 @@ log = logging.getLogger(__name__)
 
 # Providers that receive extracted frames, not native video — no audio.
 _FRAME_SAMPLING_PROVIDERS = frozenset({"openai", "openrouter", "dashscope"})
+
+# Overlay-channel prompt swaps: a detector whose row prompt describes the
+# clean clip gets its validated overlay variant on RAPID calls (the P0
+# recipe's prompt semantics — a clean-clip prompt on tinted footage, or
+# vice versa, is exactly the mismatch that caused prod seizure
+# overfiring). Detectors without an entry keep their own fragment; the
+# provider's tint note (motion_overlay_enabled) explains the red channel.
+_OVERLAY_SPECS = {"seizure": rapid_seizure_spec()}
 
 
 @dataclass
@@ -91,6 +110,8 @@ async def run_scheduled_calls(
     pcm: bytes | None,
     pcm_sample_rate: int | None,
     pcm_num_channels: int | None,
+    native_window: Sequence["FrameSnapshot"] | None = None,
+    native_fps: int | None = None,
     identity: "IdentityResult",
     settings: "Settings",
     vlm_choice: str,
@@ -98,8 +119,21 @@ async def run_scheduled_calls(
     flash_provider: Callable[..., Awaitable[ProviderResult]],
     log_tag: str,
 ) -> SchedulerTickResult:
-    """Execute every plan; merge into one tick-shaped result."""
+    """Execute every plan; merge into one tick-shaped result.
+
+    `native_window` / `native_fps`: the frame buffer's native-rate
+    snapshot for overlay (RAPID) plans — the recipe diffs and encodes at
+    `rapid_fps`, which the decimated `window` cannot supply. When absent
+    the overlay plan degrades to the decimated window (marked
+    `sched_degraded_fps`) rather than silently skipping seizure coverage.
+    """
     tracks_by_id = {t.track_id: t for t in (identity.tracks or ())}
+    # Overlay (RAPID) state: the tint pass runs at most once per tick
+    # (tint-then-crop is per-plan), and the gate readouts ride along for
+    # soak tuning exactly like the P0 lane stamped them.
+    overlay_tinted: Sequence["FrameSnapshot"] | None = None
+    rapid_gate_af: float | None = None
+    rapid_gate_score: float | None = None
 
     merged_fields: dict = {}
     # ident → (score, fields-group) so multi-call detectors keep their
@@ -130,12 +164,80 @@ async def run_scheduled_calls(
         # and the tick marked (T3/T4 review F5). Unreachable for the
         # default catalog; matters the day a P5 custom lands in
         # fine_motion before native-rate plumbing exists.
-        artifact_fps = min(plan.fps, settings.livekit_worker_target_fps)
+        if plan.channel == "overlay":
+            artifact_fps = min(
+                plan.fps, native_fps or settings.livekit_worker_target_fps,
+            )
+        else:
+            artifact_fps = min(plan.fps, settings.livekit_worker_target_fps)
         if artifact_fps < plan.fps:
             degraded_fps = True
         mp4 = scene_mp4
         degraded_this_call = False
-        if plan.crop == "person" and plan.target_track_id is not None:
+        overlay_specs = None
+        if plan.channel == "overlay":
+            # RAPID recipe as a regular bucket call (Ledger row 5, was
+            # the P0 standalone lane): native-rate frames, rapid-energy
+            # pre-gate, tint-then-crop artifact. Gate closed = no spend
+            # (the cost lever); a window too short to diff never runs;
+            # an artifact failure is recorded — never judged as clean
+            # footage under an overlay prompt.
+            nw = native_window if native_window else window
+            if native_window is None:
+                degraded_fps = True  # decimated frames under a rapid recipe
+            if len(nw) < 4:
+                call_ledger.append({
+                    "key": plan.plan_key, "detectors": idents,
+                    "gate": "short_window",
+                })
+                continue
+            track = (
+                tracks_by_id.get(plan.target_track_id)
+                if plan.target_track_id is not None else None
+            )
+            region = (
+                person_crop_box(
+                    nw, track=track,
+                    sample_width=settings.reid_inference_sample_width,
+                )
+                if track is not None else None
+            )
+            energy = (
+                rapid_energy(nw, region=region)
+                if region is not None else rapid_energy(nw)
+            )
+            rapid_gate_af = max(rapid_gate_af or 0.0, energy.active_fraction)
+            rapid_gate_score = max(rapid_gate_score or 0.0, energy.score)
+            if not (
+                energy.active_fraction >= MIN_ACTIVE_FRACTION_DEFAULT
+                and energy.score >= MIN_SCORE_DEFAULT
+            ):
+                call_ledger.append({
+                    "key": plan.plan_key, "detectors": idents,
+                    "gate": "closed",
+                })
+                continue
+            if overlay_tinted is None:
+                overlay_tinted = await tint_window(nw)
+            crop_mp4 = await build_overlay_crop_mp4(
+                overlay_tinted, track=track,
+                sample_width=settings.reid_inference_sample_width,
+                fps=artifact_fps,
+            )
+            if crop_mp4 is None:
+                degraded_calls += 1
+                call_ledger.append({
+                    "key": plan.plan_key, "detectors": idents,
+                    "gate": "artifact_failed",
+                })
+                continue
+            mp4 = crop_mp4
+            if plan.needs_audio:
+                degraded_audio = True  # overlay artifacts are video-only
+            overlay_specs = [RAPID_MOTION_SPEC] + [
+                _OVERLAY_SPECS.get(s.identifier, s) for s in specs
+            ]
+        elif plan.crop == "person" and plan.target_track_id is not None:
             track = tracks_by_id.get(plan.target_track_id)
             crop_mp4 = None
             if track is not None:
@@ -165,12 +267,17 @@ async def run_scheduled_calls(
         # ── Provider ─────────────────────────────────────────────
         try:
             if plan.tier == "flash":
-                flash_settings = settings.model_copy(update={
+                flash_update: dict = {
                     "gemini_model": settings.rapid_model,
                     "gemini_video_fps": str(artifact_fps),
-                })
+                }
+                if plan.channel == "overlay":
+                    # The provider prepends the tint note (P0 pattern).
+                    flash_update["motion_overlay_enabled"] = True
+                flash_settings = settings.model_copy(update=flash_update)
                 result = await flash_provider(
-                    mp4=mp4, detectors=specs, log_tag=log_tag,
+                    mp4=mp4, detectors=(overlay_specs or specs),
+                    log_tag=log_tag,
                     settings=flash_settings,
                     patient_in_clip=identity.patient_in_clip,
                     patient_bbox=None,
@@ -245,10 +352,18 @@ async def run_scheduled_calls(
             prev = best_by_ident.get(ident)
             if prev is None or score > prev[0]:
                 best_by_ident[ident] = (score, group)
-                # Remember the artifact + plan behind the winning
-                # answer — the k-of-N confirmation re-checks run
-                # against the SAME clip the fire came from.
-                winning_call[ident] = (d, mp4, plan)
+                # Remember the artifact + plan (+ the fps it was really
+                # encoded at) behind the winning answer — the k-of-N
+                # confirmation re-checks run against the SAME clip the
+                # fire came from, at the SAME fps.
+                winning_call[ident] = (d, mp4, plan, artifact_fps)
+
+        if plan.channel == "overlay":
+            # The describe-then-decide preamble's output is soak/debug
+            # material — carry the first one seen onto the row.
+            desc = result.detector_fields.get("rapid_motion_description")
+            if desc and "rapid_motion_description" not in merged_fields:
+                merged_fields["rapid_motion_description"] = desc
 
     if scene_result is None:
         # The packer GUARANTEES a scene plan on every tick (empty-
@@ -263,6 +378,13 @@ async def run_scheduled_calls(
     for _, group in best_by_ident.values():
         merged_fields.update(group)
 
+    if rapid_gate_af is not None:
+        # Gate readouts ride along for soak tuning (P0 pattern) — was
+        # the churn score ever worth a floor? what does the activity
+        # distribution look like on real ticks?
+        merged_fields["rapid_gate_active_fraction"] = round(rapid_gate_af, 4)
+        merged_fields["rapid_gate_score"] = round(rapid_gate_score or 0.0, 3)
+
     # ── k-of-N confirmation (P4; Aryaman: N extra calls on the SAME
     # clip, ≥k must agree). Runs only with the decision flag on AND a
     # per-detector confirm config — no built-in carries one, so parity
@@ -273,7 +395,7 @@ async def run_scheduled_calls(
     # the tick.
     confirm_ledger: dict[str, dict] = {}
     if getattr(settings, "detection_v2_decision_enabled", False):
-        for ident, (due, artifact, plan) in winning_call.items():
+        for ident, (due, artifact, plan, art_fps) in winning_call.items():
             k, n = due.dims.confirm_k, due.dims.confirm_n
             detected_key, _conf_key = detection_keys_for(ident)
             if n <= 0 or not merged_fields.get(detected_key):
@@ -284,17 +406,21 @@ async def run_scheduled_calls(
                 try:
                     if plan.tier == "flash":
                         # Votes must see what the original call saw —
-                        # same model AND same fps (P4 review finding 3:
-                        # a 4fps vote on an 8fps rapid artifact is a
-                        # systematically blind re-check).
-                        fs = settings.model_copy(update={
+                        # same model, same fps (P4 review finding 3: a
+                        # 4fps vote on an 8fps rapid artifact is a
+                        # systematically blind re-check), and on overlay
+                        # artifacts the same prompt variant + tint note.
+                        vote_update: dict = {
                             "gemini_model": settings.rapid_model,
-                            "gemini_video_fps": str(min(
-                                plan.fps, settings.livekit_worker_target_fps,
-                            )),
-                        })
+                            "gemini_video_fps": str(art_fps),
+                        }
+                        vote_spec = due.spec
+                        if plan.channel == "overlay":
+                            vote_update["motion_overlay_enabled"] = True
+                            vote_spec = _OVERLAY_SPECS.get(ident, due.spec)
+                        fs = settings.model_copy(update=vote_update)
                         res = await flash_provider(
-                            mp4=artifact, detectors=[due.spec],
+                            mp4=artifact, detectors=[vote_spec],
                             log_tag=f"{log_tag} confirm:{ident}:{i}",
                             settings=fs, patient_in_clip=identity.patient_in_clip,
                             patient_bbox=None,

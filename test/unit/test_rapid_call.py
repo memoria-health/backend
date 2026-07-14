@@ -1,102 +1,22 @@
-"""Unit tests for the RAPID seizure call path (detection v2, P0).
+"""Unit tests for the RAPID recipe pieces (detection v2).
 
-The module under test is deliberately provider-injected: these tests drive
-it with a fake provider and assert the wiring — detector splitting, the
-churn pre-gate short-circuit, settings override, and field filtering —
-without any network or model.
+Since Ledger row 5 the standalone lane is gone — the v2 executor
+consumes these pieces (overlay prompt swap, describe-then-decide
+preamble, box scaling) and its tests cover the runtime behavior
+(gate short-circuit, artifact fallback, settings override). Here we
+pin the pieces themselves.
 """
 
 from __future__ import annotations
 
-import shutil
-from types import SimpleNamespace
-
-import numpy as np
 import pytest
 
-from src.services.detection.frame_buffer import FrameSnapshot
-from src.services.detection.prompt import DetectorSpec
 from src.services.detection.rapid_call import (
+    RAPID_MOTION_SPEC,
     RAPID_SEIZURE_PROMPT,
-    filter_rapid_fields,
-    run_rapid_seizure,
+    rapid_seizure_spec,
     scale_bbox_to_frame,
-    split_rapid,
 )
-from src.settings import get_settings
-
-W, H = 160, 120
-
-
-def _i420(y: np.ndarray) -> bytes:
-    h, w = y.shape
-    uv = np.full((h // 2) * (w // 2) * 2, 128, dtype=np.uint8)
-    return y.tobytes() + uv.tobytes()
-
-
-def _frames(n: int = 12, *, flicker: bool) -> list[FrameSnapshot]:
-    out = []
-    for i in range(n):
-        y = np.full((H, W), 60, dtype=np.uint8)
-        if flicker:
-            y[40:70, 60:90] = 190 if i % 2 else 60
-        out.append(FrameSnapshot(
-            width=W, height=H, data=_i420(y), captured_at=100.0 + i / 8))
-    return out
-
-
-def _spec(ident: str) -> DetectorSpec:
-    return DetectorSpec(
-        identifier=ident, name=ident, prompt_fragment="x",
-        schema_fields={f"{ident}_detected": {"type": "boolean"}},
-    )
-
-
-class _FakeProvider:
-    def __init__(self, fields: dict, usage: dict | None = None):
-        self.fields = fields
-        self.usage = usage
-        self.calls: list[dict] = []
-
-    async def __call__(self, **kwargs):
-        self.calls.append(kwargs)
-        return SimpleNamespace(detector_fields=dict(self.fields), usage=self.usage)
-
-
-def test_split_rapid_flag_off_is_identity() -> None:
-    s = get_settings().model_copy(update={"rapid_seizure_enabled": False})
-    dets = [_spec("fall"), _spec("seizure")]
-    main, active = split_rapid(dets, s)
-    assert main == dets
-    assert active is False
-
-
-def test_split_rapid_extracts_seizure_when_enabled() -> None:
-    s = get_settings().model_copy(update={"rapid_seizure_enabled": True})
-    main, active = split_rapid([_spec("fall"), _spec("seizure")], s)
-    assert [d.identifier for d in main] == ["fall"]
-    assert active is True
-    # No seizure assigned → nothing to extract, path stays off.
-    main2, active2 = split_rapid([_spec("fall")], s)
-    assert [d.identifier for d in main2] == ["fall"]
-    assert active2 is False
-
-
-def test_filter_rapid_fields_keeps_only_namespaced_keys() -> None:
-    fields = {
-        "seizure_detected": True,
-        "seizure_confidence": 0.9,
-        "seizure_reasoning": "rhythmic",
-        "rapid_motion_description": "whole-body shaking",
-        "people_present": True,          # must NOT leak over the main call's
-        "speech_transcript": "hi",       # must NOT leak
-        "description": "scene",          # must NOT leak
-    }
-    kept = filter_rapid_fields(fields)
-    assert set(kept) == {
-        "seizure_detected", "seizure_confidence", "seizure_reasoning",
-        "rapid_motion_description",
-    }
 
 
 def test_prompt_carries_the_load_bearing_constraints() -> None:
@@ -104,6 +24,19 @@ def test_prompt_carries_the_load_bearing_constraints() -> None:
     assert "never sufficient" in p       # red tint alone can't fire it
     assert "shivering" in p              # the mutual confounder is named
     assert "any position" in p           # not predicated on lying down
+
+
+def test_overlay_spec_keeps_the_catalog_identifier_and_field_trio() -> None:
+    """The overlay variant must land on the SAME seizure_* keys the
+    catalog row owns — promotion / severity / dedup / clips downstream
+    cannot tell which prompt produced the verdict."""
+    spec = rapid_seizure_spec()
+    assert spec.identifier == "seizure"
+    assert set(spec.schema_fields) == {
+        "seizure_detected", "seizure_confidence", "seizure_reasoning",
+    }
+    assert RAPID_MOTION_SPEC.always_on is True
+    assert "rapid_motion_description" in RAPID_MOTION_SPEC.schema_fields
 
 
 def test_scale_bbox_maps_reid_space_to_native_pixels() -> None:
@@ -115,77 +48,3 @@ def test_scale_bbox_maps_reid_space_to_native_pixels() -> None:
     same = scale_bbox_to_frame((10, 10, 50, 50), 320, 240, sample_width=480)
     assert same == pytest.approx((10.0, 10.0, 50.0, 50.0))
     assert scale_bbox_to_frame((0, 0, 1, 1), 0, 0, sample_width=480) is None
-
-
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
-async def test_total_provider_failure_raises_for_degraded_marker() -> None:
-    """Gate open + every provider call failing (503 storm) must RAISE so the
-    tick stamps rapid_seizure_error — silent loss of the only seizure
-    coverage is the one unacceptable outcome."""
-    s = get_settings().model_copy(update={"rapid_seizure_enabled": True})
-
-    class _AlwaysDown:
-        async def __call__(self, **kwargs):
-            raise RuntimeError("503")
-
-    with pytest.raises(RuntimeError, match="RAPID provider"):
-        await run_rapid_seizure(
-            frames=_frames(flicker=True),
-            per_person_boxes=[[(40, 20, 110, 100)]],
-            settings=s, provider=_AlwaysDown(), log_tag="t",
-        )
-
-
-async def test_degenerate_boxes_return_none_without_spending() -> None:
-    """All-degenerate person boxes: the gate fails open to whole-frame, but
-    with no usable crop the call is skipped — never a malformed artifact."""
-    s = get_settings().model_copy(update={"rapid_seizure_enabled": True})
-    fake = _FakeProvider({"seizure_detected": True})
-    out = await run_rapid_seizure(
-        frames=_frames(flicker=True), per_person_boxes=[[]],
-        settings=s, provider=fake, log_tag="t",
-    )
-    assert out is None
-    assert fake.calls == []
-
-
-async def test_gate_closed_short_circuits_before_any_call() -> None:
-    """A still window never reaches artifacts or the provider — this is the
-    cost lever: most motion ticks exit here for free."""
-    s = get_settings().model_copy(update={"rapid_seizure_enabled": True})
-    fake = _FakeProvider({"seizure_detected": True})
-    out = await run_rapid_seizure(
-        frames=_frames(flicker=False), per_person_boxes=[[(40, 30, 100, 80)]],
-        settings=s, provider=fake, log_tag="t",
-    )
-    assert out is None
-    assert fake.calls == []
-
-
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
-async def test_fires_end_to_end_with_flash_settings() -> None:
-    s = get_settings().model_copy(update={"rapid_seizure_enabled": True})
-    fake = _FakeProvider({
-        "seizure_detected": True, "seizure_confidence": 0.88,
-        "seizure_reasoning": "sustained rhythmic shaking",
-        "rapid_motion_description": "arms oscillating",
-        "people_present": True,
-    }, usage={"input": 20900, "output": 310})
-    out = await run_rapid_seizure(
-        frames=_frames(flicker=True), per_person_boxes=[[(40, 20, 110, 100)]],
-        settings=s, provider=fake, log_tag="t",
-    )
-    assert out is not None
-    assert out["seizure_detected"] is True
-    assert "people_present" not in out
-    assert out["rapid_input_tokens"] == 20900   # ledger data rides along
-    assert out["rapid_output_tokens"] == 310
-    assert len(fake.calls) == 1
-    call = fake.calls[0]
-    # The call runs on the RAPID recipe: flash-tier model, native fps,
-    # overlay note on, exactly [motion-description, seizure] specs.
-    assert call["settings"].gemini_model == s.rapid_model
-    assert call["settings"].gemini_video_fps == str(s.rapid_fps)
-    assert call["settings"].motion_overlay_enabled is True
-    assert [d.identifier for d in call["detectors"]] == ["rapid_motion", "seizure"]
-    assert call["mp4"][4:8] == b"ftyp"

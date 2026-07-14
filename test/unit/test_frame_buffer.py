@@ -270,3 +270,36 @@ def test_data_is_stored_as_is_not_referenced() -> None:
     assert frames[0].width == 16
     assert frames[0].height == 16
     assert isinstance(frames[0], FrameSnapshot)
+
+
+# ─── retarget (Ledger row 5: RAPID retention without the flag) ────
+
+
+def test_retarget_raises_rate_and_accepts_faster_pushes() -> None:
+    buf = FrameBuffer(window_seconds=10, target_fps=4)
+    for i in range(80):
+        buf.push(width=16, height=16, data=b"x" * 384, captured_at=i / 8)
+    assert buf.target_fps == 4
+    buf.retarget(8)
+    assert buf.target_fps == 8
+    assert buf.capacity == 81
+    accepted = sum(
+        buf.push(width=16, height=16, data=b"x" * 384, captured_at=10.0 + i / 8)
+        for i in range(16)
+    )
+    assert accepted == 16          # the 8fps min-gap now admits every push
+
+
+def test_retarget_down_trims_to_new_capacity_and_is_idempotent() -> None:
+    buf = FrameBuffer(window_seconds=10, target_fps=8)
+    for i in range(81):
+        buf.push(width=16, height=16, data=b"x" * 384, captured_at=i / 8)
+    buf.retarget(4)
+    assert buf.capacity == 41
+    assert len(buf) <= 41
+    # Newest history is what survives the shrink.
+    frames = buf.snapshot_last_seconds(10, now=10.0)
+    assert frames and frames[-1].captured_at == 10.0
+    before = len(buf)
+    buf.retarget(4)                # same rate = no-op
+    assert len(buf) == before

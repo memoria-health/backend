@@ -2,8 +2,8 @@
 
 Pins D3/D4 exactly: uncapped SCENE, ≤3 crop buckets chunked
 severity-first, one call per (bucket, track), degraded-person merges
-into scene, rapid-members-without-the-P0-lane ride the wide call,
-needs_audio propagates to the call.
+into scene, rapid packs as a first-class overlay/flash crop bucket
+(Ledger row 5), needs_audio propagates to the call.
 """
 
 from __future__ import annotations
@@ -102,14 +102,39 @@ def test_degraded_fine_motion_keeps_its_own_flash_call() -> None:
     assert len(fm) == 1 and fm[0].fps == 8 and fm[0].crop == "full"
 
 
-def test_rapid_member_rides_the_wide_call_when_p0_lane_off() -> None:
+def test_rapid_member_gets_its_own_overlay_flash_call() -> None:
+    """Ledger row 5 (Aryaman 2026-07-14): the P0 standalone lane is
+    retired — RAPID packs like any crop bucket, on its validated
+    recipe, one call per person, never a clean-clip ride."""
     plans = _pack(
         _due("fall", bucket="scene"),
         _due("seizure", bucket="rapid", targets=(3,), severity=96),
     )
-    (plan,) = plans
-    assert plan.crop == "full" and plan.channel == "clean"
-    assert set(_idents(plan)) == {"fall", "seizure"}
+    assert len(plans) == 2
+    (rapid,) = [p for p in plans if p.channel == "overlay"]
+    assert (rapid.frames, rapid.fps, rapid.tier, rapid.crop) == (
+        "video", 8, "flash", "person",
+    )
+    assert rapid.target_track_id == 3
+    assert _idents(rapid) == ["seizure"]
+    assert "seizure" not in _idents(plans[0])
+    # Two targets ⇒ two per-person overlay calls (D3: never a union).
+    plans2 = _pack(_due("seizure", bucket="rapid", targets=(1, 2), severity=96))
+    crops = [p for p in plans2 if p.channel == "overlay"]
+    assert sorted(p.target_track_id for p in crops) == [1, 2]
+
+
+def test_degraded_rapid_keeps_its_own_full_frame_overlay_call() -> None:
+    """No box / crowd tick: RAPID falls back to the full tinted frame —
+    the P0 lane's exact no-box behavior — never a clean-clip ride."""
+    plans = _pack(
+        _due("fall", bucket="scene"),
+        _due("seizure", bucket="rapid", targets=None, severity=96),
+    )
+    assert len(plans) == 2
+    (rapid,) = [p for p in plans if p.channel == "overlay"]
+    assert rapid.crop == "full" and rapid.fps == 8 and rapid.tier == "flash"
+    assert rapid.target_track_id is None
 
 
 def test_snapshot_rides_the_wide_call_until_zones_exist() -> None:
@@ -176,11 +201,13 @@ def test_crop_only_loadout_still_gets_the_scene_anchor() -> None:
 
 
 def test_multi_target_scene_collapse_lists_the_member_once() -> None:
-    """A rapid/snapshot member fanning out per target must not appear
-    twice in the wide call's ledger (T3/T4 review F4)."""
+    """A member fanning out per target whose targets all collapse into
+    the SAME group must not appear twice in that call's ledger (T3/T4
+    review F4). Rapid used to be this case; since Ledger row 5 it packs
+    per person, so the pin rides the unknown-bucket → wide fallback."""
     plans = _pack(
         _due("fall", bucket="scene"),
-        _due("seizure", bucket="rapid", targets=(1, 2), severity=96),
+        _due("mystery", bucket="not_a_bucket_yet", targets=(1, 2), severity=96),
     )
     (plan,) = plans
-    assert _idents(plan).count("seizure") == 1
+    assert _idents(plan).count("mystery") == 1

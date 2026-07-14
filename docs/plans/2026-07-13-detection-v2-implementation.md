@@ -124,8 +124,8 @@ Activation resolution as a pure function (the §1.2 subject truth table + gates 
 | 2 | Standalone absence runner (`src/services/scheduling/scheduler.py`) | windowed-count absence (count==0 at deadline) | decision flag proven + one clean absence cycle |
 | 3 | Legacy state rising-edge block in event_promotion | windowed-count entry primitive | decision flag proven |
 | 4 | Global 30s `_DEDUP_WINDOW` | per-detector `cooldown_seconds` (row) | decision flag proven |
-| 5 | `split_rapid` + standalone P0 rapid lane | packer's RAPID bucket call | scheduler flag proven + rapid recipe re-validated through packer |
-| 6 | `rapid_energy` standalone gate | tick_signals map reduction | soak shows map ≈ gate on eval clips |
+| 5 | ~~`split_rapid` + standalone P0 rapid lane + `rapid_seizure_enabled` flag~~ **DONE 2026-07-14** (Aryaman-directed pre-soak: "not a flag specific to seizure — just analyze it as the rapid bucket") | packer's RAPID bucket call — overlay recipe preserved piece-for-piece (tint-before-crop, 8fps, flash, prompt swap, per-person pre-gate); buffer retention now keyed to the loadout via `FrameBuffer.retarget()`; the soak validates the unified path | ~~scheduler flag proven + rapid recipe re-validated through packer~~ shipped; soak revalidates live |
+| 6 | `rapid_energy` standalone gate (now computed inside the executor's overlay branch, per person — same thresholds) | tick_signals map reduction | soak shows map ≈ gate on eval clips |
 | 7 | `scheduled` shape value + `last_scheduled_eval_date` | state primitive absence | ledger row 2 done + shape migration |
 | 8 | `instance` value in `evidence_unit` CHECK | collapsed into `sample` | next constraint-name rotation |
 
@@ -142,7 +142,7 @@ Dimension classification, the feasibility hard-reject list with plain-language r
 
 **Soak runbook (written at P5 close; the soak is Aryaman's day of local testing before any merge):**
 1. Local stack up; apply nothing (all deltas already on the local DB).
-2. Flip flags in `.env`: `NEMARA_DETECTION_V2_SCHEDULER_ENABLED=true`, `NEMARA_DETECTION_V2_DECISION_ENABLED=true`, optionally `NEMARA_RAPID_SEIZURE_ENABLED=true` (recreate the backend container — hot-reload lies).
+2. Flip flags in `.env`: `NEMARA_DETECTION_V2_SCHEDULER_ENABLED=true`, `NEMARA_DETECTION_V2_DECISION_ENABLED=true` (recreate the backend container — hot-reload lies). There is no rapid flag anymore (Ledger row 5): seizure runs as a regular rapid-bucket detector whenever the scheduler flag is on and the detector is enabled.
 3. Live normally for the day; poke the watchlist cases deliberately: TV on in an empty room (presence union cost), fan/curtain in a closed room (perpetual wake), a visitor while the patient naps (verified-other suppression), a fake "took pills" in front of the camera (person-crop call), a custom "watching TV for more than 15 minutes" detector (M-of-T entry).
 4. `uv run python tools/soak_report.py` — per-camera tick/skip/motion/presence histograms, sig_* percentiles (the P3 floor dials come from these), sched call counts + degraded markers + confirm outcomes, token spend → $/day, events per detector.
 5. Flag-on gate = the four P4 review follow-ups are DONE (fixed in 34d8289) + soak numbers acceptable: wake count sane, tracker_only presence share sane on known-empty rooms, $/day ≤ target, zero sched_call_errors storms.

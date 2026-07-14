@@ -20,8 +20,11 @@ ships the builders the CURRENT catalog needs when the flag turns on:
                         (the packer routes snapshot members to the
                         wide call until then — full-frame stills
                         measurably fail).
-  overlay (RAPID)     → owned by the validated P0 lane
-                        (rapid_artifact.build_rapid_artifacts).
+  overlay (RAPID)     → tint_window() + build_overlay_crop_mp4():
+                        the validated P0 recipe (tint the FULL native
+                        frames first, then static per-person crop,
+                        video-only) run as a regular bucket call since
+                        the standalone lane retired (Ledger row 5).
 
 Reuses the P0 helpers directly — `union_box` (pad, min-side, slide-
 inside, even-align) and `crop_i420` (plane slicing, renegotiation +
@@ -35,6 +38,7 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING, Sequence
 
+from src.services.detection.motion_overlay import overlay_motion
 from src.services.detection.mp4_remux import Mp4RemuxError, frames_to_mp4
 from src.services.detection.rapid_artifact import crop_i420, union_box
 from src.services.detection.rapid_call import scale_bbox_to_frame
@@ -104,4 +108,43 @@ async def build_person_crop_mp4(
             "scheduling.person_crop remux failed track=%d box=%s err=%s",
             track.track_id, box, exc,
         )
+        return None
+
+
+async def tint_window(
+    window: Sequence["FrameSnapshot"],
+) -> list["FrameSnapshot"]:
+    """Motion-overlay the FULL native frames (thread-offloaded). Tint
+    before crop is load-bearing (rapid_artifact module doc): diffing a
+    moving crop window paints phantom red on stationary scenery. The
+    executor tints once per tick and crops per overlay plan."""
+    return await asyncio.to_thread(overlay_motion, list(window))
+
+
+async def build_overlay_crop_mp4(
+    tinted: Sequence["FrameSnapshot"],
+    *,
+    track: "TrackObservation | None",
+    sample_width: int,
+    fps: int,
+) -> bytes | None:
+    """Tinted frames → one RAPID artifact: static per-track crop when a
+    track is given (identical geometry to the person-crop builder), the
+    full tinted frame when not — the P0 lane's no-box fallback. Video-
+    only by recipe. None when nothing encodable came out; the executor
+    then records the call as degraded rather than silently running clean
+    footage under an overlay prompt."""
+    if len(tinted) < 2:
+        return None
+    frames: Sequence["FrameSnapshot"] = tinted
+    if track is not None:
+        box = person_crop_box(tinted, track=track, sample_width=sample_width)
+        if box is not None:
+            frames = await asyncio.to_thread(crop_i420, tinted, box)
+    if len(frames) < 2:
+        return None
+    try:
+        return await frames_to_mp4(list(frames), fps=fps)
+    except (Mp4RemuxError, ValueError) as exc:
+        log.warning("scheduling.overlay_crop remux failed err=%s", exc)
         return None

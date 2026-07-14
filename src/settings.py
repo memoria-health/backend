@@ -156,15 +156,17 @@ class Settings(BaseSettings):
     # motion heartbeats every ~5s; missing/stale → motion_in_clip=false.
     livekit_motion_state_ttl_seconds: int = Field(ge=5, le=60, default=15)
 
-    # ── RAPID seizure path (detection v2, P0) ────────────────────
-    # When ON, the seizure detector leaves the main (lite) call and runs as
-    # a dedicated person-cropped, motion-overlay-only, `rapid_fps` call on
-    # `rapid_model`, behind a cheap rapid-energy pre-gate. The frame buffer
-    # then retains `rapid_fps` natively; every other consumer decimates back
-    # to `livekit_worker_target_fps` via snapshot at_fps, so main-call cost
-    # and clip cadence are unchanged. Validated recipe (conv 8/10 R, 1/30 FP):
-    # docs/architecture/detection-architecture-v2.md §1.4.
-    rapid_seizure_enabled: bool = Field(default=False)
+    # ── RAPID recipe (detection v2) ──────────────────────────────
+    # Recipe params for RAPID-bucket detectors (seizure): person-cropped,
+    # motion-overlay-only clip at `rapid_fps` on `rapid_model`, behind the
+    # cheap rapid-energy pre-gate — run by the v2 executor as a regular
+    # bucket call, no per-detector flag (Aryaman 2026-07-14, Ledger row 5;
+    # the P0 standalone lane and its `rapid_seizure_enabled` flag are gone).
+    # While a camera's loadout carries a RAPID detector, the frame buffer
+    # retains `rapid_fps` natively; every other consumer decimates back to
+    # `livekit_worker_target_fps` via snapshot at_fps, so main-call cost
+    # and clip cadence are unchanged. Validated recipe (conv 8/10 R,
+    # 1/30 FP): docs/architecture/detection-architecture-v2.md §1.4.
     rapid_fps: int = Field(ge=2, le=15, default=8)
     rapid_model: str = Field(default="gemini-3-flash-preview")
 

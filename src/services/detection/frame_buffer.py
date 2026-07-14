@@ -67,6 +67,7 @@ class FrameBuffer:
         if target_fps <= 0:
             raise ValueError(f"target_fps must be > 0, got {target_fps}")
         self._window_seconds = float(window_seconds)
+        self._target_fps = target_fps
         self._min_gap_seconds = 1.0 / target_fps
         self._capacity = int(window_seconds * target_fps) + 1
         # `maxlen` enforces the hard cap as a safety net; the
@@ -142,6 +143,29 @@ class FrameBuffer:
     @property
     def capacity(self) -> int:
         return self._capacity
+
+    @property
+    def target_fps(self) -> int:
+        return self._target_fps
+
+    def retarget(self, target_fps: int) -> None:
+        """Change the retention rate in place (v2: the tick retargets to
+        native `rapid_fps` only while the camera's loadout carries a
+        RAPID-bucket detector, and back down when it doesn't). Existing
+        frames are kept — a raise back-fills to the new rate within one
+        window; a lower rate lets the time trim thin the surplus out.
+        Consumers are unaffected either way: they all decimate via
+        `snapshot_last_seconds(at_fps=...)`."""
+        if target_fps <= 0:
+            raise ValueError(f"target_fps must be > 0, got {target_fps}")
+        if target_fps == self._target_fps:
+            return
+        self._target_fps = target_fps
+        self._min_gap_seconds = 1.0 / target_fps
+        self._capacity = int(self._window_seconds * target_fps) + 1
+        self._frames = deque(
+            list(self._frames)[-self._capacity:], maxlen=self._capacity,
+        )
 
     def _trim_older_than(self, cutoff: float) -> None:
         # Frames in the deque are time-ordered; pop from the left

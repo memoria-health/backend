@@ -46,11 +46,6 @@ from src.services.detection.motion_overlay import overlay_motion
 from src.services.detection.mp4_remux import Mp4RemuxError, frames_to_mp4
 from src.services.detection.providers.gemini import gemini_provider
 from src.services.detection.providers.types import ProviderResult
-from src.services.detection.rapid_call import (
-    run_rapid_seizure,
-    scale_bbox_to_frame,
-    split_rapid,
-)
 # v2 scheduler (P3) — the new architecture lives in scheduling/ (D1);
 # these imports + the flag branch in the tick body are the only
 # sanctioned coupling between the two.
@@ -155,18 +150,15 @@ class CameraIngest:
         # the 11s analysis window while the post-roll asked for 15s, so the
         # post snapshot lost its oldest ~4s → a visible jump at ~11s.)
         retention_seconds = settings.frame_buffer_retention_seconds
-        # RAPID path needs native-rate frames; when enabled the buffer holds
-        # `rapid_fps` and every legacy consumer decimates back down via
-        # `snapshot_last_seconds(at_fps=target_fps)` — same frames they saw
-        # before, plus in-between ones only the RAPID artifact reads.
-        buffer_fps = (
-            max(settings.rapid_fps, settings.livekit_worker_target_fps)
-            if settings.rapid_seizure_enabled
-            else settings.livekit_worker_target_fps
-        )
+        # RAPID detectors need native-rate frames; the tick retargets the
+        # buffer to `rapid_fps` only while the camera's loadout carries a
+        # RAPID-bucket detector (Ledger row 5 — no flag). Construction
+        # starts at the plain target rate; every other consumer decimates
+        # via `snapshot_last_seconds(at_fps=target_fps)` either way, so a
+        # retarget never changes what they see.
         self.frame_buffer = FrameBuffer(
             window_seconds=retention_seconds,
-            target_fps=buffer_fps,
+            target_fps=settings.livekit_worker_target_fps,
         )
         self.audio_buffer = AudioBuffer(
             window_seconds=retention_seconds,
@@ -385,16 +377,6 @@ class CameraIngest:
                 detectors = await get_enabled_detectors_for_camera(
                     session, self.camera_id,
                 )
-            # RAPID seizure path (v2 P0, flag-gated): seizure leaves the main
-            # lite call and runs as its own flash-tier overlay-crop call
-            # further down; `detectors` from here on is the main call's list.
-            detectors, rapid_seizure_active = split_rapid(detectors, self._settings)
-            if loadout:
-                kept = {s.identifier for s in detectors}
-                loadout = [
-                    (s, row) for s, row in loadout if s.identifier in kept
-                ]
-
             # Closed-state short-circuit. Fetch the camera's CURRENT
             # state to decide whether to short-circuit the LLM. Also
             # fetch the patient so we can honor the per-patient
@@ -850,12 +832,21 @@ class CameraIngest:
                 # ── v2 path (P3): L1 due-set → L2 call plans → executor.
                 # The ONLY sanctioned coupling point with the new
                 # architecture (D1); everything downstream (speech
-                # sanitizer, RAPID lane, presence gate, analyses,
-                # promotion) consumes the merged result unchanged.
+                # sanitizer, presence gate, analyses, promotion) consumes
+                # the merged result unchanged.
                 entries = [
                     ScheduledDetector(spec=s, dims=resolve_dims(row))
                     for s, row in loadout
                 ]
+                # RAPID retention (Ledger row 5): hold native `rapid_fps`
+                # only while the loadout carries a RAPID-bucket detector.
+                # Idempotent; other consumers decimate via at_fps anyway.
+                target_fps = self._settings.livekit_worker_target_fps
+                self.frame_buffer.retarget(
+                    max(self._settings.rapid_fps, target_fps)
+                    if any(e.dims.bucket == "rapid" for e in entries)
+                    else target_fps
+                )
                 due_set = resolve_due(
                     entries,
                     signals=signals,
@@ -869,11 +860,35 @@ class CameraIngest:
                     self._log_tag, len(due_set.due), len(due_set.skipped),
                     len(plans), due_set.crowd_fallback,
                 )
+                # Overlay (RAPID) plans diff + encode at the buffer's
+                # native rate; the fps handed over is MEASURED from the
+                # snapshot's real spacing so a just-retargeted buffer
+                # (one window of 4fps history) remuxes honestly instead
+                # of time-compressing motion — the executor marks the
+                # shortfall sched_degraded_fps.
+                native_window = None
+                native_fps = None
+                if any(p.channel == "overlay" for p in plans):
+                    native_window = self.frame_buffer.snapshot_last_seconds(
+                        self._settings.livekit_worker_window_seconds,
+                        now=tick_mono,
+                    )
+                    if len(native_window) >= 2:
+                        span = (
+                            native_window[-1].captured_at
+                            - native_window[0].captured_at
+                        )
+                        if span > 0:
+                            native_fps = max(
+                                1, round((len(native_window) - 1) / span)
+                            )
                 try:
                     sched = await run_scheduled_calls(
                         plans,
                         scene_mp4=vlm_mp4,
                         window=window,
+                        native_window=native_window,
+                        native_fps=native_fps,
                         pcm=pcm if pcm else None,
                         pcm_sample_rate=self.audio_buffer.sample_rate,
                         pcm_num_channels=self.audio_buffer.num_channels,
@@ -960,59 +975,6 @@ class CameraIngest:
             if result.usage:
                 result.detector_fields["vlm_input_tokens"] = result.usage.get("input", 0)
                 result.detector_fields["vlm_output_tokens"] = result.usage.get("output", 0)
-
-            # RAPID seizure call (v2 P0, flag-gated): dedicated flash-tier
-            # overlay-crop call behind the churn pre-gate. Its `seizure_*`
-            # fields merge into this tick's detector_fields, so promotion,
-            # severity, dedup and clips downstream are untouched. Failures
-            # never break the tick.
-            if rapid_seizure_active:
-                try:
-                    native = self.frame_buffer.snapshot_last_seconds(
-                        self._settings.livekit_worker_window_seconds,
-                        now=tick_mono,
-                    )
-                    if native:
-                        fw = float(native[-1].width)
-                        fh = float(native[-1].height)
-                        # patient_bbox lives in Re-ID's extracted-frame
-                        # space (max_width=reid_inference_sample_width),
-                        # NOT native pixels — scale it up or the crop
-                        # misses the patient entirely.
-                        scaled = (
-                            scale_bbox_to_frame(
-                                identity.patient_bbox, fw, fh,
-                                sample_width=self._settings.reid_inference_sample_width,
-                            )
-                            if identity.patient_bbox is not None
-                            else None
-                        )
-                        boxes = (
-                            [[scaled]]
-                            if scaled is not None
-                            else [[(0.0, 0.0, fw, fh)]]
-                        )
-                        rapid_fields = await run_rapid_seizure(
-                            frames=native,
-                            per_person_boxes=boxes,
-                            settings=self._settings,
-                            provider=gemini_provider,
-                            log_tag=self._log_tag,
-                        )
-                        result.detector_fields["rapid_seizure_ran"] = (
-                            rapid_fields is not None
-                        )
-                        if rapid_fields:
-                            result.detector_fields.update(rapid_fields)
-                except Exception:  # noqa: BLE001
-                    # Degraded-tick marker: seizure coverage was WANTED this
-                    # tick and did not run — distinguishable in analyses
-                    # from "gate closed" (ran=False) and "ran clean".
-                    result.detector_fields["rapid_seizure_error"] = True
-                    log.exception(
-                        "%s RAPID seizure call failed — tick continues",
-                        self._log_tag,
-                    )
 
             # Presence gate (v2 P2: state machine fed by backend presence).
             # UNION semantics — a person is present if the LLM says so OR

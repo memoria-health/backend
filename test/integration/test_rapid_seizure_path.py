@@ -1,10 +1,11 @@
-"""Full-tick integration test for the RAPID seizure path (v2 P0.5).
+"""Full-tick integration test for the RAPID path as a regular bucket
+call (detection v2, Ledger row 5 — the P0 standalone lane and its flag
+are gone; the scheduler flag owns the whole path).
 
 Drives a REAL `CameraIngest._run_tick_inner` — real DB rows, real frame
-buffer, real ffmpeg artifacts, real promotion — with the VLM seam faked
-(`test/fakes/fake_vlm.py`). This is the first test that exercises the tick
-end to end: gates → main call (without seizure) → RAPID call (with it) →
-merged fields → event row.
+buffer, real rapid-energy gate, real ffmpeg artifacts, real promotion —
+with the VLM seam faked (`test/fakes/fake_vlm.py`): scene call →
+FakeVLM, overlay flash call → FakeRapidProvider.
 """
 
 from __future__ import annotations
@@ -84,7 +85,7 @@ async def _seed_seizure(session: AsyncSession, patient_id, camera_id) -> Detecto
 
 async def _make_ingest(camera_id, patient_id, monkeypatch, *, main, rapid):
     settings = get_settings().model_copy(update={
-        "rapid_seizure_enabled": True,
+        "detection_v2_scheduler_enabled": True,
         "motion_overlay_enabled": False,
     })
     monkeypatch.setattr(ci, "run_vlm", main)
@@ -104,7 +105,7 @@ async def _make_ingest(camera_id, patient_id, monkeypatch, *, main, rapid):
 
 
 @pytest.mark.asyncio
-async def test_flag_on_tick_splits_calls_and_fires_seizure_event(
+async def test_seizure_runs_as_overlay_bucket_call_and_fires_event(
     client: AsyncClient, auth_user, session: AsyncSession, monkeypatch,
 ) -> None:
     patient_id, camera_id = await _setup_patient_with_camera(
@@ -117,22 +118,34 @@ async def test_flag_on_tick_splits_calls_and_fires_seizure_event(
         "seizure_detected": True, "seizure_confidence": 0.9,
         "seizure_reasoning": "sustained rhythmic whole-body shaking",
         "rapid_motion_description": "high-amplitude oscillation",
-        "people_present": True,   # must be filtered, never merged
+        "people_present": True,   # not a member key — must never merge
     }, usage={"input": 20900, "output": 300})
     ingest = await _make_ingest(camera_id, patient_id, monkeypatch,
                                 main=main, rapid=rapid)
+    # Steady state: a prior tick already retargeted the buffer to native
+    # rate (the loadout carries a RAPID detector) — do it up front so
+    # the 8 fps flicker survives retention un-aliased.
+    ingest.frame_buffer.retarget(ingest._settings.rapid_fps)
     _push_frames(ingest, flicker=True)
 
     await ingest._run_tick_inner(_RecorderDecision())
 
-    # Main call ran WITHOUT seizure; RAPID call ran WITH it, on flash settings.
+    # Scene call ran WITHOUT seizure; the overlay call ran WITH it, on
+    # the validated recipe (flash model, native fps, tint note, prompt
+    # swap, describe-then-decide preamble).
     assert len(main.calls) == 1
     main_idents = [d.identifier for d in main.calls[0]["detectors"]]
     assert "seizure" not in main_idents
-    assert len(rapid.calls) >= 1
+    assert len(rapid.calls) == 1
     rc = rapid.calls[0]
     assert rc["settings"].gemini_model == ingest._settings.rapid_model
+    assert rc["settings"].gemini_video_fps == str(ingest._settings.rapid_fps)
+    assert rc["settings"].motion_overlay_enabled is True
     assert [d.identifier for d in rc["detectors"]] == ["rapid_motion", "seizure"]
+    assert "MOTION-OVERLAY" in rc["detectors"][1].prompt_fragment
+
+    # The tick kept the buffer at native rate (loadout still has RAPID).
+    assert ingest.frame_buffer.target_fps == ingest._settings.rapid_fps
 
     # The merged verdict promoted through the UNCHANGED path into an event.
     events = (await session.execute(
@@ -141,8 +154,8 @@ async def test_flag_on_tick_splits_calls_and_fires_seizure_event(
     assert any(e.detector_id == det.id for e in events), \
         "seizure event must fire via the normal promotion path"
 
-    # Token ledger: both the main call's and the RAPID call's spend landed
-    # on the persisted analyses row.
+    # Token ledger: one summed main-path total; the overlay call's spend
+    # itemized in sched_calls (rapid_*_tokens row fields are gone).
     from src.db.analysis import Analysis
 
     rows = (await session.execute(
@@ -150,14 +163,17 @@ async def test_flag_on_tick_splits_calls_and_fires_seizure_event(
     )).scalars().all()
     assert rows
     fields = rows[-1].detector_fields
-    assert fields["vlm_input_tokens"] == 13200
-    assert fields["vlm_output_tokens"] == 250
-    assert fields["rapid_input_tokens"] == 20900
-    assert fields["rapid_output_tokens"] == 300
+    assert fields["vlm_input_tokens"] == 13200 + 20900
+    assert fields["vlm_output_tokens"] == 250 + 300
+    overlay_entries = [
+        c for c in fields["sched_calls"] if "overlay" in str(c.get("key", ""))
+    ]
+    assert overlay_entries and overlay_entries[0]["input_tokens"] == 20900
+    assert fields["rapid_gate_active_fraction"] > 0
 
 
 @pytest.mark.asyncio
-async def test_flag_on_still_scene_never_spends_the_rapid_call(
+async def test_still_scene_never_spends_the_overlay_call(
     client: AsyncClient, auth_user, session: AsyncSession, monkeypatch,
 ) -> None:
     patient_id, camera_id = await _setup_patient_with_camera(
@@ -169,13 +185,43 @@ async def test_flag_on_still_scene_never_spends_the_rapid_call(
     rapid = FakeRapidProvider({"seizure_detected": True})
     ingest = await _make_ingest(camera_id, patient_id, monkeypatch,
                                 main=main, rapid=rapid)
+    ingest.frame_buffer.retarget(ingest._settings.rapid_fps)
     _push_frames(ingest, flicker=False)   # person present, nothing shaking
 
     await ingest._run_tick_inner(_RecorderDecision())
 
-    assert len(main.calls) == 1           # main call still runs
-    assert rapid.calls == []              # churn gate stayed closed — $0
+    assert len(main.calls) == 1           # scene call still runs
+    assert rapid.calls == []              # rapid-energy gate closed — $0
     events = (await session.execute(
         select(Event).where(Event.patient_id == patient_id)
     )).scalars().all()
     assert not any(e.detector_id == det.id for e in events)
+
+
+@pytest.mark.asyncio
+async def test_first_tick_retargets_buffer_and_degrades_honestly(
+    client: AsyncClient, auth_user, session: AsyncSession, monkeypatch,
+) -> None:
+    """Transition tick: the buffer still holds 4 fps history when the
+    loadout first shows a RAPID detector. The tick must retarget the
+    buffer for the NEXT window and, if the gate opens this tick, encode
+    at the measured (lower) rate with the degraded marker — never crash,
+    never time-compress."""
+    patient_id, camera_id = await _setup_patient_with_camera(
+        client, auth_user, session,
+    )
+    await _seed_seizure(session, patient_id, camera_id)
+
+    main = FakeVLM()
+    rapid = FakeRapidProvider({"seizure_detected": False})
+    ingest = await _make_ingest(camera_id, patient_id, monkeypatch,
+                                main=main, rapid=rapid)
+    assert ingest.frame_buffer.target_fps == \
+        ingest._settings.livekit_worker_target_fps
+    _push_frames(ingest, flicker=True)    # 8fps pushes, 4fps retention
+
+    await ingest._run_tick_inner(_RecorderDecision())
+
+    # The tick saw the RAPID loadout and retargeted for next window.
+    assert ingest.frame_buffer.target_fps == ingest._settings.rapid_fps
+    assert len(main.calls) == 1           # scene call unaffected
