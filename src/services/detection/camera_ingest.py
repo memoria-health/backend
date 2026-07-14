@@ -1117,6 +1117,7 @@ class CameraIngest:
                 occurred_at=captured_at,
                 description=result.description,
                 detector_fields=result.detector_fields,
+                settings=self._settings,
             )
             await session.commit()
 

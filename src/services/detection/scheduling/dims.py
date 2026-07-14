@@ -45,6 +45,11 @@ class EffectiveDims:
     severity: int
     shape: str              # detector row shape (state/point_in_time/scheduled)
     dims_source: str        # row | catalog | legacy_default
+    # k-of-N confirmation (P4, Aryaman: N extra calls on the SAME
+    # clip, ≥k must agree). Parsed from the row's eventing JSONB;
+    # 0/0 = no confirmation (every row today — parity).
+    confirm_k: int = 0
+    confirm_n: int = 0
 
 
 _LEGACY_DEFAULT = dict(
@@ -59,6 +64,10 @@ _LEGACY_DEFAULT = dict(
 
 def resolve_dims(row: "Detector") -> EffectiveDims:
     """Resolve the effective dimensions for one detector row."""
+    from src.services.detection.scheduling.decision import parse_eventing
+
+    ev = parse_eventing(getattr(row, "eventing", None))
+    confirm = dict(confirm_k=ev.confirm_k, confirm_n=ev.confirm_n)
     catalog_dims = catalog_v2.dims_for(row.identifier or "")
     if row.evidence_branch and row.subject_scope and row.bucket and row.duty_cycle:
         if row.severity is not None:
@@ -76,6 +85,7 @@ def resolve_dims(row: "Detector") -> EffectiveDims:
             severity=severity,
             shape=row.shape,
             dims_source="row",
+            **confirm,
         )
     if catalog_dims is not None:
         return EffectiveDims(
@@ -94,5 +104,8 @@ def resolve_dims(row: "Detector") -> EffectiveDims:
             ),
             shape=row.shape,
             dims_source="catalog",
+            **confirm,
         )
-    return EffectiveDims(shape=row.shape, dims_source="legacy_default", **_LEGACY_DEFAULT)
+    return EffectiveDims(
+        shape=row.shape, dims_source="legacy_default", **confirm, **_LEGACY_DEFAULT,
+    )

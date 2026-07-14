@@ -104,6 +104,9 @@ async def run_scheduled_calls(
     # ident → (score, fields-group) so multi-call detectors keep their
     # best answer.
     best_by_ident: dict[str, tuple[tuple[int, float], dict]] = {}
+    # ident → (DueDetector, artifact, plan) of the winning answer —
+    # the k-of-N confirmation target.
+    winning_call: dict[str, tuple] = {}
     call_ledger: list[dict] = []
     call_errors: list[str] = []
     degraded_audio = False
@@ -226,7 +229,8 @@ async def run_scheduled_calls(
         if _is_scene(plan):
             scene_result = result
             scene_provider = used_provider
-        for spec in specs:
+        for d in plan.detectors:
+            spec = d.spec
             ident = spec.identifier
             keys = set(spec.schema_fields) | {
                 f"{ident}_detected", f"{ident}_confidence", f"{ident}_reasoning",
@@ -240,6 +244,10 @@ async def run_scheduled_calls(
             prev = best_by_ident.get(ident)
             if prev is None or score > prev[0]:
                 best_by_ident[ident] = (score, group)
+                # Remember the artifact + plan behind the winning
+                # answer — the k-of-N confirmation re-checks run
+                # against the SAME clip the fire came from.
+                winning_call[ident] = (d, mp4, plan)
 
     if scene_result is None:
         # The packer GUARANTEES a scene plan on every tick (empty-
@@ -253,6 +261,72 @@ async def run_scheduled_calls(
 
     for _, group in best_by_ident.values():
         merged_fields.update(group)
+
+    # ── k-of-N confirmation (P4; Aryaman: N extra calls on the SAME
+    # clip, ≥k must agree). Runs only with the decision flag on AND a
+    # per-detector confirm config — no built-in carries one, so parity
+    # holds. Spend-on-fires: re-checks happen only for detectors whose
+    # merged verdict is True. A failed vote suppresses the fire (fields
+    # flipped false + marked) BEFORE promotion ever sees it; re-check
+    # infra errors count as non-confirming votes but can never crash
+    # the tick.
+    confirm_ledger: dict[str, dict] = {}
+    if getattr(settings, "detection_v2_decision_enabled", False):
+        for ident, (due, artifact, plan) in winning_call.items():
+            k, n = due.dims.confirm_k, due.dims.confirm_n
+            if n <= 0 or not merged_fields.get(f"{ident}_detected"):
+                continue
+            votes = 0
+            spend_in = spend_out = 0
+            for i in range(n):
+                try:
+                    if plan.tier == "flash":
+                        fs = settings.model_copy(update={
+                            "gemini_model": settings.rapid_model,
+                        })
+                        res = await flash_provider(
+                            mp4=artifact, detectors=[due.spec],
+                            log_tag=f"{log_tag} confirm:{ident}:{i}",
+                            settings=fs, patient_in_clip=identity.patient_in_clip,
+                            patient_bbox=None,
+                        )
+                    else:
+                        _, res = await run_main_vlm(
+                            choice=vlm_choice, mp4=artifact,
+                            detectors=[due.spec],
+                            identity=replace(
+                                identity, extracted_frames=None,
+                                per_frame_bboxes=None, sample_fps=None,
+                                patient_bbox=None,
+                            ),
+                            log_tag=f"{log_tag} confirm:{ident}:{i}",
+                            settings=settings,
+                        )
+                except Exception:  # noqa: BLE001 — a vote, not a tick
+                    log.warning(
+                        "%s confirm call failed ident=%s vote=%d",
+                        log_tag, ident, i,
+                    )
+                    continue
+                u = res.usage or {}
+                spend_in += int(u.get("input", 0))
+                spend_out += int(u.get("output", 0))
+                if bool(res.detector_fields.get(f"{ident}_detected")):
+                    votes += 1
+            total_in += spend_in
+            total_out += spend_out
+            passed = votes >= k
+            confirm_ledger[ident] = {
+                "votes": votes, "k": k, "n": n, "passed": passed,
+                "input_tokens": spend_in, "output_tokens": spend_out,
+            }
+            if not passed:
+                merged_fields[f"{ident}_detected"] = False
+                merged_fields[f"{ident}_confirm_suppressed"] = True
+                log.info(
+                    "%s confirm SUPPRESSED %s (%d/%d needed %d)",
+                    log_tag, ident, votes, n, k,
+                )
     # Scene-call shared block wins for the non-detector keys.
     for k, v in scene_result.detector_fields.items():
         if k not in merged_fields:
@@ -264,6 +338,8 @@ async def run_scheduled_calls(
         "vlm_input_tokens": total_in,
         "vlm_output_tokens": total_out,
     }
+    if confirm_ledger:
+        sched_fields["sched_confirm"] = confirm_ledger
     if call_errors:
         sched_fields["sched_call_errors"] = call_errors
     if degraded_audio:

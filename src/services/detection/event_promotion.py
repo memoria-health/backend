@@ -17,7 +17,7 @@ import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import Float, and_, cast, select
@@ -28,6 +28,14 @@ from src.db.camera import Camera
 from src.db.detector import Detector
 from src.db.event import Event
 from src.db.patient import Patient
+from src.services.detection.scheduling.decision import (
+    cooldown_seconds_for,
+    parse_eventing,
+    windowed_entry_verdict,
+)
+
+if TYPE_CHECKING:
+    from src.settings import Settings
 from src.services.detection import catalog
 
 _log = logging.getLogger(__name__)
@@ -263,11 +271,24 @@ async def maybe_promote_analysis(
     occurred_at: datetime,
     description: str,
     detector_fields: Mapping[str, Any],
+    settings: "Settings | None" = None,
 ) -> PromotionResult:
     """Inspect `detector_fields` for any detector that hit its
     promotion rule and insert events for them. Returns the events
     inserted + any rules that matched but were squashed by de-dup.
+
+    `settings` is optional for back-compat: None (or the
+    detection_v2_decision_enabled flag off) keeps the legacy decision
+    logic byte-for-byte. Flag on hands two decisions to the v2
+    primitives (P4, parallel-systems rule): state entry becomes the
+    windowed count (M qualifying ticks within T; NULL eventing = M=1
+    = today's rising edge exactly) and point re-fire spacing reads the
+    row's cooldown_seconds instead of the global 30 s.
     """
+    v2_decisions = bool(
+        settings is not None
+        and getattr(settings, "detection_v2_decision_enabled", False)
+    )
     cam = await session.get(Camera, camera_id)
     if cam is None:
         raise ValueError(f"[event_promotion] camera {camera_id} not found")
@@ -340,7 +361,32 @@ async def maybe_promote_analysis(
         # tick. point_in_time detectors are unaffected (momentary events).
         if det.shape == "state":
             gap = _episode_gap_for(det)
-            if await _state_episode_ongoing(
+            cfg = parse_eventing(det.eventing) if v2_decisions else None
+            if cfg is not None and cfg.entry_m > 1:
+                # v2 (P4) M>1: the count-crossing edge REPLACES the
+                # activity rising edge — prior qualifying ticks inside
+                # the window are the evidence being accumulated, so the
+                # legacy check would misread them as "ongoing" and an
+                # M=3 state could never fire. Crossing semantics carry
+                # their own anti-spam (a saturated window = ongoing);
+                # a lull that drains the window below M re-arms entry.
+                verdict, count = await windowed_entry_verdict(
+                    session,
+                    patient_id=patient_id,
+                    detected_field=detected_field,
+                    conf_field=conf_field,
+                    threshold=threshold,
+                    now=occurred_at,
+                    cfg=cfg,
+                )
+                if verdict != "fire":
+                    _log.info(
+                        "[event_promotion] %s windowed entry %s (%d/%d)",
+                        ident, verdict, count, cfg.entry_m,
+                    )
+                    ongoing.append(ident)
+                    continue
+            elif await _state_episode_ongoing(
                 session,
                 patient_id=patient_id,
                 detected_field=detected_field,
@@ -349,6 +395,8 @@ async def maybe_promote_analysis(
                 since=occurred_at - timedelta(seconds=gap),
                 before=occurred_at,
             ):
+                # M=1 (or flag off): today's on-sight rising edge,
+                # byte-for-byte.
                 ongoing.append(ident)
                 continue
 
@@ -377,7 +425,17 @@ async def maybe_promote_analysis(
         if pick is None:
             break
         if await _within_dedup_window(
-            session, patient_id=patient_id, detector_id=pick.detector.id, now=occurred_at,
+            session,
+            patient_id=patient_id,
+            detector_id=pick.detector.id,
+            now=occurred_at,
+            window_seconds=(
+                cooldown_seconds_for(
+                    pick.detector, int(_DEDUP_WINDOW.total_seconds()),
+                )
+                if v2_decisions
+                else int(_DEDUP_WINDOW.total_seconds())
+            ),
         ):
             skipped.append(pick.identifier)
             remaining.remove(pick)
@@ -446,8 +504,13 @@ async def _within_dedup_window(
     patient_id: UUID,
     detector_id: UUID,
     now: datetime,
+    window_seconds: int | None = None,
 ) -> bool:
-    cutoff = now - _DEDUP_WINDOW
+    cutoff = now - (
+        timedelta(seconds=window_seconds)
+        if window_seconds is not None
+        else _DEDUP_WINDOW
+    )
     # Strict `>` — open interval. An event landing exactly at `cutoff`
     # no longer blocks a fresh promotion.
     stmt = (

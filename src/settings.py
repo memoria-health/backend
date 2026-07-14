@@ -203,6 +203,16 @@ class Settings(BaseSettings):
     # per-person crops this tick — every detector runs full-scene.
     scheduler_crowd_fallback_tracks: int = Field(ge=1, le=16, default=4)
 
+    # ── Detection v2 decision layer (P4) ─────────────────────────
+    # OFF = legacy decision logic byte-for-byte (30s global dedup,
+    # on-sight state entry, absence runner's own counting). ON = the
+    # v2 primitives own the decisions (parallel-systems rule, one
+    # owner per flag state): windowed-count state entry (M-of-T from
+    # eventing JSONB; NULL = M=1 = today), per-detector
+    # cooldown_seconds, k-of-N confirmation re-checks in the executor,
+    # absence counting via the shared qualifying_tick_count query.
+    detection_v2_decision_enabled: bool = Field(default=False)
+
     # ── Memoria Sensor app-present heartbeat (iPhone sensors) ────
     # A live iPhone sensor polls /v1/cameras/me/desired-state every 1s
     # while its app is open. PresenceSweeper records that heartbeat

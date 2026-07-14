@@ -157,17 +157,39 @@ class ScheduledDetectorRunner:
         end_utc = datetime.combine(today, we, tzinfo=tz).astimezone(timezone.utc)
         detected_key = f"{det.identifier}_detected"
 
-        seen_stmt = (
-            select(Analysis.id)
-            .where(
-                Analysis.patient_id == patient.id,
-                Analysis.captured_at >= start_utc,
-                Analysis.captured_at < end_utc,
-                Analysis.detector_fields[detected_key].astext == "true",
+        if getattr(self._settings, "detection_v2_decision_enabled", False):
+            # v2 (P4, parallel-systems rule): same semantics, but the
+            # counting goes through the ONE shared primitive the state
+            # entry also uses (scheduling/decision.py) — a single
+            # implementation to soak. threshold=None = legacy's
+            # no-confidence-gate behavior exactly. Cleanup Ledger row 2
+            # retires this runner entirely once proven.
+            from src.services.detection.scheduling.decision import (
+                qualifying_tick_count,
             )
-            .limit(1)
-        )
-        seen = (await session.execute(seen_stmt)).scalar_one_or_none() is not None
+            seen = (
+                await qualifying_tick_count(
+                    session,
+                    patient_id=patient.id,
+                    detected_field=detected_key,
+                    conf_field=f"{det.identifier}_confidence",
+                    threshold=None,
+                    since=start_utc,
+                    before=end_utc,
+                )
+            ) > 0
+        else:
+            seen_stmt = (
+                select(Analysis.id)
+                .where(
+                    Analysis.patient_id == patient.id,
+                    Analysis.captured_at >= start_utc,
+                    Analysis.captured_at < end_utc,
+                    Analysis.detector_fields[detected_key].astext == "true",
+                )
+                .limit(1)
+            )
+            seen = (await session.execute(seen_stmt)).scalar_one_or_none() is not None
 
         # Mark evaluated regardless of outcome (single-fire for the day).
         det.last_scheduled_eval_date = today

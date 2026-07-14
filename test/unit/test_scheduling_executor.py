@@ -25,6 +25,7 @@ from src.services.reid.inference import IdentityResult
 def _due(
     ident: str, *, bucket: str = "scene", severity: int = 50,
     targets: tuple[int, ...] | None = None, needs_audio: bool = False,
+    confirm: tuple[int, int] = (0, 0),
 ) -> DueDetector:
     return DueDetector(
         spec=DetectorSpec(
@@ -36,6 +37,7 @@ def _due(
             bucket=bucket, duty_cycle="every_eligible_tick",
             needs_audio=needs_audio, severity=severity,
             shape="point_in_time", dims_source="row",
+            confirm_k=confirm[0], confirm_n=confirm[1],
         ),
         target_track_ids=targets,
     )
@@ -62,11 +64,14 @@ def _identity(track_ids=()) -> IdentityResult:
     )
 
 
-def _settings() -> SimpleNamespace:
-    return SimpleNamespace(
+def _settings(**over) -> SimpleNamespace:
+    base = dict(
         reid_inference_sample_width=480,
         livekit_worker_target_fps=4,
+        detection_v2_decision_enabled=False,
     )
+    base.update(over)
+    return SimpleNamespace(**base)
 
 
 class _ScriptedVLM:
@@ -90,7 +95,8 @@ class _ScriptedVLM:
         )
 
 
-async def _run(plans, vlm, *, identity=None, monkeypatch=None, crop=b"crop"):
+async def _run(plans, vlm, *, identity=None, monkeypatch=None, crop=b"crop",
+               settings=None):
     if monkeypatch is not None:
         async def fake_crop(*a, **k):
             return crop
@@ -98,7 +104,7 @@ async def _run(plans, vlm, *, identity=None, monkeypatch=None, crop=b"crop"):
     return await ex.run_scheduled_calls(
         plans, scene_mp4=b"scene", window=[object()], pcm=None,
         pcm_sample_rate=None, pcm_num_channels=None,
-        identity=identity or _identity(), settings=_settings(),
+        identity=identity or _identity(), settings=settings or _settings(),
         vlm_choice="gemini", run_main_vlm=vlm,
         flash_provider=None, log_tag="t",
     )
@@ -183,3 +189,63 @@ async def test_needs_audio_on_frame_sampling_provider_marks_degraded(monkeypatch
     ])
     out = await _run(plans, vlm, monkeypatch=monkeypatch)
     assert out.sched_fields["sched_degraded_audio"] is True
+
+
+# ─── k-of-N confirmation (P4) ────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_confirm_suppresses_on_failed_vote(monkeypatch) -> None:
+    """fall fires, confirm k=2/n=2, votes yes/no ⇒ suppressed before
+    promotion; votes + spend land in sched_confirm."""
+    plans = _plans(_due("fall", confirm=(2, 2)))
+    vlm = _ScriptedVLM([
+        ("gemini", {"fall_detected": True, "fall_confidence": 0.9},
+         {"input": 100, "output": 10}),                       # main call
+        ("gemini", {"fall_detected": True}, {"input": 50, "output": 5}),   # vote 1
+        ("gemini", {"fall_detected": False}, {"input": 50, "output": 5}),  # vote 2
+    ])
+    out = await _run(
+        plans, vlm, monkeypatch=monkeypatch,
+        settings=_settings(detection_v2_decision_enabled=True),
+    )
+    assert out.detector_fields["fall_detected"] is False
+    assert out.detector_fields["fall_confirm_suppressed"] is True
+    c = out.sched_fields["sched_confirm"]["fall"]
+    assert (c["votes"], c["k"], c["n"], c["passed"]) == (1, 2, 2, False)
+    assert out.sched_fields["vlm_input_tokens"] == 200   # main + 2 votes
+    assert len(vlm.calls) == 3
+    # Re-checks are SOLO calls on the same artifact.
+    assert [d.identifier for d in vlm.calls[1]["detectors"]] == ["fall"]
+    assert vlm.calls[1]["mp4"] == b"scene"
+
+
+@pytest.mark.asyncio
+async def test_confirm_passes_and_never_runs_without_flag_or_fire(monkeypatch) -> None:
+    plans = _plans(_due("fall", confirm=(2, 2)))
+    vlm = _ScriptedVLM([
+        ("gemini", {"fall_detected": True}, None),
+        ("gemini", {"fall_detected": True}, None),
+        ("gemini", {"fall_detected": True}, None),
+    ])
+    out = await _run(
+        plans, vlm, monkeypatch=monkeypatch,
+        settings=_settings(detection_v2_decision_enabled=True),
+    )
+    assert out.detector_fields["fall_detected"] is True
+    assert out.sched_fields["sched_confirm"]["fall"]["passed"] is True
+
+    # Flag off ⇒ zero extra calls even with config present.
+    vlm2 = _ScriptedVLM([("gemini", {"fall_detected": True}, None)])
+    out2 = await _run(plans, vlm2, monkeypatch=monkeypatch)
+    assert len(vlm2.calls) == 1
+    assert "sched_confirm" not in out2.sched_fields
+
+    # Flag on but the detector did NOT fire ⇒ no votes spent.
+    vlm3 = _ScriptedVLM([("gemini", {"fall_detected": False}, None)])
+    out3 = await _run(
+        plans, vlm3, monkeypatch=monkeypatch,
+        settings=_settings(detection_v2_decision_enabled=True),
+    )
+    assert len(vlm3.calls) == 1
+    assert "sched_confirm" not in out3.sched_fields

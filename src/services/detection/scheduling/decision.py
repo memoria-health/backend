@@ -93,7 +93,7 @@ async def qualifying_tick_count(
     patient_id: UUID,
     detected_field: str,
     conf_field: str,
-    threshold: float,
+    threshold: float | None,
     since: datetime,
     before: datetime,
 ) -> int:
@@ -102,23 +102,24 @@ async def qualifying_tick_count(
     evidence pools across every camera in the household. The single
     counting implementation for state entry AND (flag-on) absence:
     one query to soak, one to trust."""
-    stmt = (
-        select(func.count())
-        .select_from(Analysis)
-        .where(
-            and_(
-                Analysis.patient_id == patient_id,
-                Analysis.captured_at >= since,
-                Analysis.captured_at < before,
-                Analysis.detector_fields[detected_field].astext == "true",
-                cast(Analysis.detector_fields[conf_field].astext, Float) >= threshold,
-            )
+    preds = [
+        Analysis.patient_id == patient_id,
+        Analysis.captured_at >= since,
+        Analysis.captured_at < before,
+        Analysis.detector_fields[detected_field].astext == "true",
+    ]
+    # threshold=None ⇒ any detected=true row counts (the absence
+    # runner's legacy semantics — no confidence gate). States pass a
+    # real threshold so sub-threshold blips never count toward entry.
+    if threshold is not None:
+        preds.append(
+            cast(Analysis.detector_fields[conf_field].astext, Float) >= threshold
         )
-    )
+    stmt = select(func.count()).select_from(Analysis).where(and_(*preds))
     return int((await session.execute(stmt)).scalar_one())
 
 
-async def state_entry_met(
+async def windowed_entry_verdict(
     session: "AsyncSession",
     *,
     patient_id: UUID,
@@ -127,16 +128,24 @@ async def state_entry_met(
     threshold: float,
     now: datetime,
     cfg: EventingConfig,
-) -> tuple[bool, int]:
-    """Windowed-count entry: does the CURRENT qualifying tick, plus
-    prior qualifying ticks inside the window, reach M? Returns
-    (met, count_including_current).
+) -> tuple[str, int]:
+    """Windowed-count entry as a COUNT-CROSSING edge. With prior =
+    qualifying ticks in the T-window before now (the current tick is
+    qualifying by construction and counts as +1):
 
-    M=1 short-circuits without a query — the on-sight parity path
-    costs nothing. The episode-gap rising-edge check remains the EXIT
-    hysteresis and runs separately (it is not this primitive's job)."""
-    if cfg.entry_m <= 1:
-        return True, 1
+        prior + 1 <  M   →  "held"     evidence still accumulating
+        prior     <  M ≤ prior + 1  →  "fire"  the window just reached M
+        prior     >= M   →  "ongoing"  the episode already entered —
+                                       a saturated window means the Mth
+                                       tick happened earlier; firing
+                                       again here would spam one event
+                                       per tick for a long episode
+
+    Returns (verdict, count_including_current). Exit is implicit: a
+    lull long enough for the window to drain below M re-arms entry —
+    for M>1, T plays the anti-spam role episode_gap plays for M=1.
+    (M=1 never reaches this function; the caller keeps the legacy
+    rising edge for exact parity.)"""
     window = max(cfg.entry_t_seconds, 1)
     prior = await qualifying_tick_count(
         session,
@@ -147,5 +156,9 @@ async def state_entry_met(
         since=now - timedelta(seconds=window),
         before=now,
     )
-    count = prior + 1  # the tick being promoted is qualifying by construction
-    return count >= cfg.entry_m, count
+    count = prior + 1
+    if prior >= cfg.entry_m:
+        return "ongoing", count
+    if count >= cfg.entry_m:
+        return "fire", count
+    return "held", count
