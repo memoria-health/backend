@@ -140,7 +140,9 @@ Dimension classification, the feasibility hard-reject list with plain-language r
 
 ## Phase 6 — Reference detectors + soak  *(milestone)*
 
-**Soak runbook (written at P5 close; the soak is Aryaman's day of local testing before any merge):**
+**Soak runbook (superseded 2026-07-14 by the formal 4-hour protocol —
+`docs/plans/2026-07-14-soak-protocol.md`: TP/FP truth-scoring, gate-tuning
+segments, live watcher. The list below remains as the original outline):**
 1. Local stack up; apply nothing (all deltas already on the local DB).
 2. Flip flags in `.env`: `NEMARA_DETECTION_V2_SCHEDULER_ENABLED=true`, `NEMARA_DETECTION_V2_DECISION_ENABLED=true` (recreate the backend container — hot-reload lies). There is no rapid flag anymore (Ledger row 5): seizure runs as a regular rapid-bucket detector whenever the scheduler flag is on and the detector is enabled.
 3. Live normally for the day; poke the watchlist cases deliberately: TV on in an empty room (presence union cost), fan/curtain in a closed room (perpetual wake), a visitor while the patient naps (verified-other suppression), a fake "took pills" in front of the camera (person-crop call), a custom "watching TV for more than 15 minutes" detector (M-of-T entry).
