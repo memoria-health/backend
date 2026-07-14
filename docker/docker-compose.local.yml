@@ -46,6 +46,9 @@ services:
     # Bind-mount source for hot reload (uvicorn --reload watches /app/src).
     volumes:
       - ../src:/app/src
+      # Soak observability: identity-evidence frames + out/ artifacts the
+      # backend writes must be readable from the host (dashboard, review).
+      - ../out:/app/out
     # Dev: never auto-restart, so `make backend-down` / Ctrl-stop is final.
     restart: "no"
 

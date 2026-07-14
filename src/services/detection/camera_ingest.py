@@ -41,6 +41,7 @@ from src.services.detection.analyses_store import add_analysis
 from src.services.detection.audio_buffer import AudioBuffer
 from src.services.detection.event_promotion import maybe_promote_analysis
 from src.services.detection.frame_buffer import FrameBuffer
+from src.services.detection.id_evidence import dump_id_evidence
 from src.services.detection.motion_cache import MotionCache
 from src.services.detection.motion_overlay import overlay_motion
 from src.services.detection.mp4_remux import Mp4RemuxError, frames_to_mp4
@@ -629,6 +630,20 @@ class CameraIngest:
                 identity.confidence,
                 identity.face_count,
             )
+            # Identity evidence frame (soak observability): annotated
+            # snapshot of what tracking/attribution saw this tick —
+            # flag-gated, and never allowed to touch the tick.
+            if self._settings.soak_id_frames_enabled:
+                try:
+                    await dump_id_evidence(
+                        identity, camera_id=self.camera_id,
+                        settings=self._settings,
+                    )
+                except Exception:  # noqa: BLE001
+                    log.debug(
+                        "%s id-evidence dump failed", self._log_tag,
+                        exc_info=True,
+                    )
 
             # Layer-1 signals (v2 P2): one diff pass over the SAME
             # window the main call sees, scoped by the tick's tracks —

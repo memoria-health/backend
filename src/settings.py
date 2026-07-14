@@ -205,6 +205,14 @@ class Settings(BaseSettings):
     # per-person crops this tick — every detector runs full-scene.
     scheduler_crowd_fallback_tracks: int = Field(ge=1, le=16, default=4)
 
+    # ── Soak observability ───────────────────────────────────────
+    # One annotated identity-evidence JPEG per analyzed tick with
+    # people in it (track boxes + PATIENT/OTHER/UNKNOWN labels +
+    # face-lock marker) — the visual audit for tracking/face-ID.
+    # Ring-pruned per camera; written under out/ (host-mounted).
+    soak_id_frames_enabled: bool = Field(default=False)
+    soak_id_frames_dir: str = Field(default="out/id_frames")
+
     # ── Detection v2 decision layer (P4) ─────────────────────────
     # OFF = legacy decision logic byte-for-byte (30s global dedup,
     # on-sight state entry, absence runner's own counting). ON = the
