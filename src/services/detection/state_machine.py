@@ -171,12 +171,10 @@ async def apply_tick_update(
     """Atomic state machine update for one tick. Caller owns the
     transaction (we don't commit here).
 
-    Both `people_present` (LLM verdict) and `motion_in_clip` (wall-phone
-    motion-detector signal) drive transitions — see the module
-    docstring for the rules. Motion is the cheap wake-up trigger that
-    lets `closed → open` flip without needing the LLM to first say
-    "person here"; people_present is the authoritative gate that
-    keeps the camera open in the absence of motion noise.
+    `people_present` alone drives transitions (the SQL never reads
+    `motion_in_clip` — it is accepted purely for the analyses log).
+    Motion's real job is upstream in camera_ingest: the cheap
+    closed-state wake that decides whether a tick runs at all.
 
     Race-free under concurrent ticks — see module docstring.
 

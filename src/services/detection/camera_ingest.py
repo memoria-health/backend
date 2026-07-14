@@ -61,7 +61,7 @@ from src.services.detection.scheduling import (
     resolve_due,
 )
 from src.services.detection.scheduling.executor import run_scheduled_calls
-from src.services.detection.signals.tick_signals import compute_tick_signals
+from src.services.detection.signals.tick_signals import TickSignals, compute_tick_signals
 from src.services.detection.speech_filter import sanitize_speech_fields
 from src.services.detection.vlm_routing import resolve_vlm_provider, run_vlm
 from src.services.detection.registry import (
@@ -529,13 +529,24 @@ class CameraIngest:
                 # Off the event loop like every other CPU stage — the
                 # window is anchored to tick_mono, so the await can't
                 # shift what it contains.
-                wake_sig = await asyncio.to_thread(
-                    compute_tick_signals,
-                    wake_window,
-                    tracks=None,  # no person mask → env_motion = whole frame
-                    attribution_ran=False,
-                    sample_width=self._settings.reid_inference_sample_width,
-                )
+                try:
+                    wake_sig = await asyncio.to_thread(
+                        compute_tick_signals,
+                        wake_window,
+                        tracks=None,  # no person mask → env = whole frame
+                        attribution_ran=False,
+                        sample_width=self._settings.reid_inference_sample_width,
+                    )
+                except Exception:  # noqa: BLE001 — always-on path armor
+                    log.exception(
+                        "%s wake tick_signals crashed — treating as still",
+                        self._log_tag,
+                    )
+                    wake_sig = TickSignals(
+                        person_present=None, people_count=None,
+                        patient_present=None, track_motion=(),
+                        env_motion=0.0, face_valid=None, frames_used=0,
+                    )
                 if (
                     wake_sig.env_motion
                     >= self._settings.signals_motion_min_active_fraction
@@ -644,13 +655,25 @@ class CameraIngest:
             # every analyses row, including suppression skips); the
             # only decisions riding on it in P2 are the unified
             # `motion_in_clip` below and the closed-state wake above.
-            signals = await asyncio.to_thread(
-                compute_tick_signals,
-                window,
-                tracks=identity.tracks,
-                attribution_ran=identity.attribution_ran,
-                sample_width=self._settings.reid_inference_sample_width,
-            )
+            # Always-on path for EVERY camera — a raise here would brick
+            # every tick, so it gets the same armor as the reid call
+            # (PR #20 review M1): failure degrades to zeroed signals and
+            # the SAD hint carries motion alone.
+            try:
+                signals = await asyncio.to_thread(
+                    compute_tick_signals,
+                    window,
+                    tracks=identity.tracks,
+                    attribution_ran=identity.attribution_ran,
+                    sample_width=self._settings.reid_inference_sample_width,
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("%s tick_signals crashed — zeroed", self._log_tag)
+                signals = TickSignals(
+                    person_present=None, people_count=None,
+                    patient_present=None, track_motion=(),
+                    env_motion=0.0, face_valid=None, frames_used=0,
+                )
             motion_floor = self._settings.signals_motion_min_active_fraction
             backend_motion = signals.env_motion >= motion_floor or any(
                 t.amount >= motion_floor for t in signals.track_motion
