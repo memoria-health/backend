@@ -53,6 +53,24 @@ async def test_writes_annotated_frame_for_tracked_person(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_accepts_real_extracted_frame_shape(tmp_path) -> None:
+    # Production hands the reid pipeline's ExtractedFrame (base64 JPEG),
+    # not raw bytes — the shape that broke live on 2026-07-14.
+    import base64
+
+    from src.services.detection.frame_extraction import ExtractedFrame
+
+    frame = ExtractedFrame(data_base64=base64.b64encode(_jpeg()).decode())
+    await dump_id_evidence(
+        _identity(tracks=[_track()], frames=[frame]), camera_id="cafe0123-x",
+        settings=_settings(tmp_path),
+    )
+    files = list((tmp_path / "cafe0123").glob("*.jpg"))
+    assert len(files) == 1
+    assert files[0].read_bytes()[:2] == b"\xff\xd8"
+
+
+@pytest.mark.asyncio
 async def test_flag_off_and_empty_scene_write_nothing(tmp_path) -> None:
     await dump_id_evidence(
         _identity(tracks=[_track()]), camera_id="cafe0123-x",

@@ -116,8 +116,14 @@ async def data() -> JSONResponse:
             "tracks": len(tracks),
             "amount": round(max(amounts), 4) if amounts else None,
             "env": f.get("sig_env_motion"),
-            "calls": [c2.get("key", "")[:26] for c2 in calls],
-            "gates": [c2.get("gate") for c2 in calls if c2.get("gate")],
+            "calls": [
+                {
+                    "k": c2.get("key", ""),
+                    "n": len(c2.get("detectors") or []),
+                    "g": c2.get("gate"),
+                }
+                for c2 in calls
+            ],
             "gaf": f.get("rapid_gate_active_fraction"),
             "fired": fired,
         }
@@ -209,10 +215,11 @@ _PAGE = """<!doctype html><html><head><meta charset="utf-8">
   .tblwrap{overflow-x:auto}
   .logwin{background:var(--logbg);border:1px solid var(--line);border-radius:6px;
     max-height:440px;overflow-y:auto;font:11.5px/1.65 ui-monospace,Menlo,monospace}
-  .lr{display:flex;gap:9px;padding:2px 9px;white-space:nowrap}
+  .lr{display:flex;gap:9px;padding:2px 9px}
   .logwin .lr:nth-child(even){background:var(--zeb)}
   .lr .t{color:var(--mut);flex:0 0 58px}.lr .c{flex:0 0 62px;color:var(--acc);font-weight:600}
-  .lr .b{overflow:hidden;text-overflow:ellipsis}
+  .lr .b{overflow-wrap:anywhere;min-width:0}
+  #events>div{overflow-wrap:anywhere;padding:2px 0}
   .skip{color:var(--mut)} .fired{color:var(--crit);font-weight:700}
   img.ev{width:100%;border-radius:6px;border:1px solid var(--line);margin-top:6px}
   .frames{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}
@@ -246,7 +253,9 @@ _PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <div class="card"><h2>Identity evidence — latest</h2>
   <div class="frames" id="frames"><span class="mut">no frames yet</span></div></div>
 <div class="card"><h2>Events</h2><div id="events" class="mono mut">none yet</div></div>
-<div class="card"><h2>Tick log — newest first</h2><div class="logwin" id="log"></div></div>
+<div class="card"><h2>Tick log — newest first</h2>
+<p class="mut" style="font-size:11.5px;margin:0 0 8px">How to read a line: every detector in the loadout is asked on every analyzed tick, grouped into the calls shown — <span class="mono">key·Ndet</span> = one Gemini call carrying N detectors. Silence = every detector answered no; <span class="mono">⚑ name</span> = that detector answered YES. <span class="mono">⛔closed</span> = that call was pre-gated and never sent ($0) — today only the convulsion bucket has a pre-gate (<span class="mono">rapid_gateAF</span> is its motion evidence), which is why gate chatter looks convulsion-specific. Absence/scheduled detectors don't ride calls; they evaluate from coverage at their deadline.</p>
+<div class="logwin" id="log"></div></div>
 <div class="card"><h2>Compiler acceptance — ran Jul 14 (pure-rules half; pinned by 22 unit goldens)</h2>
 <div class="tblwrap"><table>
 <tr><th>Ask</th><th>Routed to</th><th>Extras</th></tr>
@@ -270,9 +279,9 @@ function tickLine(t){
   let b=`motion=${esc(t.motion??"—")} ppl=${t.ppl?"Y":"n"}(${esc(t.psrc??"—")}) trk=${t.tracks}`;
   if(t.amount!=null) b+=` amt=${t.amount}`;
   if(t.env!=null) b+=` env=${t.env}`;
-  if(t.calls.length) b+=` calls=[${t.calls.map(esc).join(", ")}]`;
-  if(t.gates.length) b+=` gate=${t.gates.map(esc).join(",")}`;
-  if(t.gaf!=null) b+=` rapidAF=${t.gaf}`;
+  if(t.calls.length) b+=` calls=[${t.calls.map(c=>
+    esc(c.k)+"·"+c.n+"det"+(c.g?" ⛔"+esc(c.g):"")).join(" | ")}]`;
+  if(t.gaf!=null) b+=` rapid_gateAF=${t.gaf}`;
   if(t.fired.length) b+=` ⚑ ${t.fired.map(esc).join(", ")}`;
   return b;
 }

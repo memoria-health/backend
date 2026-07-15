@@ -17,6 +17,7 @@ no coordinate scaling is involved.
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import logging
 import time
@@ -35,9 +36,14 @@ _UNKNOWN = (222, 168, 40)
 
 
 def _frame_bytes(frame: Any) -> bytes:
-    """Extracted frames are JPEGs, either raw bytes or a dataclass
-    carrying `.data` — accept both."""
-    return frame if isinstance(frame, (bytes, bytearray)) else frame.data
+    """Extracted frames are JPEGs — raw bytes, a dataclass carrying
+    base64 (`data_base64`, the reid pipeline's shape), or raw `.data`."""
+    if isinstance(frame, (bytes, bytearray)):
+        return bytes(frame)
+    b64 = getattr(frame, "data_base64", None)
+    if b64 is not None:
+        return base64.b64decode(b64)
+    return frame.data
 
 
 def _box_at(track: Any, idx: int):
