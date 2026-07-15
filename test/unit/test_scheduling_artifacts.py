@@ -94,3 +94,34 @@ async def test_remux_failure_degrades_to_none(monkeypatch) -> None:
         _window(), track=track, sample_width=480, fps=4,
     )
     assert out is None
+
+
+# ── _shrink_i420 / bounded-res tint (OOM guard, soak 2026-07-14) ─────
+
+
+def _big_frame(w: int = 1280, h: int = 720) -> FrameSnapshot:
+    y = np.full((h, w), 60, dtype=np.uint8)
+    uv = np.full((h // 2) * (w // 2) * 2, 128, dtype=np.uint8)
+    return FrameSnapshot(
+        width=w, height=h, data=y.tobytes() + uv.tobytes(),
+        captured_at=time.monotonic(),
+    )
+
+
+def test_shrink_noop_at_or_below_max_width() -> None:
+    f = _frame(time.monotonic())          # 160w — already small
+    assert artifacts._shrink_i420(f, 640) is f
+
+
+def test_shrink_downscales_even_aligned_i420() -> None:
+    f = _big_frame(1280, 720)
+    s = artifacts._shrink_i420(f, 640)
+    assert (s.width, s.height) == (640, 360)
+    assert len(s.data) == 640 * 360 * 3 // 2      # valid I420 payload
+    assert s.captured_at == f.captured_at
+
+
+async def test_tint_window_bounds_native_resolution() -> None:
+    tinted = await artifacts.tint_window([_big_frame() for _ in range(4)])
+    assert tinted and all(t.width <= artifacts._TINT_MAX_WIDTH for t in tinted)
+    assert all(len(t.data) == t.width * t.height * 3 // 2 for t in tinted)

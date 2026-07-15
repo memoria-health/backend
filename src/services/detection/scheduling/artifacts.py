@@ -38,13 +38,16 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING, Sequence
 
+import cv2
+import numpy as np
+
+from src.services.detection.frame_buffer import FrameSnapshot
 from src.services.detection.motion_overlay import overlay_motion
 from src.services.detection.mp4_remux import Mp4RemuxError, frames_to_mp4
 from src.services.detection.rapid_artifact import crop_i420, union_box
 from src.services.detection.rapid_call import scale_bbox_to_frame
 
 if TYPE_CHECKING:
-    from src.services.detection.frame_buffer import FrameSnapshot
     from src.services.reid.body_pipeline import TrackObservation
 
 log = logging.getLogger(__name__)
@@ -111,14 +114,56 @@ async def build_person_crop_mp4(
         return None
 
 
+# Tint at bounded resolution. Native-res tint on a 40-60 frame window
+# (x2 simultaneously-tracked cameras + their ffmpeg children + event
+# archival) OOM-killed the worker twice on soak day 2026-07-14. Motion
+# blobs the overlay prompt reads are limb-scale — they survive 640w
+# untouched, and every downstream copy (crop, pipe, mp4) shrinks with
+# the frames. Tint-before-crop order is unchanged.
+_TINT_MAX_WIDTH = 640
+
+
+def _shrink_i420(f: "FrameSnapshot", max_width: int) -> "FrameSnapshot":
+    """Downscale one I420 frame to ≤max_width (even-aligned), plane by
+    plane. Malformed frames pass through untouched — overlay_motion
+    already skips them."""
+    w, h = f.width, f.height
+    ysize = w * h
+    if (
+        w <= max_width or w <= 0 or h <= 0 or w % 2 or h % 2
+        or len(f.data) != ysize + 2 * (ysize // 4)
+    ):
+        return f
+    tw = max_width - (max_width % 2)
+    th = max(2, round(h * tw / w))
+    th -= th % 2
+    arr = np.frombuffer(f.data, dtype=np.uint8)
+    y = arr[:ysize].reshape(h, w)
+    u = arr[ysize:ysize + ysize // 4].reshape(h // 2, w // 2)
+    v = arr[ysize + ysize // 4:].reshape(h // 2, w // 2)
+    y2 = cv2.resize(y, (tw, th), interpolation=cv2.INTER_AREA)
+    u2 = cv2.resize(u, (tw // 2, th // 2), interpolation=cv2.INTER_AREA)
+    v2 = cv2.resize(v, (tw // 2, th // 2), interpolation=cv2.INTER_AREA)
+    data = y2.tobytes() + u2.tobytes() + v2.tobytes()
+    return FrameSnapshot(
+        width=tw, height=th, data=data, captured_at=f.captured_at,
+    )
+
+
 async def tint_window(
     window: Sequence["FrameSnapshot"],
 ) -> list["FrameSnapshot"]:
-    """Motion-overlay the FULL native frames (thread-offloaded). Tint
-    before crop is load-bearing (rapid_artifact module doc): diffing a
-    moving crop window paints phantom red on stationary scenery. The
-    executor tints once per tick and crops per overlay plan."""
-    return await asyncio.to_thread(overlay_motion, list(window))
+    """Motion-overlay the native-rate frames (thread-offloaded), each
+    first bounded to _TINT_MAX_WIDTH. Tint before crop is load-bearing
+    (rapid_artifact module doc): diffing a moving crop window paints
+    phantom red on stationary scenery. The executor tints once per tick
+    and crops per overlay plan."""
+    def _shrink_then_tint() -> list["FrameSnapshot"]:
+        return overlay_motion(
+            [_shrink_i420(f, _TINT_MAX_WIDTH) for f in window]
+        )
+
+    return await asyncio.to_thread(_shrink_then_tint)
 
 
 async def build_overlay_crop_mp4(
