@@ -140,9 +140,19 @@ async def data() -> JSONResponse:
     if _FRAMES_DIR.exists():
         for camdir in sorted(_FRAMES_DIR.iterdir()):
             if camdir.is_dir():
-                newest = sorted(camdir.glob("*.jpg"))[-2:]
+                newest = sorted(camdir.glob("*.jpg"))[-30:]
                 frames += [
-                    {"cam": camdir.name, "name": p.name} for p in reversed(newest)
+                    {
+                        "cam": camdir.name,
+                        "name": p.name,
+                        # capture reason is encoded in the filename
+                        # (…_id-change-1p-unk.jpg) by dump_id_evidence
+                        "note": (
+                            p.stem.split("_", 1)[1].replace("-", " ")
+                            if "_" in p.stem else ""
+                        ),
+                    }
+                    for p in reversed(newest)
                 ]
 
     hours = max((datetime.now(timezone.utc) - _SINCE).total_seconds() / 3600, 1e-6)
@@ -168,7 +178,7 @@ async def data() -> JSONResponse:
             "in": tot_in, "out": tot_out, "flash_tokens": flash_tok,
             "cost": round(cost, 4), "day_pace": round(cost / hours * 24, 2),
         },
-        "frames": frames[:6],
+        "frames": frames[:60],
     })
 
 
@@ -222,7 +232,9 @@ _PAGE = """<!doctype html><html><head><meta charset="utf-8">
   #events>div{overflow-wrap:anywhere;padding:2px 0}
   .skip{color:var(--mut)} .fired{color:var(--crit);font-weight:700}
   img.ev{width:100%;border-radius:6px;border:1px solid var(--line);margin-top:6px}
-  .frames{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}
+  .frames{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px;
+    max-height:430px;overflow-y:auto;padding-right:4px}
+  .fnote{color:var(--warn)}
 </style></head><body><div class="wrap">
 <header>
   <h1>Memoria soak — live</h1>
@@ -292,16 +304,33 @@ async function refresh(){
     $("flags").textContent=`sched=${d.flags.scheduler?"on":"OFF"} · decision=${d.flags.decision?"on":"OFF"} · idframes=${d.flags.id_frames?"on":"OFF"}`;
     $("since").textContent=`since ${d.since}`;
     $("pace").textContent=`$${d.totals.cost} so far · $${d.totals.day_pace}/day pace`;
+    // Tracking-consistency rollup over the visible tick window: of the
+    // ticks someone was believed present, how many had a live track,
+    // and how often a track dropped to zero while the room stayed
+    // occupied (a blip = one loss + one id-change capture).
+    const byCam={};
+    d.ticks.forEach(t=>{(byCam[t.cam]=byCam[t.cam]||[]).unshift(t)});
+    const cons={};
+    for(const [cam,arr] of Object.entries(byCam)){
+      let occ=0,trk=0,loss=0,prev=0;
+      for(const t of arr){
+        if(t.ppl){occ++; if(t.tracks>0)trk++; if(prev>0&&t.tracks===0)loss++;}
+        prev=t.tracks||0;
+      }
+      cons[cam]={occ,trk,loss};
+    }
     $("cams").innerHTML=d.cams.map(c=>{
       const l=c.last||{};
+      const k=cons[c.cam];
+      const idline=k&&k.occ?`<div class="mono ${k.loss?"warn":"mut"}">id-track ${Math.round(100*k.trk/k.occ)}% of ${k.occ} occupied ticks · losses ${k.loss} (log window)</div>`:"";
       return `<div><div class="mono"><b>${esc(c.cam)}</b> · ${c.ticks} ticks · wakes ${c.wakes} · degraded ${c.degraded} · errors ${c.errors}</div>
-      <div class="mono mut">skips: ${esc(JSON.stringify(c.skips))}</div>
+      <div class="mono mut">skips: ${esc(JSON.stringify(c.skips))}</div>${idline}
       <div class="mono">last: ${tickLine(l)}</div></div>`;
     }).join("") || '<span class="mut">no ticks yet</span>';
     $("frames").innerHTML=d.frames.length? d.frames.map(f=>
-      `<div><div class="mono mut">${esc(f.cam)} · ${esc(f.name)}</div>
-       <img class="ev" src="/frames/${encodeURIComponent(f.cam)}/${encodeURIComponent(f.name)}"></div>`
-    ).join(""):'<span class="mut">no frames yet — appear once someone is on camera</span>';
+      `<div><div class="mono mut">${esc(f.cam)} · ${esc(f.name.slice(9,11))}:${esc(f.name.slice(11,13))}:${esc(f.name.slice(13,15))}${f.note?` · <span class="fnote">${esc(f.note)}</span>`:""}</div>
+       <img class="ev" loading="lazy" src="/frames/${encodeURIComponent(f.cam)}/${encodeURIComponent(f.name)}"></div>`
+    ).join(""):'<span class="mut">no frames yet — captured on identity changes (appear/leave/label-flip/face-lock), losses, and every ~2min steady</span>';
     $("events").innerHTML=d.events.length? d.events.map(e=>
       `<div>${esc(e.t)}Z &nbsp;<b>${esc(e.d)}</b> &nbsp;${esc(e.title)}</div>`).join(""):"none yet";
     $("log").innerHTML=d.ticks.map(t=>

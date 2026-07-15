@@ -88,6 +88,19 @@ async def test_flag_off_and_empty_scene_write_nothing(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_loss_note_writes_boxless_captioned_frame(tmp_path) -> None:
+    # A zero-track tick with a note IS evidence (the blip/loss frame) —
+    # written with the caption strip, filename carries the reason slug.
+    await dump_id_evidence(
+        _identity(tracks=[]), camera_id="cafe0123-x",
+        settings=_settings(tmp_path), note="LOST was 1p",
+    )
+    files = list((tmp_path / "cafe0123").glob("*_lost-was-1p.jpg"))
+    assert len(files) == 1
+    assert files[0].read_bytes()[:2] == b"\xff\xd8"
+
+
+@pytest.mark.asyncio
 async def test_ring_prune_keeps_newest(tmp_path) -> None:
     cam = tmp_path / "cafe0123"
     cam.mkdir(parents=True)

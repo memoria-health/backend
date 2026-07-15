@@ -23,6 +23,7 @@ def _due(
     severity: int = 50,
     targets: tuple[int, ...] | None = None,
     needs_audio: bool = False,
+    windowed: bool = False,
 ) -> DueDetector:
     return DueDetector(
         spec=DetectorSpec(
@@ -36,6 +37,7 @@ def _due(
             shape="point_in_time", dims_source="row",
         ),
         target_track_ids=targets,
+        windowed=windowed,
     )
 
 
@@ -211,3 +213,33 @@ def test_multi_target_scene_collapse_lists_the_member_once() -> None:
     )
     (plan,) = plans
     assert _idents(plan).count("mystery") == 1
+
+
+# ── when_scope windowed subgroup (recalibration 2026-07-14) ──────────
+
+
+def test_windowed_detector_gets_its_own_call() -> None:
+    # Same degraded-wide recipe as scene, but windowed ⇒ distinct call,
+    # ordered after the always-on scene anchor, key suffixed :win.
+    plans = _pack(
+        _due("fall", bucket="scene", severity=95),
+        _due("medication", bucket="person", severity=20, windowed=True),
+    )
+    assert len(plans) == 2
+    scene, win = plans
+    assert not scene.windowed
+    assert _idents(scene) == ["fall"]
+    assert win.windowed and win.plan_key.endswith(":win")
+    assert _idents(win) == ["medication"]
+
+
+def test_windowed_and_always_on_never_share_a_crop_call() -> None:
+    plans = _pack(
+        _due("medication", bucket="person", targets=(1,), windowed=True),
+        _due("choking", bucket="person", targets=(1,)),
+    )
+    keys = sorted(p.plan_key for p in plans if p.target_track_id == 1)
+    assert keys == [
+        "person:video4:clean:lite:track1",
+        "person:video4:clean:lite:track1:win",
+    ]

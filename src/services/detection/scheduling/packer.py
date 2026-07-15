@@ -57,12 +57,16 @@ class CallPlan:
     target_track_id: int | None
     detectors: tuple["DueDetector", ...]
     needs_audio: bool
+    # when_scope subgroup (2026-07-14): windowed detectors never share
+    # a call with always-on ones, even when the recipes match.
+    windowed: bool = False
 
     @property
     def plan_key(self) -> str:
         """Stable log/debug label."""
         tgt = "scene" if self.target_track_id is None else f"track{self.target_track_id}"
-        return f"{self.crop}:{self.frames}{self.fps}:{self.channel}:{self.tier}:{tgt}"
+        base = f"{self.crop}:{self.frames}{self.fps}:{self.channel}:{self.tier}:{tgt}"
+        return f"{base}:win" if self.windowed else base
 
 
 # (frames, fps, channel, tier, crop-when-targeted). The scene tuple is
@@ -76,14 +80,17 @@ _RECIPES: dict[str, tuple[str, int, str, str, str]] = {
     "snapshot":    ("frame", 1, "clean",   "lite",  "zone"),
 }
 
-_SCENE_KEY = ("video", 4, "clean", "lite", "full", None)
+_SCENE_KEY = ("video", 4, "clean", "lite", "full", None, False)
 
 
 def _group_key(
     d: "DueDetector", target: int | None,
-) -> tuple[str, int, str, str, str, int | None]:
-    """Final recipe group for one (detector, target) pairing."""
+) -> tuple[str, int, str, str, str, int | None, bool]:
+    """Final recipe group for one (detector, target) pairing. The last
+    element is the when_scope subgroup flag: windowed detectors group
+    apart from always-on ones even under an identical recipe."""
     bucket = d.dims.bucket
+    win = d.windowed
     # SNAPSHOT rides the wide call until per-camera zone configs exist
     # (P6): the still recipe was validated with ZONE CROPS; a full-
     # frame still measurably FAILS object checks (phone-vs-remote 100%
@@ -91,9 +98,10 @@ def _group_key(
     # worse than today. When zones land, this becomes a zone-crop
     # frame call.
     if bucket == "snapshot":
-        return _SCENE_KEY
+        return _SCENE_KEY[:6] + (win,)
     if bucket not in _RECIPES:
-        return _SCENE_KEY  # unknown bucket: never brick a tick — go wide
+        # unknown bucket: never brick a tick — go wide
+        return _SCENE_KEY[:6] + (win,)
     frames, fps, channel, tier, crop = _RECIPES[bucket]
     if target is None:
         # Degraded (no box): full-frame. PERSON's degraded recipe is
@@ -101,9 +109,9 @@ def _group_key(
         # FACE keep their fps/channel/tier in their own full-frame call
         # (RAPID full-frame = the P0 lane's exact no-box fallback).
         if bucket == "person":
-            return _SCENE_KEY
+            return _SCENE_KEY[:6] + (win,)
         crop = "full"
-    return (frames, fps, channel, tier, crop, target)
+    return (frames, fps, channel, tier, crop, target, win)
 
 
 def pack_calls(due_set: "DueSet", *, settings: "Settings") -> tuple[CallPlan, ...]:
@@ -139,8 +147,12 @@ def pack_calls(due_set: "DueSet", *, settings: "Settings") -> tuple[CallPlan, ..
 
     plans: list[CallPlan] = []
     for key, members in groups.items():
-        frames, fps, channel, tier, crop, target = key
+        frames, fps, channel, tier, crop, target, win = key
         members = sorted(members, key=lambda m: -m.dims.severity)
+        # Only the always-on scene group is uncapped; a WINDOWED wide
+        # group holds the measured crop cap — windowed members are
+        # typically micro-evidence (medication), exactly the dilution-
+        # sensitive class.
         cap = _SCENE_KEY_CAP if key == _SCENE_KEY else _CROP_CAP
         chunks = (
             [members] if cap is None
@@ -152,14 +164,17 @@ def pack_calls(due_set: "DueSet", *, settings: "Settings") -> tuple[CallPlan, ..
                 crop=crop, target_track_id=target,
                 detectors=tuple(chunk),
                 needs_audio=any(m.dims.needs_audio for m in chunk),
+                windowed=win,
             ))
 
     # Scene call(s) first, then by descending top severity, then by
-    # plan_key for full determinism.
+    # plan_key for full determinism. A windowed wide call is NOT the
+    # scene anchor — the executor pins the tick's shared block on the
+    # always-on scene call only.
     def _order(p: CallPlan) -> tuple:
         is_scene = (
             p.crop == "full" and p.fps == 4 and p.tier == "lite"
-            and p.target_track_id is None
+            and p.target_track_id is None and not p.windowed
         )
         top = max((m.dims.severity for m in p.detectors), default=0)
         return (0 if is_scene else 1, -top, p.plan_key)

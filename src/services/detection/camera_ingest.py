@@ -33,8 +33,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 from uuid import UUID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from src.db.camera import Camera
+from src.db.caregiver import Caregiver
 from src.db.patient import Patient
 from src.services import clip_archival, email, push
 from src.services.detection.analyses_store import add_analysis
@@ -141,6 +143,15 @@ class CameraIngest:
         # Retained for log identification; the actual reaper for a
         # vanished camera lives in `LiveKitRoomReconciler`.
         self._livekit_identity = livekit_identity
+        # Caregiver-local timezone for when_scope windows (2026-07-14).
+        # Resolved once on first use and cached for the worker's life —
+        # a caregiver timezone change picks up on the next worker
+        # restart, which matches the scheduled runner's tolerance.
+        self._caregiver_tz: "ZoneInfo | None" = None
+        # Previous tick's identity signature (n_tracks, labels, face
+        # locks) — drives change-triggered evidence capture. None until
+        # the first tick that runs tracking.
+        self._last_id_sig: tuple | None = None
         # Retain enough history for the LONGEST consumer — the LLM
         # analysis window OR the incident-clip post-roll, whichever is
         # bigger — derived from clip length so the two can never drift.
@@ -306,6 +317,30 @@ class CameraIngest:
             )
             log.exception("%s tick failed (full traceback): %s", self._log_tag, exc)
             return
+
+    async def _resolve_caregiver_tz(self, session, patient: "Patient") -> ZoneInfo:
+        """Caregiver's IANA timezone for when_scope windows, cached for
+        the worker's life. Any failure falls back to the scheduled
+        runner's convention (America/New_York) — window gating degrades,
+        never crashes a tick."""
+        if self._caregiver_tz is not None:
+            return self._caregiver_tz
+        name = None
+        try:
+            cg = await session.get(Caregiver, patient.caregiver_id)
+            name = cg.timezone if cg else None
+        except Exception:  # noqa: BLE001
+            log.warning(
+                "%s caregiver tz lookup failed — using fallback",
+                self._log_tag,
+            )
+        try:
+            tz = ZoneInfo(name) if name else ZoneInfo("America/New_York")
+        except ZoneInfoNotFoundError:
+            log.warning("%s bad caregiver tz %r — using fallback", self._log_tag, name)
+            tz = ZoneInfo("America/New_York")
+        self._caregiver_tz = tz
+        return tz
 
     async def _run_tick(self) -> None:
         """Run one tick, then drive the data-collection recorder.
@@ -630,15 +665,42 @@ class CameraIngest:
                 identity.confidence,
                 identity.face_count,
             )
-            # Identity evidence frame (soak observability): annotated
-            # snapshot of what tracking/attribution saw this tick —
-            # flag-gated, and never allowed to touch the tick.
+            # Identity evidence frames (soak observability): captured at
+            # the KEY MOMENTS of tracking consistency, not every tick —
+            # any change in the identity signature (person appears/
+            # leaves, UNKNOWN→PATIENT flip, face lock gained), a LOSS
+            # frame when tracks drop to zero (blip evidence: captioned,
+            # boxless), and a sparse keepalive during long-stable
+            # stretches. Flag-gated; never allowed to touch the tick.
             if self._settings.soak_id_frames_enabled:
                 try:
-                    await dump_id_evidence(
-                        identity, camera_id=self.camera_id,
-                        settings=self._settings,
+                    trks = identity.tracks or ()
+                    sig = (
+                        len(trks),
+                        tuple(sorted(t.label for t in trks)),
+                        sum(1 for t in trks
+                            if getattr(t, "face_locked", False)),
                     )
+                    prev, self._last_id_sig = self._last_id_sig, sig
+                    desc = (
+                        f"{sig[0]}p " + "/".join(l[:3] for l in sig[1])
+                        + (f" {sig[2]}face" if sig[2] else "")
+                    ).strip()
+                    note = None
+                    if prev is not None and sig != prev:
+                        note = (
+                            f"LOST was {prev[0]}p" if sig[0] == 0
+                            else f"id-change {desc}"
+                        )
+                    elif prev is None and sig[0]:
+                        note = f"first {desc}"
+                    elif sig[0] and self._tick_counter % 12 == 0:
+                        note = f"steady {desc}"
+                    if note is not None:
+                        await dump_id_evidence(
+                            identity, camera_id=self.camera_id,
+                            settings=self._settings, note=note,
+                        )
                 except Exception:  # noqa: BLE001
                     log.debug(
                         "%s id-evidence dump failed", self._log_tag,
@@ -850,7 +912,10 @@ class CameraIngest:
                 # sanitizer, presence gate, analyses, promotion) consumes
                 # the merged result unchanged.
                 entries = [
-                    ScheduledDetector(spec=s, dims=resolve_dims(row))
+                    ScheduledDetector(
+                        spec=s, dims=resolve_dims(row),
+                        when_scope=getattr(row, "when_scope", None),
+                    )
                     for s, row in loadout
                 ]
                 # RAPID retention (Ledger row 5): hold native `rapid_fps`
@@ -868,6 +933,9 @@ class CameraIngest:
                     identity=identity,
                     settings=self._settings,
                     tick_index=self._tick_counter,
+                    local_now=datetime.now(
+                        await self._resolve_caregiver_tz(session, patient)
+                    ),
                 )
                 plans = pack_calls(due_set, settings=self._settings)
                 log.info(

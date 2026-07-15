@@ -43,6 +43,7 @@ def _entry(
     bucket: str = "scene",
     duty: str = "every_eligible_tick",
     shape: str = "point_in_time",
+    when_scope: str | None = None,
 ) -> ScheduledDetector:
     return ScheduledDetector(
         spec=DetectorSpec(
@@ -54,6 +55,7 @@ def _entry(
             duty_cycle=duty, needs_audio=False, severity=50, shape=shape,
             dims_source="row",
         ),
+        when_scope=when_scope,
     )
 
 
@@ -348,3 +350,53 @@ def test_emptied_patient_targets_fall_open_to_scene() -> None:
     )
     (d,) = ds.due
     assert d.target_track_ids is None
+
+
+# ── when_scope gating (recalibration 2026-07-14) ─────────────────────
+
+
+def _resolve_at(entries, hh, mm=0):
+    from datetime import datetime
+
+    return resolve_due(
+        entries, signals=_signals(), identity=_identity(None),
+        settings=_settings(), tick_index=0,
+        local_now=datetime(2026, 7, 14, hh, mm),
+    )
+
+
+def test_when_scope_outside_window_skips_with_reason() -> None:
+    out = _resolve_at([_entry("medication", when_scope="8 AM, 8 PM ±1H")], 17)
+    assert not out.due
+    assert ("medication", "outside_when_scope") in out.skipped
+
+
+def test_when_scope_inside_window_is_due_and_windowed() -> None:
+    out = _resolve_at([_entry("medication", when_scope="8 AM, 8 PM ±1H")], 8, 30)
+    assert [d.spec.identifier for d in out.due] == ["medication"]
+    assert out.due[0].windowed is True
+
+
+def test_always_scope_is_due_and_not_windowed() -> None:
+    out = _resolve_at([_entry("fall", when_scope="ALWAYS")], 3)
+    assert out.due and out.due[0].windowed is False
+
+
+def test_scheduled_shape_exempt_from_window_gate() -> None:
+    # Absence rows keep their all-day per-tick collection regardless of
+    # any when_scope text — their schedule_config governs timing.
+    out = _resolve_at(
+        [_entry("stretching", shape="scheduled", when_scope="6 PM ±1H")], 3,
+    )
+    assert [d.spec.identifier for d in out.due] == ["stretching"]
+    assert out.due[0].windowed is False
+
+
+def test_no_local_now_fails_open() -> None:
+    out = resolve_due(
+        [_entry("medication", when_scope="8 AM, 8 PM ±1H")],
+        signals=_signals(), identity=_identity(None),
+        settings=_settings(), tick_index=0,
+    )
+    assert [d.spec.identifier for d in out.due] == ["medication"]
+    assert out.due[0].windowed is False

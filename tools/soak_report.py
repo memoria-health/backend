@@ -72,6 +72,7 @@ async def run(hours: float) -> None:
         "present_src": Counter(), "wakes": 0, "env": [], "amounts": [],
         "calls": Counter(), "in": 0, "out": 0, "rapid_in": 0,
         "rapid_out": 0, "degraded": Counter(), "confirm": Counter(),
+        "seq": [],
     })
 
     for r in rows:
@@ -88,6 +89,11 @@ async def run(hours: float) -> None:
             c["env"].append(float(f["sig_env_motion"]))
         for t in f.get("sig_tracks", []):
             c["amounts"].append(float(t.get("amount", 0.0)))
+        # id-consistency raw material: (when, occupied?, n_tracks)
+        c["seq"].append((
+            r.captured_at, bool(f.get("people_present")),
+            len(f.get("sig_tracks") or []),
+        ))
         if "sched_calls" in f:
             c["calls"][len(f["sched_calls"])] += 1
             for call in f["sched_calls"]:
@@ -127,6 +133,21 @@ async def run(hours: float) -> None:
         if c["calls"]:
             print(f"  sched calls/tick={dict(c['calls'])}  degraded={dict(c['degraded'])}"
                   f"  confirm={dict(c['confirm'])}")
+        # Tracking consistency (soak recalibration, 2026-07-14): of the
+        # ticks a person was believed present, how many had a live
+        # track — and how often tracking dropped to zero while the room
+        # stayed occupied (blips). The seated-person blindness and any
+        # tracker churn both land here.
+        seq = sorted(c["seq"])
+        occ = sum(1 for _, p, _ in seq if p)
+        trk = sum(1 for _, p, n in seq if p and n)
+        losses = sum(
+            1 for i in range(1, len(seq))
+            if seq[i - 1][2] > 0 and seq[i][2] == 0 and seq[i][1]
+        )
+        pct = (100 * trk / occ) if occ else 0.0
+        print(f"  id-consistency: tracked {trk}/{occ} occupied ticks "
+              f"({pct:.0f}%)  losses(track→0 while occupied)={losses}")
         print(f"  tokens in={c['in']}(+{c['rapid_in']} rapid) out={c['out']}(+{c['rapid_out']})\n")
 
     # Tier-split pricing: overlay (flash) tokens at flash rates, the

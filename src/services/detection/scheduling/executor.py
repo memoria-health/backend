@@ -93,6 +93,7 @@ def _is_scene(plan: CallPlan) -> bool:
     return (
         plan.crop == "full" and plan.fps == 4
         and plan.tier == "lite" and plan.target_track_id is None
+        and not plan.windowed
     )
 
 

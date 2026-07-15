@@ -33,9 +33,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Sequence
 
 from src.services.detection.scheduling.dims import CROP_BUCKETS, EffectiveDims
+from src.services.detection.scheduling.when_scope import is_active
 from src.services.reid.body_pipeline import LABEL_OTHER, LABEL_PATIENT
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from src.services.detection.prompt import DetectorSpec
     from src.services.detection.signals.tick_signals import TickSignals
     from src.services.reid.inference import IdentityResult
@@ -44,10 +47,14 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class ScheduledDetector:
-    """One loadout entry: the compiled spec + its effective dims."""
+    """One loadout entry: the compiled spec + its effective dims.
+
+    `when_scope` is the row's operator-facing time window; None/"ALL
+    DAY"-flavored means always-on (see scheduling.when_scope)."""
 
     spec: "DetectorSpec"
     dims: EffectiveDims
+    when_scope: str | None = None
 
 
 @dataclass(frozen=True)
@@ -57,11 +64,16 @@ class DueDetector:
     `target_track_ids` is None for scene-level artifacts (full frame /
     zone); a tuple of track ids means the packer builds ONE CROP CALL
     PER TRACK (D3 — per-person, never a union box).
+
+    `windowed` marks a detector inside a real when_scope window this
+    tick — the packer groups windowed detectors into their own call,
+    never shared with always-on ones.
     """
 
     spec: "DetectorSpec"
     dims: EffectiveDims
     target_track_ids: tuple[int, ...] | None
+    windowed: bool = False
 
 
 @dataclass(frozen=True)
@@ -80,8 +92,12 @@ def resolve_due(
     identity: "IdentityResult",
     settings: "Settings",
     tick_index: int,
+    local_now: "datetime | None" = None,
 ) -> DueSet:
-    """Resolve the due set for one tick. Pure: no I/O, no clock."""
+    """Resolve the due set for one tick. Pure: no I/O, no clock — the
+    caller supplies `local_now` (caregiver-local wall time) for
+    when_scope windows; None skips window gating entirely (fail open).
+    """
     tracks = identity.tracks
     n_tracks = len(tracks) if tracks else 0
     crowd = tracks is not None and n_tracks > settings.scheduler_crowd_fallback_tracks
@@ -120,6 +136,18 @@ def resolve_due(
             skipped.append((ident, "scheduled_only_duty"))
             continue
 
+        # when_scope gate (2026-07-14). Scheduled-shape rows are exempt
+        # — their per-tick fields feed the absence runner all day and
+        # their schedule_config governs timing. Everything else skips
+        # outside its window; inside it, the entry is marked `windowed`
+        # so the packer gives it a distinct call.
+        windowed = False
+        if local_now is not None and d.shape != "scheduled":
+            eligible, windowed = is_active(entry.when_scope, local_now)
+            if not eligible:
+                skipped.append((ident, "outside_when_scope"))
+                continue
+
         if d.duty_cycle == "sampled" and tick_index % settings.scheduler_sample_every_k:
             skipped.append((ident, "sampled_off_tick"))
             continue
@@ -146,7 +174,10 @@ def resolve_due(
             if measurement_ok and signals.env_motion < settings.scheduler_env_motion_floor:
                 skipped.append((ident, "env_floor"))
                 continue
-            due.append(DueDetector(spec=entry.spec, dims=d, target_track_ids=None))
+            due.append(DueDetector(
+                spec=entry.spec, dims=d, target_track_ids=None,
+                windowed=windowed,
+            ))
             continue
 
         # ── PERSON branches (person_motion / person_still) ────────
@@ -194,6 +225,9 @@ def resolve_due(
         targets: tuple[int, ...] | None = None
         if d.bucket in CROP_BUCKETS and not crowd and qualifying:
             targets = tuple(qualifying)
-        due.append(DueDetector(spec=entry.spec, dims=d, target_track_ids=targets))
+        due.append(DueDetector(
+            spec=entry.spec, dims=d, target_track_ids=targets,
+            windowed=windowed,
+        ))
 
     return DueSet(due=tuple(due), crowd_fallback=crowd, skipped=tuple(skipped))

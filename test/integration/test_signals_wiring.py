@@ -69,6 +69,10 @@ def _make_ingest(
 ):
     settings = get_settings().model_copy(update={
         "motion_overlay_enabled": False,
+        # This suite pins the LEGACY branch; a developer .env with the
+        # soak's v2 flags on must not leak into it.
+        "detection_v2_scheduler_enabled": False,
+        "detection_v2_decision_enabled": False,
     })
     monkeypatch.setattr(ci, "run_vlm", main)
     cache = MotionCache(ttl_seconds=60)

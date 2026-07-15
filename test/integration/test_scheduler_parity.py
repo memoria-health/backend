@@ -78,6 +78,11 @@ async def _assign_detectors(session: AsyncSession, patient_id, camera_id) -> dic
     assert len(rows) == 3, "onboarding must have seeded these presets"
     now = datetime.now(timezone.utc)
     for r in rows:
+        # Neutralize seeded time windows (medication ships "8 AM, 8 PM
+        # ±1H"): this suite pins bucket-splitting mechanics, and the
+        # when_scope gate (2026-07-14) would otherwise skip windowed
+        # rows depending on the wall clock the test runs at.
+        r.when_scope = "ALL DAY"
         session.add(CameraDetector(
             camera_id=camera_id, detector_id=r.id, created_at=now,
         ))

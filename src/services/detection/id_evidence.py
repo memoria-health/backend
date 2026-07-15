@@ -57,7 +57,9 @@ def _box_at(track: Any, idx: int):
     return box
 
 
-def _draw(jpeg: bytes, identity: "IdentityResult") -> bytes | None:
+def _draw(
+    jpeg: bytes, identity: "IdentityResult", note: str | None,
+) -> bytes | None:
     from PIL import Image, ImageDraw
 
     im = Image.open(io.BytesIO(jpeg)).convert("RGB")
@@ -82,6 +84,13 @@ def _draw(jpeg: bytes, identity: "IdentityResult") -> bytes | None:
         d.rectangle(tuple(identity.patient_bbox),
                     outline=_COLORS["PATIENT"], width=5)
         drew = True
+    if note:
+        # Caption strip: the capture reason (id-change / LOST / steady)
+        # — a LOST frame deliberately has no boxes; the caption IS the
+        # evidence ("someone was here last tick, tracker sees nobody").
+        d.rectangle((0, 0, im.width, 16), fill=(20, 20, 20))
+        d.text((4, 2), note[:80], fill=_UNKNOWN)
+        drew = True
     if not drew:
         return None
     out = io.BytesIO()
@@ -89,26 +98,37 @@ def _draw(jpeg: bytes, identity: "IdentityResult") -> bytes | None:
     return out.getvalue()
 
 
+def _slug(note: str) -> str:
+    import re
+
+    return re.sub(r"[^a-z0-9-]+", "-", note.lower()).strip("-")[:28]
+
+
 async def dump_id_evidence(
     identity: "IdentityResult", *, camera_id, settings: "Settings",
+    note: str | None = None,
 ) -> None:
     """Annotate + write one evidence frame; prune the ring. No-ops
-    when the flag is off, nothing was extracted, or nobody was seen."""
+    when the flag is off, nothing was extracted, or nobody was seen —
+    unless a `note` is given: a noted zero-track frame is loss/blip
+    evidence (tracking-consistency observability, Aryaman 2026-07-14)
+    and is written with the caption instead of boxes."""
     if not getattr(settings, "soak_id_frames_enabled", False):
         return
     frames = identity.extracted_frames or ()
     if not frames:
         return
-    if not (identity.tracks or identity.patient_bbox is not None):
+    if not (identity.tracks or identity.patient_bbox is not None or note):
         return
     idx = identity.best_frame_index
     pick = frames[idx] if (idx is not None and 0 <= idx < len(frames)) else frames[-1]
-    annotated = await asyncio.to_thread(_draw, _frame_bytes(pick), identity)
+    annotated = await asyncio.to_thread(_draw, _frame_bytes(pick), identity, note)
     if annotated is None:
         return
     cam_dir = Path(settings.soak_id_frames_dir) / str(camera_id)[:8]
     cam_dir.mkdir(parents=True, exist_ok=True)
-    name = time.strftime("%Y%m%dT%H%M%S") + ".jpg"
+    stamp = time.strftime("%Y%m%dT%H%M%S")
+    name = f"{stamp}_{_slug(note)}.jpg" if note else f"{stamp}.jpg"
     (cam_dir / name).write_bytes(annotated)
     stale = sorted(cam_dir.glob("*.jpg"))[:-_RING]
     for f in stale:
