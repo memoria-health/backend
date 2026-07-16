@@ -121,3 +121,30 @@ async def test_roster_includes_unowned_null_cameras(
     await session.commit()
 
     assert "cam_orphan" in await _roster_identities(client, "gw-token-A")
+
+
+@pytest.mark.asyncio
+async def test_roster_assigns_stable_unique_tunnel_ports(
+    client: AsyncClient, auth_user, session: AsyncSession,
+) -> None:
+    """First roster poll assigns a unique reverse-SSH port (never the
+    reserved 22001); later polls return the SAME port; two boxes never
+    collide."""
+    _, email, _ = await _setup_patient(client, auth_user)
+    await _provision(client, email, "gw-token-A", room="Room A")
+    await _provision(client, email, "gw-token-B", room="Room B")
+
+    async def _port(token: str) -> int:
+        r = await client.get(
+            "/v1/gateway/roster",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r.status_code == 200, r.text
+        return r.json()["tunnel_port"]
+
+    port_a = await _port("gw-token-A")
+    port_b = await _port("gw-token-B")
+    assert port_a >= 22002  # 22001 is reserved for the legacy box-01 unit
+    assert port_b >= 22002
+    assert port_a != port_b
+    assert await _port("gw-token-A") == port_a  # stable across polls

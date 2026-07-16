@@ -188,11 +188,18 @@ create trigger patients_set_updated_at
 -- its cameras binds to a patient via cameras.gateway_id). Backend-
 -- internal (accessed by the service role via the gateway roster/
 -- provision endpoints); no RLS — mirrors apply_gateway_delta.sql.
+-- Reverse-SSH tunnel ports: each box gets a UNIQUE port on the relay VPS,
+-- assigned lazily by the roster endpoint on the box's first poll. 22001 is
+-- deliberately never issued by the sequence — the original OptiPlex (box-01)
+-- holds it via a legacy hardcoded tunnel unit; pin its row manually.
+create sequence public.gateway_tunnel_port_seq start 22002;
+
 create table public.gateways (
   id           uuid primary key default gen_random_uuid(),
   caregiver_id uuid references public.caregivers(id) on delete cascade,
   patient_id   uuid,
   token_hash   text not null,
+  tunnel_port  int unique,       -- relay reverse port; null until first roster poll
   created_at   timestamptz default now(),
   last_seen_at timestamptz
 );

@@ -352,19 +352,39 @@ async def gateway_roster(
         )
     digest = hash_ingest_token(presented)
     gw = (await session.execute(
-        text("SELECT id, caregiver_id FROM public.gateways WHERE token_hash = :d"),
+        text("SELECT id, caregiver_id, tunnel_port "
+             "FROM public.gateways WHERE token_hash = :d"),
         {"d": digest},
     )).first()
     if gw is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_gateway_token",
         )
-    gateway_id, caregiver_id = gw[0], gw[1]
+    gateway_id, caregiver_id, tunnel_port = gw[0], gw[1], gw[2]
     # Liveness: polling the roster IS the heartbeat (gateway + its cameras).
     await session.execute(
         text("UPDATE public.gateways SET last_seen_at = now() WHERE id = :id"),
         {"id": gateway_id},
     )
+    # Reverse-SSH tunnel port: assign a unique relay port on the box's FIRST
+    # poll (lazy — covers rows that predate the column too). The box writes it
+    # to .tunnel-port and its tunnel unit dials the relay on that port, which
+    # is what makes every deployed box reachable by ops. The guarded UPDATE
+    # keeps concurrent polls safe: whoever loses the race re-reads the winner's
+    # value. nextval() never issues 22001 (reserved for the legacy box-01 unit).
+    if tunnel_port is None:
+        tunnel_port = (await session.execute(
+            text("UPDATE public.gateways "
+                 "SET tunnel_port = nextval('public.gateway_tunnel_port_seq') "
+                 "WHERE id = :id AND tunnel_port IS NULL "
+                 "RETURNING tunnel_port"),
+            {"id": gateway_id},
+        )).scalar()
+        if tunnel_port is None:  # lost the race — the port is already set
+            tunnel_port = (await session.execute(
+                text("SELECT tunnel_port FROM public.gateways WHERE id = :id"),
+                {"id": gateway_id},
+            )).scalar()
     # A gateway box serves a CAREGIVER, but each gateway camera is OWNED by
     # a specific box (cameras.gateway_id). Return only THIS box's cameras,
     # plus any not-yet-assigned (gateway_id IS NULL) rows as a transitional
@@ -385,7 +405,7 @@ async def gateway_roster(
         {"c": caregiver_id, "gw": gateway_id},
     )).all()
     await session.commit()
-    return {"cameras": [
+    return {"tunnel_port": tunnel_port, "cameras": [
         {"camera_id": str(r[0]), "livekit_identity": r[1],
          "livekit_room": r[2], "desired_state": r[3]}
         for r in rows
