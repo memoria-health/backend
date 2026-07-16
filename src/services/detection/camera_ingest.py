@@ -93,6 +93,44 @@ class _RecorderDecision:
     privacy: bool = False
 
 
+def _motion_stats(window) -> dict:
+    """Gateway-motion tuning stats (hotfix 2026-07-16, Aryaman's night-
+    noise experiment): recompute the gateway box's motion statistic on
+    the frames the backend received — the fraction of sampled luma
+    pixels (every 397th, matching the box) whose frame-to-frame delta
+    exceeds the box's PIXEL_DELTA=30, plus higher-threshold variants
+    and the mean |delta|. Max over the window = what the box's
+    per-frame tripwire would see at its worst moment. Stamped on every
+    analyzed tick so night-noise distributions are queryable and both
+    the gateway thresholds and a future server-side floor can be tuned
+    against real data. Observation only — NOTHING gates on these."""
+    import numpy as np
+
+    f30 = f45 = f60 = 0.0
+    means: list[float] = []
+    prev = None
+    for f in window:
+        n = f.width * f.height
+        if n <= 0 or len(f.data) < n:
+            prev = None
+            continue
+        y = np.frombuffer(f.data, dtype=np.uint8, count=n)[::397].astype(np.int16)
+        if prev is not None and y.shape == prev.shape:
+            d = np.abs(y - prev)
+            size = d.size or 1
+            f30 = max(f30, float((d > 30).sum()) / size)
+            f45 = max(f45, float((d > 45).sum()) / size)
+            f60 = max(f60, float((d > 60).sum()) / size)
+            means.append(float(d.mean()))
+        prev = y
+    return {
+        "motion_frac30_max": round(f30, 5),
+        "motion_frac45_max": round(f45, 5),
+        "motion_frac60_max": round(f60, 5),
+        "motion_mean_abs": round(sum(means) / len(means), 3) if means else 0.0,
+    }
+
+
 class CameraIngest:
     """One per camera. Owns the frame buffer, the tick scheduler, and
     the per-camera lock. Lifecycle is controlled by the parent
@@ -694,6 +732,21 @@ class CameraIngest:
             result.detector_fields["identity_patient_in_clip"] = identity.patient_in_clip
             result.detector_fields["identity_confidence"] = round(identity.confidence, 4)
             result.detector_fields["identity_face_count"] = identity.face_count
+
+            # Motion-threshold tuning stats (hotfix 2026-07-16):
+            # backend-side recomputation of the gateway's tripwire
+            # statistic on this tick's frames. Observation only.
+            try:
+                stats = _motion_stats(window)
+                result.detector_fields.update(stats)
+                log.info(
+                    "%s motion_stats f30=%.4f f45=%.4f f60=%.4f mean=%.2f",
+                    self._log_tag, stats["motion_frac30_max"],
+                    stats["motion_frac45_max"], stats["motion_frac60_max"],
+                    stats["motion_mean_abs"],
+                )
+            except Exception:  # noqa: BLE001 — tuning stats must never break a tick
+                log.debug("%s motion_stats failed", self._log_tag, exc_info=True)
 
             # Presence gate. The LLM is the GENERIC people detector — it's
             # looser / more sensitive than YOLO body tracking — and the re-ID
