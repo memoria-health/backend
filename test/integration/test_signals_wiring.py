@@ -248,4 +248,7 @@ async def test_closed_camera_still_skips_when_pixels_still(
     f = row.detector_fields
     assert f["skipped_reason"] == "camera_closed"
     assert f["motion_src"] == "none"
-    assert "sig_env_motion" in f
+    # Motion consolidation (2026-07-17): closed-skip telemetry is the
+    # block-motion verdict now (wake_block_max), not the old whole-
+    # frame sig_env stash — block motion IS the wake authority.
+    assert "wake_block_max" in f
