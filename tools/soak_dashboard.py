@@ -130,6 +130,10 @@ async def data() -> JSONResponse:
             "rfps": f.get("ingress_recv_fps"),
             "kfps": f.get("ingress_kept_fps"),
             "gap": f.get("ingress_max_gap_ms"),
+            # tick_failed rows (any tick error, not just model): class +
+            # first line of the message, rendered crit-red in the log.
+            "err": f.get("error_class"),
+            "emsg": (f.get("error_msg") or "")[:90] or None,
             "fired": fired,
         }
         if c["last"] is None:
@@ -232,6 +236,8 @@ _PAGE = """<!doctype html><html><head><meta charset="utf-8">
     max-height:440px;overflow-y:auto;font:11.5px/1.65 ui-monospace,Menlo,monospace}
   .lr{display:flex;gap:9px;padding:2px 9px}
   .logwin .lr:nth-child(even){background:var(--zeb)}
+  .logwin .lr.fail{border-left:3px solid var(--crit)}
+  .logwin .lr.fail .b{color:var(--crit)}
   .lr .t{color:var(--mut);flex:0 0 58px}.lr .c{flex:0 0 62px;color:var(--acc);font-weight:600}
   .lr .b{overflow-wrap:anywhere;min-width:0}
   #events>div{overflow-wrap:anywhere;padding:2px 0}
@@ -293,6 +299,8 @@ const $=id=>document.getElementById(id);
 function esc(s){return String(s??"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]))}
 function tickLine(t){
   const fps=t.rfps!=null?` fps=${t.rfps}→${t.kfps??"?"} gap=${t.gap??"?"}ms`:"";
+  if(t.skip==="tick_failed")
+    return `<span class="crit">⛔ TICK FAILED · ${esc(t.err??"?")}: ${esc(t.emsg??"")}</span>${fps}`;
   if(t.skip) return `skipped · ${esc(t.skip)}${fps}`;
   let b=`motion=${esc(t.motion??"—")} ppl=${t.ppl?"Y":"n"}(${esc(t.psrc??"—")}) trk=${t.tracks}`;
   if(t.amount!=null) b+=` amt=${t.amount}`;
@@ -341,7 +349,7 @@ async function refresh(){
     $("events").innerHTML=d.events.length? d.events.map(e=>
       `<div>${esc(e.t)}Z &nbsp;<b>${esc(e.d)}</b> &nbsp;${esc(e.title)}</div>`).join(""):"none yet";
     $("log").innerHTML=d.ticks.map(t=>
-      `<div class="lr ${t.skip?"skip":""} ${t.fired.length?"fired":""}">
+      `<div class="lr ${t.skip==="tick_failed"?"fail":t.skip?"skip":""} ${t.fired.length?"fired":""}">
         <span class="t">${esc(t.t)}</span><span class="c">${esc(t.cam)}</span>
         <span class="b">${tickLine(t)}</span></div>`).join("");
   }catch(e){ $("live").textContent="reconnecting…"; }

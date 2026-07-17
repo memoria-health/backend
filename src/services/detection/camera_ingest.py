@@ -349,11 +349,57 @@ class CameraIngest:
             # value (e.g. 'dashscope') otherwise hides at its very bottom.
             reason = (str(exc).splitlines() or [""])[0] or type(exc).__name__
             log.error(
-                "%s ⛔ NO ANALYSIS SAVED — %s: %s",
+                "%s ⛔ TICK FAILED — %s: %s",
                 self._log_tag, type(exc).__name__, reason,
             )
             log.exception("%s tick failed (full traceback): %s", self._log_tag, exc)
+            await self._write_failed_row(exc)
             return
+
+    async def _write_failed_row(self, exc: Exception) -> None:
+        """Visibility row for a failed tick (Aryaman 2026-07-17: ANY
+        tick error — model, DB, ffmpeg, anywhere — must show on the
+        dashboard for that camera/tick, not just in logs).
+
+        provider stays 'skipped' because the analyses CHECK constraint
+        allows only gemini/openai/openrouter/skipped — the truth rides
+        in skipped_reason='tick_failed' + error_class/error_msg. Uses a
+        FRESH session (the tick's own session may be mid-rollback) and
+        never raises: the visibility writer must not hurt the loop."""
+        try:
+            fields: dict = {
+                "people_present": False,
+                "skipped_reason": "tick_failed",
+                "error_class": type(exc).__name__,
+                "error_msg": ((str(exc).splitlines() or [""])[0] or "?")[:200],
+            }
+            self._stamp_ingress(fields)
+            async with self._sessionmaker() as session:
+                cam = await session.get(Camera, self.camera_id)
+                state = (
+                    cam.state
+                    if cam is not None and cam.state in ("open", "closed")
+                    else "open"
+                )
+                await add_analysis(
+                    session,
+                    camera_id=self.camera_id,
+                    provider="skipped",
+                    description=(
+                        f"(tick FAILED: {type(exc).__name__} — see logs)"
+                    ),
+                    detector_fields=fields,
+                    people_present=False,
+                    people_count=0,
+                    motion_in_clip=False,
+                    state_after=state,
+                    captured_at=datetime.now(timezone.utc),
+                )
+                await session.commit()
+        except Exception:  # noqa: BLE001 — never fail the failure writer
+            log.debug(
+                "%s failed-row write failed", self._log_tag, exc_info=True,
+            )
 
     async def _resolve_caregiver_tz(self, session, patient: "Patient") -> ZoneInfo:
         """Caregiver's IANA timezone for when_scope windows, cached for
@@ -1052,7 +1098,10 @@ class CameraIngest:
                         "%s scheduler tick failed (choice=%s)",
                         self._log_tag, vlm_choice,
                     )
-                    return
+                    # Re-raise: _run_tick_safely writes the visible
+                    # `tick_failed` row (2026-07-17 — silent returns
+                    # here made dying ticks invisible on the dashboard).
+                    raise
                 used_provider = sched.provider
                 result = ProviderResult(
                     description=sched.description,
@@ -1083,7 +1132,8 @@ class CameraIngest:
                         "%s all VLM providers failed (choice=%s)",
                         self._log_tag, vlm_choice,
                     )
-                    return
+                    # Re-raise for the same visibility row as the v2 path.
+                    raise
 
             # Deterministic guard on the model's speech fields: if the
             # actual PCM has no voiced speech (VAD), or the transcript is a
