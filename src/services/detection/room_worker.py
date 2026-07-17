@@ -913,15 +913,28 @@ class RoomWorker:
         def _push_video(event: rtc.VideoEvent) -> None:
             nonlocal online_signaled
             frame = event.frame
+            # Timed: convert+copy runs at native res for EVERY delivered
+            # frame on the event loop — the ingress meter reports its
+            # worst case per window so loop starvation is measurable,
+            # not guessed (soak #1 finding 3).
+            t0 = time.perf_counter()
             if frame.type != rtc.VideoBufferType.I420:
                 frame = frame.convert(rtc.VideoBufferType.I420)
-            now_mono = time.monotonic()
             frame_bytes = bytes(frame.data)
-            ingest.frame_buffer.push(
+            convert_ms = (time.perf_counter() - t0) * 1000.0
+            now_mono = time.monotonic()
+            accepted = ingest.frame_buffer.push(
                 width=frame.width,
                 height=frame.height,
                 data=frame_bytes,
                 captured_at=now_mono,
+            )
+            ingest.ingress_meter.record(
+                now_mono,
+                accepted=accepted,
+                convert_ms=convert_ms,
+                width=frame.width,
+                height=frame.height,
             )
             # Fork the full-rate frame to the data-collection recorder
             # (sync, non-blocking; an O(1) no-op unless this camera has an

@@ -125,6 +125,11 @@ async def data() -> JSONResponse:
                 for c2 in calls
             ],
             "gaf": f.get("rapid_gate_active_fraction"),
+            # SDK video-delivery health (ingress meter): received fps →
+            # kept fps, worst inter-frame gap. Present on skip rows too.
+            "rfps": f.get("ingress_recv_fps"),
+            "kfps": f.get("ingress_kept_fps"),
+            "gap": f.get("ingress_max_gap_ms"),
             "fired": fired,
         }
         if c["last"] is None:
@@ -287,13 +292,15 @@ _PAGE = """<!doctype html><html><head><meta charset="utf-8">
 const $=id=>document.getElementById(id);
 function esc(s){return String(s??"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]))}
 function tickLine(t){
-  if(t.skip) return `skipped · ${esc(t.skip)}`;
+  const fps=t.rfps!=null?` fps=${t.rfps}→${t.kfps??"?"} gap=${t.gap??"?"}ms`:"";
+  if(t.skip) return `skipped · ${esc(t.skip)}${fps}`;
   let b=`motion=${esc(t.motion??"—")} ppl=${t.ppl?"Y":"n"}(${esc(t.psrc??"—")}) trk=${t.tracks}`;
   if(t.amount!=null) b+=` amt=${t.amount}`;
   if(t.env!=null) b+=` env=${t.env}`;
   if(t.calls.length) b+=` calls=[${t.calls.map(c=>
     esc(c.k)+"·"+c.n+"det"+(c.g?" ⛔"+esc(c.g):"")).join(" | ")}]`;
   if(t.gaf!=null) b+=` rapid_gateAF=${t.gaf}`;
+  b+=fps;
   if(t.fired.length) b+=` ⚑ ${t.fired.map(esc).join(", ")}`;
   return b;
 }

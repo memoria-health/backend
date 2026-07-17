@@ -44,6 +44,7 @@ from src.services.detection.audio_buffer import AudioBuffer
 from src.services.detection.event_promotion import maybe_promote_analysis
 from src.services.detection.frame_buffer import FrameBuffer
 from src.services.detection.id_evidence import dump_id_evidence
+from src.services.detection.ingress_meter import IngressMeter
 from src.services.detection.motion import (
     BlockMotion,
     BlockMotionTracker,
@@ -181,6 +182,11 @@ class CameraIngest:
             window_seconds=retention_seconds,
             target_fps=settings.livekit_worker_target_fps,
         )
+        # Fed by RoomWorker._consume_video for every SDK-delivered frame
+        # (accepted or not); each tick stamps its snapshot on the row so
+        # delivered-vs-published fps is auditable per tick (soak #1
+        # finding 3: 4–6 fps delivered against a CFR-15 publish).
+        self.ingress_meter = IngressMeter()
         self.audio_buffer = AudioBuffer(
             window_seconds=retention_seconds,
         )
@@ -217,6 +223,28 @@ class CameraIngest:
         REST-presence signal to decide the column.
         """
         self._last_frame_at = monotonic_ts
+
+    def _stamp_ingress(self, fields: dict) -> None:
+        """Stash the video-ingress snapshot on whatever row this tick
+        writes. Starvation — the SDK delivering below even the buffer's
+        own target rate — additionally logs at INFO so `railway logs`
+        shows it without DB access. No-op while the meter is cold
+        (paths that bypass the video consumer, e.g. tests pushing
+        straight into FrameBuffer, must not stamp lying zeros)."""
+        snap = self.ingress_meter.snapshot(time.monotonic())
+        if snap is None:
+            return
+        fields.update(snap)
+        recv = float(snap["ingress_recv_fps"])  # type: ignore[arg-type]
+        target = self.frame_buffer.target_fps
+        if recv < target:
+            log.info(
+                "%s video ingress STARVED: recv=%.1ffps target=%dfps "
+                "kept=%s gap_max=%sms convert_max=%sms res=%s",
+                self._log_tag, recv, target,
+                snap["ingress_kept_fps"], snap["ingress_max_gap_ms"],
+                snap["ingress_convert_ms_max"], snap["ingress_res"],
+            )
 
     async def stop(self) -> None:
         # Cancel the loop FIRST so no new ticks get spawned while we wait
@@ -618,6 +646,9 @@ class CameraIngest:
                             # The hint said wake and the authority said
                             # grain — make the veto auditable per row.
                             synthetic_fields["wake_vetoed"] = True
+                    # Closed nights are exactly when delivery health
+                    # must stay visible — stamp ingress on skip rows too.
+                    self._stamp_ingress(synthetic_fields)
                     await add_analysis(
                         session,
                         camera_id=self.camera_id,
@@ -1096,6 +1127,8 @@ class CameraIngest:
                 )
             except Exception:  # noqa: BLE001 — stats must never break a tick
                 log.debug("%s sample_stats failed", self._log_tag, exc_info=True)
+            # SDK-delivery health for this tick (soak #1 finding 3).
+            self._stamp_ingress(result.detector_fields)
 
             # Presence gate (v2 P2: state machine fed by backend presence).
             # UNION semantics — a person is present if the LLM says so OR
