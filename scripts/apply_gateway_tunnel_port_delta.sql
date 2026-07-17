@@ -1,8 +1,8 @@
 -- Gateway reverse-SSH tunnel ports (fleet ops access).
 --
--- Adds gateways.tunnel_port to an EXISTING database (local dev or prod).
--- schema.sql already includes it for fresh creates; this delta is for a DB
--- that predates the column. Idempotent — safe to re-run.
+-- Adds gateways.tunnel_port to an EXISTING database. schema.sql already
+-- includes it for fresh creates (with the DEV port range — see below).
+-- Idempotent — safe to re-run.
 --
 -- Each gateway box holds a reverse-SSH tunnel open to the relay VPS
 -- (memoria-relay, 144.126.211.110) on a UNIQUE port. The roster endpoint
@@ -12,13 +12,30 @@
 -- (re)connects autossh on it. Ops then reach the box via
 --   ssh -J root@relay -p <tunnel_port> potaton00b@localhost
 --
--- The sequence starts at 22002: port 22001 is deliberately reserved for the
--- original OptiPlex (box-01), which runs the legacy HARDCODED-22001 tunnel
--- unit. After applying, pin its row so the numbers agree:
---   update public.gateways set tunnel_port = 22001 where id = '<box-01 row id>';
+-- PORT RANGES — all environments share ONE relay, so each database must
+-- issue from a range no other database uses, or two environments can hand
+-- the same port to different physical boxes (autossh bind fight on the
+-- relay, ops ssh lands on the wrong box):
+--   22001          reserved: box-01 (OptiPlex) legacy HARDCODED tunnel unit
+--   22002 - 41999  PROD  (this delta's default)
+--   42002 -        DEV / local stacks (schema.sql default; for an existing
+--                  dev DB change START below to 42002 before applying)
 --
--- Apply locally:  psql "$NEMARA_DB_URL_without_+asyncpg" -f scripts/apply_gateway_tunnel_port_delta.sql
--- or paste into the Supabase SQL editor / run via the Management API.
+-- ⚠️ PROD APPLY — RUN AS ONE TRANSACTION, PIN INCLUDED. Boxes poll the
+-- roster every ~1s, so if the column commits before box-01's pin, its row is
+-- lazily assigned 22002+ within a second while its legacy unit keeps dialing
+-- 22001 — the DB then lies to ops about the port. Committing the pin
+-- atomically with the column closes that window: no poll can see the column
+-- without the pin already in place. Template (fill in box-01's row id from
+-- `select id, last_seen_at from gateways`):
+--
+--   begin;
+--     \i scripts/apply_gateway_tunnel_port_delta.sql
+--     update public.gateways set tunnel_port = 22001
+--       where id = '<box-01 row id>';
+--   commit;
+--
+-- (Local/dev DBs with no legacy box skip the pin.)
 
 create sequence if not exists public.gateway_tunnel_port_seq start 22002;
 

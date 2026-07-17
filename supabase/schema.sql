@@ -189,10 +189,13 @@ create trigger patients_set_updated_at
 -- internal (accessed by the service role via the gateway roster/
 -- provision endpoints); no RLS — mirrors apply_gateway_delta.sql.
 -- Reverse-SSH tunnel ports: each box gets a UNIQUE port on the relay VPS,
--- assigned lazily by the roster endpoint on the box's first poll. 22001 is
--- deliberately never issued by the sequence — the original OptiPlex (box-01)
--- holds it via a legacy hardcoded tunnel unit; pin its row manually.
-create sequence public.gateway_tunnel_port_seq start 22002;
+-- assigned lazily by the roster endpoint on the box's first poll. All
+-- environments share ONE relay, so each database issues from its own range
+-- (see scripts/apply_gateway_tunnel_port_delta.sql): 22001 is reserved for
+-- box-01's legacy hardcoded unit, PROD issues 22002+, and fresh dev DBs
+-- (this file) start at 42002 so a dev-assigned port can never collide with
+-- a production box on the relay.
+create sequence public.gateway_tunnel_port_seq start 42002;
 
 create table public.gateways (
   id           uuid primary key default gen_random_uuid(),
