@@ -27,8 +27,12 @@ is allowed to spend money because of it:
    of each block's normal wiggle) additionally silences STATIONARY
    PERIODIC sources — a blinking PC LED, a flickering standby light —
    which are locally coherent but always in the same block: they
-   raise their own baseline within seconds and stop counting, while a
-   person entering hits FRESH blocks and always trips. Wake authority:
+   raise their own baseline within seconds and stop counting. A
+   person entering normally lands on FRESH blocks and trips; and even
+   inside a fully-habituated block, motion ≥ BASELINE_MULT ×
+   BASELINE_CAP (80 luma levels — person-scale) is GUARANTEED to trip
+   (the baseline is capped), so habituation quiets blocks but can
+   never blind one. Wake authority:
    camera_ingest's closed-state path calls `block_motion()` when the
    hint says "wake" and stays closed (free) when this says grain.
 
@@ -76,6 +80,15 @@ BLOCK_DELTA_TRIP = 12.0
 BASELINE_MULT = 4.0
 # EMA weight per observation for the per-block baseline.
 BASELINE_ALPHA = 0.08
+# Habituation ceiling (review 2026-07-17): without a cap, a strong
+# periodic source could push a block's baseline high enough that
+# BASELINE_MULT × baseline exceeds any achievable delta — a
+# permanently veto-blind block, the WRONG failure direction for a
+# safety product. Capped so that any block delta ≥ BASELINE_MULT ×
+# BASELINE_CAP (= 80 luma levels, squarely person-scale) ALWAYS trips
+# no matter how habituated the block is. Habituation therefore
+# QUIETS a block, never immunizes it.
+BASELINE_CAP = 20.0
 
 
 @dataclass(frozen=True)
@@ -142,8 +155,12 @@ class BlockMotionTracker:
                 active = max(active, int(trip.sum()))
                 max_d = max(max_d, float(d.max()))
                 # Habituate AFTER judging, so a novel source counts
-                # before it starts raising its own bar.
-                self._baseline += BASELINE_ALPHA * (d - self._baseline)
+                # before it starts raising its own bar; capped so no
+                # block can ever become untrippable (see BASELINE_CAP).
+                self._baseline = np.minimum(
+                    self._baseline + BASELINE_ALPHA * (d - self._baseline),
+                    BASELINE_CAP,
+                )
             prev = g
         return BlockMotion(
             coherent=active > 0,

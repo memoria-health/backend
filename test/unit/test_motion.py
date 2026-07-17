@@ -60,9 +60,18 @@ def test_coherent_blob_trips_even_over_grain() -> None:
     assert out.active_blocks >= 1
 
 
+def _with_led(y: np.ndarray, x0: int = 300) -> np.ndarray:
+    """An LED-scale blinker: ~8x8px inside one 20x20 block (block-mean
+    delta ≈ 22 — over the trip floor, under the habituation cap's
+    guaranteed-trip line)."""
+    y2 = y.reshape(H, W).copy()
+    y2[160:168, x0:x0 + 8] = 200
+    return y2.reshape(-1)
+
+
 def test_stationary_blinker_habituates_out() -> None:
     t = BlockMotionTracker()
-    on = _frame(_with_blob(_grain(0, 2.0), 300))
+    on = _frame(_with_led(_grain(0, 2.0)))
     off = _frame(_grain(1, 2.0))
     # First look: novel blinker counts (wake is correct — we don't know
     # it's a lamp yet).
@@ -72,6 +81,22 @@ def test_stationary_blinker_habituates_out() -> None:
     for _ in range(40):
         t.assess([off, on, off])
     assert t.assess([off, on, off]).coherent is False
+
+
+def test_habituation_cap_never_blinds_a_block() -> None:
+    # Saturate one block's baseline with a strong repeating source,
+    # then hit the SAME block with person-scale motion (delta ≥
+    # BASELINE_MULT × BASELINE_CAP = 80): must ALWAYS trip — the cap
+    # guarantees habituation quiets, never immunizes (review fix
+    # 2026-07-17).
+    t = BlockMotionTracker()
+    on = _frame(_with_led(_grain(0, 2.0)))
+    off = _frame(_grain(1, 2.0))
+    for _ in range(60):
+        t.assess([off, on, off])
+    big = _grain(2, 2.0).reshape(H, W).copy()
+    big[160:180, 300:320] = 250                     # full block, delta ~190
+    assert t.assess([off, _frame(big.reshape(-1))]).coherent is True
 
 
 def test_moving_object_keeps_tripping_after_habituation() -> None:
