@@ -725,6 +725,46 @@ class RoomWorker:
                 continue
             await self._handle_track_subscribed(track, publication, participant)
 
+    def _request_full_dimension(
+        self, publication: rtc.RemoteTrackPublication, camera_id
+    ) -> None:
+        """Ask the SFU for the top simulcast layer (UpdateTrackSettings
+        on the wire — what the JS SDK calls setVideoDimensions).
+
+        The gateway publishes the default simulcast ladder and a
+        default subscriber never states what it consumes, so the SFU's
+        congestion controller picks for us — measured on the soak rig
+        (ingress meter, 2026-07-17): demoted from 1920x1080 to
+        320x180/640x360 with 2-9fps and multi-second stalls within a
+        minute of connecting, on an otherwise idle backend. Declaring
+        full dimensions pins the selection to the top layer.
+
+        The Python wrapper doesn't expose this request yet, so we
+        drive the FFI directly (private SDK surface — revisit when
+        livekit-rtc grows a public setVideoDimensions). Best-effort:
+        on any failure we stay on whatever layer the SFU chose, which
+        is exactly today's behavior."""
+        try:
+            from livekit.rtc._ffi_client import FfiClient
+            from livekit.rtc._proto import ffi_pb2 as proto_ffi
+
+            req = proto_ffi.FfiRequest()
+            dim = req.update_remote_track_publication_dimension
+            dim.track_publication_handle = publication._ffi_handle.handle
+            dim.width = 1920
+            dim.height = 1080
+            FfiClient.instance.request(req)
+            log.info(
+                "room_worker.layer_request camera=%s requested=1920x1080",
+                camera_id,
+            )
+        except Exception:  # noqa: BLE001 — never let a hint break subscribe
+            log.warning(
+                "room_worker.layer_request FAILED camera=%s "
+                "(staying on SFU-chosen layer)",
+                camera_id, exc_info=True,
+            )
+
     async def _handle_track_subscribed(
         self,
         track: rtc.Track,
@@ -766,6 +806,7 @@ class RoomWorker:
             prev = self._video_tasks_by_identity.get(identity)
             if prev is not None and not prev.done():
                 prev.cancel()
+            self._request_full_dimension(publication, ingest.camera_id)
             consumer = asyncio.create_task(
                 self._consume_video(track, ingest),
                 name=f"video-consumer-{identity}",
