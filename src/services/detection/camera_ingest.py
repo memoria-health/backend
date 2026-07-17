@@ -564,15 +564,21 @@ class CameraIngest:
                 # because the timer kept ticking and the SKIP branch
                 # kept writing. Observed 2026-05-28 in Test 2 — Pi
                 # service stopped but online stayed true past 55s.
+                # Ingress health rides even fully-paused rows: frames
+                # keep flowing while AI is off, so a paused rig measures
+                # SDK delivery at zero VLM cost (the reid-off arm of the
+                # soak-finding-3 bisect comes free).
+                paused_fields = {
+                    "people_present": False,
+                    "skipped_reason": reason,
+                }
+                self._stamp_ingress(paused_fields)
                 await add_analysis(
                     session,
                     camera_id=self.camera_id,
                     provider="skipped",
                     description=description,
-                    detector_fields={
-                        "people_present": False,
-                        "skipped_reason": reason,
-                    },
+                    detector_fields=paused_fields,
                     people_present=False,
                     people_count=0,
                     motion_in_clip=False,
