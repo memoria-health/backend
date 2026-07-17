@@ -44,6 +44,11 @@ from src.services.detection.audio_buffer import AudioBuffer
 from src.services.detection.event_promotion import maybe_promote_analysis
 from src.services.detection.frame_buffer import FrameBuffer
 from src.services.detection.id_evidence import dump_id_evidence
+from src.services.detection.motion import (
+    BlockMotion,
+    BlockMotionTracker,
+    sample_stats,
+)
 from src.services.detection.motion_cache import MotionCache
 from src.services.detection.motion_overlay import overlay_motion
 from src.services.detection.mp4_remux import Mp4RemuxError, frames_to_mp4
@@ -136,6 +141,10 @@ class CameraIngest:
         self._motion_cache = motion_cache
         self._settings = settings
         self._reid = reid
+        # Backend wake authority (motion.py #3): verifies the gateway's
+        # motion hint before a closed camera buys a VLM call. Owns the
+        # per-block habituation baselines for this camera.
+        self._block_motion = BlockMotionTracker()
         # Data-collection recorder (owned by the RoomWorker, shared
         # across the room's cameras). None when the feature is off /
         # not wired — then every recorder hook is a no-op.
@@ -342,6 +351,25 @@ class CameraIngest:
         self._caregiver_tz = tz
         return tz
 
+    async def _verify_wake(self) -> "BlockMotion | None":
+        """Backend wake authority (motion.py #3): assess the last ~3s
+        of buffered frames off the event loop. Returns None when
+        verification could not run (too few frames, or any error) —
+        the caller then honors a SAD hint if one exists (fail open on
+        the hint path; the hint-less closed path stays closed, exactly
+        like the pre-consolidation backend wake on a still frame)."""
+        try:
+            recent = self.frame_buffer.snapshot_last_seconds(3.0)
+            if len(recent) < 3:
+                return None
+            return await asyncio.to_thread(self._block_motion.assess, recent)
+        except Exception:  # noqa: BLE001
+            log.debug(
+                "%s wake verification failed open",
+                self._log_tag, exc_info=True,
+            )
+            return None
+
     async def _run_tick(self) -> None:
         """Run one tick, then drive the data-collection recorder.
 
@@ -533,51 +561,43 @@ class CameraIngest:
                 )
                 return
 
-            if cam.state == "closed" and not sad_motion:
-                # No SAD hint — but SAD is only a hint now (and gateway
-                # cameras never send one). Backend-owned wake: one cheap
-                # whole-frame diff pass over the window; pixels moving
-                # above the floor run the full tick exactly as a SAD
-                # packet would have. Below it, keep skipping.
-                wake_window = self.frame_buffer.snapshot_last_seconds(
-                    self._settings.livekit_worker_window_seconds,
-                    now=tick_mono,
-                    at_fps=self._settings.livekit_worker_target_fps,
-                )
-                # Off the event loop like every other CPU stage — the
-                # window is anchored to tick_mono, so the await can't
-                # shift what it contains.
-                try:
-                    wake_sig = await asyncio.to_thread(
-                        compute_tick_signals,
-                        wake_window,
-                        tracks=None,  # no person mask → env = whole frame
-                        attribution_ran=False,
-                        sample_width=self._settings.reid_inference_sample_width,
-                    )
-                except Exception:  # noqa: BLE001 — always-on path armor
-                    log.exception(
-                        "%s wake tick_signals crashed — treating as still",
-                        self._log_tag,
-                    )
-                    wake_sig = TickSignals(
-                        person_present=None, people_count=None,
-                        patient_present=None, track_motion=(),
-                        env_motion=0.0, face_valid=None, frames_used=0,
-                    )
-                if (
-                    wake_sig.env_motion
-                    >= self._settings.signals_motion_min_active_fraction
-                ):
+            if cam.state == "closed":
+                # Closed-state wake — ONE authority for hint and
+                # no-hint alike (motion consolidation 2026-07-17):
+                # block motion (motion.py #3). The SAD packet and the
+                # old whole-frame env fraction are demoted to hints/
+                # telemetry — the global fraction is exactly the metric
+                # IR night grain defeats (Nagpur 2026-07-16: the hint
+                # tripped on 97.4% of night ticks ≈ $31/day of Gemini
+                # calls on a verified-empty office), while block motion
+                # crushes grain ~60× inside each block and habituates
+                # stationary blinkers without ever blinding a block
+                # (BASELINE_CAP).
+                wake_check = await self._verify_wake()
+                if wake_check is not None:
+                    woke = wake_check.coherent
+                else:
+                    # Verifier unavailable (cold buffer / bug). Honor a
+                    # SAD hint — fail OPEN on the hint path, never lose
+                    # a real wake; with no hint, stay closed exactly as
+                    # the pre-consolidation no-hint path did.
+                    woke = bool(sad_motion)
+                if woke:
                     log.info(
-                        "%s closed-state WAKE on backend motion %.4f",
-                        self._log_tag, wake_sig.env_motion,
+                        "%s closed-state WAKE (sad=%s block_max=%.1f blocks=%d)",
+                        self._log_tag, bool(sad_motion),
+                        wake_check.max_block_delta if wake_check else -1.0,
+                        wake_check.active_blocks if wake_check else -1,
                     )
-                    # Stash the wake on whatever row this tick ends up
-                    # writing — otherwise a woken tick whose regional
-                    # floors then read low lands as motion_src="none"
-                    # with the wake visible only in logs.
-                    backend_wake_env = wake_sig.env_motion
+                    # Stash the wake on whatever row this tick writes —
+                    # otherwise a woken tick whose regional floors then
+                    # read low lands as motion_src="none" with the wake
+                    # visible only in logs. Unit note: since the block-
+                    # motion consolidation this carries the max BLOCK
+                    # DELTA (luma levels), not the old env fraction.
+                    backend_wake_env = (
+                        wake_check.max_block_delta if wake_check else 0.0
+                    )
                 else:
                     state_after = await apply_tick_update(
                         session,
@@ -589,8 +609,15 @@ class CameraIngest:
                         "people_present": False,
                         "skipped_reason": "camera_closed",
                         "motion_src": "none",
-                        **wake_sig.stash_fields(),
                     }
+                    if wake_check is not None:
+                        synthetic_fields["wake_block_max"] = (
+                            wake_check.max_block_delta
+                        )
+                        if sad_motion:
+                            # The hint said wake and the authority said
+                            # grain — make the veto auditable per row.
+                            synthetic_fields["wake_vetoed"] = True
                     await add_analysis(
                         session,
                         camera_id=self.camera_id,
@@ -605,9 +632,10 @@ class CameraIngest:
                     )
                     await session.commit()
                     log.info(
-                        "%s SKIP closed-state, no motion (sad=none backend=%.4f) "
+                        "%s SKIP closed-state, no motion (sad=%s block_max=%s) "
                         "— counter=%s/%s",
-                        self._log_tag, wake_sig.env_motion,
+                        self._log_tag, bool(sad_motion),
+                        f"{wake_check.max_block_delta:.1f}" if wake_check else "n/a",
                         state_after.no_people_count, state_after.close_threshold,
                     )
                     return
@@ -1058,6 +1086,16 @@ class CameraIngest:
             if result.usage:
                 result.detector_fields["vlm_input_tokens"] = result.usage.get("input", 0)
                 result.detector_fields["vlm_output_tokens"] = result.usage.get("output", 0)
+
+            # Gateway-threshold tuning stats (see motion.py #1/#4):
+            # observation only, queryable per row. Supersedes the
+            # 2026-07-16 hotfix's inline copy.
+            try:
+                result.detector_fields.update(
+                    await asyncio.to_thread(sample_stats, window)
+                )
+            except Exception:  # noqa: BLE001 — stats must never break a tick
+                log.debug("%s sample_stats failed", self._log_tag, exc_info=True)
 
             # Presence gate (v2 P2: state machine fed by backend presence).
             # UNION semantics — a person is present if the LLM says so OR
