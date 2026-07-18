@@ -197,7 +197,7 @@ def classify_custom_dims(
         and not _STILL_ACTIVITY.search(hay)
         and not _EXIT_VERBS.search(hay)
     ):
-        branch, subject, bucket = "environment", "environment", "snapshot"
+        branch, subject, bucket = "environment", "environment", "scene"
     elif _STILL_ACTIVITY.search(hay):
         branch, subject, bucket = "person_still", "patient", "person"
     else:

@@ -16,10 +16,10 @@ ships the builders the CURRENT catalog needs when the flag turns on:
                         face_px_max), and nothing in the default 24
                         lands in the FACE bucket. Do not build ahead
                         of the data it needs.
-  snapshot / zone     → DEFERRED to P6 with per-camera zone configs
-                        (the packer routes snapshot members to the
-                        wide call until then — full-frame stills
-                        measurably fail).
+  snapshot / zone     → RETIRED (2026-07-18). Stills are dead per the
+                        experiment record (full-frame stills fail
+                        object checks; action-over-time + crops win).
+                        Environment checks ride the scene call.
   overlay (RAPID)     → tint_window() + build_overlay_crop_mp4():
                         the validated P0 recipe (tint the FULL native
                         frames first, then static per-person crop,

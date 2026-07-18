@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     from src.db.detector import Detector
 
 # Buckets whose artifact is a crop targeted at a specific track. SCENE
-# and SNAPSHOT are scene-level (full frame / zone), never per-track.
+# is scene-level (full frame), never per-track.
 CROP_BUCKETS = frozenset({"person", "fine_motion", "rapid", "face"})
 
 
@@ -37,9 +37,14 @@ CROP_BUCKETS = frozenset({"person", "fine_motion", "rapid", "face"})
 class EffectiveDims:
     """The dimension values the scheduler actually acts on."""
 
-    evidence_branch: str    # environment | person_motion | person_still
+    # Collapse of the old evidence_branch enum (2026-07-18, Aryaman):
+    # 'environment' was always derivable from subject_scope; the only
+    # real information was person_motion vs person_still — which is
+    # this boolean (does the per-track motion floor apply, or is a
+    # still person the whole point). Same semantics, one axis fewer.
+    requires_motion: bool
     subject_scope: str      # patient | anyone | environment
-    bucket: str             # scene | person | fine_motion | rapid | face | snapshot
+    bucket: str             # scene | person | fine_motion | rapid | face
     duty_cycle: str         # every_eligible_tick | sampled | scheduled_only
     needs_audio: bool
     severity: int
@@ -53,13 +58,21 @@ class EffectiveDims:
 
 
 _LEGACY_DEFAULT = dict(
-    evidence_branch="person_motion",
+    requires_motion=True,
     subject_scope="anyone",
     bucket="scene",
     duty_cycle="every_eligible_tick",
     needs_audio=False,
     severity=50,
 )
+
+
+def _normalize_bucket(bucket: str) -> str:
+    """snapshot bucket retired (2026-07-18): it always rode the scene
+    call anyway (full-frame stills failed object checks — packer note);
+    rows/catalogs that still say 'snapshot' resolve to 'scene' so
+    pre-delta databases keep working."""
+    return "scene" if bucket == "snapshot" else bucket
 
 
 def resolve_dims(row: "Detector") -> EffectiveDims:
@@ -77,9 +90,11 @@ def resolve_dims(row: "Detector") -> EffectiveDims:
         else:
             severity = _LEGACY_DEFAULT["severity"]
         return EffectiveDims(
-            evidence_branch=row.evidence_branch,
+            # The DB column keeps the old enum; only person_motion
+            # means "apply the motion floor".
+            requires_motion=(row.evidence_branch == "person_motion"),
             subject_scope=row.subject_scope,
-            bucket=row.bucket,
+            bucket=_normalize_bucket(row.bucket),
             duty_cycle=row.duty_cycle,
             needs_audio=bool(row.needs_audio),
             severity=severity,
@@ -89,9 +104,9 @@ def resolve_dims(row: "Detector") -> EffectiveDims:
         )
     if catalog_dims is not None:
         return EffectiveDims(
-            evidence_branch=catalog_dims.evidence_branch,
+            requires_motion=(catalog_dims.evidence_branch == "person_motion"),
             subject_scope=catalog_dims.subject_scope,
-            bucket=catalog_dims.bucket,
+            bucket=_normalize_bucket(catalog_dims.bucket),
             duty_cycle=catalog_dims.duty_cycle,
             needs_audio=catalog_dims.needs_audio,
             # Row severity wins even on the catalog branch — same

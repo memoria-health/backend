@@ -77,7 +77,6 @@ _RECIPES: dict[str, tuple[str, int, str, str, str]] = {
     "fine_motion": ("video", 8, "clean",   "flash", "person"),
     "rapid":       ("video", 8, "overlay", "flash", "person"),
     "face":        ("video", 8, "clean",   "flash", "face"),
-    "snapshot":    ("frame", 1, "clean",   "lite",  "zone"),
 }
 
 _SCENE_KEY = ("video", 4, "clean", "lite", "full", None, False)
@@ -91,14 +90,12 @@ def _group_key(
     apart from always-on ones even under an identical recipe."""
     bucket = d.dims.bucket
     win = d.windowed
-    # SNAPSHOT rides the wide call until per-camera zone configs exist
-    # (P6): the still recipe was validated with ZONE CROPS; a full-
-    # frame still measurably FAILS object checks (phone-vs-remote 100%
-    # FP, plate 0/10 — spec §1.4), so packing one would be strictly
-    # worse than today. When zones land, this becomes a zone-crop
-    # frame call.
-    if bucket == "snapshot":
-        return _SCENE_KEY[:6] + (win,)
+    # (snapshot bucket retired 2026-07-18: it always rode the wide call
+    # anyway — full-frame stills measurably failed object checks
+    # (phone-vs-remote 100% FP, plate 0/10, spec §1.4) and stills stay
+    # dead per the experiment record. resolve_dims normalizes legacy
+    # 'snapshot' rows to 'scene'; the unknown-bucket fallback below
+    # covers any straggler.)
     if bucket not in _RECIPES:
         # unknown bucket: never brick a tick — go wide
         return _SCENE_KEY[:6] + (win,)

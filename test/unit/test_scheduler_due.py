@@ -45,13 +45,17 @@ def _entry(
     shape: str = "point_in_time",
     when_scope: str | None = None,
 ) -> ScheduledDetector:
+    # `branch` kept as the fixture vocabulary (tests read naturally);
+    # EffectiveDims carries its collapsed form: person_motion ⇒
+    # requires_motion=True, environment/person_still ⇒ False.
     return ScheduledDetector(
         spec=DetectorSpec(
             identifier=ident, name=ident, prompt_fragment="frag",
             schema_fields={},
         ),
         dims=EffectiveDims(
-            evidence_branch=branch, subject_scope=subject, bucket=bucket,
+            requires_motion=(branch == "person_motion"),
+            subject_scope=subject, bucket=bucket,
             duty_cycle=duty, needs_audio=False, severity=50, shape=shape,
             dims_source="row",
         ),

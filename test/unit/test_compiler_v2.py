@@ -77,10 +77,10 @@ def _dims(name, text, shape="point_in_time", category="safety"):
     )
 
 
-def test_environment_subject_classifies_env_snapshot() -> None:
+def test_environment_subject_classifies_env_scene() -> None:
     d = _dims("Stove check", "tell me if the stove is left on")
     assert (d["evidence_branch"], d["subject_scope"], d["bucket"]) == (
-        "environment", "environment", "snapshot",
+        "environment", "environment", "scene",
     )
 
 

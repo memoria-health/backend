@@ -35,7 +35,7 @@ def _due(
             schema_fields={f"{ident}_detected": {"type": "boolean"}},
         ),
         dims=EffectiveDims(
-            evidence_branch="person_motion", subject_scope="anyone",
+            requires_motion=True, subject_scope="anyone",
             bucket=bucket, duty_cycle="every_eligible_tick",
             needs_audio=needs_audio, severity=severity,
             shape="point_in_time", dims_source="row",

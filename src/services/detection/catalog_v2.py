@@ -21,7 +21,7 @@ from src.services.detection import catalog
 
 EVIDENCE_BRANCHES = ("environment", "person_motion", "person_still")
 SUBJECT_SCOPES = ("patient", "anyone", "environment")
-BUCKETS = ("scene", "person", "fine_motion", "rapid", "face", "snapshot")
+BUCKETS = ("scene", "person", "fine_motion", "rapid", "face")
 EVIDENCE_UNITS = ("verdict", "instance", "sample")
 DUTY_CYCLES = ("every_eligible_tick", "sampled", "scheduled_only")
 DEGRADATION_WARNINGS = ("none", "distance_class")
@@ -75,7 +75,7 @@ DIMS: dict[str, DetectorDims] = {
                                      needs_audio=True),
     "choking":          DetectorDims(_MOTION, "patient", "person", 100),
     "meal_eaten":       DetectorDims(_MOTION, "patient", "person", 22),
-    "stove_left_on":    DetectorDims(_ENV, "environment", "snapshot", 74,
+    "stove_left_on":    DetectorDims(_ENV, "environment", "scene", 74,
                                      evidence_unit="sample",
                                      duty_cycle="sampled",
                                      degradation_warning="distance_class"),
@@ -84,10 +84,10 @@ DIMS: dict[str, DetectorDims] = {
     # Intruder = visible concealment (mask), never "unenrolled person" —
     # only the patient is enrolled, so identity can't be the trigger.
     "possible_intruder": DetectorDims(_MOTION, "anyone", "scene", 78),
-    "env_hazard_glass":  DetectorDims(_ENV, "environment", "snapshot", 62,
+    "env_hazard_glass":  DetectorDims(_ENV, "environment", "scene", 62,
                                       duty_cycle="sampled",
                                       degradation_warning="distance_class"),
-    "env_hazard_water":  DetectorDims(_ENV, "environment", "snapshot", 56,
+    "env_hazard_water":  DetectorDims(_ENV, "environment", "scene", 56,
                                       duty_cycle="sampled",
                                       degradation_warning="distance_class"),
     "fire_smoke":        DetectorDims(_ENV, "environment", "scene", 98),

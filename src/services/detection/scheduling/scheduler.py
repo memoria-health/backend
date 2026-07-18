@@ -166,11 +166,12 @@ def resolve_due(
             skipped.append((ident, "verified_not_patient"))
             continue
 
-        # ── ENVIRONMENT branch: no person needed, gated only by env
+        # ── ENVIRONMENT scope: no person needed, gated only by env
         # change (parity floor 0.0 never skips; unmeasurable windows
         # fail open). With no tracks, env_motion is whole-frame —
-        # still the right reading for this branch.
-        if d.evidence_branch == "environment":
+        # still the right reading here. (evidence_branch collapse
+        # 2026-07-18: 'environment' was always ≡ subject_scope.)
+        if d.subject_scope == "environment":
             if measurement_ok and signals.env_motion < settings.scheduler_env_motion_floor:
                 skipped.append((ident, "env_floor"))
                 continue
@@ -188,12 +189,12 @@ def resolve_due(
             skipped.append((ident, "no_person"))
             continue
 
-        # Qualifying tracks. person_motion applies the per-track
-        # motion floor; person_still is presence-only (a still person
-        # is the whole point of that branch).
+        # Qualifying tracks. requires_motion applies the per-track
+        # motion floor; still-condition detectors are presence-only (a
+        # still person is the whole point of those).
         qualifying: list[int] | None = None
         if tracks:
-            if d.evidence_branch == "person_motion" and measurement_ok:
+            if d.requires_motion and measurement_ok:
                 floor = settings.scheduler_person_motion_floor
                 qualifying = [
                     t.track_id for t in tracks

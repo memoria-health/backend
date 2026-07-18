@@ -28,7 +28,7 @@ def test_load_bearing_dims_pinned() -> None:
     assert d["seizure"].bucket == "rapid"                       # the P0 recipe
     assert d["seizure"].evidence_branch == "person_motion"
     assert d["stove_left_on"].evidence_branch == "environment"  # no person needed
-    assert d["stove_left_on"].bucket == "snapshot"
+    assert d["stove_left_on"].bucket == "scene"  # snapshot retired 2026-07-18
     assert d["agitation"].needs_audio is True                   # tone matters
     assert d["possible_intruder"].subject_scope == "anyone"     # concealment, not identity
     assert d["fall"].subject_scope == "patient"                 # Aryaman: patient-scoped
