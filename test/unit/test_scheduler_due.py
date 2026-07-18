@@ -118,7 +118,7 @@ def test_parity_defaults_everything_due_even_with_reid_down() -> None:
     entries = [
         _entry("fall"),
         _entry("stove_left_on", branch="environment", subject="environment",
-               bucket="snapshot", duty="sampled"),
+               bucket="snapshot", duty="thinned"),
         _entry("medication", bucket="person"),
     ]
     ds = resolve_due(
@@ -163,7 +163,7 @@ def test_scheduled_shape_stays_due_only_scheduled_only_duty_skips() -> None:
 
 
 def test_sampled_duty_runs_every_kth_tick() -> None:
-    e = [_entry("agitation", duty="sampled")]
+    e = [_entry("agitation", duty="thinned")]
     s = _settings(scheduler_sample_every_k=3)
     results = [
         bool(resolve_due(e, signals=_signals(), identity=_identity(None),

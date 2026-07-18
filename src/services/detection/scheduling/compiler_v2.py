@@ -207,7 +207,7 @@ def classify_custom_dims(
         subject = "anyone"
 
     duty = (
-        "sampled"
+        "thinned"
         if shape == "state" and category == "routine"
         else "every_eligible_tick"
     )

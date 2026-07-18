@@ -30,7 +30,7 @@ def _row(**over) -> SimpleNamespace:
 def test_row_columns_win_over_catalog() -> None:
     row = _row(
         evidence_branch="environment", subject_scope="environment",
-        bucket="snapshot", duty_cycle="sampled", needs_audio=True,
+        bucket="snapshot", duty_cycle="thinned", needs_audio=True,
         severity=33,
     )
     d = resolve_dims(row)
@@ -55,7 +55,7 @@ def test_classified_row_with_null_severity_falls_back_to_catalog() -> None:
 def test_person_still_row_does_not_require_motion() -> None:
     row = _row(
         evidence_branch="person_still", subject_scope="patient",
-        bucket="person", duty_cycle="sampled",
+        bucket="person", duty_cycle="thinned",
     )
     d = resolve_dims(row)
     assert d.requires_motion is False

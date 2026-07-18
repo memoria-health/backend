@@ -148,8 +148,8 @@ def resolve_due(
                 skipped.append((ident, "outside_when_scope"))
                 continue
 
-        if d.duty_cycle == "sampled" and tick_index % settings.scheduler_sample_every_k:
-            skipped.append((ident, "sampled_off_tick"))
+        if d.duty_cycle == "thinned" and tick_index % settings.scheduler_sample_every_k:
+            skipped.append((ident, "thinned_off_tick"))
             continue
 
         # Verified-absence suppression is a SUBJECT rule, so it is

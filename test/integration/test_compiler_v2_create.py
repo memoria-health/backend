@@ -111,6 +111,6 @@ async def test_background_compile_writes_v2_dims(
     assert row.evidence_branch == "person_still"
     assert row.subject_scope == "patient"
     assert row.bucket == "person"
-    assert row.duty_cycle == "sampled"
+    assert row.duty_cycle == "thinned"
     assert row.eventing == {"entry": {"m": 5, "t_seconds": 900}}
     assert row.degradation_warning == "none"

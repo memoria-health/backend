@@ -89,7 +89,7 @@ def test_still_activity_classifies_person_still() -> None:
     assert (d["evidence_branch"], d["subject_scope"], d["bucket"]) == (
         "person_still", "patient", "person",
     )
-    assert d["duty_cycle"] == "sampled"      # routine state
+    assert d["duty_cycle"] == "thinned"      # routine state
 
 
 def test_default_is_todays_behavior() -> None:

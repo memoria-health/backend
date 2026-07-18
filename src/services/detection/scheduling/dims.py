@@ -45,7 +45,7 @@ class EffectiveDims:
     requires_motion: bool
     subject_scope: str      # patient | anyone | environment
     bucket: str             # scene | person | fine_motion | rapid | face
-    duty_cycle: str         # every_eligible_tick | sampled | scheduled_only
+    duty_cycle: str         # every_eligible_tick | thinned | scheduled_only
     needs_audio: bool
     severity: int
     shape: str              # detector row shape (state/point_in_time/scheduled)
@@ -55,6 +55,14 @@ class EffectiveDims:
     # 0/0 = no confirmation (every row today — parity).
     confirm_k: int = 0
     confirm_n: int = 0
+    # How this detector FIRES (2026-07-18 unification) — the one
+    # readable answer to "when does an event happen":
+    #   instant     first qualifying occurrence (point/state downstream)
+    #   accumulate  entry_m qualifying ticks within entry_t_seconds
+    #   window      scheduled shape — hit/miss against its window
+    fire_rule: str = "instant"
+    entry_m: int = 1
+    entry_t_seconds: int = 0
 
 
 _LEGACY_DEFAULT = dict(
@@ -75,12 +83,29 @@ def _normalize_bucket(bucket: str) -> str:
     return "scene" if bucket == "snapshot" else bucket
 
 
+def _normalize_duty(duty: str) -> str:
+    """'sampled' renamed to 'thinned' (2026-07-18) — the old name
+    collided with accumulate-style firing. Pre-delta rows keep working."""
+    return "thinned" if duty == "sampled" else duty
+
+
+def _fire_rule(shape: str | None, entry_m: int) -> str:
+    """The unified firing semantics (see EffectiveDims.fire_rule)."""
+    if shape == "scheduled":
+        return "window"
+    return "accumulate" if entry_m > 1 else "instant"
+
+
 def resolve_dims(row: "Detector") -> EffectiveDims:
     """Resolve the effective dimensions for one detector row."""
     from src.services.detection.scheduling.decision import parse_eventing
 
     ev = parse_eventing(getattr(row, "eventing", None))
-    confirm = dict(confirm_k=ev.confirm_k, confirm_n=ev.confirm_n)
+    confirm = dict(
+        confirm_k=ev.confirm_k, confirm_n=ev.confirm_n,
+        fire_rule=_fire_rule(row.shape, ev.entry_m),
+        entry_m=ev.entry_m, entry_t_seconds=ev.entry_t_seconds,
+    )
     catalog_dims = catalog_v2.dims_for(row.identifier or "")
     if row.evidence_branch and row.subject_scope and row.bucket and row.duty_cycle:
         if row.severity is not None:
@@ -95,7 +120,7 @@ def resolve_dims(row: "Detector") -> EffectiveDims:
             requires_motion=(row.evidence_branch == "person_motion"),
             subject_scope=row.subject_scope,
             bucket=_normalize_bucket(row.bucket),
-            duty_cycle=row.duty_cycle,
+            duty_cycle=_normalize_duty(row.duty_cycle),
             needs_audio=bool(row.needs_audio),
             severity=severity,
             shape=row.shape,
@@ -107,7 +132,7 @@ def resolve_dims(row: "Detector") -> EffectiveDims:
             requires_motion=(catalog_dims.evidence_branch == "person_motion"),
             subject_scope=catalog_dims.subject_scope,
             bucket=_normalize_bucket(catalog_dims.bucket),
-            duty_cycle=catalog_dims.duty_cycle,
+            duty_cycle=_normalize_duty(catalog_dims.duty_cycle),
             needs_audio=catalog_dims.needs_audio,
             # Row severity wins even on the catalog branch — same
             # precedence event promotion uses (row value preferred,

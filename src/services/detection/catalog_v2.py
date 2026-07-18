@@ -23,7 +23,7 @@ EVIDENCE_BRANCHES = ("environment", "person_motion", "person_still")
 SUBJECT_SCOPES = ("patient", "anyone", "environment")
 BUCKETS = ("scene", "person", "fine_motion", "rapid", "face")
 EVIDENCE_UNITS = ("verdict", "instance", "sample")
-DUTY_CYCLES = ("every_eligible_tick", "sampled", "scheduled_only")
+DUTY_CYCLES = ("every_eligible_tick", "thinned", "scheduled_only")
 DEGRADATION_WARNINGS = ("none", "distance_class")
 
 
@@ -51,7 +51,7 @@ DIMS: dict[str, DetectorDims] = {
     "fall":        DetectorDims(_MOTION, "patient", "scene", 95),
     "agitation":   DetectorDims(_MOTION, "patient", "scene", 60,
                                 needs_audio=True, evidence_unit="sample",
-                                duty_cycle="sampled"),
+                                duty_cycle="thinned"),
     "seizure":     DetectorDims(_MOTION, "patient", "rapid", 96),
     "wandering":   DetectorDims(_MOTION, "patient", "scene", 55),
     "medication":  DetectorDims(_MOTION, "patient", "person", 20),
@@ -69,7 +69,7 @@ DIMS: dict[str, DetectorDims] = {
     "child_wandering":         DetectorDims(_MOTION, "patient", "scene", 55),
     "child_device_usage":      DetectorDims(_STILL, "patient", "person", 25,
                                             evidence_unit="sample",
-                                            duty_cycle="sampled"),
+                                            duty_cycle="thinned"),
     # ── Adult library ───────────────────────────────────────────────
     "calling_for_help": DetectorDims(_MOTION, "patient", "scene", 88,
                                      needs_audio=True),
@@ -77,7 +77,7 @@ DIMS: dict[str, DetectorDims] = {
     "meal_eaten":       DetectorDims(_MOTION, "patient", "person", 22),
     "stove_left_on":    DetectorDims(_ENV, "environment", "scene", 74,
                                      evidence_unit="sample",
-                                     duty_cycle="sampled",
+                                     duty_cycle="thinned",
                                      degradation_warning="distance_class"),
     # ── Both cohorts ────────────────────────────────────────────────
     "emergency":         DetectorDims(_MOTION, "patient", "scene", 80),
@@ -85,10 +85,10 @@ DIMS: dict[str, DetectorDims] = {
     # only the patient is enrolled, so identity can't be the trigger.
     "possible_intruder": DetectorDims(_MOTION, "anyone", "scene", 78),
     "env_hazard_glass":  DetectorDims(_ENV, "environment", "scene", 62,
-                                      duty_cycle="sampled",
+                                      duty_cycle="thinned",
                                       degradation_warning="distance_class"),
     "env_hazard_water":  DetectorDims(_ENV, "environment", "scene", 56,
-                                      duty_cycle="sampled",
+                                      duty_cycle="thinned",
                                       degradation_warning="distance_class"),
     "fire_smoke":        DetectorDims(_ENV, "environment", "scene", 98),
     # ── Internal ────────────────────────────────────────────────────
