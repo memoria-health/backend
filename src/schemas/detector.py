@@ -138,6 +138,21 @@ class InferDetectorRequest(BaseModel):
     prompt: Prompt
 
 
+class DetectorPlan(BaseModel):
+    """What the compiler deduced from the caregiver's words, in plain
+    English — surfaced on the review screen so the detector's actual
+    configured behavior is visible (and correctable) BEFORE it exists
+    (Aryaman 2026-07-18: customs visibility)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    watches: str   # who: "Your patient only" / "Anyone in view" / room
+    media: str     # what pixels: whole-room view vs per-person crop
+    fires: str     # the fire rule as a sentence
+    checks: str    # look cadence as a sentence
+    listens: bool  # audio evidence used
+
+
 class InferDetectorResponse(BaseModel):
     """LLM-inferred fields for the create review screen. Anything the
     model can't confidently determine comes back null/empty so the UI
@@ -153,6 +168,10 @@ class InferDetectorResponse(BaseModel):
     # Set when shape == 'state': the inferred rising-edge episode gap
     # (seconds). The review screen may show/adjust it; null otherwise.
     episode_gap_seconds: int | None = None
+    # Compiled-behavior preview (pure classification, no extra LLM
+    # spend). Null only if composition fails — the review screen then
+    # hides the card rather than blocking creation.
+    plan: DetectorPlan | None = None
 
 
 class UpdateDetectorRequest(BaseModel):

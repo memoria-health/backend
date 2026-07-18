@@ -446,7 +446,63 @@ async def infer_detector(
             ScheduleConfig(**inferred.schedule) if inferred.schedule else None
         ),
         episode_gap_seconds=inferred.episode_gap_seconds,
+        plan=_compose_plan(
+            name=body.name or "", prompt=body.prompt,
+            shape=str(inferred.shape), category=str(inferred.category),
+        ),
     )
+
+
+def _compose_plan(
+    *, name: str, prompt: str, shape: str, category: str,
+):
+    """Plain-English preview of the compiled behavior (customs
+    visibility, Aryaman 2026-07-18). Pure classification — the same
+    `classify_custom_dims` the create-time compiler uses, so the
+    preview can never disagree with what actually gets built. Any
+    failure returns None; the review screen hides the card."""
+    from src.schemas.detector import DetectorPlan
+
+    try:
+        dims = compiler_v2.classify_custom_dims(
+            name=name, user_text=prompt, shape=shape, category=category,
+        )
+        watches = {
+            "patient": "Your patient only",
+            "anyone": "Anyone in view",
+            "environment": "The room itself (no person needed)",
+        }[dims["subject_scope"]]
+        media = (
+            "A close-up of each person"
+            if dims["bucket"] in ("person", "fine_motion", "rapid", "face")
+            else "The whole room view"
+        )
+        entry = (dims.get("eventing") or {}).get("entry") or {}
+        m = int(entry.get("m", 1) or 1)
+        t = int(entry.get("t_seconds", 0) or 0)
+        # Caregiver language only (Aryaman 2026-07-18): no internal
+        # vocabulary — a non-technical reader must understand every
+        # line without explanation.
+        if shape == "scheduled":
+            fires = "Only if it doesn't happen during the scheduled time"
+        elif m > 1 and t > 0:
+            fires = f"After it's noticed {m} times within {max(1, t // 60)} minutes"
+        elif shape == "state":
+            fires = "One alert for the whole activity, not repeats"
+        else:
+            fires = "Right away, the moment it's noticed"
+        checks = (
+            "Every few minutes"
+            if dims["duty_cycle"] == "thinned"
+            else "Continuously"
+        )
+        return DetectorPlan(
+            watches=watches, media=media, fires=fires, checks=checks,
+            listens=bool(dims.get("needs_audio")),
+        )
+    except Exception:  # noqa: BLE001 — preview must never block creation
+        log.debug("detector plan composition failed", exc_info=True)
+        return None
 
 
 @router.post(
