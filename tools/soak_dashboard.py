@@ -327,9 +327,10 @@ _PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <div class="card"><h2>Identity evidence — latest</h2>
   <div class="frames" id="frames"><span class="mut">no frames yet</span></div></div>
 <div class="card"><h2>Events</h2><div id="events" class="mono mut">none yet</div></div>
-<div class="card"><h2>Calls per hour — live</h2>
-<p class="mut" style="font-size:11.5px;margin:0 0 8px">Bars = VLM calls actually SENT that hour (gated plans excluded, $0). Under each bar: analyzed ticks · tokens in/out · provider split g=gemini d=dashscope o=openrouter. Refreshes ~1 min.</p>
-<div id="hourly" class="mono mut">no data yet</div></div>
+<div class="card"><h2>API calls per hour</h2>
+<p class="mut" style="font-size:11.5px;margin:0 0 8px">Each bar = model calls sent that hour. The dollar figure is that hour's estimated cost. Hover any bar for tokens and provider breakdown.</p>
+<div id="hourtotals" class="mono" style="margin:0 0 8px"></div>
+<div id="hourly" class="mono mut">no calls yet — waiting for the first analyzed tick</div></div>
 <div class="card"><h2>Tick log — newest first</h2>
 <p class="mut" style="font-size:11.5px;margin:0 0 8px">How to read a line: every detector in the loadout is asked on every analyzed tick, grouped into the calls shown — <span class="mono">key·Ndet</span> = one Gemini call carrying N detectors. Silence = every detector answered no; <span class="mono">⚑ name</span> = that detector answered YES. <span class="mono">⛔closed</span> = that call was pre-gated and never sent ($0) — today only the convulsion bucket has a pre-gate (<span class="mono">rapid_gateAF</span> is its motion evidence), which is why gate chatter looks convulsion-specific. Absence/scheduled detectors don't ride calls; they evaluate from coverage at their deadline. <span class="mono">fps=A→B</span> = LiveKit delivered A fps to the backend (stream health; want ≥8) → buffer kept B for analysis (capped at the 4fps target by design; ~3.4 is normal, NOT a problem); <span class="mono">gap</span> = worst frame silence in the window.</p>
 <div class="logwin" id="log"></div></div>
@@ -403,13 +404,24 @@ async function refresh(){
     $("events").innerHTML=d.events.length? d.events.map(e=>
       `<div>${esc(e.t)}Z &nbsp;<b>${esc(e.d)}</b> &nbsp;${esc(e.title)}</div>`).join(""):"none yet";
     if(d.hourly&&d.hourly.length){
+      const cost=x=>x.tin*0.10/1e6+x.tout*0.40/1e6;
       const mx=Math.max(...d.hourly.map(x=>x.calls),1);
-      $("hourly").innerHTML=`<div style="display:flex;align-items:flex-end;gap:6px;overflow-x:auto;padding:4px 0">`+
-        d.hourly.map(x=>`<div style="text-align:center;min-width:64px">
+      const totCalls=d.hourly.reduce((a,x)=>a+x.calls,0);
+      const totCost=d.hourly.reduce((a,x)=>a+cost(x),0);
+      $("hourtotals").textContent=
+        `Since start: ${totCalls} calls · $${totCost.toFixed(2)} estimated · `+
+        `on pace for $${(totCost/Math.max(1,d.hourly.length)*24).toFixed(2)}/day`;
+      $("hourly").innerHTML=`<div style="display:flex;align-items:flex-end;gap:8px;overflow-x:auto;padding:4px 0">`+
+        d.hourly.map(x=>{
+          const tip=`${esc(x.h)} — ${x.calls} calls from ${x.an} analyzed ticks\n`+
+            `${(x.tin/1000).toFixed(1)}k tokens in, ${(x.tout/1000).toFixed(1)}k out\n`+
+            `Gemini ${x.g} · DashScope ${x.d} · OpenRouter ${x.o}`;
+          return `<div style="text-align:center;min-width:56px" title="${tip}">
           <div class="mono" style="font-size:11px">${x.calls}</div>
           <div style="height:${Math.max(3,Math.round(90*x.calls/mx))}px;background:var(--ok);border-radius:3px 3px 0 0;opacity:.85"></div>
-          <div class="mono mut" style="font-size:10px;margin-top:3px">${esc(x.h.slice(6))}<br>${x.an}t · ${(x.tin/1000).toFixed(0)}k/${(x.tout/1000).toFixed(1)}k<br>g${x.g} d${x.d} o${x.o}</div>
-        </div>`).join("")+`</div>`;
+          <div class="mono" style="font-size:11px;margin-top:3px">${esc(x.h.slice(6))}</div>
+          <div class="mono mut" style="font-size:10.5px">$${cost(x).toFixed(2)}</div>
+        </div>`}).join("")+`</div>`;
     }
     $("log").innerHTML=d.ticks.map(t=>
       `<div class="lr ${t.skip==="tick_failed"?"fail":t.skip?"skip":""} ${t.fired.length?"fired":""}">
