@@ -308,6 +308,19 @@ class CameraIngest:
         try:
             while True:
                 await asyncio.sleep(tick_seconds)
+                # Bounded in-flight (resource contract, 2026-07-18): at
+                # most 2 tick generations per camera may run at once.
+                # Overlap is normal pipelining (slow provider), but an
+                # unbounded pile-up is the OOM/parallel-calls failure
+                # mode — the 3rd generation sheds VISIBLY instead.
+                if len(self._inflight_ticks) >= 2:
+                    log.warning(
+                        "%s tick SHED — %d generations already in flight "
+                        "(provider latency >> cadence)",
+                        self._log_tag, len(self._inflight_ticks),
+                    )
+                    await self._write_backlog_row()
+                    continue
                 task = asyncio.create_task(
                     self._run_tick_safely(),
                     name=f"tick-{self.camera_id}",
@@ -320,6 +333,39 @@ class CameraIngest:
                 task.add_done_callback(self._inflight_ticks.discard)
         except asyncio.CancelledError:
             raise
+
+    async def _write_backlog_row(self) -> None:
+        """Visibility row for a shed tick (dashboard: 'skipped ·
+        tick_backlog'). Same fresh-session, never-raises contract as
+        `_write_failed_row`."""
+        try:
+            fields: dict = {
+                "people_present": False,
+                "skipped_reason": "tick_backlog",
+            }
+            self._stamp_ingress(fields)
+            async with self._sessionmaker() as session:
+                cam = await session.get(Camera, self.camera_id)
+                state = (
+                    cam.state
+                    if cam is not None and cam.state in ("open", "closed")
+                    else "open"
+                )
+                await add_analysis(
+                    session,
+                    camera_id=self.camera_id,
+                    provider="skipped",
+                    description="(tick shed — 2 generations already in flight)",
+                    detector_fields=fields,
+                    people_present=False,
+                    people_count=0,
+                    motion_in_clip=False,
+                    state_after=state,
+                    captured_at=datetime.now(timezone.utc),
+                )
+                await session.commit()
+        except Exception:  # noqa: BLE001
+            log.debug("%s backlog-row write failed", self._log_tag, exc_info=True)
 
     async def _run_tick_safely(self) -> None:
         """Wrap one tick body so that failures NEVER kill the loop.

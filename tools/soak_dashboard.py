@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from src.db.analysis import Analysis
 from src.db.detector import Detector
@@ -42,6 +43,54 @@ app = FastAPI()
 _SINCE: datetime = datetime.now(timezone.utc)
 _FRAMES_DIR = Path("out/id_frames")
 
+# Hourly rollup cache — the lateral jsonb explode over a full soak day
+# is too heavy to run on every 10s poll; 55s staleness is invisible on
+# an hours-scale chart.
+_HOURLY_CACHE: tuple[float, list] | None = None
+
+# Per-hour sent-call + token rollup for the whole soak window. A call
+# counts as SENT when its ledger entry has no 'gate' key (gated plans
+# were never dispatched, $0). Tokens = per-call ledger sums plus the
+# row-level fallback fields legacy rows carry.
+_HOURLY_SQL = text("""
+select to_char(date_trunc('hour', a.created_at), 'MM-DD HH24:00') as h,
+       count(*) filter (where a.provider != 'skipped')  as analyzed,
+       coalesce(sum(c.calls_sent), 0)                    as calls,
+       coalesce(sum(c.led_in), 0)
+         + coalesce(sum((a.detector_fields->>'vlm_input_tokens')::bigint), 0)  as tin,
+       coalesce(sum(c.led_out), 0)
+         + coalesce(sum((a.detector_fields->>'vlm_output_tokens')::bigint), 0) as tout,
+       count(*) filter (where a.provider = 'gemini')     as g,
+       count(*) filter (where a.provider = 'dashscope')  as d,
+       count(*) filter (where a.provider = 'openrouter') as o
+from analyses a
+left join lateral (
+    select count(*) filter (where not (e ? 'gate'))            as calls_sent,
+           sum((e->>'input_tokens')::bigint)                   as led_in,
+           sum((e->>'output_tokens')::bigint)                  as led_out
+    from jsonb_array_elements(
+        coalesce(a.detector_fields->'sched_calls', '[]'::jsonb)) e
+) c on true
+where a.created_at >= :since
+group by 1 order by 1
+""")
+
+
+async def _hourly(s) -> list:
+    global _HOURLY_CACHE
+    now = time.monotonic()
+    if _HOURLY_CACHE is not None and now - _HOURLY_CACHE[0] < 55:
+        return _HOURLY_CACHE[1]
+    rows = (await s.execute(_HOURLY_SQL, {"since": _SINCE})).all()
+    out = [
+        {"h": r.h, "an": r.analyzed, "calls": int(r.calls),
+         "tin": int(r.tin), "tout": int(r.tout),
+         "g": r.g, "d": r.d, "o": r.o}
+        for r in rows
+    ]
+    _HOURLY_CACHE = (now, out)
+    return out
+
 
 @app.get("/data")
 async def data() -> JSONResponse:
@@ -58,6 +107,7 @@ async def data() -> JSONResponse:
             .where(Event.created_at >= _SINCE)
             .order_by(Event.created_at.desc()).limit(30)
         )).all()
+        hourly = await _hourly(s)
 
     cams: dict[str, dict] = {}
     ticks = []
@@ -168,6 +218,7 @@ async def data() -> JSONResponse:
     return JSONResponse({
         "now": datetime.now(timezone.utc).strftime("%H:%M:%S"),
         "since": _SINCE.strftime("%H:%M UTC"),
+        "hourly": hourly,
         "flags": {
             "scheduler": settings.detection_v2_scheduler_enabled,
             "decision": settings.detection_v2_decision_enabled,
@@ -276,6 +327,9 @@ _PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <div class="card"><h2>Identity evidence — latest</h2>
   <div class="frames" id="frames"><span class="mut">no frames yet</span></div></div>
 <div class="card"><h2>Events</h2><div id="events" class="mono mut">none yet</div></div>
+<div class="card"><h2>Calls per hour — live</h2>
+<p class="mut" style="font-size:11.5px;margin:0 0 8px">Bars = VLM calls actually SENT that hour (gated plans excluded, $0). Under each bar: analyzed ticks · tokens in/out · provider split g=gemini d=dashscope o=openrouter. Refreshes ~1 min.</p>
+<div id="hourly" class="mono mut">no data yet</div></div>
 <div class="card"><h2>Tick log — newest first</h2>
 <p class="mut" style="font-size:11.5px;margin:0 0 8px">How to read a line: every detector in the loadout is asked on every analyzed tick, grouped into the calls shown — <span class="mono">key·Ndet</span> = one Gemini call carrying N detectors. Silence = every detector answered no; <span class="mono">⚑ name</span> = that detector answered YES. <span class="mono">⛔closed</span> = that call was pre-gated and never sent ($0) — today only the convulsion bucket has a pre-gate (<span class="mono">rapid_gateAF</span> is its motion evidence), which is why gate chatter looks convulsion-specific. Absence/scheduled detectors don't ride calls; they evaluate from coverage at their deadline. <span class="mono">fps=A→B</span> = LiveKit delivered A fps to the backend (stream health; want ≥8) → buffer kept B for analysis (capped at the 4fps target by design; ~3.4 is normal, NOT a problem); <span class="mono">gap</span> = worst frame silence in the window.</p>
 <div class="logwin" id="log"></div></div>
@@ -348,6 +402,15 @@ async function refresh(){
     ).join(""):'<span class="mut">no frames yet — captured on identity changes (appear/leave/label-flip/face-lock), losses, and every ~2min steady</span>';
     $("events").innerHTML=d.events.length? d.events.map(e=>
       `<div>${esc(e.t)}Z &nbsp;<b>${esc(e.d)}</b> &nbsp;${esc(e.title)}</div>`).join(""):"none yet";
+    if(d.hourly&&d.hourly.length){
+      const mx=Math.max(...d.hourly.map(x=>x.calls),1);
+      $("hourly").innerHTML=`<div style="display:flex;align-items:flex-end;gap:6px;overflow-x:auto;padding:4px 0">`+
+        d.hourly.map(x=>`<div style="text-align:center;min-width:64px">
+          <div class="mono" style="font-size:11px">${x.calls}</div>
+          <div style="height:${Math.max(3,Math.round(90*x.calls/mx))}px;background:var(--ok);border-radius:3px 3px 0 0;opacity:.85"></div>
+          <div class="mono mut" style="font-size:10px;margin-top:3px">${esc(x.h.slice(6))}<br>${x.an}t · ${(x.tin/1000).toFixed(0)}k/${(x.tout/1000).toFixed(1)}k<br>g${x.g} d${x.d} o${x.o}</div>
+        </div>`).join("")+`</div>`;
+    }
     $("log").innerHTML=d.ticks.map(t=>
       `<div class="lr ${t.skip==="tick_failed"?"fail":t.skip?"skip":""} ${t.fired.length?"fired":""}">
         <span class="t">${esc(t.t)}</span><span class="c">${esc(t.cam)}</span>
