@@ -59,3 +59,36 @@ def test_window_crossing_midnight() -> None:
     assert is_active(scope, _at(0, 15)) == (True, True)
     assert is_active(scope, _at(23, 0)) == (True, True)
     assert is_active(scope, _at(2, 0)) == (False, True)
+
+
+# ─── schedule_config dissolution (2026-07-18) ────────────────────
+
+
+def test_parse_days_tokens_and_absence() -> None:
+    from src.services.detection.scheduling.when_scope import parse_days
+    assert parse_days("MON,WED,FRI 8:00 AM - 9:00 AM") == (0, 2, 4)
+    assert parse_days("tuesdays 5 PM - 7 PM") == (1,)
+    assert parse_days("8:00 AM - 9:00 AM") is None
+    assert parse_days(None) is None
+
+
+def test_parse_schedule_window_and_deadline_is_end() -> None:
+    from src.services.detection.scheduling.when_scope import parse_schedule
+    sw = parse_schedule("MON,WED 8:00 AM - 9:30 AM")
+    assert sw is not None
+    assert (sw.start_min, sw.end_min, sw.days) == (480.0, 570.0, (0, 2))
+    daily = parse_schedule("8:00 AM - 9:00 AM")
+    assert daily is not None and daily.days is None
+    assert parse_schedule("ALWAYS") is None
+    assert parse_schedule("9 PM - 2 AM") is None  # midnight-cross rejected
+
+
+def test_is_active_gates_on_weekday() -> None:
+    from datetime import datetime
+
+    from src.services.detection.scheduling.when_scope import is_active
+    scope = "MON 8:00 AM - 9:00 AM"
+    monday_in = datetime(2026, 7, 20, 8, 30)     # a Monday
+    tuesday_in = datetime(2026, 7, 21, 8, 30)    # a Tuesday
+    assert is_active(scope, monday_in) == (True, True)
+    assert is_active(scope, tuesday_in) == (False, True)

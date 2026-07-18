@@ -20,12 +20,24 @@ the absence runner all day; their own schedule_config governs timing.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import datetime
 
 _ALWAYS = frozenset({
     "", "always", "all day", "all-day", "allday", "24/7", "24x7",
     "anytime", "any time", "all rooms",
 })
+
+# Weekday prefix grammar (2026-07-18, schedule_config dissolution):
+# "MON,WED,FRI 8:00 AM - 9:00 AM" — day tokens may appear anywhere;
+# no day tokens = every day. 0=Mon..6=Sun (Python weekday()).
+_DAY_MAP = {
+    "mon": 0, "tue": 1, "tues": 1, "wed": 2, "thu": 3, "thur": 3,
+    "thurs": 3, "fri": 4, "sat": 5, "sun": 6,
+}
+_DAY_TOKEN = re.compile(
+    r"\b(mon|tues?|wed|thur?s?|fri|sat|sun)(?:day)?s?\b", re.IGNORECASE,
+)
 
 _TIME = re.compile(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)", re.IGNORECASE)
 _SLACK = re.compile(
@@ -82,15 +94,55 @@ def parse_windows(text: str | None) -> tuple[tuple[float, float], ...] | None:
     return tuple(windows) or None
 
 
+def parse_days(text: str | None) -> tuple[int, ...] | None:
+    """Weekdays named in the scope (0=Mon..6=Sun), or None for every
+    day. Same fail-open law: no recognizable day tokens = no day gate."""
+    if not text:
+        return None
+    days = sorted({
+        _DAY_MAP[m.group(1).lower()] for m in _DAY_TOKEN.finditer(text)
+    })
+    return tuple(days) or None
+
+
+@dataclass(frozen=True)
+class ScheduleWindow:
+    """One evaluable window for the absence runner (schedule_config
+    dissolution, 2026-07-18): start/end as minute-of-day, deadline ≡
+    window end (Aryaman's fire-rule model: window(hit|miss) evaluates
+    at close), days=None means daily."""
+
+    start_min: float
+    end_min: float
+    days: tuple[int, ...] | None
+
+
+def parse_schedule(text: str | None) -> ScheduleWindow | None:
+    """The absence runner's view of a when_scope. None when the text is
+    always-flavored, unparseable, or midnight-crossing (the runner's
+    v1 parity: inverted windows are rejected, never guessed)."""
+    windows = parse_windows(text)
+    if not windows:
+        return None
+    start, end = windows[0]
+    if start >= end:
+        return None
+    return ScheduleWindow(start_min=start, end_min=end, days=parse_days(text))
+
+
 def is_active(text: str | None, local_now: datetime) -> tuple[bool, bool]:
     """(eligible, windowed) for a when_scope at caregiver-local time.
 
     Always-eligible scopes → (True, False). Real windows → (inside,
     True). `windowed=True` is what drives the packer's distinct-call
-    grouping, so it is returned even when currently outside."""
+    grouping, so it is returned even when currently outside. Weekday
+    tokens gate eligibility the same way hours do."""
     windows = parse_windows(text)
     if windows is None:
         return True, False
+    days = parse_days(text)
+    if days is not None and local_now.weekday() not in days:
+        return False, True
     now = local_now.hour * 60.0 + local_now.minute + local_now.second / 60.0
     for start, end in windows:
         if start <= end:

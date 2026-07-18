@@ -117,18 +117,37 @@ class ScheduledDetectorRunner:
             return ZoneInfo(_FALLBACK_TZ)
 
     async def _evaluate_one(self, session: AsyncSession, det: Detector) -> None:
-        cfg = det.schedule_config or {}
-        cadence = cfg.get("cadence")
-        ws = _parse_hhmm(cfg.get("window_start"))
-        we = _parse_hhmm(cfg.get("window_end"))
-        dl = _parse_hhmm(cfg.get("deadline"))
-        if cadence not in ("daily", "weekly") or ws is None or we is None or dl is None:
-            log.warning("scheduled_runner.incomplete_config detector=%s", det.id)
-            return
-        if ws >= we:
-            # v1 doesn't support windows crossing midnight.
-            log.warning("scheduled_runner.inverted_window detector=%s", det.id)
-            return
+        # schedule_config dissolution (Aryaman 2026-07-18): when_scope
+        # is THE windows mechanism. The runner reads it first —
+        # "MON,WED 8:00 AM - 9:00 AM" ⇒ window 8-9, weekly on those
+        # days; no day tokens ⇒ daily; deadline ≡ window end (the
+        # window(hit|miss) fire rule evaluates at close). Legacy rows
+        # whose when_scope is ALWAYS-flavored fall back to their old
+        # schedule_config until the app migration backfills them.
+        from src.services.detection.scheduling.when_scope import parse_schedule
+
+        sw = parse_schedule(det.when_scope)
+        days: list[int] | None
+        if sw is not None:
+            ws = time(int(sw.start_min // 60), int(sw.start_min % 60))
+            we = time(int(sw.end_min // 60), int(sw.end_min % 60))
+            dl = we
+            days = list(sw.days) if sw.days is not None else None
+            cadence = "weekly" if days else "daily"
+        else:
+            cfg = det.schedule_config or {}
+            cadence = cfg.get("cadence")
+            ws = _parse_hhmm(cfg.get("window_start"))
+            we = _parse_hhmm(cfg.get("window_end"))
+            dl = _parse_hhmm(cfg.get("deadline"))
+            days = cfg.get("days_of_week") or []
+            if cadence not in ("daily", "weekly") or ws is None or we is None or dl is None:
+                log.warning("scheduled_runner.incomplete_config detector=%s", det.id)
+                return
+            if ws >= we:
+                # v1 doesn't support windows crossing midnight.
+                log.warning("scheduled_runner.inverted_window detector=%s", det.id)
+                return
 
         patient = await session.get(Patient, det.patient_id)
         if patient is None:
@@ -139,8 +158,7 @@ class ScheduledDetectorRunner:
 
         # Weekly: only on configured weekdays (0=Mon..6=Sun).
         if cadence == "weekly":
-            days = cfg.get("days_of_week") or []
-            if now_local.weekday() not in days:
+            if now_local.weekday() not in (days or []):
                 return
 
         # Deadline not yet reached today → wait.
