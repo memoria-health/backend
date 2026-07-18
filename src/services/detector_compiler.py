@@ -322,6 +322,8 @@ async def compile_custom_detector(
     scheduled: bool = False,
     category: str = "safety",
     settings: Settings,
+    identifier: str | None = None,
+    refinements: list[str] | None = None,
 ) -> CompiledDetector:
     """Compile a caregiver's natural-language description into a
     runtime-ready (identifier, prompt_fragment, schema_json) triple.
@@ -341,7 +343,18 @@ async def compile_custom_detector(
     positive fires); safety reactive detectors stay inclusive (a missed
     emergency is worse than a false alarm).
     """
-    identifier = _gen_identifier()
+    # Recompiles (prompt edit / caregiver refinement) pass the existing
+    # identifier so analyses history and schema keys stay stable; only
+    # a brand-new detector mints one.
+    identifier = identifier or _gen_identifier()
+    if refinements:
+        user_text = (
+            f"{user_text}\n\nThe caregiver reviewed this detector's "
+            "behavior and asked for these changes (apply ALL of them, "
+            "newest last; they refine, never replace, the description "
+            "above — and never weaken the safety bias):\n"
+            + "\n".join(f"  {i + 1}. {r}" for i, r in enumerate(refinements))
+        )
 
     try:
         fragment = await _compile_with_openai(
@@ -596,3 +609,59 @@ async def infer_detector_config(
         raise RuntimeError(
             "could not infer detector config — both gemini and openai failed"
         ) from openai_err
+
+
+# ── Caregiver-facing summary (customs visibility, 2026-07-18) ─────
+
+
+_SUMMARY_PROMPT = """The text below is the internal instruction block a \
+home-camera AI follows for one detector. Rewrite it for the patient's \
+FAMILY — people with zero technical background.
+
+Return 3 to 5 short lines, one per line, no numbering or bullets:
+- at least one line starting "Counts: " — what WILL trigger it
+- at least one line starting "Doesn't count: " — what will NOT
+- one line starting "Caution: " — how careful it is before alerting
+
+Rules: everyday words only. Never mention booleans, confidence, fields, \
+identifiers, frames, clips, cameras, models, or code of any kind. Never \
+promise certainty. Under 320 characters total.
+
+Internal instructions:
+'''
+{fragment}
+'''"""
+
+
+async def summarize_detector_prompt(
+    *, fragment: str, settings: Settings,
+) -> list[str] | None:
+    """Plain-English criteria lines for a compiled prompt_fragment.
+
+    One cheap Gemini call (same model as detection — lite-tier). Runs
+    after every compile/recompile so the summary can never drift from
+    the fragment it describes. Returns None on ANY failure — the UI
+    hides the card; a summary must never block or break a compile."""
+    try:
+        client = genai.Client(api_key=settings.gemini_api_key)
+        response = await client.aio.models.generate_content(
+            model=settings.gemini_model,
+            contents=[genai_types.Content(
+                role="user",
+                parts=[genai_types.Part(
+                    text=_SUMMARY_PROMPT.format(fragment=fragment),
+                )],
+            )],
+            config=genai_types.GenerateContentConfig(
+                response_mime_type="text/plain",
+            ),
+        )
+        lines = [
+            ln.strip().lstrip("-• ").strip()
+            for ln in (response.text or "").splitlines()
+            if ln.strip()
+        ]
+        return lines[:5] or None
+    except Exception:  # noqa: BLE001 — summary is best-effort by contract
+        log.warning("detector_compiler.summarize_failed", exc_info=True)
+        return None

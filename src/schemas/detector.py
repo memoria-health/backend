@@ -91,6 +91,12 @@ class DetectorResponse(BaseModel):
     schedule_config: ScheduleConfig | None = None
     # Null unless shape == 'state'; the rising-edge episode gap (seconds).
     episode_gap_seconds: int | None = None
+    # Caregiver-facing summary of the compiled prompt (3-5 plain lines:
+    # "Counts: …" / "Doesn't count: …" / "Caution: …"). Regenerated on
+    # every compile. Null while compiling or if summarization failed.
+    user_criteria: list[str] | None = None
+    # Plain-words change requests accumulated via /refine, oldest first.
+    refinements: list[str] | None = None
     # Wandering only: the caregiver's saved exit-door choice, so the picker can
     # pre-highlight it. {box:[x,y,w,h]|null, label, source, no_exit_door}.
     door_config: dict | None = None
@@ -193,6 +199,16 @@ class UpdateDetectorRequest(BaseModel):
     sensitivity: DetectorSensitivity | None = None
     is_on: bool | None = None
     custom_prompt: Prompt | None = None
+
+
+class RefineDetectorRequest(BaseModel):
+    """Body of POST /v1/detectors/{id}/refine — one plain-words change
+    request from the caregiver ("don't count eating as choking"). The
+    compiler receives the FULL accumulated list on every recompile."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    feedback: Prompt
 
 
 class DetectorLibraryEntry(BaseModel):

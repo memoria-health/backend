@@ -34,6 +34,7 @@ from src.schemas.detector import (
     DetectorShape,
     InferDetectorRequest,
     InferDetectorResponse,
+    RefineDetectorRequest,
     ScheduleConfig,
     UpdateDetectorRequest,
 )
@@ -43,6 +44,7 @@ from src.services.detection.scheduling import compiler_v2
 from src.services.detector_compiler import (
     compile_custom_detector,
     infer_detector_config,
+    summarize_detector_prompt,
 )
 from src.settings import Settings
 
@@ -638,6 +640,8 @@ async def _compile_and_update_detector(
     shape: str,
     category: str,
     settings: Settings,
+    identifier: str | None = None,
+    refinements: list[str] | None = None,
 ) -> None:
     """Background task: run Gemini compile + UPDATE the detector row.
 
@@ -652,6 +656,7 @@ async def _compile_and_update_detector(
             name=name, description=description,
             user_text=user_text, scheduled=scheduled, category=category,
             settings=settings,
+            identifier=identifier, refinements=refinements,
         )
     except Exception as e:
         log.error(
@@ -675,6 +680,13 @@ async def _compile_and_update_detector(
         )
         return
 
+    # Caregiver-facing summary of the fresh fragment (customs
+    # visibility): best-effort, regenerated on every compile so it can
+    # never describe a stale prompt. None on failure = card hidden.
+    criteria = await summarize_detector_prompt(
+        fragment=compiled.prompt_fragment, settings=settings,
+    )
+
     # Write back. Use a fresh session — the request's session is closed.
     sessionmaker = get_sessionmaker()
     async with sessionmaker() as session:
@@ -685,14 +697,15 @@ async def _compile_and_update_detector(
                 identifier=compiled.identifier,
                 prompt_fragment=compiled.prompt_fragment,
                 schema_json=compiled.schema_json,
+                user_criteria=criteria,
                 updated_at=datetime.now(timezone.utc),
                 **dims,
             )
         )
         await session.commit()
     log.info(
-        "detector_compile_background.ok detector_id=%s identifier=%s",
-        detector_id, compiled.identifier,
+        "detector_compile_background.ok detector_id=%s identifier=%s criteria=%s",
+        detector_id, compiled.identifier, bool(criteria),
     )
 
 
@@ -705,6 +718,7 @@ async def patch_detector(
     auth: CaregiverAuth,
     body: UpdateDetectorRequest,
     session: SessionDep,
+    settings: SettingsDep,
 ) -> DetectorResponse:
     fields = body.model_dump(exclude_unset=True)
     # Enum → string for the ORM string columns.
@@ -720,6 +734,84 @@ async def patch_detector(
             detail="detector_not_found",
         )
     await session.commit()
+    # Recompile-on-edit (bug fix 2026-07-18): an edited custom_prompt
+    # used to update the stored TEXT while the detector kept running on
+    # the OLD compiled instructions forever. Now any prompt change on a
+    # custom detector re-runs the background compile — identifier is
+    # preserved so analyses history stays keyed; accumulated
+    # refinements still apply on top of the new description.
+    if (
+        "custom_prompt" in fields
+        and det.source == "custom"
+        and det.custom_prompt
+    ):
+        asyncio.create_task(
+            _compile_and_update_detector(
+                detector_id=det.id,
+                name=det.name,
+                description=det.description or "Custom detector",
+                user_text=det.custom_prompt,
+                scheduled=det.shape == "scheduled",
+                shape=det.shape,
+                category=det.category,
+                settings=settings,
+                identifier=det.identifier,
+                refinements=list(det.refinements or []),
+            )
+        )
+    return _to_response(det)
+
+
+@router.post(
+    "/detectors/{detector_id}/refine",
+    response_model=DetectorResponse,
+)
+async def refine_detector(
+    detector_id: UUID,
+    auth: CaregiverAuth,
+    body: RefineDetectorRequest,
+    session: SessionDep,
+    settings: SettingsDep,
+) -> DetectorResponse:
+    """One plain-words change request from the caregiver ("don't count
+    eating as choking"). Appends to the detector's refinement list and
+    recompiles with the FULL accumulated list — the compiler applies
+    every refinement on top of the original description, never weakens
+    the safety bias, and the fresh summary shows the result. Customs
+    only: preset prompts are curated, not user-writable."""
+    det = await detector_repo.find_by_id(
+        session, detector_id, caregiver_id=auth.id,
+    )
+    if det is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="detector_not_found",
+        )
+    if det.source != "custom" or not det.custom_prompt:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="preset_not_refinable",
+        )
+    refinements = [*(det.refinements or []), body.feedback.strip()]
+    det = await detector_repo.update_partial(
+        session, detector_id, caregiver_id=auth.id,
+        fields={"refinements": refinements},
+    )
+    await session.commit()
+    asyncio.create_task(
+        _compile_and_update_detector(
+            detector_id=det.id,
+            name=det.name,
+            description=det.description or "Custom detector",
+            user_text=det.custom_prompt,
+            scheduled=det.shape == "scheduled",
+            shape=det.shape,
+            category=det.category,
+            settings=settings,
+            identifier=det.identifier,
+            refinements=refinements,
+        )
+    )
     return _to_response(det)
 
 

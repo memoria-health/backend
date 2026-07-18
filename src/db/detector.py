@@ -50,6 +50,15 @@ class Detector(Base):
     identifier: Mapped[str | None] = mapped_column(String(80), default=None)
     prompt_fragment: Mapped[str | None] = mapped_column(String, default=None)
     schema_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    # Caregiver-facing summary of prompt_fragment (customs visibility,
+    # 2026-07-18): 3-5 plain-English bullets from a cheap summarizer
+    # call, regenerated whenever the fragment changes so the two can
+    # never drift. Null = not summarized yet (UI hides the card).
+    user_criteria: Mapped[list[str] | None] = mapped_column(JSONB, default=None)
+    # Plain-words change requests submitted via /refine, oldest first.
+    # Every recompile receives the full list — intent accumulates and
+    # "reset to original" stays possible.
+    refinements: Mapped[list[str] | None] = mapped_column(JSONB, default=None)
 
     # ── Wandering exit-door selection ───────────────────────────────
     # Only meaningful on the 'wandering' detector. The caregiver's choice
