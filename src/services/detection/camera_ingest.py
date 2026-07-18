@@ -51,6 +51,7 @@ from src.services.detection.motion import (
     sample_stats,
 )
 from src.services.detection.motion_cache import MotionCache
+from src.services.detection.patient_presence import PatientPresence
 from src.services.detection.motion_overlay import overlay_motion
 from src.services.detection.mp4_remux import Mp4RemuxError, frames_to_mp4
 from src.services.detection.providers.gemini import gemini_provider
@@ -131,6 +132,7 @@ class CameraIngest:
         patient_id: UUID,
         sessionmaker: "async_sessionmaker",
         motion_cache: MotionCache,
+        patient_presence: "PatientPresence | None" = None,
         settings: "Settings",
         reid: ReIDInference,
         livekit_identity: str | None = None,
@@ -140,6 +142,9 @@ class CameraIngest:
         self.patient_id = patient_id
         self._sessionmaker = sessionmaker
         self._motion_cache = motion_cache
+        # Cross-camera patient-confirmation registry (shared per room;
+        # None in unit harnesses = feature inert, fail-open).
+        self._patient_presence = patient_presence
         self._settings = settings
         self._reid = reid
         # Backend wake authority (motion.py #3): verifies the gateway's
@@ -1084,12 +1089,20 @@ class CameraIngest:
                     if any(e.dims.bucket == "rapid" for e in entries)
                     else target_fps
                 )
+                # Mark BEFORE resolving so this tick's own positive
+                # confirmation shields the other cameras immediately.
+                if identity.patient_in_clip and self._patient_presence:
+                    self._patient_presence.mark(self.camera_id)
                 due_set = resolve_due(
                     entries,
                     signals=signals,
                     identity=identity,
                     settings=self._settings,
                     tick_index=self._tick_counter,
+                    patient_confirmed_elsewhere=(
+                        self._patient_presence.confirmed_elsewhere(self.camera_id)
+                        if self._patient_presence else False
+                    ),
                     local_now=datetime.now(
                         await self._resolve_caregiver_tz(session, patient)
                     ),

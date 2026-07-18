@@ -93,6 +93,7 @@ def resolve_due(
     settings: "Settings",
     tick_index: int,
     local_now: "datetime | None" = None,
+    patient_confirmed_elsewhere: bool = False,
 ) -> DueSet:
     """Resolve the due set for one tick. Pure: no I/O, no clock — the
     caller supplies `local_now` (caregiver-local wall time) for
@@ -150,6 +151,21 @@ def resolve_due(
 
         if d.duty_cycle == "thinned" and tick_index % settings.scheduler_sample_every_k:
             skipped.append((ident, "thinned_off_tick"))
+            continue
+
+        # Cross-camera exclusivity (Aryaman 2026-07-18): the patient
+        # was POSITIVELY face-confirmed on a DIFFERENT camera within
+        # the TTL, and THIS tick's own identity does not see them —
+        # patient-scoped detectors skip here (they cannot be about a
+        # person who is provably elsewhere). Anyone/environment scopes
+        # are untouched; any ambiguity fails open by construction
+        # (the registry only holds positive confirmations).
+        if (
+            d.subject_scope == "patient"
+            and patient_confirmed_elsewhere
+            and not identity.patient_in_clip
+        ):
+            skipped.append((ident, "patient_elsewhere"))
             continue
 
         # Verified-absence suppression is a SUBJECT rule, so it is

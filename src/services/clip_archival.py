@@ -136,6 +136,17 @@ async def _archive_one(
     remaining = target_wall_time - time.monotonic()
     if remaining > 0:
         await asyncio.sleep(remaining)
+    elif -remaining > settings.frame_buffer_retention_seconds:
+        # Stale-window guard (2026-07-18): the archive task started so
+        # late that the buffer no longer holds the event's post-roll —
+        # packaging frames from NOW would attach footage of a DIFFERENT
+        # moment to the event (a lying clip is worse for FP review than
+        # no clip). Leave has_clip=false and say so.
+        log.warning(
+            "clip_archival.stale_window event_id=%s lag=%.1fs — skipping clip",
+            event_id, -remaining,
+        )
+        return
 
     # `now=target_wall_time` makes the snapshot cutoff exactly
     # `pre_end_captured_at` (i.e., the next frame after pre ended),

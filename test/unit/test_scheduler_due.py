@@ -404,3 +404,31 @@ def test_no_local_now_fails_open() -> None:
     )
     assert [d.spec.identifier for d in out.due] == ["medication"]
     assert out.due[0].windowed is False
+
+
+# ─── Cross-camera patient exclusivity (2026-07-18) ───────────────
+
+
+def test_patient_elsewhere_skips_patient_scoped_only() -> None:
+    entries = [
+        _entry("fall"),
+        _entry("stove_left_on", branch="environment", subject="environment"),
+        _entry("intruder", subject="anyone"),
+    ]
+    ds = resolve_due(
+        entries, signals=_signals(), identity=_identity(None),
+        settings=_settings(), tick_index=0,
+        patient_confirmed_elsewhere=True,
+    )
+    assert _due_idents(ds) == ["stove_left_on", "intruder"]
+    assert _skip_reasons(ds) == {"fall": "patient_elsewhere"}
+
+
+def test_patient_seen_here_overrides_elsewhere() -> None:
+    ds = resolve_due(
+        [_entry("fall")], signals=_signals(),
+        identity=_identity((), patient_in_clip=True),
+        settings=_settings(), tick_index=0,
+        patient_confirmed_elsewhere=True,
+    )
+    assert _due_idents(ds) == ["fall"]

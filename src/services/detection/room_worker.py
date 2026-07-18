@@ -38,6 +38,7 @@ from src.db.camera import Camera
 from src.db.patient import Patient
 from src.services.data_collection.manager import RecorderManager
 from src.services.detection.camera_ingest import CameraIngest
+from src.services.detection.patient_presence import PatientPresence
 from src.services.detection.room_reconciler import LiveKitRoomReconciler
 
 if TYPE_CHECKING:
@@ -169,6 +170,9 @@ class RoomWorker:
         self._sessionmaker = sessionmaker
         self._motion_cache = motion_cache
         self._reid = reid
+        # One per room (= per patient): "patient confirmed on camera A
+        # ⇒ patient-scoped detectors skip on B/C" (2026-07-18).
+        self._patient_presence = PatientPresence()
         # Optional callback used by the idle monitor to ask the
         # parent DetectorWorker to remove this room. See
         # _IDLE_TEARDOWN_WINDOW_S for the trigger condition.
@@ -1068,6 +1072,7 @@ class RoomWorker:
             patient_id=row.patient_id,
             sessionmaker=self._sessionmaker,
             motion_cache=self._motion_cache,
+            patient_presence=self._patient_presence,
             settings=self._settings,
             reid=self._reid,
             livekit_identity=identity,
