@@ -360,11 +360,23 @@ async def gateway_roster(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_gateway_token",
         )
     gateway_id, caregiver_id = gw[0], gw[1]
-    # Liveness: polling the roster IS the heartbeat (gateway + its cameras).
-    await session.execute(
-        text("UPDATE public.gateways SET last_seen_at = now() WHERE id = :id"),
+    # Liveness (polling the roster IS the heartbeat) + reverse-SSH tunnel port
+    # in one statement. The port is assigned lazily on the box's FIRST poll
+    # (covers rows that predate the column too — no backfill needed); the box
+    # writes it to .tunnel-port and its tunnel unit dials the relay on it,
+    # which is what makes every deployed box reachable by ops. COALESCE
+    # short-circuits (Postgres §9.18), so nextval() fires only when the port
+    # is NULL — steady-state polls burn nothing — and the row lock serializes
+    # concurrent first polls, so RETURNING always yields the final port.
+    # nextval() never issues 22001 (reserved for the legacy box-01 unit); see
+    # scripts/apply_gateway_tunnel_port_delta.sql for the per-env port ranges.
+    tunnel_port = (await session.execute(
+        text("UPDATE public.gateways SET last_seen_at = now(), "
+             "tunnel_port = COALESCE(tunnel_port, "
+             "  nextval('public.gateway_tunnel_port_seq')) "
+             "WHERE id = :id RETURNING tunnel_port"),
         {"id": gateway_id},
-    )
+    )).scalar()
     # A gateway box serves a CAREGIVER, but each gateway camera is OWNED by
     # a specific box (cameras.gateway_id). Return only THIS box's cameras,
     # plus any not-yet-assigned (gateway_id IS NULL) rows as a transitional
@@ -385,7 +397,7 @@ async def gateway_roster(
         {"c": caregiver_id, "gw": gateway_id},
     )).all()
     await session.commit()
-    return {"cameras": [
+    return {"tunnel_port": tunnel_port, "cameras": [
         {"camera_id": str(r[0]), "livekit_identity": r[1],
          "livekit_room": r[2], "desired_state": r[3]}
         for r in rows

@@ -1,13 +1,16 @@
-"""Integration tests for gateway camera -> gateway ownership.
+"""Integration tests for the gateway roster: per-box camera ownership
++ reverse-SSH tunnel_port assignment (branch + main union, 2026-07-19).
 
-The roster used to fan every one of a caregiver's gateway cameras to every
-box. Now each gateway camera is owned by a specific box (cameras.gateway_id),
-so a caregiver with more than one gateway gets only its own cameras. These
-tests lock in that isolation plus the transitional NULL-owner fallback.
+Each gateway camera is owned by a specific box (cameras.gateway_id), so
+a caregiver with more than one gateway gets only its own cameras — plus
+the transitional NULL-owner fallback. Each box's FIRST roster poll also
+lazily assigns it a UNIQUE reverse-SSH relay port (folded into the
+liveness UPDATE).
 
-Requires the local DB to have `scripts/apply_gateway_delta.sql` AND
-`scripts/apply_gateway_ownership_delta.sql` applied (the gateways table +
-cameras.gateway_id column), same as the other delta-gated suites.
+Requires the local DB to have `scripts/apply_gateway_delta.sql`,
+`scripts/apply_gateway_ownership_delta.sql` AND
+`scripts/apply_gateway_tunnel_port_delta.sql` applied, same as the
+other delta-gated suites.
 """
 
 from __future__ import annotations
@@ -121,3 +124,30 @@ async def test_roster_includes_unowned_null_cameras(
     await session.commit()
 
     assert "cam_orphan" in await _roster_identities(client, "gw-token-A")
+
+
+@pytest.mark.asyncio
+async def test_roster_assigns_stable_unique_tunnel_ports(
+    client: AsyncClient, auth_user, session: AsyncSession,
+) -> None:
+    """First roster poll assigns a unique reverse-SSH port (never the
+    reserved 22001); later polls return the SAME port; two boxes never
+    collide."""
+    _, email, _ = await _setup_patient(client, auth_user)
+    await _provision(client, email, "gw-token-A", room="Room A")
+    await _provision(client, email, "gw-token-B", room="Room B")
+
+    async def _port(token: str) -> int:
+        r = await client.get(
+            "/v1/gateway/roster",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r.status_code == 200, r.text
+        return r.json()["tunnel_port"]
+
+    port_a = await _port("gw-token-A")
+    port_b = await _port("gw-token-B")
+    assert port_a >= 22002  # 22001 is reserved for the legacy box-01 unit
+    assert port_b >= 22002
+    assert port_a != port_b
+    assert await _port("gw-token-A") == port_a  # stable across polls
