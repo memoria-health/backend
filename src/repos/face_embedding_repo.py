@@ -18,6 +18,7 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.patient import Patient
+from src.repos.access import accessible_patient_ids
 from src.db.patient_face_embedding import PatientFaceEmbedding
 
 
@@ -146,7 +147,7 @@ async def list_for_patient(
         .join(Patient, Patient.id == PatientFaceEmbedding.patient_id)
         .where(
             PatientFaceEmbedding.patient_id == patient_id,
-            Patient.caregiver_id == caregiver_id,
+            Patient.id.in_(accessible_patient_ids(caregiver_id)),
         )
         .order_by(PatientFaceEmbedding.created_at.desc())
     )
@@ -215,7 +216,7 @@ async def count_by_source(
         .where(
             PatientFaceEmbedding.patient_id == patient_id,
             PatientFaceEmbedding.status == "ready",
-            Patient.caregiver_id == caregiver_id,
+            Patient.id.in_(accessible_patient_ids(caregiver_id)),
         )
         .group_by(PatientFaceEmbedding.source)
     )
@@ -243,7 +244,7 @@ async def delete_by_id(
         .join(Patient, Patient.id == PatientFaceEmbedding.patient_id)
         .where(
             PatientFaceEmbedding.id == embedding_id,
-            Patient.caregiver_id == caregiver_id,
+            Patient.id.in_(accessible_patient_ids(caregiver_id)),
         )
         .scalar_subquery()
     )

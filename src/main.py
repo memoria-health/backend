@@ -82,6 +82,7 @@ from src.api.health import router as health_router
 from src.api.livekit import router as livekit_router
 from src.api.livekit_webhooks import router as livekit_webhooks_router
 from src.api.pairing import router as pairing_router
+from src.api.patient_members import router as patient_members_router
 from src.api.patients import router as patients_router
 from src.api.pi_discovery import router as pi_discovery_router
 from src.api.support import router as support_router
@@ -172,6 +173,7 @@ def create_app() -> FastAPI:
     app.include_router(health_router)
     app.include_router(caregivers_router)
     app.include_router(patients_router)
+    app.include_router(patient_members_router)
     app.include_router(detectors_router)
     app.include_router(events_router)
     app.include_router(cameras_router)

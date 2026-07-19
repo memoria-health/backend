@@ -21,7 +21,7 @@ from src.api import cameras_ingest as pi_ingest_module
 from src.api.deps import CaregiverAuth, SessionDep, SettingsDep
 from src.db.patient import Patient
 from src.errors import StorageError
-from src.repos import camera_repo, caregiver_repo, patient_repo
+from src.repos import access, camera_repo, caregiver_repo, patient_repo
 from src.schemas.patient import (
     CreatePatientRequest,
     PatientResponse,
@@ -106,6 +106,9 @@ async def create_patient(
         last_event_at=None,
     )
     await patient_repo.insert(session, p)
+    # The creator is the patient's first member, role='owner'. Membership-scoped
+    # reads (and the future roles layer) key off this row, not patients.caregiver_id.
+    await access.add_member(session, patient_id=p.id, caregiver_id=auth.id, role="owner")
     await onboarding.seed_detectors_for_patient(session, p.id, p.date_of_birth)
     await session.commit()
     return _to_response(p)

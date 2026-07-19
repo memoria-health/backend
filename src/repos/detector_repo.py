@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.detector import Detector
 from src.db.patient import Patient
+from src.repos.access import accessible_patient_ids
 from src.services.detection import catalog
 
 
@@ -40,7 +41,7 @@ async def list_for_patient(
         .join(Patient, Patient.id == Detector.patient_id)
         .where(
             Detector.patient_id == patient_id,
-            Patient.caregiver_id == caregiver_id,
+            Patient.id.in_(accessible_patient_ids(caregiver_id)),
             hide_clause,
         )
         # `id` is a stable tie-breaker — `onboarding.seed_detectors_for_patient`
@@ -63,7 +64,7 @@ async def find_by_id(
         .join(Patient, Patient.id == Detector.patient_id)
         .where(
             Detector.id == detector_id,
-            Patient.caregiver_id == caregiver_id,
+            Patient.id.in_(accessible_patient_ids(caregiver_id)),
         )
     )
     return result.scalar_one_or_none()
@@ -85,7 +86,7 @@ async def find_by_patient_identifier(
         .where(
             Detector.patient_id == patient_id,
             Detector.identifier == identifier,
-            Patient.caregiver_id == caregiver_id,
+            Patient.id.in_(accessible_patient_ids(caregiver_id)),
         )
     )
     return result.scalar_one_or_none()

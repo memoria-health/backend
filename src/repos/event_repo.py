@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.event import Event
 from src.db.patient import Patient
+from src.repos.access import accessible_patient_ids
 
 
 def encode_cursor(occurred_at: datetime, event_id: UUID) -> str:
@@ -63,7 +64,7 @@ async def list_for_patient(
         .join(Patient, Patient.id == Event.patient_id)
         .where(
             Event.patient_id == patient_id,
-            Patient.caregiver_id == caregiver_id,
+            Patient.id.in_(accessible_patient_ids(caregiver_id)),
         )
         .order_by(Event.occurred_at.desc(), Event.id.desc())
         .limit(limit + 1)   # +1 sentinel: tells us whether another page exists
@@ -107,7 +108,7 @@ async def find_by_id(
         .join(Patient, Patient.id == Event.patient_id)
         .where(
             Event.id == event_id,
-            Patient.caregiver_id == caregiver_id,
+            Patient.id.in_(accessible_patient_ids(caregiver_id)),
         )
     )
     return result.scalar_one_or_none()

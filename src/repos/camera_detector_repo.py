@@ -16,6 +16,7 @@ from src.db.camera import Camera
 from src.db.camera_detector import CameraDetector
 from src.db.detector import Detector
 from src.db.patient import Patient
+from src.repos.access import accessible_patient_ids
 
 
 async def list_detector_ids_for_camera(
@@ -32,7 +33,7 @@ async def list_detector_ids_for_camera(
         .join(Patient, Patient.id == Camera.patient_id)
         .where(
             CameraDetector.camera_id == camera_id,
-            Patient.caregiver_id == caregiver_id,
+            Patient.id.in_(accessible_patient_ids(caregiver_id)),
         )
     )
     return (await session.execute(stmt)).scalars().all()
@@ -55,7 +56,7 @@ async def replace_assignments_for_camera(
     cam_stmt = (
         select(Camera.id, Camera.patient_id)
         .join(Patient, Patient.id == Camera.patient_id)
-        .where(Camera.id == camera_id, Patient.caregiver_id == caregiver_id)
+        .where(Camera.id == camera_id, Patient.id.in_(accessible_patient_ids(caregiver_id)))
     )
     cam_row = (await session.execute(cam_stmt)).one_or_none()
     if cam_row is None:

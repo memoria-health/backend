@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.camera import Camera
 from src.db.patient import Patient
+from src.repos.access import accessible_patient_ids
 
 
 async def list_for_patient(
@@ -25,7 +26,7 @@ async def list_for_patient(
         .join(Patient, Patient.id == Camera.patient_id)
         .where(
             Camera.patient_id == patient_id,
-            Patient.caregiver_id == caregiver_id,
+            Patient.id.in_(accessible_patient_ids(caregiver_id)),
         )
         .order_by(Camera.display_id.asc())
     )
@@ -40,7 +41,7 @@ async def find_by_id(
         .join(Patient, Patient.id == Camera.patient_id)
         .where(
             Camera.id == camera_id,
-            Patient.caregiver_id == caregiver_id,
+            Patient.id.in_(accessible_patient_ids(caregiver_id)),
         )
     )
     return result.scalar_one_or_none()
