@@ -717,72 +717,92 @@ create index ui_events_occurred_idx on public.ui_events(occurred_at);
 -- caregiver's own rows. Without it, Realtime would broadcast every
 -- table change to every subscriber.
 
+-- ── Patient sharing (multi-caregiver membership) ──────────────────
+-- A caregiver's access to a patient is a row in patient_members, NOT the single
+-- patients.caregiver_id FK. `role` is unused in the MVP (every member has full
+-- access) but present so per-patient permission levels drop in later with NO
+-- migration. The original owner is mirrored as a role='owner' row (backfill).
+create table if not exists public.patient_members (
+  id           uuid primary key default gen_random_uuid(),
+  patient_id   uuid not null references public.patients(id)   on delete cascade,
+  caregiver_id uuid not null references public.caregivers(id) on delete cascade,
+  role         text not null default 'caregiver'
+                 check (role in ('owner','caregiver','viewer')),
+  invited_by   uuid references public.caregivers(id) on delete set null,
+  created_at   timestamptz not null default now(),
+  unique (patient_id, caregiver_id)
+);
+create index if not exists patient_members_caregiver_idx on public.patient_members(caregiver_id);
+create index if not exists patient_members_patient_idx   on public.patient_members(patient_id);
+
+-- Backfill: every existing patient's owner becomes an 'owner' membership row.
+insert into public.patient_members (patient_id, caregiver_id, role)
+select id, caregiver_id, 'owner' from public.patients
+on conflict (patient_id, caregiver_id) do nothing;
+
+-- Single source of truth for "can this caller access this patient?" Referenced
+-- by every patient-scoped RLS policy below. SECURITY DEFINER so the membership
+-- lookup isn't itself re-filtered by RLS on patient_members.
+create or replace function public.has_patient_access(pid uuid)
+returns boolean language sql stable security definer set search_path = public as $$
+  select exists (
+    select 1 from public.patient_members m
+    where m.patient_id = pid and m.caregiver_id = auth.uid()
+  );
+$$;
+
 alter table public.caregivers enable row level security;
 create policy caregivers_self on public.caregivers
   for all using (id = auth.uid()) with check (id = auth.uid());
 
+-- patient_members: a caregiver may READ membership rows for patients they can
+-- access. Inserts/deletes go through the owner-guarded service-role API, so the
+-- authed client only needs read.
+alter table public.patient_members enable row level security;
+create policy patient_members_read on public.patient_members
+  for select using (public.has_patient_access(patient_id));
+
+-- Patient + children: gated by MEMBERSHIP (has_patient_access), not ownership.
+-- The patients write-check stays caregiver_id = auth.uid() so a direct authed-
+-- client write can't reassign ownership (patient writes actually go through the
+-- service-role API).
 alter table public.patients enable row level security;
-create policy patients_owner on public.patients
-  for all using (caregiver_id = auth.uid()) with check (caregiver_id = auth.uid());
+create policy patients_member on public.patients
+  for all using (public.has_patient_access(id)) with check (caregiver_id = auth.uid());
 
 alter table public.cameras enable row level security;
-create policy cameras_owner on public.cameras
-  for all using (
-    patient_id in (select id from public.patients where caregiver_id = auth.uid())
-  ) with check (
-    patient_id in (select id from public.patients where caregiver_id = auth.uid())
-  );
+create policy cameras_member on public.cameras
+  for all using (public.has_patient_access(patient_id))
+  with check (public.has_patient_access(patient_id));
 
 alter table public.detectors enable row level security;
-create policy detectors_owner on public.detectors
-  for all using (
-    patient_id in (select id from public.patients where caregiver_id = auth.uid())
-  ) with check (
-    patient_id in (select id from public.patients where caregiver_id = auth.uid())
-  );
+create policy detectors_member on public.detectors
+  for all using (public.has_patient_access(patient_id))
+  with check (public.has_patient_access(patient_id));
 
--- cameras_detectors: scoped through the camera's patient → caregiver.
--- Joining via cameras (not detectors) is fine — both FKs point to the
--- same patient by construction, and going through cameras matches the
--- pattern used by `cameras_owner` above.
+-- cameras_detectors: scoped through the camera's patient.
 alter table public.cameras_detectors enable row level security;
-create policy cameras_detectors_owner on public.cameras_detectors
+create policy cameras_detectors_member on public.cameras_detectors
   for all using (
-    camera_id in (
-      select c.id from public.cameras c
-      join public.patients p on p.id = c.patient_id
-      where p.caregiver_id = auth.uid()
-    )
+    camera_id in (select c.id from public.cameras c where public.has_patient_access(c.patient_id))
   ) with check (
-    camera_id in (
-      select c.id from public.cameras c
-      join public.patients p on p.id = c.patient_id
-      where p.caregiver_id = auth.uid()
-    )
+    camera_id in (select c.id from public.cameras c where public.has_patient_access(c.patient_id))
   );
 
 alter table public.events enable row level security;
-create policy events_owner on public.events
-  for all using (
-    patient_id in (select id from public.patients where caregiver_id = auth.uid())
-  ) with check (
-    patient_id in (select id from public.patients where caregiver_id = auth.uid())
-  );
+create policy events_member on public.events
+  for all using (public.has_patient_access(patient_id))
+  with check (public.has_patient_access(patient_id));
 
--- patient_face_embeddings: scoped through the embedding's patient → caregiver.
--- Mirrors the events_owner pattern: rows visible only to the caregiver who owns
--- the patient.
 alter table public.patient_face_embeddings enable row level security;
-create policy patient_face_embeddings_owner on public.patient_face_embeddings
-  for all using (
-    patient_id in (select id from public.patients where caregiver_id = auth.uid())
-  ) with check (
-    patient_id in (select id from public.patients where caregiver_id = auth.uid())
-  );
+create policy patient_face_embeddings_member on public.patient_face_embeddings
+  for all using (public.has_patient_access(patient_id))
+  with check (public.has_patient_access(patient_id));
 
 alter table public.analyses enable row level security;
-create policy analyses_owner on public.analyses
-  for all using (caregiver_id = auth.uid()) with check (caregiver_id = auth.uid());
+create policy analyses_member on public.analyses
+  for all using (public.has_patient_access(patient_id))
+  with check (public.has_patient_access(patient_id));
 
 alter table public.caregiver_devices enable row level security;
 create policy caregiver_devices_owner on public.caregiver_devices
