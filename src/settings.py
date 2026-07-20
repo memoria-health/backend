@@ -65,6 +65,11 @@ class Settings(BaseSettings):
     # match the 4fps frame source + openai_frames_fps (lower than the old 5 to
     # cut frames-per-call cost).
     gemini_model: str = Field(default="gemini-3.5-flash")
+    # Second Gemini tier: tried on the SAME native-video path when the primary
+    # gemini_model errors/overloads, BEFORE dropping to another provider. Prod
+    # primary = gemini-3.1-flash-lite; this steps up to full flash. Env:
+    # NEMARA_GEMINI_FALLBACK_MODEL.
+    gemini_fallback_model: str = Field(default="gemini-3.5-flash")
     gemini_video_fps: str = Field(default="4")
     # Per-frame token budget Gemini spends on each image/video frame — the real
     # "how much detail does the VLM see" dial (independent of the pixels we

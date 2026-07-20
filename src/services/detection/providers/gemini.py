@@ -66,6 +66,7 @@ async def gemini_provider(
     settings: Settings,
     patient_in_clip: bool = False,
     patient_bbox: tuple[float, float, float, float] | None = None,
+    model: str | None = None,
 ) -> ProviderResult:
     # `patient_bbox` is accepted for signature parity with
     # `openai_provider`. Gemini's input is the raw MP4 (no per-frame
@@ -139,7 +140,7 @@ async def gemini_provider(
         config_kwargs["media_resolution"] = media_res
 
     response = await client.aio.models.generate_content(
-        model=settings.gemini_model,
+        model=model or settings.gemini_model,
         contents=[genai_types.Content(role="user", parts=parts)],
         config=genai_types.GenerateContentConfig(**config_kwargs),
     )

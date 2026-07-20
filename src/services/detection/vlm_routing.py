@@ -34,9 +34,13 @@ _VALID = ("gemini", "openai", "openrouter", "dashscope")
 # Chosen-first, then fallbacks — detection never goes dark if the primary
 # errors out.
 _CHAINS: dict[str, tuple[str, ...]] = {
-    # Sandbox cost guard: gemini falls back to Qwen (cheap), never to the
-    # expensive OpenAI, so a gemini 503/outage can't quietly run up an OpenAI bill.
-    "gemini": ("gemini", "openrouter"),
+    # Gemini path: primary model (gemini_model, e.g. flash-lite) → fallback model
+    # (gemini_fallback_model, e.g. flash) on the SAME native-video path → DashScope
+    # (Alibaba-direct Qwen3-VL, ALSO native video) → OpenRouter (frame-based Qwen)
+    # only as a last-resort net so detection never goes fully dark. Immediate
+    # failover on first error, no retry. `gemini_fallback` is a chain-internal
+    # token (NOT a user choice); run_vlm reports it as "gemini".
+    "gemini": ("gemini", "gemini_fallback", "dashscope", "openrouter"),
     "openai": ("openai", "openrouter"),
     "openrouter": ("openrouter", "gemini"),
     # SANDBOX: Alibaba-direct Qwen3-VL (native video + fps) primary, OpenRouter
@@ -95,26 +99,36 @@ async def run_vlm(
     errors: dict[str, str] = {}
     for prov in chain:
         try:
-            if prov == "gemini":
+            if prov in ("gemini", "gemini_fallback"):
+                # Two gemini tiers on the SAME native-video path: primary model,
+                # then the fallback model. Reported as "gemini" either way — the
+                # analyses.provider CHECK constraint has no separate value and
+                # both ARE the gemini provider.
+                gmodel = (
+                    settings.gemini_fallback_model
+                    if prov == "gemini_fallback"
+                    else settings.gemini_model
+                )
                 result = await gemini_provider(
                     mp4=mp4, detectors=detectors, log_tag=log_tag, settings=settings,
                     patient_in_clip=identity.patient_in_clip,
                     patient_bbox=identity.patient_bbox,
+                    model=gmodel,
                 )
-            else:
-                fn = {
-                    "openai": openai_provider,
-                    "openrouter": openrouter_provider,
-                    "dashscope": dashscope_provider,
-                }[prov]
-                result = await fn(
-                    mp4=mp4, detectors=detectors, log_tag=log_tag, settings=settings,
-                    patient_in_clip=identity.patient_in_clip,
-                    patient_bbox=identity.patient_bbox,
-                    pre_extracted_frames=identity.extracted_frames,
-                    per_frame_bboxes=identity.per_frame_bboxes,
-                    sample_fps=identity.sample_fps,
-                )
+                return "gemini", result
+            fn = {
+                "openai": openai_provider,
+                "openrouter": openrouter_provider,
+                "dashscope": dashscope_provider,
+            }[prov]
+            result = await fn(
+                mp4=mp4, detectors=detectors, log_tag=log_tag, settings=settings,
+                patient_in_clip=identity.patient_in_clip,
+                patient_bbox=identity.patient_bbox,
+                pre_extracted_frames=identity.extracted_frames,
+                per_frame_bboxes=identity.per_frame_bboxes,
+                sample_fps=identity.sample_fps,
+            )
             return prov, result
         except Exception as e:  # noqa: BLE001
             errors[prov] = str(e)
