@@ -256,3 +256,48 @@ def test_stash_fields_caps_track_list_at_eight() -> None:
     assert d["sig_person_present"] is True
     assert d["sig_people_count"] == 11
     assert isinstance(sig, TickSignals)
+
+
+# ─── JPEG-in-buffer path (2026-07-19 soak bug) ───────────────────
+
+
+def _jpeg_window(n: int = 12, *, with_luma: bool = True) -> list[FrameSnapshot]:
+    """Same flickering window as `_window`, but frames stored the way
+    the live buffer stores them since JPEG-in-buffer: JPEG bytes + the
+    320x180 luma thumbnail. Whole-frame flicker so the env pass sees it."""
+    from src.services.detection import frame_codec
+
+    t0 = time.monotonic() - n / 4.0
+    frames = []
+    for i in range(n):
+        y = np.full((H, W), 200 if i % 2 else 60, dtype=np.uint8)
+        uv = np.full((H // 2) * (W // 2) * 2, 128, dtype=np.uint8)
+        jpeg, luma = frame_codec.compress_for_buffer(
+            W, H, y.tobytes() + uv.tobytes(), quality=88,
+        )
+        frames.append(FrameSnapshot(
+            width=W, height=H, data=jpeg, captured_at=t0 + i / 4.0,
+            luma=luma if with_luma else b"",
+        ))
+    return frames
+
+
+def test_env_motion_sees_jpeg_frames_via_luma_thumbnail() -> None:
+    # The live-soak blindness: _map_plane read JPEG bytes as a raw Y
+    # plane, failed the size guard, and skipped EVERY frame — env
+    # motion pinned at 0.0 while the person visibly moved.
+    sig = compute_tick_signals(
+        _jpeg_window(), tracks=None, attribution_ran=False,
+        sample_width=_SAMPLE_WIDTH,
+    )
+    assert sig.env_motion > 0.5
+    assert sig.frames_used >= 10
+
+
+def test_jpeg_frames_without_luma_skip_not_misread() -> None:
+    sig = compute_tick_signals(
+        _jpeg_window(with_luma=False), tracks=None, attribution_ran=False,
+        sample_width=_SAMPLE_WIDTH,
+    )
+    assert sig.env_motion == 0.0
+    assert sig.frames_used == 0

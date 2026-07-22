@@ -275,14 +275,23 @@ async def test_tick_writes_identity_into_analyses(
         return [_Frame(_TINY_JPEG) for _ in range(3)]
     monkeypatch.setattr(frame_extraction, "extract_frames", fake_extract)
 
-    settings = get_settings().model_copy(update={"reid_enabled": True})
+    settings = get_settings().model_copy(update={
+        "reid_enabled": True,
+        # This test mocks _run_pipeline_sync; the SAM wire hop
+        # (env-selected on the soak box) must not run for real.
+        "reid_pipeline_backend": "legacy",
+    })
     sm = get_sessionmaker()
     reid = ReIDInference(sessionmaker=sm, settings=settings)
 
     # Bypass the heavy CV pipeline — emulate a clean PATIENT lock with
     # a body bbox so the rest of ReIDInference (async wrapper,
     # IdentityResult assembly, harvest hop) is what we exercise.
-    def fake_pipeline_sync(*, frames, gallery, patient_id, sample_fps):
+    # **_ absorbs newer keyword-only params (carry=, remote_obs=) so
+    # this fake tracks the real _run_pipeline_sync signature — a
+    # TypeError here would be swallowed by label_clip's fail-open
+    # wrapper and silently flip the test's premise (review G2).
+    def fake_pipeline_sync(*, frames, gallery, patient_id, sample_fps, **_):
         return (
             IdentityResult(
                 reid_ran=True,

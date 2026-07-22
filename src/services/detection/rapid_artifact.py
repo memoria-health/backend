@@ -24,6 +24,7 @@ import asyncio
 import logging
 from typing import Sequence
 
+from src.services.detection import frame_codec
 from src.services.detection.frame_buffer import FrameSnapshot
 from src.services.detection.motion_overlay import overlay_motion
 from src.services.detection.mp4_remux import Mp4RemuxError, frames_to_mp4
@@ -112,9 +113,34 @@ def crop_i420(
     cw, ch = x1 - x0, y1 - y0
     out: list[FrameSnapshot] = []
     for f in frames:
+        if (f.width, f.height) != (ref_w, ref_h):
+            continue
+        # JPEG-in-buffer (2026-07-19): decode → crop → re-encode so
+        # the cropped window keeps the input's format. Rapid-gated
+        # path only — the decode cost lands on windows that earn it.
+        if frame_codec.is_jpeg(f.data):
+            import cv2
+            try:
+                bgr = frame_codec.jpeg_to_bgr(f.data)
+            except ValueError:
+                continue
+            if bgr.shape[0] < y1 or bgr.shape[1] < x1:
+                continue
+            ok, buf = cv2.imencode(
+                ".jpg", bgr[y0:y1, x0:x1],
+                [int(cv2.IMWRITE_JPEG_QUALITY),
+                 frame_codec.DEFAULT_JPEG_QUALITY],
+            )
+            if not ok:
+                continue
+            out.append(FrameSnapshot(
+                width=cw, height=ch, data=bytes(buf),
+                captured_at=f.captured_at,
+            ))
+            continue
         ysize = f.width * f.height
         csize = ysize // 4
-        if (f.width, f.height) != (ref_w, ref_h) or len(f.data) < ysize + 2 * csize:
+        if len(f.data) < ysize + 2 * csize:
             continue
         arr = np.frombuffer(f.data, dtype=np.uint8)
         y = arr[:ysize].reshape(f.height, f.width)[y0:y1, x0:x1]

@@ -32,6 +32,7 @@ import os
 import tempfile
 from collections.abc import Sequence
 
+from src.services.detection import frame_codec
 from src.services.detection.frame_buffer import FrameSnapshot
 
 log = logging.getLogger(__name__)
@@ -77,11 +78,11 @@ async def frames_to_mp4(
 
     # WebRTC's adaptive bitrate can change publish resolution mid-
     # stream — the buffer may contain a mix of (e.g.) 320x180 startup
-    # frames + later 1280x720 steady-state frames. ffmpeg's rawvideo
-    # input needs constant dimensions, so filter the window to only
-    # frames matching the MOST RECENT frame's size and drop the rest.
-    # Last frame's resolution is what the LLM should see — that's the
-    # current publish state.
+    # frames + later 1280x720 steady-state frames. Both input modes
+    # need constant dimensions (rawvideo strictly; mjpeg for a stable
+    # h264 encode), so filter the window to only frames matching the
+    # MOST RECENT frame's size and drop the rest. Last frame's
+    # resolution is what the LLM should see — the current publish state.
     width = frames[-1].width
     height = frames[-1].height
     filtered = [f for f in frames if f.width == width and f.height == height]
@@ -95,13 +96,26 @@ async def frames_to_mp4(
     if not frames:
         raise ValueError("frames_to_mp4: no frames at the most-recent resolution")
 
-    expected_bytes_per_frame = width * height * 3 // 2  # I420 = 1.5 bpp
-    for i, f in enumerate(frames):
-        if len(f.data) != expected_bytes_per_frame:
-            raise ValueError(
-                f"frame {i} has {len(f.data)} bytes; expected "
-                f"{expected_bytes_per_frame} for I420 at {width}x{height}"
-            )
+    # Format sniff (JPEG-in-buffer, 2026-07-19): the live buffer now
+    # stores JPEG frames; ffmpeg consumes them directly as an MJPEG
+    # stream (its C decoder, no Python-side decode). Legacy raw-I420
+    # windows (tests, transitional) keep the rawvideo path. A window
+    # never legitimately mixes formats — reject if it does.
+    jpeg_input = frame_codec.is_jpeg(frames[0].data)
+    if jpeg_input:
+        for i, f in enumerate(frames):
+            if not frame_codec.is_jpeg(f.data):
+                raise ValueError(
+                    f"frame {i} is not JPEG in a JPEG window",
+                )
+    else:
+        expected_bytes_per_frame = width * height * 3 // 2  # I420 = 1.5 bpp
+        for i, f in enumerate(frames):
+            if len(f.data) != expected_bytes_per_frame:
+                raise ValueError(
+                    f"frame {i} has {len(f.data)} bytes; expected "
+                    f"{expected_bytes_per_frame} for I420 at {width}x{height}"
+                )
 
     audio_path: str | None = None
     if pcm:
@@ -116,15 +130,17 @@ async def frames_to_mp4(
         audio_path = af.name
 
     try:
-        cmd: list[str] = [
-            "ffmpeg",
-            "-hide_banner", "-loglevel", "error",
-            "-f", "rawvideo",
-            "-pix_fmt", "yuv420p",
-            "-s", f"{width}x{height}",
-            "-r", str(fps),
-            "-i", "pipe:0",
-        ]
+        cmd: list[str] = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+        if jpeg_input:
+            cmd += ["-f", "mjpeg", "-r", str(fps), "-i", "pipe:0"]
+        else:
+            cmd += [
+                "-f", "rawvideo",
+                "-pix_fmt", "yuv420p",
+                "-s", f"{width}x{height}",
+                "-r", str(fps),
+                "-i", "pipe:0",
+            ]
         if audio_path is not None:
             cmd += [
                 "-f", "s16le",
@@ -132,9 +148,15 @@ async def frames_to_mp4(
                 "-ac", str(pcm_num_channels),
                 "-i", audio_path,
             ]
+        # veryfast+crf20 replaced ultrafast (2026-07-19): this encode
+        # is what the VLM actually SEES, and ultrafast at default crf
+        # was the lossiest hop in the whole pipeline. ~2× encode time
+        # (~0.5s/window at 2K) buys visibly cleaner frames for
+        # detection accuracy.
         cmd += [
             "-c:v", "libx264",
-            "-preset", "ultrafast",
+            "-preset", "veryfast",
+            "-crf", "20",
             "-tune", "zerolatency",
             "-pix_fmt", "yuv420p",
         ]

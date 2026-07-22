@@ -36,7 +36,16 @@ class FrameSnapshot:
 
     `data` is a fresh `bytes` copy (memoryview lifetime in the SDK
     expires when the next frame arrives, so callers must copy before
-    handing the frame to `FrameBuffer.push`).
+    handing the frame to `FrameBuffer.push`). Since 2026-07-19 the
+    live receive path stores `data` as a JPEG (~6-10× smaller than raw
+    I420 — what makes native 2K retainable); consumers format-sniff
+    via `frame_codec.is_jpeg` and keep their legacy raw-I420 path, so
+    synthetic raw frames in tests remain valid.
+
+    `luma` is a small raw grayscale thumbnail (`frame_codec.LUMA_W`×
+    `LUMA_H`) built from the I420 Y plane at push time so the
+    motion/wake math never pays a JPEG decode. Empty on legacy raw
+    frames (the math falls back to `data` itself).
 
     `captured_at` is monotonic seconds (`time.monotonic()`), not
     wall-clock. Used only for relative-window math inside the buffer;
@@ -48,6 +57,7 @@ class FrameSnapshot:
     height: int
     data: bytes
     captured_at: float
+    luma: bytes = b""
 
 
 class FrameBuffer:
@@ -75,6 +85,13 @@ class FrameBuffer:
         self._frames: deque[FrameSnapshot] = deque(maxlen=self._capacity)
         self._last_accepted_at: float = float("-inf")
 
+    def accepts(self, captured_at: float) -> bool:
+        """Would a frame stamped `captured_at` be accepted right now?
+        Lets the receive path skip the convert+compress work entirely
+        for frames the sampler is about to drop (~half the delivered
+        frames) — the check is the same min-gap rule `push` applies."""
+        return captured_at - self._last_accepted_at >= self._min_gap_seconds
+
     def push(
         self,
         *,
@@ -82,6 +99,7 @@ class FrameBuffer:
         height: int,
         data: bytes,
         captured_at: float,
+        luma: bytes = b"",
     ) -> bool:
         """Accept or drop one frame.
 
@@ -94,7 +112,8 @@ class FrameBuffer:
             return False
         self._frames.append(
             FrameSnapshot(
-                width=width, height=height, data=data, captured_at=captured_at,
+                width=width, height=height, data=data,
+                captured_at=captured_at, luma=luma,
             )
         )
         self._last_accepted_at = captured_at

@@ -36,6 +36,27 @@ def _select_device():
     return torch.device("cpu")
 
 
+# One OSNet backend per (weights, device), shared by every tracker.
+# PersonTracker is built PER TICK by design (per-clip track state),
+# but the old code rebuilt PyTorchBackend — a full model load — each
+# time. Leaked ~1 native thread + tens of MB of arena per analyzed
+# tick (2026-07-19 soak: ~90-130MB/min climb, 236 futex-parked
+# threads). Weights are read-only at inference; concurrent forward
+# from both cameras' pipelines is safe.
+_REID_BACKENDS: dict[tuple[str, str], object] = {}
+
+
+def _shared_reid_backend(weights: Path, device) -> object:
+    key = (str(weights), str(device))
+    be = _REID_BACKENDS.get(key)
+    if be is None:
+        from boxmot.reid.backends.pytorch_backend import PyTorchBackend
+        be = PyTorchBackend(weights=weights, device=device, half=False)
+        _REID_BACKENDS[key] = be
+        log.info("reid.osnet_backend_loaded weights=%s device=%s", weights, device)
+    return be
+
+
 class PersonTracker:
     """BoT-SORT + OSNet appearance Re-ID wrapper.
 
@@ -48,19 +69,31 @@ class PersonTracker:
         *,
         reid_weights: Path = Path("osnet_x0_25_msmt17.pt"),
         frame_rate: int = 5,
+        track_high_thresh: float = 0.5,
+        track_low_thresh: float = 0.1,
+        new_track_thresh: float = 0.6,
     ) -> None:
         # Local imports keep the cold-start cost of `pytest`-only
         # paths low; boxmot pulls torch + several CV libs.
-        from boxmot.reid.backends.pytorch_backend import PyTorchBackend
         from boxmot.trackers.botsort.botsort import BotSort
         device = _select_device()
-        reid_model = PyTorchBackend(weights=reid_weights, device=device, half=False)
+        reid_model = _shared_reid_backend(reid_weights, device)
         # `frame_rate` controls how aggressively the tracker ages out
         # stale tracks. 5 fps matches our per-tick Re-ID sample rate.
+        # The three thresholds expose BoT-SORT's ByteTrack-style
+        # two-stage association (identity-persistence W6): detections
+        # ≥ high go through the first association pass and may BIRTH
+        # tracks (subject to new_track_thresh); detections in
+        # [low, high) are second-pass CONTINUATION-only — they keep an
+        # existing track alive through seated/lying stillness but can
+        # never create one.
         self.tracker = BotSort(
             reid_model=reid_model,
             frame_rate=frame_rate,
             with_reid=True,
+            track_high_thresh=track_high_thresh,
+            track_low_thresh=track_low_thresh,
+            new_track_thresh=new_track_thresh,
         )
 
     def update(self, dets: np.ndarray, frame_bgr: np.ndarray) -> np.ndarray:

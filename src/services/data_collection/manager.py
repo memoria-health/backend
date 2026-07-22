@@ -173,6 +173,13 @@ class RecorderManager:
                     "data_collection: abort_camera failed for %s", camera_id
                 )
 
+    def wants_video(self, camera_id: UUID) -> bool:
+        """Cheap probe: does this camera have a session that would
+        consume a fed frame right now? Lets the receive path skip the
+        native-res convert entirely when neither the recorder nor the
+        frame buffer needs the frame (JPEG-in-buffer rework 2026-07-19)."""
+        return self._sessions.get(camera_id) is not None
+
     def feed_video(self, camera_id: UUID, width: int, height: int, data: bytes) -> None:
         rec = self._sessions.get(camera_id)
         if rec is not None:

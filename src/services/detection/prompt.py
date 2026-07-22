@@ -37,7 +37,12 @@ BASE_PROMPT = (
     "happened, start to finish, and why it was flagged. So justify whatever "
     "you detect below: describe what the person did and said and the "
     "specific things about them that led to your conclusion, making clear "
-    "what about the person made each detector you mark true. Mention an "
+    "what about the person made each detector you mark true. Justify ONLY "
+    "the detectors you mark true. Never write what did not happen and never "
+    "mention a detector you mark false: no sentences like 'no signs of "
+    "distress were observed' or 'there was no fall' — leaving something "
+    "unmentioned already says it did not happen. Every sentence must report "
+    "something actually seen or heard in the clip. Mention an "
     "object only when it matters to the detection, and include a specific "
     "detail about it (such as which medication was taken) only when you can "
     "credibly see it — never guess or invent details. Skip surroundings and "
@@ -123,7 +128,18 @@ def build_prompt_and_schema(
     if motion_overlay:
         parts.append(_MOTION_OVERLAY_NOTE)
     schema_properties: dict[str, dict[str, str]] = {
-        "description": {"type": "string"},
+        "description": {
+            "type": "string",
+            # Schema-level reinforcement of the BASE_PROMPT rule —
+            # flash-lite kept writing "no signs of X" filler when the
+            # rule lived only mid-prompt.
+            "description": (
+                "Only what actually happened and was seen or heard. "
+                "Never mention absences or detectors that are false — "
+                "no sentences like 'no signs of distress' or 'there "
+                "was no fall'."
+            ),
+        },
     }
     schema_required: list[str] = ["description"]
 

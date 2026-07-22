@@ -23,6 +23,7 @@ def _settings(*, reid_enabled: bool, timeout: float = 5.0) -> SimpleNamespace:
     return SimpleNamespace(
         reid_enabled=reid_enabled,
         reid_timeout_seconds=timeout,
+        reid_pipeline_backend="legacy",
     )
 
 
@@ -57,7 +58,7 @@ def _make(reid_enabled: bool, gallery_rows: int | None) -> tuple[ReIDInference, 
             raise AssertionError("_get_gallery must not be called when reid_enabled=False")
         return np.zeros((gallery_rows, 512), dtype=np.float32)
 
-    async def fake_inner(*, mp4_bytes, patient_id, gallery):
+    async def fake_inner(*, mp4_bytes, patient_id, gallery, camera_id=None, **_):
         seen["inner_calls"].append(gallery)
         return _sentinel()
 
@@ -103,7 +104,7 @@ async def test_timeout_reports_eligibility_truthfully() -> None:
     svc, _ = _make(reid_enabled=True, gallery_rows=2)
     svc._settings = _settings(reid_enabled=True, timeout=0.01)
 
-    async def slow_inner(*, mp4_bytes, patient_id, gallery):
+    async def slow_inner(*, mp4_bytes, patient_id, gallery, **_):
         await asyncio.sleep(1.0)
 
     svc._label_clip_inner = slow_inner  # type: ignore[method-assign]
@@ -117,7 +118,7 @@ async def test_timeout_reports_eligibility_truthfully() -> None:
 async def test_error_with_flag_off_reports_not_enrolled() -> None:
     svc, _ = _make(reid_enabled=False, gallery_rows=None)
 
-    async def boom(*, mp4_bytes, patient_id, gallery):
+    async def boom(*, mp4_bytes, patient_id, gallery, **_):
         raise RuntimeError("pipeline exploded")
 
     svc._label_clip_inner = boom  # type: ignore[method-assign]

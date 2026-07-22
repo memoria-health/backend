@@ -85,8 +85,13 @@ def test_people_present_is_always_merged_into_prompt_and_schema() -> None:
     # description must be first in required.
     assert result.schema_required[0] == "description"
 
-    # Type-match the inner field shapes.
-    assert result.schema_properties["description"] == {"type": "string"}
+    # Type-match the inner field shapes. The description field also
+    # carries a schema-level style instruction (2026-07-19: flash-lite
+    # ignored the no-negative-observations rule when it lived only in
+    # the prose prompt).
+    desc = result.schema_properties["description"]
+    assert desc["type"] == "string"
+    assert "Never mention absences" in desc["description"]
     assert result.schema_properties["people_present"] == {"type": "boolean"}
     assert result.schema_properties["people_count"] == {"type": "number"}
     assert result.schema_properties["fall_detected"] == {"type": "boolean"}

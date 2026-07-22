@@ -52,6 +52,7 @@ from src.services.detection.motion import (
 )
 from src.services.detection.motion_cache import MotionCache
 from src.services.detection.patient_presence import PatientPresence
+from src.services.reid.track_ledger import TrackLedger
 from src.services.detection.motion_overlay import overlay_motion
 from src.services.detection.mp4_remux import Mp4RemuxError, frames_to_mp4
 from src.services.detection.providers.gemini import gemini_provider
@@ -98,6 +99,26 @@ _STOP_INFLIGHT_TIMEOUT: float = 2.0
 
 
 @dataclass
+class _PinnedTick:
+    """A shed tick's evidence, frozen at shed time (identity-persistence
+    W1). When the 2-generation in-flight cap sheds a tick, the window
+    it WOULD have analyzed is snapshotted immediately — the action may
+    exist only in that window (Aryaman 2026-07-19: "what if that clip
+    was where the action occurred?"). The tick then runs as soon as a
+    slot frees, using these frozen frames instead of re-snapshotting a
+    buffer that has since rotated past the moment. Depth is 1 per
+    camera and the payload dies after `scheduler_tick_queue_max_age_s`,
+    so at most one extra window (~tens of MB, seconds of lifetime) is
+    ever held."""
+
+    captured_at: "datetime"
+    tick_mono: float
+    window: list
+    pcm: object
+    enqueued_mono: float
+
+
+@dataclass
 class _RecorderDecision:
     """Per-tick verdict handed to the data-collection recorder.
 
@@ -116,6 +137,41 @@ class _RecorderDecision:
     # taking the linger→finalize→upload route, so pre-privacy footage is
     # dropped on the device rather than uploaded.
     privacy: bool = False
+
+
+def compute_reid_mode(
+    *,
+    all_bound: bool,
+    confirmed_elsewhere: bool,
+    holder_seen: bool,
+    occupied_count: int,
+) -> str:
+    """Patient-focus governor (2026-07-22): decide this camera's reid
+    fidelity so the home's TOTAL GPU demand always fits — the fix for
+    the both-cameras-full saturation spiral (45 shed ticks / 3 min).
+
+      lean    — this camera holds the patient and everyone in view is
+                identified: light continuity is enough.
+      minimal — the patient is freshly SEEN on another camera: this
+                room needs presence only, zero face work (guests are
+                counted, never identified — Aryaman's tenet). The
+                holder_seen condition is the escalation trigger: the
+                instant the holder loses sight, this room returns to
+                full so a room change is never blinded.
+      split   — nobody holds the patient and several rooms are
+                occupied: share the frame budget; the cross-tick
+                evidence accumulators finish identification over a
+                few ticks instead of demanding it inside one.
+      full    — otherwise (the only occupied room, patient unfound):
+                full fidelity.
+    """
+    if all_bound:
+        return "lean"
+    if confirmed_elsewhere and holder_seen:
+        return "minimal"
+    if occupied_count >= 2:
+        return "split"
+    return "full"
 
 
 class CameraIngest:
@@ -147,6 +203,15 @@ class CameraIngest:
         self._patient_presence = patient_presence
         self._settings = settings
         self._reid = reid
+        # Track-anchored identity ledger (2026-07-21, replaced the
+        # IdentityLock ENTER/HOLD/PARK/RELEASE machine): persistent
+        # geometric track stitching + identity bindings. Feeds the
+        # home-wide single-holder registry above.
+        self._identity_lock = TrackLedger(
+            camera_id=camera_id,
+            registry=patient_presence,
+            settings=settings,
+        )
         # Backend wake authority (motion.py #3): verifies the gateway's
         # motion hint before a closed camera buys a VLM call. Owns the
         # per-block habituation baselines for this camera.
@@ -212,6 +277,16 @@ class CameraIngest:
         # finish cleanly before we force-cancel — otherwise their
         # analyses writes would FK-violate after the row CASCADE-deletes.
         self._inflight_ticks: set[asyncio.Task[None]] = set()
+        # W1 bounded tick queue: the one shed tick whose window is
+        # frozen and waiting for a free slot (None = queue empty).
+        self._queued_tick: _PinnedTick | None = None
+        # Teardown latch (review F4): once stop() begins, done-callbacks
+        # must never spawn the queued tick — an escaped task would run a
+        # full VLM+DB tick against a camera row being CASCADE-deleted.
+        self._stopping = False
+        # Fire-and-forget housekeeping tasks (stale-drop rows) — held
+        # so the event loop doesn't GC them mid-write.
+        self._bg_tasks: set[asyncio.Task] = set()
         self._log_tag = f"worker cam={camera_id}"
 
     async def start(self) -> None:
@@ -252,6 +327,12 @@ class CameraIngest:
             )
 
     async def stop(self) -> None:
+        # Latch BEFORE anything else: done-callbacks fire during the
+        # drain below and must not respawn the queued tick (F4). Drop
+        # the frozen window immediately — its moment will never be
+        # analyzed and holding ~50MB through teardown helps nobody.
+        self._stopping = True
+        self._queued_tick = None
         # Cancel the loop FIRST so no new ticks get spawned while we wait
         # on the in-flight ones. Idempotent — second stop() is a no-op
         # because _tick_task is None after the first call.
@@ -293,6 +374,31 @@ class CameraIngest:
                 # Drain the cancellations so we don't leak warnings about
                 # un-awaited tasks at process shutdown.
                 await asyncio.gather(*in_flight, return_exceptions=True)
+        # Second sweep: anything a done-callback managed to add between
+        # the snapshot and the latch (F4 belt-and-suspenders) — cancel
+        # and drain rather than let it write against a reaped camera.
+        while self._inflight_ticks:
+            stragglers = list(self._inflight_ticks)
+            for task in stragglers:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*stragglers, return_exceptions=True)
+            for task in stragglers:
+                self._inflight_ticks.discard(task)
+        # Housekeeping writers (backlog/stale rows) — give them a short
+        # window to land, then cancel; a lost visibility row beats an
+        # FK-violating write after the camera row is gone.
+        if self._bg_tasks:
+            bg = list(self._bg_tasks)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*bg, return_exceptions=True), timeout=3.0,
+                )
+            except asyncio.TimeoutError:
+                for task in bg:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*bg, return_exceptions=True)
         self._motion_cache.drop(self.camera_id)
 
     async def _tick_loop(self) -> None:
@@ -313,18 +419,18 @@ class CameraIngest:
         try:
             while True:
                 await asyncio.sleep(tick_seconds)
+                # A frozen shed tick (W1) gets first claim on capacity
+                # — it is older than this beat's tick.
+                self._maybe_run_queued()
                 # Bounded in-flight (resource contract, 2026-07-18): at
                 # most 2 tick generations per camera may run at once.
                 # Overlap is normal pipelining (slow provider), but an
                 # unbounded pile-up is the OOM/parallel-calls failure
-                # mode — the 3rd generation sheds VISIBLY instead.
+                # mode. The 3rd generation is no longer dropped — its
+                # WINDOW is frozen and runs when a slot frees (W1),
+                # because the action may live only in that window.
                 if len(self._inflight_ticks) >= 2:
-                    log.warning(
-                        "%s tick SHED — %d generations already in flight "
-                        "(provider latency >> cadence)",
-                        self._log_tag, len(self._inflight_ticks),
-                    )
-                    await self._write_backlog_row()
+                    self._pin_or_shed_tick()
                     continue
                 task = asyncio.create_task(
                     self._run_tick_safely(),
@@ -332,21 +438,123 @@ class CameraIngest:
                 )
                 # Track so stop() can wait on or cancel in-flight ticks.
                 # The done callback runs synchronously when the task
-                # finishes (or is cancelled) and discards the reference,
-                # so the set stays bounded.
+                # finishes (or is cancelled), discards the reference,
+                # and gives any frozen shed tick the freed slot.
                 self._inflight_ticks.add(task)
-                task.add_done_callback(self._inflight_ticks.discard)
+                task.add_done_callback(self._on_tick_done)
         except asyncio.CancelledError:
             raise
 
-    async def _write_backlog_row(self) -> None:
-        """Visibility row for a shed tick (dashboard: 'skipped ·
-        tick_backlog'). Same fresh-session, never-raises contract as
-        `_write_failed_row`."""
+    def _pin_or_shed_tick(self) -> None:
+        """In-flight cap hit. Freeze this tick's evidence window for a
+        deferred run (identity-persistence W1) — or shed visibly like
+        before when the queue is occupied, disabled, or the buffer is
+        empty."""
+        max_age = self._settings.scheduler_tick_queue_max_age_s
+        if max_age > 0 and self._queued_tick is None:
+            mono = time.monotonic()
+            window = self.frame_buffer.snapshot_last_seconds(
+                self._settings.livekit_worker_window_seconds,
+                now=mono,
+                at_fps=self._settings.livekit_worker_target_fps,
+            )
+            if window:
+                pcm = self.audio_buffer.snapshot_last_seconds(
+                    self._settings.livekit_worker_window_seconds,
+                    now=mono,
+                )
+                self._queued_tick = _PinnedTick(
+                    captured_at=datetime.now(timezone.utc),
+                    tick_mono=mono,
+                    window=window,
+                    pcm=pcm,
+                    enqueued_mono=mono,
+                )
+                log.warning(
+                    "%s tick QUEUED — %d generations in flight; window "
+                    "frozen (%d frames), runs when a slot frees (max %.0fs)",
+                    self._log_tag, len(self._inflight_ticks),
+                    len(window), max_age,
+                )
+                return
+        log.warning(
+            "%s tick SHED — %d generations already in flight "
+            "(provider latency >> cadence)%s",
+            self._log_tag, len(self._inflight_ticks),
+            "; queue occupied" if self._queued_tick is not None else "",
+        )
+        self._spawn_bg(self._write_backlog_row())
+
+    def _spawn_bg(self, coro) -> None:
+        """Fire-and-forget housekeeping task, reference-held so the
+        loop can't GC it mid-write."""
+        t = asyncio.create_task(coro)
+        self._bg_tasks.add(t)
+        t.add_done_callback(self._bg_tasks.discard)
+
+    def _on_tick_done(self, task: "asyncio.Task") -> None:
+        self._inflight_ticks.discard(task)
+        # Runs in the event loop (call_soon) — safe to spawn here. The
+        # frozen shed tick starts the instant a slot frees instead of
+        # waiting for the next cadence beat.
+        self._maybe_run_queued()
+
+    def _maybe_run_queued(self) -> None:
+        """Run the frozen shed tick the moment capacity exists — or
+        drop it loudly once it has aged past the cap (a stale window
+        would attach a verdict to a moment long gone — the lying-clip
+        rule applies to analysis too)."""
+        if self._stopping:
+            return
+        q = self._queued_tick
+        if q is None:
+            return
+        # Age check BEFORE the slot check (review): the ~50MB frozen
+        # payload must die at max_age even while both slots stay busy —
+        # this runs every cadence beat, so expiry is never gated on a
+        # slot freeing.
+        age = time.monotonic() - q.enqueued_mono
+        if age > self._settings.scheduler_tick_queue_max_age_s:
+            self._queued_tick = None
+            log.warning(
+                "%s queued tick DROPPED stale after %.1fs — window lost",
+                self._log_tag, age,
+            )
+            self._spawn_bg(self._write_backlog_row(
+                reason="tick_dropped_stale",
+                description=(
+                    f"(queued tick expired after {age:.0f}s — "
+                    "frozen window discarded)"
+                ),
+            ))
+            return
+        if len(self._inflight_ticks) >= 2:
+            return
+        self._queued_tick = None
+        log.info(
+            "%s queued tick RUNNING after %.1fs wait (frozen window, "
+            "%d frames)",
+            self._log_tag, age, len(q.window),
+        )
+        task = asyncio.create_task(
+            self._run_tick_safely(pinned=q),
+            name=f"tick-queued-{self.camera_id}",
+        )
+        self._inflight_ticks.add(task)
+        task.add_done_callback(self._on_tick_done)
+
+    async def _write_backlog_row(
+        self,
+        reason: str = "tick_backlog",
+        description: str = "(tick shed — 2 generations already in flight)",
+    ) -> None:
+        """Visibility row for a shed/expired tick (dashboard: 'skipped ·
+        tick_backlog' / 'tick_dropped_stale'). Same fresh-session,
+        never-raises contract as `_write_failed_row`."""
         try:
             fields: dict = {
                 "people_present": False,
-                "skipped_reason": "tick_backlog",
+                "skipped_reason": reason,
             }
             self._stamp_ingress(fields)
             async with self._sessionmaker() as session:
@@ -360,7 +568,7 @@ class CameraIngest:
                     session,
                     camera_id=self.camera_id,
                     provider="skipped",
-                    description="(tick shed — 2 generations already in flight)",
+                    description=description,
                     detector_fields=fields,
                     people_present=False,
                     people_count=0,
@@ -372,8 +580,10 @@ class CameraIngest:
         except Exception:  # noqa: BLE001
             log.debug("%s backlog-row write failed", self._log_tag, exc_info=True)
 
-    async def _run_tick_safely(self) -> None:
+    async def _run_tick_safely(self, pinned: "_PinnedTick | None" = None) -> None:
         """Wrap one tick body so that failures NEVER kill the loop.
+        `pinned` carries a shed tick's frozen evidence window (W1);
+        None = normal live tick.
 
         Vanished-row ticks (the camera row was deleted mid-flight) used
         to count toward a self-destruct threshold; that mechanism was
@@ -385,7 +595,7 @@ class CameraIngest:
         miss. Until then, vanished-row ticks just log and return.
         """
         try:
-            await self._run_tick()
+            await self._run_tick(pinned)
         except CameraVanishedError:
             log.warning(
                 "%s tick failed: camera row missing — reconciler will reap",
@@ -495,7 +705,7 @@ class CameraIngest:
             )
             return None
 
-    async def _run_tick(self) -> None:
+    async def _run_tick(self, pinned: "_PinnedTick | None" = None) -> None:
         """Run one tick, then drive the data-collection recorder.
 
         The recorder is driven in a `finally` so EVERY tick path —
@@ -506,7 +716,7 @@ class CameraIngest:
         """
         decision = _RecorderDecision()
         try:
-            await self._run_tick_inner(decision)
+            await self._run_tick_inner(decision, pinned)
         finally:
             await self._drive_recorder(decision)
 
@@ -531,7 +741,11 @@ class CameraIngest:
         except Exception:
             log.exception("%s data-collection recorder tick failed", self._log_tag)
 
-    async def _run_tick_inner(self, decision: "_RecorderDecision") -> None:
+    async def _run_tick_inner(
+        self,
+        decision: "_RecorderDecision",
+        pinned: "_PinnedTick | None" = None,
+    ) -> None:
         """One tick — mirrors `src/api/clips.py:ingest_clip` body."""
         self._tick_counter += 1
         # Phone/gateway SAD packet, demoted to a HINT (v2 P2): backend-
@@ -546,12 +760,23 @@ class CameraIngest:
         # Set iff this tick was woken out of the closed state by the
         # backend motion pass (whole-frame env fraction that fired).
         backend_wake_env: float | None = None
-        captured_at = datetime.now(timezone.utc)
+        # Pinned (queued-shed) ticks anchor EVERYTHING at their shed
+        # moment: the row's captured_at, and tick_mono so any further
+        # buffer snapshot (e.g. the RAPID native window) reads the same
+        # slice of time as the frozen main window — not the buffer's
+        # present.
+        captured_at = (
+            pinned.captured_at if pinned else datetime.now(timezone.utc)
+        )
         # One monotonic anchor for EVERY buffer snapshot this tick takes —
         # the main window and the RAPID native window must be the same
         # slice of time even though seconds of VLM latency separate the
         # calls that read them.
-        tick_mono = time.monotonic()
+        tick_mono = pinned.tick_mono if pinned else time.monotonic()
+        queued_delay_s = (
+            round(time.monotonic() - pinned.enqueued_mono, 1)
+            if pinned else None
+        )
 
         async with self._sessionmaker() as session:
             # v2 scheduler path (P3, flag-gated) needs each spec's row for
@@ -776,11 +1001,16 @@ class CameraIngest:
 
             # Build the MP4 from the buffered window (video + audio).
             # at_fps: the buffer may retain a higher native rate for the
-            # RAPID path; the main call always sees target_fps.
-            window = self.frame_buffer.snapshot_last_seconds(
-                self._settings.livekit_worker_window_seconds,
-                now=tick_mono,
-                at_fps=self._settings.livekit_worker_target_fps,
+            # RAPID path; the main call always sees target_fps. A pinned
+            # tick uses its FROZEN window/pcm — the live buffer has
+            # rotated past the moment this tick exists to analyze.
+            window = (
+                pinned.window if pinned
+                else self.frame_buffer.snapshot_last_seconds(
+                    self._settings.livekit_worker_window_seconds,
+                    now=tick_mono,
+                    at_fps=self._settings.livekit_worker_target_fps,
+                )
             )
             if not window:
                 log.info(
@@ -789,8 +1019,11 @@ class CameraIngest:
                     self._log_tag,
                 )
                 return
-            pcm = self.audio_buffer.snapshot_last_seconds(
-                self._settings.livekit_worker_window_seconds,
+            pcm = (
+                pinned.pcm if pinned
+                else self.audio_buffer.snapshot_last_seconds(
+                    self._settings.livekit_worker_window_seconds,
+                )
             )
             try:
                 mp4_bytes = await frames_to_mp4(
@@ -810,22 +1043,76 @@ class CameraIngest:
             # the tick. `IdentityResult.empty()` has reid_ran=False
             # which makes event_promotion bypass the identity gate
             # entirely (identity-agnostic / today's behavior).
+            # Patient-focus governor: this camera's fidelity for the
+            # tick, from home-wide state (who holds the patient, is
+            # the patient in sight, how many rooms are occupied).
+            if self._patient_presence is not None:
+                reid_mode = compute_reid_mode(
+                    all_bound=self._identity_lock.all_bound(),
+                    confirmed_elsewhere=(
+                        self._patient_presence.confirmed_elsewhere(
+                            self.camera_id,
+                        )
+                    ),
+                    holder_seen=self._patient_presence.holder_seen(),
+                    occupied_count=self._patient_presence.occupied_count(),
+                )
+            else:
+                reid_mode = (
+                    "lean" if self._identity_lock.all_bound() else "full"
+                )
             try:
                 identity = await self._reid.label_clip(
-                    mp4_bytes=mp4_bytes, patient_id=self.patient_id,
+                    mp4_bytes=mp4_bytes,
+                    patient_id=self.patient_id,
+                    camera_id=self.camera_id,
+                    # Binding-aware face throttle (optimization #1):
+                    # full face cadence while anyone in view is
+                    # unbound/suspect or the room is empty; 1-in-3
+                    # heartbeat once everyone is bound. (`minimal`
+                    # mode force-disables faces inside label_clip.)
+                    face_evidence=self._identity_lock.wants_face_evidence(),
+                    # Face-afterglow harvest hint (pool learns far/
+                    # seated appearances from the bound track).
+                    harvest_hint=self._identity_lock.harvest_hint(),
+                    mode=reid_mode,
                 )
             except Exception:
                 log.exception("%s reid.label_clip crashed", self._log_tag)
                 identity = IdentityResult.empty()
+            # W3 identity lock: fold this tick into the sticky lock —
+            # fresh PATIENT evidence (re)enters it; a held lock rides
+            # through blur/track-death and upgrades the result so every
+            # downstream consumer (prompt addendum, subject router,
+            # evidence frames, event gate) sees the persistent identity.
+            identity = self._identity_lock.apply(identity, tick_mono=tick_mono)
+            # Governor heartbeat: occupancy for every camera; and when
+            # THIS camera holds the seat, whether the patient was
+            # actually seen this tick (other rooms escalate out of
+            # minimal the moment the holder loses sight).
+            if self._patient_presence is not None:
+                _is_holder = (
+                    self._patient_presence.holder() == self.camera_id
+                )
+                self._patient_presence.note_tick(
+                    self.camera_id,
+                    people_present=bool(identity.people_present_reid),
+                    holder_seen=(
+                        self._identity_lock.patient_seen
+                        if _is_holder else None
+                    ),
+                )
             log.info(
-                "%s reid reid_ran=%s attribution_ran=%s patient_in_clip=%s "
-                "confidence=%.3f face_count=%d",
+                "%s reid mode=%s reid_ran=%s attribution_ran=%s "
+                "patient_in_clip=%s confidence=%.3f face_count=%d lock=%s",
                 self._log_tag,
+                reid_mode,
                 identity.reid_ran,
                 identity.attribution_ran,
                 identity.patient_in_clip,
                 identity.confidence,
                 identity.face_count,
+                self._identity_lock.stash_fields().get("id_lock"),
             )
             # Identity evidence frames (soak observability): captured at
             # the KEY MOMENTS of tracking consistency, not every tick —
@@ -976,11 +1263,39 @@ class CameraIngest:
             # `has_ready_enrollment` guard remains the day-zero clause,
             # without an enrollment we can't tell "non-patient" from
             # anything else.
+            #
+            # PATIENT-LOCATED guard (2026-07-19, Aryaman-approved after
+            # the living-room incident): this skip silences the ENTIRE
+            # tick — every detector, including severity-100 — so it may
+            # only fire when the patient is POSITIVELY accounted for on
+            # a DIFFERENT camera (home single-holder registry). Without
+            # this, a patient sitting in frame whose face fails to match
+            # at range (the observed norm at 640×360 couch distance)
+            # gets their room's analysis switched off: soak #2 showed
+            # sharp ticks being muted this way WITH the patient present,
+            # while blurry ticks (faces unreadable) kept spending — the
+            # exact inversion of what the money-saver intends. Costs
+            # more when the patient is unlocated (guests-only rooms
+            # analyze), which is the correct direction: "verified
+            # not-patient" may save money only when we know where the
+            # patient actually is. Fail-open when no registry is wired.
+            # Suppression requires GENUINELY verified strangers, not
+            # merely a face being DETECTED. The old `face_count > 0`
+            # disjunct fired on any SCRFD hit — so an unknown person
+            # whose face is present but unmatchable (aunt/uncle at
+            # couch distance) silenced the whole room while the patient
+            # sat in another room (2026-07-22 live: living-room ticks
+            # skipped identity_not_patient with every track UNKNOWN).
+            # `has_only_verified_other_tracks` (now produced by the
+            # cross-tick OTHER accumulator) is the real signal: every
+            # track confirmed not-patient. Unknowns keep the room live.
             if (
                 identity.reid_ran
                 and identity.attribution_ran
                 and not identity.patient_in_clip
-                and (identity.face_count > 0 or identity.has_only_verified_other_tracks)
+                and identity.has_only_verified_other_tracks
+                and self._patient_presence is not None
+                and self._patient_presence.confirmed_elsewhere(self.camera_id)
             ):
                 if await has_ready_enrollment(session, self.patient_id):
                     state_after = await apply_tick_update(
@@ -1003,10 +1318,20 @@ class CameraIngest:
                         "identity_face_count": identity.face_count,
                         "identity_has_only_verified_other_tracks":
                             identity.has_only_verified_other_tracks,
+                        "quality_width": identity.quality_width,
+                        "quality_sharpness": (
+                            round(identity.quality_sharpness)
+                            if identity.quality_sharpness is not None
+                            else None
+                        ),
+                        "quality_frames": identity.quality_frames,
+                        "quality_degraded": identity.quality_degraded,
                         "motion_src": motion_src,
                         **wake_fields,
                         **signals.stash_fields(),
                     }
+                    if queued_delay_s is not None:
+                        synthetic_fields["tick_queued_delay_s"] = queued_delay_s
                     await add_analysis(
                         session,
                         camera_id=self.camera_id,
@@ -1077,6 +1402,7 @@ class CameraIngest:
                     ScheduledDetector(
                         spec=s, dims=resolve_dims(row),
                         when_scope=getattr(row, "when_scope", None),
+                        category=getattr(row, "category", None) or "safety",
                     )
                     for s, row in loadout
                 ]
@@ -1089,10 +1415,13 @@ class CameraIngest:
                     if any(e.dims.bucket == "rapid" for e in entries)
                     else target_fps
                 )
-                # Mark BEFORE resolving so this tick's own positive
-                # confirmation shields the other cameras immediately.
-                if identity.patient_in_clip and self._patient_presence:
-                    self._patient_presence.mark(self.camera_id)
+                # Registry claims now flow through the identity lock
+                # (W3): fresh face evidence claims at TIER_FACE, body
+                # at TIER_BODY, a coasting hold refreshes at TIER_HELD
+                # — replacing the old bare ≥0.6 mark. The lock applied
+                # its claim in `apply()` above, before resolve_due, so
+                # this tick's own positive confirmation still shields
+                # the other cameras immediately.
                 due_set = resolve_due(
                     entries,
                     signals=signals,
@@ -1113,6 +1442,13 @@ class CameraIngest:
                     self._log_tag, len(due_set.due), len(due_set.skipped),
                     len(plans), due_set.crowd_fallback,
                 )
+                # soak 0.5 (reid-only): reid already ran above; the VLM
+                # execution is SKIPPED below (zero Gemini — incl. the
+                # always-on scene call) while identity keeps validating on
+                # the dashboard. Flag-gated, default off.
+                if self._settings.reid_soak_only and plans:
+                    log.info("%s reid_soak_only: skipping %d VLM calls",
+                             self._log_tag, len(plans))
                 # Overlay (RAPID) plans diff + encode at the buffer's
                 # native rate; the fps handed over is MEASURED from the
                 # snapshot's real spacing so a just-retargeted buffer
@@ -1121,7 +1457,18 @@ class CameraIngest:
                 # shortfall sched_degraded_fps.
                 native_window = None
                 native_fps = None
-                if any(p.channel == "overlay" for p in plans):
+                if pinned is not None:
+                    # A queued tick's moment has left the live buffer
+                    # (retention < queue max age) — re-snapshotting now
+                    # would hand the RAPID channel frames from a
+                    # DIFFERENT moment than the frozen window (review
+                    # F5: the lying-clip rule applies to analysis).
+                    # Leave native_window None: the executor degrades
+                    # the overlay call honestly (sched_degraded_*),
+                    # while the frozen main window serves everything
+                    # else.
+                    pass
+                elif any(p.channel == "overlay" for p in plans):
                     native_window = self.frame_buffer.snapshot_last_seconds(
                         self._settings.livekit_worker_window_seconds,
                         now=tick_mono,
@@ -1135,47 +1482,65 @@ class CameraIngest:
                             native_fps = max(
                                 1, round((len(native_window) - 1) / span)
                             )
-                try:
-                    sched = await run_scheduled_calls(
-                        plans,
-                        scene_mp4=vlm_mp4,
-                        window=window,
-                        native_window=native_window,
-                        native_fps=native_fps,
-                        pcm=pcm if pcm else None,
-                        pcm_sample_rate=self.audio_buffer.sample_rate,
-                        pcm_num_channels=self.audio_buffer.num_channels,
-                        identity=identity,
-                        settings=self._settings,
-                        vlm_choice=vlm_choice,
-                        run_main_vlm=run_vlm,
-                        flash_provider=gemini_provider,
-                        log_tag=self._log_tag,
+                if self._settings.reid_soak_only:
+                    # soak 0.5: skip the executor entirely (it asserts a
+                    # scene-call result, which we intentionally don't make)
+                    # and synthesize an empty result — presence from reid —
+                    # so downstream eventing no-ops cleanly. Zero Gemini.
+                    # `used_provider` must be a real provider value (the
+                    # analyses row has a provider CHECK constraint); reuse
+                    # the resolved vlm_choice — the row records identity
+                    # evidence for the dashboard, just with empty detection.
+                    used_provider = vlm_choice
+                    result = ProviderResult(
+                        description="",
+                        detector_fields={},
+                        people_present=identity.people_present_reid,
+                        people_count=identity.people_count_reid,
+                        usage=None,
                     )
-                except Exception:  # noqa: BLE001
-                    log.error(
-                        "%s scheduler tick failed (choice=%s)",
-                        self._log_tag, vlm_choice,
+                else:
+                    try:
+                        sched = await run_scheduled_calls(
+                            plans,
+                            scene_mp4=vlm_mp4,
+                            window=window,
+                            native_window=native_window,
+                            native_fps=native_fps,
+                            pcm=pcm if pcm else None,
+                            pcm_sample_rate=self.audio_buffer.sample_rate,
+                            pcm_num_channels=self.audio_buffer.num_channels,
+                            identity=identity,
+                            settings=self._settings,
+                            vlm_choice=vlm_choice,
+                            run_main_vlm=run_vlm,
+                            flash_provider=gemini_provider,
+                            log_tag=self._log_tag,
+                        )
+                    except Exception:  # noqa: BLE001
+                        log.error(
+                            "%s scheduler tick failed (choice=%s)",
+                            self._log_tag, vlm_choice,
+                        )
+                        # Re-raise: _run_tick_safely writes the visible
+                        # `tick_failed` row (2026-07-17 — silent returns
+                        # here made dying ticks invisible on the dashboard).
+                        raise
+                    used_provider = sched.provider
+                    result = ProviderResult(
+                        description=sched.description,
+                        detector_fields=sched.detector_fields,
+                        people_present=sched.people_present,
+                        people_count=sched.people_count,
+                        usage=None,  # ledger keys come pre-summed in sched_fields
                     )
-                    # Re-raise: _run_tick_safely writes the visible
-                    # `tick_failed` row (2026-07-17 — silent returns
-                    # here made dying ticks invisible on the dashboard).
-                    raise
-                used_provider = sched.provider
-                result = ProviderResult(
-                    description=sched.description,
-                    detector_fields=sched.detector_fields,
-                    people_present=sched.people_present,
-                    people_count=sched.people_count,
-                    usage=None,  # ledger keys come pre-summed in sched_fields
-                )
-                result.detector_fields.update(sched.sched_fields)
-                if due_set.skipped:
-                    result.detector_fields["sched_skipped"] = [
-                        f"{ident}:{reason}" for ident, reason in due_set.skipped
-                    ]
-                if due_set.crowd_fallback:
-                    result.detector_fields["sched_crowd_fallback"] = True
+                    result.detector_fields.update(sched.sched_fields)
+                    if due_set.skipped:
+                        result.detector_fields["sched_skipped"] = [
+                            f"{ident}:{reason}" for ident, reason in due_set.skipped
+                        ]
+                    if due_set.crowd_fallback:
+                        result.detector_fields["sched_crowd_fallback"] = True
             else:
                 try:
                     used_provider, result = await run_vlm(
@@ -1221,6 +1586,19 @@ class CameraIngest:
             result.detector_fields["identity_patient_in_clip"] = identity.patient_in_clip
             result.detector_fields["identity_confidence"] = round(identity.confidence, 4)
             result.detector_fields["identity_face_count"] = identity.face_count
+            # W2 input-quality probes — per-tick admissibility evidence
+            # (width <400 = SFU low rung; sharpness = Laplacian var).
+            result.detector_fields["quality_width"] = identity.quality_width
+            result.detector_fields["quality_sharpness"] = (
+                round(identity.quality_sharpness)
+                if identity.quality_sharpness is not None else None
+            )
+            result.detector_fields["quality_frames"] = identity.quality_frames
+            result.detector_fields["quality_degraded"] = identity.quality_degraded
+            if queued_delay_s is not None:
+                # W1: this row analyzed a FROZEN shed window; captured_at
+                # is the shed moment, this is how long it waited.
+                result.detector_fields["tick_queued_delay_s"] = queued_delay_s
             # Layer-1 signals + unified motion verdict (v2 P2) — the
             # sig_* block is the soak's raw material for the P3 floors.
             result.detector_fields["motion_src"] = motion_src
@@ -1293,6 +1671,10 @@ class CameraIngest:
                 present_src = "reid_unavailable_llm"
             result.detector_fields["people_present_src"] = present_src
             result.detector_fields["people_count_reid"] = identity.people_count_reid
+            # W3: feed the LLM's presence verdict back to the lock (one
+            # tick of lag vs a 45 s grace — fine) and stash lock state.
+            self._identity_lock.note_scene_presence(bool(result.people_present))
+            result.detector_fields.update(self._identity_lock.stash_fields())
 
             # Data-collection recorder decision — READ-ONLY over the
             # signals detection just computed (opt-in flag + motion +
@@ -1321,14 +1703,40 @@ class CameraIngest:
                 # A/V by ~window seconds. Record live-forward only; a paced
                 # lead-in replay is a future improvement.
 
-            # State machine + analyses + event promotion. Same session,
-            # one commit at the end.
-            state_after = await apply_tick_update(
-                session,
-                camera_id=self.camera_id,
-                people_present=gate_people_present,
-                motion_in_clip=motion_in_clip,
+            # W2 evidence admissibility (identity-persistence, 2026-07-19,
+            # mechanism corrected per review F3): a degraded window —
+            # blur / 320×180 rung / thin — cannot testify to EMPTINESS
+            # *while we believe the patient is in the room* (lock
+            # active). On such ticks we SKIP the state-machine update
+            # entirely: the close countdown neither advances nor resets,
+            # and a closed camera can never be opened by garbage input.
+            # Gating on the lock keeps a dark, low-texture EMPTY room
+            # (whose sharpness legitimately sits under the floor on
+            # every frame) closing normally instead of burning a call
+            # per tick forever. Degraded ticks that DO see people pass
+            # through unchanged — degraded input may add presence,
+            # never subtract it.
+            state_freeze = bool(
+                identity.reid_ran
+                and identity.quality_degraded
+                and not gate_people_present
+                and self._identity_lock.is_active
             )
+            if state_freeze:
+                result.detector_fields["state_freeze_degraded"] = True
+                state_after_state = (
+                    cam.state if cam.state in ("open", "closed") else "open"
+                )
+            else:
+                # State machine update. Same session, one commit at
+                # the end.
+                state_after = await apply_tick_update(
+                    session,
+                    camera_id=self.camera_id,
+                    people_present=gate_people_present,
+                    motion_in_clip=motion_in_clip,
+                )
+                state_after_state = state_after.state
             await add_analysis(
                 session,
                 camera_id=self.camera_id,
@@ -1338,7 +1746,7 @@ class CameraIngest:
                 people_present=gate_people_present,
                 people_count=gate_people_count,
                 motion_in_clip=motion_in_clip,
-                state_after=state_after.state,
+                state_after=state_after_state,
                 captured_at=captured_at,
             )
             promotion = await maybe_promote_analysis(

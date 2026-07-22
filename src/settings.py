@@ -179,7 +179,13 @@ class Settings(BaseSettings):
     # scale — deliberately below the person-scoped RAPID floor (0.03);
     # the map's blur + diff threshold already reject sensor noise.
     # Soak dial: sig_env_motion is stashed on every analyses row.
-    signals_motion_min_active_fraction: float = Field(ge=0.0, le=1.0, default=0.02)
+    # 2026-07-19 recalibrated 0.02 → 0.003 against live data: Aryaman's
+    # collar-tug (the agreed minimum detectable motion) measured
+    # 0.003-0.007 track-active fraction; map noise baseline sits at
+    # ~0.0007, so 0.003 keeps ~4x margin. Watch empty-room ticks for
+    # false "backend" motion; noise held 0.0006-0.0007 on both cameras
+    # when set.
+    signals_motion_min_active_fraction: float = Field(ge=0.0, le=1.0, default=0.003)
 
     # ── Detection v2 scheduler + packer (P3) ─────────────────────
     # Master flag: OFF = today's single-call tick, byte-for-byte. ON =
@@ -189,6 +195,10 @@ class Settings(BaseSettings):
     # packing changes. The cost inversion (action buckets only under
     # motion) is a post-soak settings change, never a code change.
     detection_v2_scheduler_enabled: bool = Field(default=False)
+    # soak 0.5: run reid (identity) every tick but skip ALL VLM/Gemini
+    # calls — including the always-on scene call — so identity continuity
+    # can be validated for ~$0. Default off; set NEMARA_REID_SOAK_ONLY=true.
+    reid_soak_only: bool = Field(default=False)
     # Per-track motion floor for the person_motion branch gate.
     # 0.0 = parity (any present track qualifies).
     scheduler_person_motion_floor: float = Field(ge=0.0, le=1.0, default=0.0)
@@ -365,7 +375,37 @@ class Settings(BaseSettings):
     # IDs stable as the patient moves. 15s tick × 5 fps = 75 frames
     # per tick, processed sequentially through YOLO + tracker.
     reid_inference_sample_fps: int = Field(ge=1, le=15, default=5)
+    # LEAN sampling (2026-07-22 headroom fix): when a camera has the
+    # patient locked AND everyone in view is identified, it samples
+    # fewer frames — the binding is already stable and just needs light
+    # continuity, so this frees GPU for a co-occupied camera still
+    # working to identify someone (Aryaman: "enough headroom for both
+    # cameras when the patient isn't confirmed in one of them"). SAM
+    # per-frame cost is the bottleneck, so fewer frames = proportional
+    # headroom. Full sampling resumes the instant anyone is unbound.
+    reid_inference_sample_fps_lean: int = Field(ge=1, le=15, default=3)
     reid_inference_sample_width: int = Field(ge=240, le=1920, default=480)
+    # SAM identity microservice (GPU pod). "legacy" = the in-Docker
+    # YOLO+BoT-SORT+SCRFD+ArcFace pipeline (default, untouched). "sam" =
+    # offload reid to the pod over HTTP; inference.py adapts the response
+    # into a byte-identical IdentityResult. Flag-gated: legacy is the fallback.
+    reid_pipeline_backend: str = "legacy"
+    reid_sam_service_url: str = "http://localhost:8000"
+    # NOTE: on the SAM arm, reid_timeout_seconds must exceed the wire
+    # round trip (pod SAM ≈ 210ms/frame) + local replay — inference
+    # logs a loud warning when this timeout ordering is inverted.
+    reid_sam_request_timeout_s: float = Field(gt=0, default=30.0)
+    # SAM concept-detection threshold for the "person" prompt (pod).
+    reid_sam_person_thr: float = Field(ge=0.0, le=1.0, default=0.4)
+    # CEILING on per-track pod face detect+embed attempts per clip.
+    # The actual request cap is computed per tick as
+    # min(this, n_frames // face_check_interval + 1) — the legacy
+    # arm's effective (uncapped) budget — so both arms see the same
+    # face-evidence budget and OTHER-lock economics (review G3); 0 is
+    # sent when the patient has no enrolled gallery, skipping all pod
+    # face work (review G1). GPU faces are ~25ms/attempt, so the
+    # ceiling is safety, not tuning.
+    reid_sam_face_cap: int = Field(ge=1, le=64, default=32)
     # ── Body Re-ID pipeline (mirrors the experiment) ───────────────
     # YOLO weights. `yolo11n.pt` (nano, 2.5M params) is fastest but
     # misses partial / distant / occluded bodies — observed
@@ -444,6 +484,120 @@ class Settings(BaseSettings):
     # Master switch — set False to disable the gallery entirely
     # (harvest + match become no-ops). Useful for A/B comparison.
     reid_body_gallery_enabled: bool = Field(default=True)
+
+    # ── Identity persistence, Batch A (2026-07-19) ──────────────
+    # See docs/plans/2026-07-19-identity-persistence.md.
+    #
+    # W1 — bounded tick queue: when the 2-generation in-flight cap
+    # sheds a tick, its WINDOW is snapshotted at shed time and the
+    # tick runs as soon as a slot frees — unless it has aged past
+    # this. Rationale (Aryaman): the action may live only in the shed
+    # window; a verdict 15s late beats a dropped window. 0 disables
+    # (old drop-on-shed behavior).
+    # 15 keeps the age ≤ the frame buffer's ~17 s retention so a
+    # queued tick's moment is never mostly evicted (review F5), and
+    # bounds the frozen payload's lifetime.
+    scheduler_tick_queue_max_age_s: float = Field(ge=0, default=15.0)
+    # W2 — input-quality admissibility floors. A tick below any floor
+    # is "degraded": analysis still runs (the LLM reads blur far
+    # better than YOLO) but the tick cannot testify toward EMPTINESS —
+    # the state machine's close countdown is frozen so a blurry/180p
+    # window can never close an occupied room or (Batch B) release an
+    # identity lock. Floors calibrated on 2026-07-19 soak data:
+    # sharpness (Laplacian variance on ≤480px extraction frames) ran
+    # median 4745 on tracked frames vs 2436 on tracking-lost frames;
+    # width <400 means the SFU delivered the 320×180 rung.
+    # Sharpness floor re-derived 2026-07-19 evening from the outcome
+    # curve (patient-found rate by sharpness band at 1280w occupied):
+    # ≥3000 → 100%, 2500-2975 → 94%, 2160-2500 → 37%. The cliff is at
+    # ~2500; 3200 branded dim-but-working evening ticks degraded.
+    # Laplacian variance is luminance-sensitive — expect this absolute
+    # floor to be WRONG under IR (no IR data exists yet; first IR rows
+    # land tonight). Durable fix = per-camera rolling baseline.
+    reid_quality_min_width: int = Field(ge=0, default=400)
+    reid_quality_sharpness_floor: float = Field(ge=0, default=2500.0)
+    reid_quality_min_frames: int = Field(ge=0, default=6)
+    # W6 — still-person track continuation (ByteTrack two-stage
+    # association). YOLO now returns candidates down to the detect
+    # floor so BoT-SORT's low-confidence second pass can keep an
+    # EXISTING track alive on a seated/lying person (observed conf
+    # 0.10-0.35 at 360p). Track BIRTH stays at the birth confidence —
+    # weak boxes can continue a proven track, never create one.
+    reid_yolo_detect_floor: float = Field(gt=0, le=1, default=0.10)
+    reid_track_birth_confidence: float = Field(gt=0, le=1, default=0.40)
+
+    # ── Identity persistence (2026-07-19 → 2026-07-21) ──────────
+    # Track-anchored identity: the TrackLedger (persistent geometric
+    # track stitching + identity bindings — confirm once, follow the
+    # track, audit passively) IS the identity layer; the IdentityLock
+    # ENTER/HOLD/PARK/RELEASE machine and tracklet carry were deleted
+    # 2026-07-21. See docs/plans/2026-07-21-track-anchored-identity.md.
+    # How long a patient binding survives its track being unseen on
+    # GOOD ticks before retiring (degraded ticks never count). 45s —
+    # the 30s experiment regressed live (2026-07-22): under shedding
+    # and normal in-and-out movement it retired bindings the grace
+    # exists to bridge. Display staleness is the truth fields' job.
+    reid_binding_retire_after_s: float = Field(ge=0, default=45.0)
+    # W5 — face-lock quality floors: dim faces may VOTE, only quality
+    # faces may LOCK (the lunch green-box fix: 15-30px guest faces
+    # cleared the quality-ADAPTIVE match bar and locked PATIENT).
+    # Height in extracted-frame pixels (~480px wide frames).
+    reid_face_lock_min_px: float = Field(ge=0, default=36.0)
+    reid_face_lock_min_det: float = Field(ge=0, le=1, default=0.6)
+    # Wrong-green margin split (2026-07-19 late soak: the aunt case).
+    # Dim light puts the true patient AND a blood relative in the same
+    # 0.38-0.51 face-score band — a flat bar cannot separate them and
+    # the green box alternated. Locks now need: single-person clip
+    # score ≥ _single; multi-person clip score ≥ _multi AND a margin
+    # gap over every rival track's best face score. The 0.40 base
+    # remains the VOTE bar (hits, OTHER-block) only.
+    reid_face_lock_score_single: float = Field(ge=0, le=1, default=0.45)
+    reid_face_lock_score_multi: float = Field(ge=0, le=1, default=0.55)
+    reid_face_lock_margin: float = Field(ge=0, le=1, default=0.15)
+    # W4 — flat per-label embedding POOL (replaces merge-threshold
+    # clusters, which fragmented into singletons: same-person
+    # cross-pose cosines 0.6-0.75 can never clear a 0.85 merge bar).
+    # Match = mean of top-3 cosines against the pool.
+    reid_body_pool_max: int = Field(ge=1, default=64)
+    # Harvest bar: only face locks at/above this match score feed the
+    # pool (with the W5 pixel floor) — ends silent gallery poisoning
+    # by marginal locks. 0.40 calibrated on soak #2: Aryaman's six
+    # genuine bedroom locks scored 0.402-0.495 (all pass) while the
+    # lunch green-box locks sat ~0.34 (all blocked). 0.45 would have
+    # starved half the legitimate harvests (review finding). Stays
+    # 0.40 after the 2026-07-19 margin split: anti-poison moved
+    # upstream into the LOCK bars (a near-tie face can no longer lock,
+    # so it can no longer harvest) — raising this too would only
+    # starve legitimate dim solo harvests.
+    reid_harvest_min_confidence: float = Field(ge=0, le=1, default=0.40)
+    # Harvest hygiene (2026-07-19 late soak): the pool churned at up to
+    # 3 harvests/tick, FIFO-evicting good entries within minutes.
+    # Rate-cap per (patient,label); protect the top-scored "golden"
+    # entries from eviction so the pool keeps its best evidence.
+    reid_gallery_harvest_min_interval_s: float = Field(ge=0, default=20.0)
+    # One lock event may deposit this many poses inside a window (the
+    # multi-pose design teaches an outfit from several angles at once);
+    # the interval then gates the NEXT event, not the burst itself.
+    reid_gallery_harvest_burst: int = Field(ge=1, default=4)
+    reid_gallery_golden_count: int = Field(ge=0, default=8)
+    # Negative (OTHER) pool is deliberately SHORT-LIVED (Aryaman
+    # 2026-07-19): body embeddings are outfit embeddings — a guest's
+    # entry is meaningful for the visit that produced it and becomes
+    # pure wrong-mute risk after (a stale negative can verify the
+    # PATIENT as not-patient, releasing locks + muting his room).
+    # Positive pool: 4h refreshed continuously; negatives: 2h, small.
+    reid_other_pool_max: int = Field(ge=1, default=32)
+    reid_other_pool_ttl_seconds: float = Field(ge=0, default=7200.0)
+
+    # ── JPEG-in-buffer + native quality (2026-07-19) ────────────
+    # Storage quality for buffered frames (see frame_codec.py). The
+    # per-round H.264 the VLM sees is lossier than this, so 88 adds no
+    # accuracy-relevant loss while shrinking 2K frames ~6-10×.
+    frame_jpeg_quality: int = Field(ge=50, le=100, default=88)
+    # Which simulcast layer the detector bot subscribes to. "high" =
+    # the top layer (the camera's full resolution). "medium" was the
+    # soak-1 crash-night triage — kept selectable for rollback.
+    livekit_subscribe_quality: str = Field(default="high")
 
     # ── APNs (Phase 4) ──────────────────────────────────────────
     # Apple Developer credentials for HTTP/2 push. team_id +

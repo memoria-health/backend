@@ -36,6 +36,14 @@ from src.services.detection.scheduling.dims import CROP_BUCKETS, EffectiveDims
 from src.services.detection.scheduling.when_scope import is_active
 from src.services.reid.body_pipeline import LABEL_OTHER, LABEL_PATIENT
 
+# Emergency line (2026-07-18, the enacted-choking miss): detectors at
+# or above this severity are EXEMPT from every cost gate — cross-camera
+# exclusivity and the per-person motion floor. Real loadout values:
+# choking 100 / seizure 96 / fall 95 / calling_for_help 88 stay
+# ungateable; agitation 60 / wandering 55 / medication 20 / customs
+# remain cost-managed. A missed emergency is never worth a saved call.
+_EMERGENCY_SEVERITY = 80
+
 if TYPE_CHECKING:
     from datetime import datetime
 
@@ -55,6 +63,13 @@ class ScheduledDetector:
     spec: "DetectorSpec"
     dims: EffectiveDims
     when_scope: str | None = None
+    # Detector row category — OBSERVABILITY ONLY. The cost-gate
+    # exemptions (cross-camera exclusivity, per-person motion floor)
+    # key on `severity >= _EMERGENCY_SEVERITY`, NOT on category: the
+    # category axis proved unusable (2026-07-18 — everything is
+    # 'safety' except medication), so severity is the exemption
+    # contract. Nothing gates on this field.
+    category: str = "safety"
 
 
 @dataclass(frozen=True)
@@ -164,6 +179,11 @@ def resolve_due(
             d.subject_scope == "patient"
             and patient_confirmed_elsewhere
             and not identity.patient_in_clip
+            # Emergency exemption (2026-07-18, the enacted-choking
+            # miss): one misidentified face at lunch poisoned the
+            # registry and suppressed choking on the REAL patient.
+            # Cost gates never apply above the emergency line.
+            and d.severity < _EMERGENCY_SEVERITY
         ):
             skipped.append((ident, "patient_elsewhere"))
             continue
@@ -210,7 +230,14 @@ def resolve_due(
         # still person is the whole point of those).
         qualifying: list[int] | None = None
         if tracks:
-            if d.requires_motion and measurement_ok:
+            # Emergency detectors ignore the motion floor: choking/
+            # fidget-scale distress is LOW gross motion by nature
+            # (hands at throat while seated reads ~0.01 — under any
+            # useful floor).
+            if (
+                d.requires_motion and measurement_ok
+                and d.severity < _EMERGENCY_SEVERITY
+            ):
                 floor = settings.scheduler_person_motion_floor
                 qualifying = [
                     t.track_id for t in tracks

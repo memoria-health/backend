@@ -37,6 +37,7 @@ from sqlalchemy import select
 from src.db.camera import Camera
 from src.db.patient import Patient
 from src.services.data_collection.manager import RecorderManager
+from src.services.detection import frame_codec
 from src.services.detection.camera_ingest import CameraIngest
 from src.services.detection.patient_presence import PatientPresence
 from src.services.detection.room_reconciler import LiveKitRoomReconciler
@@ -746,13 +747,23 @@ class RoomWorker:
         1.1.13) — replaces the raw-FFI dimension hack. Re-asserted on
         every (re)subscribe by our caller. Best-effort: on failure we
         stay on whatever layer the SFU chose (= old behavior)."""
+        # Settings-driven since 2026-07-19: "high" = the top simulcast
+        # layer (the camera's full/native resolution) — JPEG-in-buffer
+        # storage made native retainable, so the MEDIUM crash-night
+        # triage is no longer the ceiling. "medium" stays selectable
+        # for instant rollback if 2K decode starves this rig's CPU
+        # (watch ingress_recv_fps after any flip).
+        quality_name = (self._settings.livekit_subscribe_quality or "high").lower()
+        quality = {
+            "low": rtc.VideoQuality.VIDEO_QUALITY_LOW,
+            "medium": rtc.VideoQuality.VIDEO_QUALITY_MEDIUM,
+            "high": rtc.VideoQuality.VIDEO_QUALITY_HIGH,
+        }.get(quality_name, rtc.VideoQuality.VIDEO_QUALITY_HIGH)
         try:
-            publication.set_video_quality(
-                rtc.VideoQuality.VIDEO_QUALITY_MEDIUM
-            )
+            publication.set_video_quality(quality)
             log.info(
-                "room_worker.layer_request camera=%s quality=MEDIUM(640x360)",
-                camera_id,
+                "room_worker.layer_request camera=%s quality=%s",
+                camera_id, quality_name.upper(),
             )
         except Exception:  # noqa: BLE001 — never let a hint break subscribe
             log.warning(
@@ -947,38 +958,67 @@ class RoomWorker:
         # every subscribe, so this re-arms naturally on reconnect.
         online_signaled = False
 
-        def _push_video(event: rtc.VideoEvent) -> None:
+        async def _push_video(event: rtc.VideoEvent) -> None:
             nonlocal online_signaled
             frame = event.frame
-            # Timed: convert+copy runs at native res for EVERY delivered
-            # frame on the event loop — the ingress meter reports its
-            # worst case per window so loop starvation is measurable,
-            # not guessed (soak #1 finding 3).
-            t0 = time.perf_counter()
-            if frame.type != rtc.VideoBufferType.I420:
-                frame = frame.convert(rtc.VideoBufferType.I420)
-            frame_bytes = bytes(frame.data)
-            convert_ms = (time.perf_counter() - t0) * 1000.0
             now_mono = time.monotonic()
-            accepted = ingest.frame_buffer.push(
-                width=frame.width,
-                height=frame.height,
-                data=frame_bytes,
-                captured_at=now_mono,
-            )
+            # JPEG-in-buffer receive rework (2026-07-19): decide FIRST
+            # who needs this frame. Frames neither the buffer's sampler
+            # nor an active recording session wants skip the native-res
+            # convert entirely — at 2K that eliminates roughly half the
+            # receive-path CPU (delivered ~15fps vs the 8fps kept), and
+            # ALL of it for idle/paused cameras.
+            will_buffer = ingest.frame_buffer.accepts(now_mono)
+            recording = self._recorder.wants_video(ingest.camera_id)
+            convert_ms = 0.0
+            if will_buffer or recording:
+                # Timed: convert+copy at native res on the event loop —
+                # the ingress meter reports the worst case per window so
+                # loop starvation is measurable, not guessed (soak #1
+                # finding 3). Compression hops to a worker thread.
+                t0 = time.perf_counter()
+                if frame.type != rtc.VideoBufferType.I420:
+                    frame = frame.convert(rtc.VideoBufferType.I420)
+                frame_bytes = bytes(frame.data)
+                convert_ms = (time.perf_counter() - t0) * 1000.0
+                if recording:
+                    # Full-rate raw feed to the data-collection recorder
+                    # — its encoder wants raw frames, unchanged.
+                    self._recorder.feed_video(
+                        ingest.camera_id, frame.width, frame.height,
+                        frame_bytes,
+                    )
+                if will_buffer:
+                    try:
+                        jpeg, luma = await asyncio.to_thread(
+                            frame_codec.compress_for_buffer,
+                            frame.width, frame.height, frame_bytes,
+                            quality=self._settings.frame_jpeg_quality,
+                        )
+                    except Exception:  # noqa: BLE001 — never kill the reader
+                        log.exception(
+                            "room_worker.frame_compress_failed camera=%s",
+                            ingest.camera_id,
+                        )
+                        jpeg = None
+                        luma = b""
+                    if jpeg is not None:
+                        # push() re-applies the min-gap rule, so the
+                        # rare frame that raced past accepts() during
+                        # the compress await is still dropped correctly.
+                        ingest.frame_buffer.push(
+                            width=frame.width,
+                            height=frame.height,
+                            data=jpeg,
+                            captured_at=now_mono,
+                            luma=luma,
+                        )
             ingest.ingress_meter.record(
                 now_mono,
-                accepted=accepted,
+                accepted=will_buffer,
                 convert_ms=convert_ms,
                 width=frame.width,
                 height=frame.height,
-            )
-            # Fork the full-rate frame to the data-collection recorder
-            # (sync, non-blocking; an O(1) no-op unless this camera has an
-            # active session). This is the SECOND consumer of the frames,
-            # BEFORE the 4fps detector downsample inside frame_buffer.
-            self._recorder.feed_video(
-                ingest.camera_id, frame.width, frame.height, frame_bytes
             )
             # Stamp the liveness timestamp. `LiveKitRoomReconciler`
             # reads this every poll (10s) and treats frames within
@@ -1022,7 +1062,13 @@ class RoomWorker:
             stream = open_stream()
             try:
                 async for event in stream:
-                    consume_one(event)
+                    # Video's consumer is async (thread-hopped JPEG
+                    # compression); audio's stays sync. Awaiting here
+                    # also serializes pushes per camera, preserving
+                    # frame order through the compress hop.
+                    result = consume_one(event)
+                    if asyncio.iscoroutine(result):
+                        await result
                 # Stream ended cleanly (LiveKit closed the track) —
                 # exit the retry loop; track_subscribed will fire
                 # again if the publisher re-publishes.

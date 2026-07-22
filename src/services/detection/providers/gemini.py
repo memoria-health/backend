@@ -153,8 +153,20 @@ async def gemini_provider(
     if meta is not None:
         import dataclasses
 
+        # Billing truth (2026-07-19, the $14/day audit): Gemini 3.x
+        # models THINK by default and thinking tokens bill at the
+        # OUTPUT rate — but they live in `thoughts_token_count`, not
+        # `candidates_token_count`. Recording candidates alone made
+        # most of the real output bill invisible to our ledger.
+        # `output` is now the BILLED output (candidates + thoughts);
+        # `thoughts` rides separately for observability.
+        thoughts = int(getattr(meta, "thoughts_token_count", 0) or 0)
         res = dataclasses.replace(res, usage={
             "input": int(getattr(meta, "prompt_token_count", 0) or 0),
-            "output": int(getattr(meta, "candidates_token_count", 0) or 0),
+            "output": (
+                int(getattr(meta, "candidates_token_count", 0) or 0)
+                + thoughts
+            ),
+            "thoughts": thoughts,
         })
     return res

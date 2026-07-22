@@ -62,6 +62,14 @@ def _settings() -> SimpleNamespace:
         reid_face_min_det_score=0.5, reid_face_checks_for_other=5,
         reid_match_threshold_base=0.40, reid_insightface_model="stub",
         reid_body_gallery_enabled=False,
+        # Identity-persistence (2026-07-19) fields the pipeline reads.
+        reid_yolo_detect_floor=0.10, reid_track_birth_confidence=0.40,
+        reid_face_lock_min_px=36.0, reid_face_lock_min_det=0.6,
+        reid_face_lock_score_single=0.45, reid_face_lock_score_multi=0.55,
+        reid_face_lock_margin=0.15,
+        reid_harvest_min_confidence=0.45,
+        reid_quality_min_width=400, reid_quality_sharpness_floor=3200.0,
+        reid_quality_min_frames=6,
     )
 
 

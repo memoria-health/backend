@@ -35,10 +35,14 @@ _VALID = ("gemini", "openai", "openrouter", "dashscope")
 # errors out.
 _CHAINS: dict[str, tuple[str, ...]] = {
     # Sandbox cost guard: gemini falls back to Qwen (cheap), never to the
-    # expensive OpenAI, so a gemini 503/outage can't quietly run up an OpenAI bill.
-    "gemini": ("gemini", "openrouter"),
+    # expensive OpenAI, so a gemini 503/outage can't quietly run up an OpenAI
+    # bill. DashScope (Alibaba-direct Qwen, native video) sits before
+    # OpenRouter (Aryaman 2026-07-19: "fall back to dashscope locally, not
+    # just openrouter") — run_vlm skips it when no key is configured, so
+    # keyless environments behave exactly as before.
+    "gemini": ("gemini", "dashscope", "openrouter"),
     "openai": ("openai", "openrouter"),
-    "openrouter": ("openrouter", "gemini"),
+    "openrouter": ("openrouter", "dashscope", "gemini"),
     # SANDBOX: Alibaba-direct Qwen3-VL (native video + fps) primary, OpenRouter
     # fallback so detection never goes dark if DashScope errors or the model
     # isn't activated on the account yet.
@@ -94,6 +98,11 @@ async def run_vlm(
     chain = _CHAINS.get(choice, _CHAINS["gemini"])
     errors: dict[str, str] = {}
     for prov in chain:
+        # A chain entry with no credentials configured is skipped
+        # silently rather than burning a guaranteed-failing attempt
+        # (and a warning line) on every tick.
+        if prov == "dashscope" and not settings.dashscope_api_key:
+            continue
         try:
             if prov == "gemini":
                 result = await gemini_provider(

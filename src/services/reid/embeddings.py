@@ -79,6 +79,10 @@ class FaceHit:
     embedding: np.ndarray   # shape (EMBEDDING_DIM,) float32
     det_score: float        # SCRFD detection confidence in [0, 1]
     bbox: tuple[float, float, float, float]  # x1, y1, x2, y2 in image coords
+    # SAM-face countersign (remote arm): False = the face concept
+    # session refuted this claim (e.g. SCRFD firing on the back of a
+    # head). Local SCRFD hits default True (no oracle in that path).
+    oracle_face: bool = True
 
     @property
     def face_pixel_area(self) -> float:

@@ -44,6 +44,8 @@ def _entry(
     duty: str = "every_eligible_tick",
     shape: str = "point_in_time",
     when_scope: str | None = None,
+    category: str = "safety",
+    severity: int = 50,
 ) -> ScheduledDetector:
     # `branch` kept as the fixture vocabulary (tests read naturally);
     # EffectiveDims carries its collapsed form: person_motion ⇒
@@ -56,10 +58,11 @@ def _entry(
         dims=EffectiveDims(
             requires_motion=(branch == "person_motion"),
             subject_scope=subject, bucket=bucket,
-            duty_cycle=duty, needs_audio=False, severity=50, shape=shape,
+            duty_cycle=duty, needs_audio=False, severity=severity, shape=shape,
             dims_source="row",
         ),
         when_scope=when_scope,
+        category=category,
     )
 
 
@@ -411,7 +414,7 @@ def test_no_local_now_fails_open() -> None:
 
 def test_patient_elsewhere_skips_patient_scoped_only() -> None:
     entries = [
-        _entry("fall"),
+        _entry("tv_time", category="routine"),
         _entry("stove_left_on", branch="environment", subject="environment"),
         _entry("intruder", subject="anyone"),
     ]
@@ -421,7 +424,28 @@ def test_patient_elsewhere_skips_patient_scoped_only() -> None:
         patient_confirmed_elsewhere=True,
     )
     assert _due_idents(ds) == ["stove_left_on", "intruder"]
-    assert _skip_reasons(ds) == {"fall": "patient_elsewhere"}
+    assert _skip_reasons(ds) == {"tv_time": "patient_elsewhere"}
+
+
+def test_safety_detectors_exempt_from_exclusivity_and_floor() -> None:
+    """The enacted-choking miss (2026-07-18): a misidentified face on
+    another camera must NEVER suppress safety detectors, and fidget-
+    scale distress must never fall under the motion floor."""
+    tracks = (_track(1),)
+    ds = resolve_due(
+        [_entry("choking", bucket="person", severity=100)],
+        signals=_signals(amounts={1: 0.005}),   # fidget-scale motion
+        identity=_identity(tracks, attribution_ran=False),
+        settings=_settings(
+            scheduler_person_motion_floor=0.03,
+            scheduler_person_requires_track=True,
+        ),
+        tick_index=0,
+        patient_confirmed_elsewhere=True,
+    )
+    (d,) = ds.due
+    assert d.spec.identifier == "choking"
+    assert d.target_track_ids == (1,)   # floor ignored for safety
 
 
 def test_patient_seen_here_overrides_elsewhere() -> None:

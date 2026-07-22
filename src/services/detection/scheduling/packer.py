@@ -85,11 +85,19 @@ _SCENE_KEY = ("video", 4, "clean", "lite", "full", None, False)
 def _group_key(
     d: "DueDetector", target: int | None,
 ) -> tuple[str, int, str, str, str, int | None, bool]:
-    """Final recipe group for one (detector, target) pairing. The last
-    element is the when_scope subgroup flag: windowed detectors group
-    apart from always-on ones even under an identical recipe."""
+    """Final recipe group for one (detector, target) pairing.
+
+    2026-07-19 (Aryaman): windowed detectors FOLD into the same call
+    as always-on ones — the contract is 3 media classes and no extra
+    call shapes. The old when_scope subgroup split sent the identical
+    clip twice per tick (`track1` + `track1:win`, ~1/3 of occupied
+    cost) for zero semantic gain: when_scope eligibility is enforced
+    upstream (a detector outside its window never reaches the packer),
+    and the executor's only windowed dependence (`_is_scene`) is
+    unaffected. `win` stays in the tuple shape as a constant so key
+    comparisons and tests keep their arity."""
     bucket = d.dims.bucket
-    win = d.windowed
+    win = False
     # (snapshot bucket retired 2026-07-18: it always rode the wide call
     # anyway — full-frame stills measurably failed object checks
     # (phone-vs-remote 100% FP, plate 0/10, spec §1.4) and stills stay

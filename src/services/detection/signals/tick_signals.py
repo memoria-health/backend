@@ -50,6 +50,7 @@ from typing import TYPE_CHECKING, Sequence
 import cv2
 import numpy as np
 
+from src.services.detection import frame_codec
 from src.services.detection.frame_buffer import FrameSnapshot
 from src.services.detection.signals.rapid_energy import (
     _DIFF_THRESHOLD,
@@ -125,13 +126,28 @@ class TickSignals:
 
 
 def _map_plane(frame: FrameSnapshot) -> np.ndarray | None:
-    """Y plane → downscale to map width → denoise blur. None on
-    truncated frame data (skip, never raise per-tick)."""
-    if len(frame.data) < frame.width * frame.height:
+    """Grayscale plane → downscale to map width → denoise blur.
+
+    Live buffer frames are JPEG (2026-07-19 JPEG-in-buffer) carrying a
+    320×180 luma thumbnail — exactly map-sized, so it is used as-is.
+    Raw I420 frames (tests, legacy) read the Y plane. A JPEG without a
+    thumbnail is unreadable to this per-tick path (never decode full
+    JPEGs here): skip. Missing this consumer was the 2026-07-19 soak
+    bug where env_motion pinned at 0.0 for every tick.
+    """
+    if frame_codec.is_jpeg(frame.data):
+        luma = frame.luma
+        if len(luma) != frame_codec.LUMA_W * frame_codec.LUMA_H:
+            return None
+        y = np.frombuffer(luma, dtype=np.uint8).reshape(
+            frame_codec.LUMA_H, frame_codec.LUMA_W
+        )
+    elif len(frame.data) < frame.width * frame.height:
         return None
-    y = np.frombuffer(
-        frame.data, dtype=np.uint8, count=frame.width * frame.height
-    ).reshape(frame.height, frame.width)
+    else:
+        y = np.frombuffer(
+            frame.data, dtype=np.uint8, count=frame.width * frame.height
+        ).reshape(frame.height, frame.width)
     if y.shape[1] > _MAP_WIDTH:
         scale = _MAP_WIDTH / y.shape[1]
         y = cv2.resize(

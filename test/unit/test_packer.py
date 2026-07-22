@@ -218,28 +218,30 @@ def test_multi_target_scene_collapse_lists_the_member_once() -> None:
 # ── when_scope windowed subgroup (recalibration 2026-07-14) ──────────
 
 
-def test_windowed_detector_gets_its_own_call() -> None:
-    # Same degraded-wide recipe as scene, but windowed ⇒ distinct call,
-    # ordered after the always-on scene anchor, key suffixed :win.
+def test_windowed_detector_folds_into_base_call() -> None:
+    # 2026-07-19 (Aryaman): 3 media classes, no extra call shapes.
+    # A windowed detector rides the SAME call as always-on ones under
+    # an identical recipe — when_scope eligibility is enforced
+    # upstream, so reaching the packer means "run it this tick".
     plans = _pack(
         _due("fall", bucket="scene", severity=95),
         _due("medication", bucket="person", severity=20, windowed=True),
     )
-    assert len(plans) == 2
-    scene, win = plans
+    assert len(plans) == 1
+    (scene,) = plans
     assert not scene.windowed
-    assert _idents(scene) == ["fall"]
-    assert win.windowed and win.plan_key.endswith(":win")
-    assert _idents(win) == ["medication"]
+    assert _idents(scene) == ["fall", "medication"]
+    assert not scene.plan_key.endswith(":win")
 
 
-def test_windowed_and_always_on_never_share_a_crop_call() -> None:
+def test_windowed_and_always_on_share_one_crop_call() -> None:
+    # The old :win split sent the identical person crop TWICE per tick
+    # (~1/3 of occupied-hour cost). Folded 2026-07-19.
     plans = _pack(
         _due("medication", bucket="person", targets=(1,), windowed=True),
         _due("choking", bucket="person", targets=(1,)),
     )
-    keys = sorted(p.plan_key for p in plans if p.target_track_id == 1)
-    assert keys == [
-        "person:video4:clean:lite:track1",
-        "person:video4:clean:lite:track1:win",
-    ]
+    keys = [p.plan_key for p in plans if p.target_track_id == 1]
+    assert keys == ["person:video4:clean:lite:track1"]
+    (crop,) = [p for p in plans if p.target_track_id == 1]
+    assert sorted(_idents(crop)) == ["choking", "medication"]

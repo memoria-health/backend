@@ -50,6 +50,38 @@ class PipelineConfig:
     face_checks_for_other: int = 5
     match_threshold_base: float = 0.40
     insightface_model: str = "buffalo_l"
+    # Identity-persistence W6 (2026-07-19): YOLO detects down to the
+    # floor so BoT-SORT's second association pass can CONTINUE an
+    # existing track on weak (seated/lying) detections; `yolo_confidence`
+    # becomes the first-pass bar and `track_birth_confidence` the
+    # track-BIRTH bar — weak boxes never create tracks. Defaults are
+    # None = PRESERVE pre-W6 behavior (detector at yolo_confidence,
+    # boxmot's stock 0.6 birth) so untouched callers (clip_annotate's
+    # caregiver-facing archive annotation) don't silently shift;
+    # inference.py opts in explicitly from Settings (review F11).
+    yolo_detect_floor: float | None = None
+    track_birth_confidence: float | None = None
+    # Identity-persistence W5: dim faces VOTE, only quality faces LOCK.
+    # A match below these floors still counts a hit (which also keeps
+    # blocking the OTHER lock — a maybe-patient must never be branded
+    # not-patient) but cannot flip the label to PATIENT. Kills the
+    # lunch green-box class: 15-30px guest faces passing the
+    # quality-ADAPTIVE match bar. Height in extracted-frame pixels.
+    face_lock_min_px: float = 36.0
+    face_lock_min_det: float = 0.6
+    # Wrong-green fix (2026-07-19 late soak, Aryaman's aunt): in dim
+    # light the true patient AND a blood relative both score 0.38-0.51
+    # against the enrollment — the flat 0.40 bar cannot separate them,
+    # so the green box alternated between the two. Locking (label flip
+    # + harvest eligibility) now demands more than voting:
+    #   single-person clip: score ≥ face_lock_score_single
+    #   multi-person clip:  score ≥ face_lock_score_multi AND the
+    #     winner clears every other track's best face score by
+    #     face_lock_margin (near-ties must never lock).
+    # Votes (hits, OTHER-block) stay at match_threshold_base.
+    face_lock_score_single: float = 0.45
+    face_lock_score_multi: float = 0.55
+    face_lock_margin: float = 0.15
 
 
 @dataclass
@@ -63,6 +95,11 @@ class _TrackState:
     # forward the gallery's earned identity. Within-clip face match
     # (Path D → PATIENT, Path C → OTHER) still wins if it succeeds.
     pre_label: Optional[str] = None
+    # Where the pre-label came from: "gallery" (body-pool match — real
+    # cross-clip evidence). The TrackLedger treats only gallery
+    # pre-labels as fresh binding evidence; "held" is stamped by the
+    # ledger itself when a binding relabels a track.
+    pre_label_source: Optional[str] = None
     confidence: float = 0.0
     face_hits: int = 0
     # Total face_check attempts on this track, regardless of whether
@@ -89,6 +126,15 @@ class _TrackState:
     face_seen_attempts: int = 0
     last_face_check_frame: int = -10_000
     last_match_score: float = 0.0
+    # Best gallery match score seen on this track this clip (any
+    # quality). Feeds the ledger's sustained small-face accumulator.
+    best_match_score: float = 0.0
+    # Attempts that cleared the single-person LOCK bar and the det
+    # floor but failed ONLY the face-px quality floor — the
+    # "identity information present, pixels insufficient" class
+    # (couch-at-20ft, 2026-07-21). The ledger converts a sustained
+    # run of these across ticks into a PATIENT bind.
+    smallface_events: int = 0
     last_seen_bbox: Optional[tuple[float, float, float, float]] = None
     # For cross-clip body gallery harvest: remember the frame where
     # this track's body box had the highest YOLO confidence — that's
@@ -144,6 +190,19 @@ class TrackObservation:
     # (0.0 = none). Scale by native_width/extracted_width before
     # comparing against the ~300 px FACE-bucket floor.
     face_px_max: float = 0.0
+    # Pre-label provenance: "gallery" | "carry" | "held" | None. The
+    # identity lock keys fresh-evidence decisions on this.
+    pre_label_source: str | None = None
+    # Ledger accumulator inputs (2026-07-21 two-way evidence):
+    # verified attempts that scored AND failed to match, on a track
+    # with ZERO hits this clip (pure not-patient evidence, sub-lock
+    # count) — accumulates toward OTHER across ticks.
+    verified_mismatches: int = 0
+    # Above-lock-bar matches refused only by the face-px floor —
+    # accumulates toward PATIENT across ticks.
+    smallface_events: int = 0
+    # Best gallery match score on this track this clip (any quality).
+    best_match_score: float = 0.0
 
 
 @dataclass
@@ -170,7 +229,21 @@ class BodyReIDPipeline:
             if result.patient_bbox is not None:
                 draw_box(frame_bgr, result.patient_bbox)
         summary = pipeline.summary()  # locked tracks, best score, etc.
+
+    Perception seam (GPU port, 2026-07-20): detect+track and face
+    detect+embed are isolated behind `_perceive()` / `_face_hits()`.
+    The defaults below run the local YOLO + BoT-SORT + SCRFD path,
+    byte-identical to the pre-seam behavior. `RemoteReplayPipeline`
+    (remote_replay.py) overrides both to feed pod-computed SAM tracks
+    and face observations through this SAME decision machinery — every
+    label, lock, threshold, and invariant runs here either way; the
+    brain never knows the eyes changed.
     """
+
+    # Subclasses running on remote observations set this False so
+    # __init__ skips constructing the local YOLO detector + BoT-SORT
+    # tracker they will never call.
+    LOCAL_PERCEPTION: bool = True
 
     def __init__(
         self,
@@ -191,11 +264,24 @@ class BodyReIDPipeline:
         self._gallery = gallery
         self._has_gallery = gallery.size > 0
         self._cfg = config
-        self._detector = body_detector.PersonDetector(
-            model_name=config.yolo_model,
-            confidence=config.yolo_confidence,
+        # Detector runs at the FLOOR (not the confidence bar) so weak
+        # seated/lying detections reach the tracker's second
+        # association pass. The bar/birth split lives in the tracker.
+        # floor=None (legacy callers) keeps the old single-bar mode.
+        self._detect_floor = (
+            config.yolo_detect_floor
+            if config.yolo_detect_floor is not None
+            else config.yolo_confidence
         )
-        self._tracker = PersonTracker(frame_rate=max(1, config.sample_fps))
+        if self.LOCAL_PERCEPTION:
+            self._detector = body_detector.PersonDetector(
+                model_name=config.yolo_model,
+                confidence=self._detect_floor,
+            )
+            self._tracker = self._build_tracker()
+        else:
+            self._detector = None
+            self._tracker = None
         self._tracks: dict[int, _TrackState] = {}
         # Cross-clip body gallery hook. When set, called once per track
         # the first time it's seen this clip. Signature:
@@ -233,6 +319,34 @@ class BodyReIDPipeline:
         self._yolo_max_confidence = 0.0
         self._yolo_confidence_sum = 0.0
 
+    def _build_tracker(self) -> PersonTracker:
+        cfg = self._cfg
+        if cfg.yolo_detect_floor is None:
+            # PRESERVE pre-W6 behavior for floor-less callers
+            # (clip_annotate's caregiver-facing archive annotation):
+            # boxmot stock association bars, exactly as before the
+            # floor/birth split. Passing yolo_confidence/floor here
+            # moved [0.40, 0.50) detections from the IoU-only second
+            # pass into the ReID-fused first pass and shifted ID
+            # continuity in archived clips (review C9).
+            return PersonTracker(
+                frame_rate=max(1, cfg.sample_fps),
+                track_high_thresh=0.5,
+                track_low_thresh=0.1,
+                new_track_thresh=0.6,
+            )
+        return PersonTracker(
+            frame_rate=max(1, cfg.sample_fps),
+            track_high_thresh=cfg.yolo_confidence,
+            track_low_thresh=self._detect_floor,
+            # None preserves boxmot's stock 0.6 birth bar; inference.py
+            # passes the Settings value.
+            new_track_thresh=(
+                cfg.track_birth_confidence
+                if cfg.track_birth_confidence is not None else 0.6
+            ),
+        )
+
     def reset_tracker(self) -> None:
         """Rebuild BoT-SORT and clear the per-track state machine.
         Keeps the gallery + face/body models in place. Use this when
@@ -240,7 +354,8 @@ class BodyReIDPipeline:
         boundary between the pre-event and post-event halves of an
         archived clip) so the post-discontinuity frames get their
         own clean lock instead of inheriting stale tracks."""
-        self._tracker = PersonTracker(frame_rate=max(1, self._cfg.sample_fps))
+        if self.LOCAL_PERCEPTION:
+            self._tracker = self._build_tracker()
         self._tracks = {}
 
     def process_frame(self, frame_bgr: np.ndarray, frame_idx: int) -> FrameResult:
@@ -251,22 +366,7 @@ class BodyReIDPipeline:
         we only emit a bbox tied to a track present in the current
         update, never a stale last_seen position from frames ago."""
         cfg = self._cfg
-        dets = self._detector.detect(frame_bgr)
-        tracked = self._tracker.update(dets, frame_bgr)
-
-        # Accumulate per-frame YOLO stats. `dets` is Nx6 where col 4 is
-        # confidence. Tracked here rather than inside _detector so we
-        # don't have to plumb a callback through PersonDetector.
-        n_dets = int(dets.shape[0])
-        self._yolo_frames_processed += 1
-        self._yolo_total_detections += n_dets
-        if n_dets > 0:
-            self._yolo_frames_with_detections += 1
-            frame_confs = dets[:, 4].astype(float)
-            frame_max = float(frame_confs.max())
-            if frame_max > self._yolo_max_confidence:
-                self._yolo_max_confidence = frame_max
-            self._yolo_confidence_sum += float(frame_confs.sum())
+        tracked = self._perceive(frame_bgr, frame_idx)
 
         frame_result = FrameResult()
 
@@ -309,8 +409,26 @@ class BodyReIDPipeline:
                 except Exception:
                     log.exception("body_pipeline.pre_match_callback raised")
                     pre_label = None
-                if pre_label in (LABEL_PATIENT, LABEL_OTHER):
+                # Callback may return a bare label (legacy: gallery
+                # match) or (label, source) with source "gallery".
+                pre_source = "gallery"
+                if isinstance(pre_label, tuple):
+                    pre_label, pre_source = pre_label[0], pre_label[1]
+                if pre_label == LABEL_PATIENT and any(
+                    s is not state and s.label == LABEL_PATIENT
+                    for s in self._tracks.values()
+                ):
+                    # Single-PATIENT invariant (W5): a body-gallery
+                    # pre-label never seats a SECOND patient — the
+                    # earlier evidence keeps the label; this track
+                    # stays UNKNOWN and face checks can still speak.
+                    log.info(
+                        "reid.pre_match_skipped_second_patient tid=%d",
+                        tid,
+                    )
+                elif pre_label in (LABEL_PATIENT, LABEL_OTHER):
                     state.pre_label = pre_label
+                    state.pre_label_source = pre_source
                     state.label = pre_label
 
             # Face check runs while we still have something to learn:
@@ -349,6 +467,42 @@ class BodyReIDPipeline:
 
         return frame_result
 
+    # ── perception seam (overridden by RemoteReplayPipeline) ──────
+
+    def _perceive(self, frame_bgr: np.ndarray, frame_idx: int) -> np.ndarray:
+        """Detect + track one frame. Returns BoT-SORT-shaped rows
+        (x1, y1, x2, y2, tid, det_conf, cls, det_ind). The default is
+        the local YOLO + BoT-SORT path; per-frame detection stats
+        accumulate here (col 4 = confidence) so `yolo_stats` stays
+        truthful for whichever perception ran."""
+        dets = self._detector.detect(frame_bgr)
+        n_dets = int(dets.shape[0])
+        self._yolo_frames_processed += 1
+        self._yolo_total_detections += n_dets
+        if n_dets > 0:
+            self._yolo_frames_with_detections += 1
+            frame_confs = dets[:, 4].astype(float)
+            frame_max = float(frame_confs.max())
+            if frame_max > self._yolo_max_confidence:
+                self._yolo_max_confidence = frame_max
+            self._yolo_confidence_sum += float(frame_confs.sum())
+        return self._tracker.update(dets, frame_bgr)
+
+    def _face_hits(
+        self,
+        state: _TrackState,
+        frame_bgr: np.ndarray,
+        bbox: tuple[float, float, float, float],
+        frame_idx: int,
+    ) -> list["reid_embeddings.FaceHit"]:
+        """Detect + embed faces inside this track's body bbox. Default
+        = local SCRFD + ArcFace via `embed_in_box`. RemoteReplayPipeline
+        overrides with a lookup of pod-computed observations for
+        (track, frame). Returned bboxes are in frame coords."""
+        return reid_embeddings.embed_in_box(
+            frame_bgr, bbox, model_name=self._cfg.insightface_model,
+        )
+
     def _face_check(
         self,
         state: _TrackState,
@@ -358,9 +512,7 @@ class BodyReIDPipeline:
         frame_result: FrameResult,
     ) -> None:
         cfg = self._cfg
-        hits = reid_embeddings.embed_in_box(
-            frame_bgr, bbox, model_name=cfg.insightface_model,
-        )
+        hits = self._face_hits(state, frame_bgr, bbox, frame_idx)
         # Path A: SCRFD didn't detect any face in this body crop. We
         # have NO identity evidence on this attempt. Track stays at
         # whatever label it had (UNKNOWN unless a prior attempt landed
@@ -380,10 +532,21 @@ class BodyReIDPipeline:
         if best.det_score < cfg.face_min_det_score:
             return
 
-        # We have a high-enough-quality face to embed and compare. From
-        # this point on, the attempt counts as a "verified attempt" —
-        # used by `_maybe_lock_other` to gate the OTHER decision so it
-        # only fires after several genuine match failures.
+        # SAM-face countersign gate (B3 incident, 2026-07-21): a claim
+        # the face CONCEPT session refuted (SCRFD firing on the back of
+        # a head — those scored ~0.07 vs the gallery and branded the
+        # patient OTHER) is counterfeit evidence. Epistemically Path B:
+        # no vote, no OTHER testimony, no best-score pollution. The
+        # original det bar below keeps full guest-branding recall for
+        # ORACLE-CONFIRMED faces; unconfirmed ones are silence.
+        if not getattr(best, "oracle_face", True):
+            return
+
+        # We have a high-enough-quality, oracle-confirmed face to embed
+        # and compare. From this point on, the attempt counts as a
+        # "verified attempt" — used by `_maybe_lock_other` to gate the
+        # OTHER decision so it only fires after several genuine match
+        # failures.
         state.face_seen_attempts += 1
         state.face_px_max = max(
             state.face_px_max, float(best.bbox[3] - best.bbox[1]),
@@ -394,6 +557,8 @@ class BodyReIDPipeline:
             cfg.match_threshold_base, best.det_score, best.face_pixel_area,
         )
         state.last_match_score = match.score
+        if match.score > state.best_match_score:
+            state.best_match_score = match.score
         frame_result.best_match_score_this_frame = match.score
         frame_result.best_face_embedding = best.embedding
         frame_result.best_face_det_score = best.det_score
@@ -405,25 +570,111 @@ class BodyReIDPipeline:
             self._best_face_det_score = best.det_score
 
         # Path D: match succeeded above threshold. Accumulate hits;
-        # lock as PATIENT after enough.
+        # lock as PATIENT after enough — but only on a QUALITY face
+        # (W5): sub-floor matches vote (and keep blocking the OTHER
+        # lock via face_hits > 0) yet can never flip the label. The
+        # floors exist because tiny/blurred faces produce embeddings
+        # that collide across people — the lunch green-box incident.
         if match.score >= threshold:
             state.face_hits += 1
-            if state.face_hits >= cfg.hits_to_lock:
-                state.label = LABEL_PATIENT
-                state.confidence = match.score
-                # Face evidence has overridden whatever pre-label the
-                # gallery match may have set. Stop further face checks
-                # on this track for the rest of the clip.
-                state.face_locked = True
+            face_h = float(best.bbox[3] - best.bbox[1])
+            lock_quality = (
+                face_h >= cfg.face_lock_min_px
+                and best.det_score >= cfg.face_lock_min_det
+            )
+            if (
+                not lock_quality
+                and match.score >= cfg.face_lock_score_single
+                and best.det_score >= cfg.face_lock_min_det
+                and face_h < cfg.face_lock_min_px
+            ):
+                # Above the LOCK bar on a confident detection, refused
+                # only by pixels: a sustained-evidence event.
+                state.smallface_events += 1
+            if state.face_hits >= cfg.hits_to_lock and lock_quality:
+                self._lock_patient(state, match.score, frame_idx)
+            elif state.face_hits >= cfg.hits_to_lock:
                 log.info(
-                    "reid.track_locked frame=%d tid=%d score=%.3f hits=%d",
-                    frame_idx, state.track_id, match.score, state.face_hits,
+                    "reid.lock_deferred_quality frame=%d tid=%d score=%.3f "
+                    "face_px=%.0f det=%.2f (floors %.0fpx/%.2f)",
+                    frame_idx, state.track_id, match.score, face_h,
+                    best.det_score, cfg.face_lock_min_px,
+                    cfg.face_lock_min_det,
                 )
             return
 
         # Path C: face embedded + scored + match failed. This is
         # positive disambiguation; counts toward the OTHER lock.
         self._maybe_lock_other(state)
+
+    def _lock_patient(
+        self, state: _TrackState, score: float, frame_idx: int,
+    ) -> None:
+        """Face-lock `state` as PATIENT, enforcing the in-clip
+        SINGLE-PATIENT invariant (identity-persistence W5, Aryaman:
+        one patient per home — a fortiori one per clip): if another
+        track already holds PATIENT, the higher face score keeps it
+        and the loser reverts to UNKNOWN (never OTHER) with its face
+        checking re-opened so fresh evidence can still speak."""
+        cfg = self._cfg
+        multi = self._max_concurrent_tracks >= 2
+        bar = cfg.face_lock_score_multi if multi else cfg.face_lock_score_single
+        if score < bar:
+            log.info(
+                "reid.lock_deferred_score frame=%d tid=%d score=%.3f "
+                "< bar %.2f (%s-person clip) — voting only",
+                frame_idx, state.track_id, score, bar,
+                "multi" if multi else "single",
+            )
+            return
+        if multi:
+            rival = max(
+                (
+                    float(t.last_match_score)
+                    for t in self._tracks.values()
+                    if t is not state
+                ),
+                default=0.0,
+            )
+            if score - rival < cfg.face_lock_margin:
+                # Near-tie between two faces (the aunt case): a lock
+                # here is a coin flip on who gets the green box.
+                # Neither locks; both keep voting.
+                log.info(
+                    "reid.lock_deferred_margin frame=%d tid=%d "
+                    "score=%.3f rival=%.3f margin=%.3f < %.2f",
+                    frame_idx, state.track_id, score, rival,
+                    score - rival, cfg.face_lock_margin,
+                )
+                return
+        for other in self._tracks.values():
+            if other is state or other.label != LABEL_PATIENT:
+                continue
+            if float(other.confidence) >= score:
+                log.info(
+                    "reid.lock_conflict_kept_existing tid=%d(%.3f) over "
+                    "tid=%d(%.3f)",
+                    other.track_id, other.confidence,
+                    state.track_id, score,
+                )
+                return
+            other.label = LABEL_UNKNOWN
+            other.face_locked = False
+            log.info(
+                "reid.lock_conflict_demoted tid=%d(%.3f) to UNKNOWN — "
+                "tid=%d(%.3f) wins",
+                other.track_id, other.confidence, state.track_id, score,
+            )
+        state.label = LABEL_PATIENT
+        state.confidence = score
+        # Face evidence has overridden whatever pre-label the gallery
+        # match may have set. Stop further face checks on this track
+        # for the rest of the clip.
+        state.face_locked = True
+        log.info(
+            "reid.track_locked frame=%d tid=%d score=%.3f hits=%d",
+            frame_idx, state.track_id, score, state.face_hits,
+        )
 
     def _maybe_lock_other(self, state: _TrackState) -> None:
         cfg = self._cfg
@@ -534,7 +785,11 @@ class BodyReIDPipeline:
             "total_detections": self._yolo_total_detections,
             "max_confidence": round(self._yolo_max_confidence, 3),
             "mean_confidence": round(mean_conf, 3),
-            "confidence_threshold": self._cfg.yolo_confidence,
+            # The bar the detector actually RAN at (the W6 floor when
+            # enabled) plus the association/birth bars, so soak
+            # telemetry stays honest about what 0-detection means.
+            "confidence_threshold": self._detect_floor,
+            "association_threshold": self._cfg.yolo_confidence,
         }
 
     @property
@@ -572,6 +827,12 @@ class BodyReIDPipeline:
                 face_locked=s.face_locked,
                 pre_labeled=s.pre_label is not None,
                 face_px_max=float(s.face_px_max),
+                pre_label_source=s.pre_label_source,
+                verified_mismatches=(
+                    s.face_seen_attempts if s.face_hits == 0 else 0
+                ),
+                smallface_events=s.smallface_events,
+                best_match_score=float(s.best_match_score),
             )
             for s in sorted(self._tracks.values(), key=lambda s: s.track_id)
         ]

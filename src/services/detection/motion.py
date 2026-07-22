@@ -115,15 +115,24 @@ class BlockMotionTracker:
 
     @staticmethod
     def _grid(frame) -> np.ndarray | None:
-        n = frame.width * frame.height
-        if n <= 0 or len(frame.data) < n:
+        # JPEG-in-buffer (2026-07-19): compressed frames carry a raw
+        # grayscale thumbnail in `luma` precisely so this math never
+        # decodes. Block MEANS are scale-invariant (averaging a
+        # downscaled region ≈ averaging the native region), so the
+        # calibration table in the module docstring carries over.
+        luma = getattr(frame, "luma", b"")
+        if luma:
+            from src.services.detection.frame_codec import LUMA_H, LUMA_W
+            w, h, buf = LUMA_W, LUMA_H, luma
+        else:
+            w, h, buf = frame.width, frame.height, frame.data
+        n = w * h
+        if n <= 0 or len(buf) < n:
             return None
-        bh, bw = frame.height // GRID_H, frame.width // GRID_W
+        bh, bw = h // GRID_H, w // GRID_W
         if bh == 0 or bw == 0:
             return None
-        y = np.frombuffer(frame.data, dtype=np.uint8, count=n).reshape(
-            frame.height, frame.width,
-        )
+        y = np.frombuffer(buf, dtype=np.uint8, count=n).reshape(h, w)
         return (
             y[: bh * GRID_H, : bw * GRID_W]
             .reshape(GRID_H, bh, GRID_W, bw)
@@ -181,11 +190,18 @@ def sample_stats(window: Sequence) -> dict:
     means: list[float] = []
     prev = None
     for f in window:
-        n = f.width * f.height
-        if n <= 0 or len(f.data) < n:
+        # Same luma-thumbnail preference as BlockMotionTracker._grid
+        # (JPEG-in-buffer): per-pixel deltas on the thumbnail are the
+        # same statistic at a smaller sample count — observation-only.
+        luma = getattr(f, "luma", b"")
+        buf = luma if luma else f.data
+        n = (
+            len(luma) if luma else f.width * f.height
+        )
+        if n <= 0 or len(buf) < n:
             prev = None
             continue
-        y = np.frombuffer(f.data, dtype=np.uint8, count=n)[::397].astype(np.int16)
+        y = np.frombuffer(buf, dtype=np.uint8, count=n)[::397].astype(np.int16)
         if prev is not None and y.shape == prev.shape:
             d = np.abs(y - prev)
             size = d.size or 1
