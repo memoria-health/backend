@@ -9,15 +9,42 @@ What actually runs today (2026-07-23). Onboarding for detector accuracy work. Me
 
 ## The pipeline (one camera, every 10 s tick)
 
-`RoomWorker` (per room) spawns a `CameraIngest` (per camera) that runs a fire-and-forget tick over an ~11 s clip:
+`RoomWorker` (per room) spawns a `CameraIngest` (per camera) that runs a fire-and-forget tick over an ~11 s clip. Each stage reads specific detector attributes (glossary below):
 
-1. **L0 signals** (`signals/`, `reid/`) — always-on YOLO+BoT-SORT tracking + ArcFace face attribution → per-track `{bbox, label ∈ PATIENT|OTHER|UNKNOWN}`; per-track + environment motion.
-2. **L1 schedule** (`scheduling/scheduler.py:resolve_due`) — per detector: when-window, duty cycle, subject suppression, per-track motion floor (severity ≥ 80 is **exempt**) → the due set.
-3. **L2 pack** (`scheduling/packer.py`) — group due detectors into VLM calls by (bucket, track): one uncapped **SCENE** call + **≤3-per-call PERSON crops** + the **RAPID** seizure crop. `executor.py` builds the clips and runs the calls **sequentially**.
-4. **L3 decide** (`event_promotion.py`) — a detector fires if `detected=true` AND `confidence ≥ threshold`; `state` detectors also need a rising edge; one event per clip (highest severity wins); 30 s per-(patient,detector) dedup.
-5. **L4 deliver** (`camera_ingest.py`, `clip_archival.py`) — APNs push + email + a ±15 s clip assembled in-process.
+1. **L0 signals** (`signals/`, `reid/`) — always-on YOLO+BoT-SORT tracking + ArcFace face attribution → per-track `{bbox, label ∈ PATIENT|OTHER|UNKNOWN}`; per-track motion + whole-frame `env_motion`. Detector-agnostic: the raw evidence every detector draws on.
+2. **L1 schedule** (`scheduler.py:resolve_due`) — decides *which detectors run this tick*. Skips anything with `is_on=false`, outside its `when_scope` window, or off-tick for its `duty_cycle` (`thinned` = every k-th tick). `subject_scope` gates presence: `environment` detectors need no person; `patient` detectors suppress only when re-ID *positively* places the patient elsewhere. A per-track motion floor then drops still people for `requires_motion` detectors — **unless `severity ≥ 80`** (emergencies are never gated on motion). Output: the due set + which track each detector targets.
+3. **L2 pack** (`packer.py` → `executor.py`) — turns the due set into VLM calls. `bucket` picks the fixed clip recipe (**SCENE** = full-frame 4 fps lite; **PERSON** = person crop; **RAPID** = tinted 8 fps flash crop, seizure only); `needs_audio` forces a native-video provider. Each detector contributes its `prompt_fragment` + `schema_json` (what the model is asked + the JSON it returns back). Grouped ≤3 per call, one call per person per bucket, dispatched **sequentially**.
+4. **L3 decide** (`event_promotion.py` → `decision.py`) — turns verdicts into events. A detector clears the bar when `<id>_detected=true` AND `confidence ≥` its base threshold shifted by `sensitivity` (low +0.15 stricter / high −0.30 looser). `shape` decides the rest: `point_in_time` fires on that one clip; `state` fires only on a rising edge and re-arms after `episode_gap_seconds`; `scheduled` fires on *absence* at a deadline. `eventing` (`entry:{m,t}` windowed count + `confirm:{k,n}` re-check) would add confirmation but is **NULL on every built-in ⇒ k=1**. One event per clip (`severity` breaks ties), then a `cooldown_seconds` re-fire guard (default 30 s).
+5. **L4 deliver** (`camera_ingest.py`, `clip_archival.py`) — APNs push + email (if `email_alerts_enabled`) + a ±15 s clip assembled in-process (skipped under privacy mode).
 
 Provider: Gemini `gemini-3.1-flash-lite`, with a **silent fallback to Qwen** (`openrouter`) on any Gemini error.
+
+### Detector attributes (columns on `detectors`)
+
+Grouped by the stage that reads them:
+
+| attribute | what it does | stage |
+|---|---|---|
+| `is_on` | master on/off switch | L1 |
+| `identifier` | the detector key; must be non-null to run at all | L1 |
+| `subject_scope` | `patient` / `anyone` / `environment` — who it's about, and how attribution gates it | L1 |
+| `evidence_branch` → `requires_motion` | whether a still person is dropped by the motion floor (only the `person_motion` bit is read — see TODO) | L1 |
+| `when_scope` | time-of-day window; outside it the detector is skipped | L1 |
+| `where_scope` | room hint for initial auto-assignment only; runtime "where" is the `cameras_detectors` join | assign |
+| `duty_cycle` | `every_eligible_tick` or `thinned` (only every k-th tick) | L1 |
+| `bucket` | the clip recipe — `scene` / `person` / `rapid` (fps, crop, tier, channel are all fixed by the bucket) | L2 |
+| `needs_audio` | forces the call onto a native-video (audio-carrying) provider | L2 |
+| `prompt_fragment` / `schema_json` | this detector's VLM instruction + the structured-output schema it returns | L2 |
+| `door_config` (per-camera) | wandering's exit-door zones, stored on `cameras_detectors` | L2 |
+| `severity` | 0–100; **≥80 = emergency** (exempt from motion floor + cross-camera suppression); also breaks the one-event-per-clip tie | L1 & L3 |
+| `sensitivity` | shifts the confidence bar: `low` +0.15, `standard` 0, `high` −0.30 | L3 |
+| `shape` | `point_in_time` (fires per clip) / `state` (rising edge + hysteresis) / `scheduled` (fires on absence) | L3 |
+| `eventing` | optional `entry:{m,t}` windowed count + `confirm:{k,n}` re-check; NULL ⇒ single-verdict (k=1) | L3 |
+| `episode_gap_seconds` | for `state` detectors: how long an episode stays "ongoing" before it can re-fire | L3 |
+| `cooldown_seconds` | minimum spacing between repeat events (default 30 s) | L3 |
+| `category` | `safety` / `routine` — sets the default state gap (60 s vs 300 s) + event styling | L3 |
+
+The base confidence bar (0.70; seizure 0.65) lives in `catalog.py`, not a row column — `sensitivity` shifts it.
 
 ## The detectors (9 built-in + hidden setup_test)
 
