@@ -65,18 +65,8 @@ async def gemini_provider(
     log_tag: str,
     settings: Settings,
     patient_in_clip: bool = False,
-    patient_bbox: tuple[float, float, float, float] | None = None,
     model: str | None = None,
 ) -> ProviderResult:
-    # `patient_bbox` is accepted for signature parity with
-    # `openai_provider`. Gemini's input is the raw MP4 (no per-frame
-    # rewrite path here), so visual annotation isn't applied — the
-    # text addendum from `build_identity_addendum(patient_in_clip)`
-    # carries the identification cue. If we ever observe Gemini
-    # misattributing detector outcomes in multi-person scenes, the
-    # path is to decode → annotate → re-encode the MP4 here
-    # (expensive, ~1-2s extra).
-    _ = patient_bbox
     if not settings.gemini_api_key:
         raise RuntimeError("NEMARA_GEMINI_API_KEY not configured")
 
