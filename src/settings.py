@@ -76,9 +76,11 @@ class Settings(BaseSettings):
 
     # EXPERIMENT: tint moved regions red on the VLM clip (frame-diff overlay) so
     # the model can see small/sustained motion — a vibrating hand / tremor — that
-    # is invisible in raw sampled frames. Off by default; A/B via env. When ON,
-    # the prompt explains the tint (or detectors misread red as blood/objects).
-    # Applies to the native-video (Gemini) path only; Re-ID runs on the clean clip.
+    # is invisible in raw sampled frames. Off by default.
+    # NOTE (2026-07-23): the global SCENE tint was removed from camera_ingest —
+    # overlay is now a RAPID-lane recipe property ONLY (the seizure/overlay channel
+    # tints its own crop and sets this flag per-call in executor.py). Turning this
+    # ON globally now only mis-adds the tint note to clean scene/person calls; leave off.
     motion_overlay_enabled: bool = Field(default=False)
 
     openai_api_key: str = Field(default="")
@@ -385,11 +387,36 @@ class Settings(BaseSettings):
     # headroom. Full sampling resumes the instant anyone is unbound.
     reid_inference_sample_fps_lean: int = Field(ge=1, le=15, default=3)
     reid_inference_sample_width: int = Field(ge=240, le=1920, default=480)
-    # SAM identity microservice (GPU pod). "legacy" = the in-Docker
-    # YOLO+BoT-SORT+SCRFD+ArcFace pipeline (default, untouched). "sam" =
-    # offload reid to the pod over HTTP; inference.py adapts the response
-    # into a byte-identical IdentityResult. Flag-gated: legacy is the fallback.
-    reid_pipeline_backend: str = "legacy"
+    # ── Tracker-eval rig (SAM3 vs SAM3+EdgeTAM) ─────────────────────
+    # LEAN EVAL MODE: strips every optimization/hidden hold so we test
+    # the RAW tracker + identity. When True: governor forced to FULL
+    # (no adaptive sampling throttle), recent-lane OFF, scene-extension
+    # OFF, and sampling runs at reid_inference_sample_fps regardless of
+    # occupancy. Face + body ID stay on — that's the whole point. The
+    # only per-run flag is NEMARA_TRACKER (sam3 | edgetam). Off in prod.
+    reid_lean_eval_mode: bool = Field(default=False)
+    # Frames/sec fed to the tracker under lean eval. The pod costs ~275ms
+    # per frame, and the reid window is ~4s, so fps=5 → ~20 frames → ~5.5s
+    # observe, which fits the 10s tick even with a second camera. Going to
+    # 8-10 (~32-40 frames) buys smoothness but risks observe > tick →
+    # pileups/429s that DROP ticks and contaminate the run. Raise it only
+    # for solo scenarios where one camera has the whole budget.
+    reid_lean_eval_sample_fps: int = Field(ge=1, le=15, default=5)
+    # Structured JSONL trace for the eval: per-frame TRK, IDEVENT (with
+    # de-floored real scores), pool-write HARVEST, per-stage LATENCY.
+    # The soak dashboard + tools/trace_tracks.py read this one file.
+    reid_trace_enabled: bool = Field(default=False)
+    reid_trace_path: str = Field(default="out/track_trace.jsonl")
+    # Tracker-eval arm label (sam3 | edgetam). The pipeline reads this
+    # straight from os.environ so the pod and backend always agree on the
+    # label; it is modeled here ONLY so a host process that loads the .env
+    # FILE (the soak dashboard) doesn't trip extra="forbid" on the
+    # NEMARA_TRACKER key. (pydantic filters os.environ extras but validates
+    # .env-file extras — which is why the container was fine and the
+    # dashboard 500'd.)
+    tracker: str = Field(default="edgetam")
+    # SAM identity microservice (GPU pod) — the ONLY perception arm since
+    # the legacy in-Docker YOLO+BoT-SORT arm was removed (2026-07-22).
     reid_sam_service_url: str = "http://localhost:8000"
     # NOTE: on the SAM arm, reid_timeout_seconds must exceed the wire
     # round trip (pod SAM ≈ 210ms/frame) + local replay — inference
@@ -537,7 +564,15 @@ class Settings(BaseSettings):
     # the 30s experiment regressed live (2026-07-22): under shedding
     # and normal in-and-out movement it retired bindings the grace
     # exists to bridge. Display staleness is the truth fields' job.
-    reid_binding_retire_after_s: float = Field(ge=0, default=45.0)
+    reid_binding_retire_after_s: float = Field(ge=0, default=15.0)
+    # Fix B (2026-07-22, re-applied): cap on how long the scene-presence
+    # layer may extend a PATIENT binding with NO real body re-sighting.
+    # Bounds the phantom lock — an EdgeTAM mask that drifted onto the couch
+    # keeps num_tracks>0 -> people_present -> scene_present, which unbounded
+    # held a departed patient present for 890s over an empty room. A still
+    # patient in bed is re-grounded by SAM3 within this window. 0 = old
+    # unbounded behaviour.
+    reid_scene_extension_max_s: float = Field(ge=0, default=150.0)
     # W5 — face-lock quality floors: dim faces may VOTE, only quality
     # faces may LOCK (the lunch green-box fix: 15-30px guest faces
     # cleared the quality-ADAPTIVE match bar and locked PATIENT).

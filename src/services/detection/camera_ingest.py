@@ -27,6 +27,7 @@ once Phase 2 ships — the deleted HTTP route can no longer touch it.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 import logging
 from dataclasses import dataclass
@@ -52,8 +53,8 @@ from src.services.detection.motion import (
 )
 from src.services.detection.motion_cache import MotionCache
 from src.services.detection.patient_presence import PatientPresence
+from src.services.reid import trace
 from src.services.reid.track_ledger import TrackLedger
-from src.services.detection.motion_overlay import overlay_motion
 from src.services.detection.mp4_remux import Mp4RemuxError, frames_to_mp4
 from src.services.detection.providers.gemini import gemini_provider
 from src.services.detection.providers.types import ProviderResult
@@ -333,6 +334,10 @@ class CameraIngest:
         # analyzed and holding ~50MB through teardown helps nobody.
         self._stopping = True
         self._queued_tick = None
+        # Reset marker: this teardown WIPES the in-memory ledger, so any
+        # identity loss straddling it is infrastructure, not the tracker —
+        # the dashboard flags a run containing one as contaminated.
+        trace.reset(cam=str(self.camera_id), kind="worker_stop")
         # Cancel the loop FIRST so no new ticks get spawned while we wait
         # on the in-flight ones. Idempotent — second stop() is a no-op
         # because _tick_task is None after the first call.
@@ -1061,6 +1066,16 @@ class CameraIngest:
                 reid_mode = (
                     "lean" if self._identity_lock.all_bound() else "full"
                 )
+            # Lean eval strips the governor inside label_clip; force the
+            # local to match so "mode=full" in the log is honest proof the
+            # confounder is off (the governor if/else above still ran for
+            # its presence-tracking side effects; only the label changes).
+            if self._settings.reid_lean_eval_mode:
+                reid_mode = "full"
+            # Real capture time (window end ≈ now, BEFORE processing). One
+            # value, reused for the label_clip trace ctx AND the ledger ctx
+            # below, so every record for this tick shares one timestamp.
+            _capture_ts = time.time()
             try:
                 identity = await self._reid.label_clip(
                     mp4_bytes=mp4_bytes,
@@ -1069,13 +1084,20 @@ class CameraIngest:
                     # Binding-aware face throttle (optimization #1):
                     # full face cadence while anyone in view is
                     # unbound/suspect or the room is empty; 1-in-3
-                    # heartbeat once everyone is bound. (`minimal`
-                    # mode force-disables faces inside label_clip.)
-                    face_evidence=self._identity_lock.wants_face_evidence(),
+                    # heartbeat once everyone is bound. Lean eval forces
+                    # FULL cadence so a real face always gets its chance.
+                    face_evidence=(
+                        True if self._settings.reid_lean_eval_mode
+                        else self._identity_lock.wants_face_evidence()
+                    ),
                     # Face-afterglow harvest hint (pool learns far/
                     # seated appearances from the bound track).
                     harvest_hint=self._identity_lock.harvest_hint(),
                     mode=reid_mode,
+                    # Trace key: stable per-camera tick + real capture time
+                    # (window end ≈ now, BEFORE the 2-4s of processing).
+                    tick_seq=self._tick_counter,
+                    capture_ts=_capture_ts,
                 )
             except Exception:
                 log.exception("%s reid.label_clip crashed", self._log_tag)
@@ -1085,6 +1107,18 @@ class CameraIngest:
             # through blur/track-death and upgrades the result so every
             # downstream consumer (prompt addendum, subject router,
             # evidence frames, event gate) sees the persistent identity.
+            # This lock IS the binding brain (single-seat, bind-once,
+            # conflict) — NOT a bypassable hysteresis layer. Under lean eval
+            # we KEEP it: grace=2s + scene-extension OFF already reduce the
+            # HOLD to a 2s blink-bridge, so what we measure is the tracker
+            # feeding the real binding logic, not a primitive raw-label path.
+            # The ledger runs HERE, outside label_clip's begin_tick scope, so
+            # re-stamp the trace ctx or its IDEVENTs silently no-op.
+            trace.begin_tick(
+                cam=str(self.camera_id), tick=self._tick_counter,
+                arm=os.environ.get("NEMARA_TRACKER", "edgetam"),
+                capture_ts=_capture_ts,
+            )
             identity = self._identity_lock.apply(identity, tick_mono=tick_mono)
             # Governor heartbeat: occupancy for every camera; and when
             # THIS camera holds the seat, whether the patient was
@@ -1368,29 +1402,16 @@ class CameraIngest:
                 session, patient.caregiver_id, self._settings,
             )
 
-            # Optional motion overlay: tint moved regions red so the VLM can see
-            # small/sustained motion (tremor/shaking). Only the native-video
-            # (Gemini) path consumes this mp4 (the frame-sampled providers use
-            # Re-ID's clean frames), so only build it when the choice is gemini.
-            # Re-ID above ran on the CLEAN clip. Runs off the event loop; any
-            # failure falls back to the clean clip.
+            # Scene/person calls always run on the CLEAN clip. The motion
+            # overlay (red tint) is a RAPID-lane recipe property only: the
+            # seizure/overlay channel tints its OWN crop in the executor
+            # (tint_window -> build_overlay_crop_mp4) and carries its own tint
+            # note per-call (executor.py: flash_update["motion_overlay_enabled"]).
+            # The global scene tint was removed 2026-07-23 -- it silently tinted
+            # EVERY scene-bucket detector's clip (fall / agitation / wandering /
+            # calling_for_help / emergency / stove), a measured over-trigger.
+            # See docs/architecture/detection-architecture-v2.md section 1.4.
             vlm_mp4 = mp4_bytes
-            if self._settings.motion_overlay_enabled and vlm_choice == "gemini":
-                try:
-                    tinted = await asyncio.to_thread(overlay_motion, window)
-                    vlm_mp4 = await frames_to_mp4(
-                        tinted,
-                        fps=self._settings.livekit_worker_target_fps,
-                        pcm=pcm if pcm else None,
-                        pcm_sample_rate=self.audio_buffer.sample_rate,
-                        pcm_num_channels=self.audio_buffer.num_channels,
-                    )
-                except Exception:  # noqa: BLE001
-                    log.exception(
-                        "%s motion_overlay failed — using clean clip",
-                        self._log_tag,
-                    )
-                    vlm_mp4 = mp4_bytes
 
             if self._settings.detection_v2_scheduler_enabled:
                 # ── v2 path (P3): L1 due-set → L2 call plans → executor.
