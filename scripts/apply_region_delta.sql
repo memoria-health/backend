@@ -70,6 +70,51 @@ as $$
   select region from public.caregivers where id = p_caregiver_id;
 $$;
 
+-- ─── patients.region: the AUTHORITATIVE data-residency key ──────────────
+-- Follows the monitored home/camera location (a US caregiver may manage an
+-- India patient). All heavy media + per-patient rows route by this column.
+
+-- 5. region column — defaults every existing patient to 'US'.
+alter table public.patients
+  add column if not exists region text not null default 'US';
+
+-- 6. allowed values.
+alter table public.patients drop constraint if exists patients_region_check;
+alter table public.patients
+  add constraint patients_region_check check (region in ('US', 'IN'));
+
+-- 7. client-immutability guard (mirrors caregivers).
+create or replace function public.enforce_patient_region_immutable()
+returns trigger
+language plpgsql
+as $$
+begin
+  if new.region is distinct from old.region then
+    if current_setting('request.jwt.claims', true) is not null
+       or current_user in ('authenticated', 'anon') then
+      raise exception
+        'patients.region is immutable from the client path (data-residency attribute); change it only via an admin/service connection'
+        using errcode = 'check_violation';
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists patients_region_immutable on public.patients;
+create trigger patients_region_immutable
+  before update on public.patients
+  for each row execute function public.enforce_patient_region_immutable();
+
+-- 8. canonical resolver (storage routing calls this).
+create or replace function public.region_of_patient(p_patient_id uuid)
+returns text
+language sql
+stable
+as $$
+  select region from public.patients where id = p_patient_id;
+$$;
+
 commit;
 
 -- ─── Tagging India accounts (run manually, authoritatively) ──────────────

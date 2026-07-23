@@ -103,6 +103,7 @@ async def create_patient(
         date_of_birth=body.date_of_birth,
         gender=body.gender,
         home_address=body.home_address,
+        region=body.region.value,
         last_event_at=None,
     )
     await patient_repo.insert(session, p)
@@ -305,6 +306,7 @@ async def upload_patient_photo(
             image_bytes=body,
             content_type=content_type,
             settings=settings,
+            region=p.region,
         )
     except StorageError as exc:
         msg = str(exc)

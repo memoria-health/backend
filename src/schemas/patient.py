@@ -29,6 +29,17 @@ class PatientState(str, Enum):
     offline = "offline"
 
 
+class Region(str, Enum):
+    """Data-residency region for a patient's data. The client's country
+    picker (United States / India) maps to these values; the backend routes
+    storage (Backblaze bucket, Supabase key prefix) and lift/breach/DSAR
+    scoping off the patient's region. See `patients.region` in schema.sql.
+    """
+
+    us = "US"
+    india = "IN"
+
+
 Name200 = Annotated[str, Field(min_length=1, max_length=200)]
 Name80 = Annotated[str, Field(min_length=1, max_length=80)]
 Address = Annotated[str, Field(min_length=1, max_length=500)]
@@ -49,6 +60,9 @@ class PatientResponse(BaseModel):
     gender: Gender | None
     relation: Relation
     home_address: Address | None
+    # Data-residency region for this patient's data ('US' | 'IN'). Set at
+    # onboarding, immutable thereafter. Drives storage routing + liftability.
+    region: Region
     state: PatientState
     status_line: str
     last_event_at: datetime | None
@@ -101,6 +115,11 @@ class CreatePatientRequest(BaseModel):
     date_of_birth: date | None = None
     gender: Gender | None = None
     home_address: Address | None = None
+    # Data-residency region for this patient. Optional + defaults to 'US' so
+    # pre-region clients keep working during rollout; the onboarding UI sends
+    # 'IN' for India homes. Immutable after creation (not in UpdatePatientRequest,
+    # and the DB trigger blocks client-path changes).
+    region: Region = Region.us
 
 
 class UpdatePatientRequest(BaseModel):

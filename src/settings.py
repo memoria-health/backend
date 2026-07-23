@@ -233,6 +233,15 @@ class Settings(BaseSettings):
     b2_bucket: str = Field(default="memoria-data")
     b2_endpoint_url: str = Field(default="https://s3.us-west-004.backblazeb2.com")
     b2_region: str = Field(default="us-west-004")
+    # Data-residency: India patients' research clips route to their OWN bucket
+    # (services/region.b2_bucket_for) so India collected video is isolated and
+    # liftable as a unit. Empty until an India bucket exists — while empty, IN
+    # clips fall back to `b2_bucket` with a warning (see region.b2_bucket_for).
+    # NOTE: if the India bucket is created in a different B2 region, add
+    # matching b2_endpoint_url_in / b2_region_in and thread them through
+    # region.b2_bucket_for; today B2 has no India POP so a single endpoint is
+    # assumed.
+    b2_bucket_in: str = Field(default="")
     # Hard ceiling on a single clip file. ~15min of H.264 720p @2.5Mbps
     # is ~280 MB; 1.5 GB leaves generous headroom for the roll + audio.
     data_collection_max_clip_bytes: int = Field(ge=1024, default=1_500_000_000)

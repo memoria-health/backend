@@ -64,10 +64,12 @@ class _FakeMuxer:
 class _FakeUploader:
     def __init__(self, fail_times: int = 0) -> None:
         self.calls: list[tuple[Path, str, dict]] = []
+        self.regions: list[str] = []
         self.fail_times = fail_times
 
-    async def __call__(self, path, key, *, metadata, settings) -> str:
+    async def __call__(self, path, key, *, metadata, settings, region="US") -> str:
         self.calls.append((Path(path), key, dict(metadata)))
+        self.regions.append(region)
         if len(self.calls) <= self.fail_times:
             raise RuntimeError("transient upload error")
         return key

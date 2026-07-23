@@ -154,6 +154,7 @@ async def create_face_embeddings(
                 image_bytes=body,
                 content_type=content_type,
                 settings=settings,
+                region=patient.region,
             )
         except StorageError as exc:
             log.warning(

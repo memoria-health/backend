@@ -190,6 +190,10 @@ async def _archive_one(
     # caregiver — only the video is suppressed.
     async with sessionmaker() as session:
         patient = await session.get(Patient, patient_id)
+        # Capture region inside the session (attribute may expire after close).
+        # Missing patient defaults to US — the clip still uploads, just to the
+        # default region (a vanished patient is an edge case, not India data).
+        patient_region = patient.region if patient is not None else "US"
         if patient is not None and patient.privacy_mode_enabled:
             log.info(
                 "clip_archival.privacy_drop event_id=%s — clip discarded "
@@ -208,6 +212,7 @@ async def _archive_one(
 
     final_key = await storage.upload_clip(
         event_id=event_id, mp4_bytes=annotated_mp4, settings=settings,
+        region=patient_region,
     )
 
     async with sessionmaker() as session:

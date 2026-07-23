@@ -215,11 +215,58 @@ create table public.patients (
   -- fall back to initials while NULL. The signed URL is minted at
   -- read time by GET /v1/patients/{id}/photo-url.
   photo_storage_key text,
+  -- Data-residency region for THIS patient's data: 'US' | 'IN'. This is
+  -- the authoritative residency key — it follows the monitored home /
+  -- camera location, NOT the caregiver (a US-based caregiver can manage a
+  -- patient living in India, whose video/audio/biometrics are Indian
+  -- data). All heavy media (research clips → Backblaze, selfies + incident
+  -- clips → Supabase Storage) and every per-patient row route by this
+  -- column, so a region's data is liftable to in-region infra as one
+  -- `where region = ?` slice. Captured at patient onboarding (India → 'IN',
+  -- else 'US'); defaults 'US' so pre-region clients keep working. IMMUTABLE
+  -- from the client path (see patients_region_immutable trigger).
+  region          text not null default 'US' check (region in ('US', 'IN')),
   created_at      timestamptz not null default now(),
   updated_at      timestamptz not null default now()
 );
 
 create index patients_caregiver_id_idx on public.patients(caregiver_id);
+
+-- Same data-residency guard as caregivers.region: block any region change
+-- arriving on the RLS/PostgREST client path (JWT claims / authenticated|
+-- anon). The backend/admin (direct connection) may still set it at insert
+-- or correct it. Residency must not silently move.
+create or replace function public.enforce_patient_region_immutable()
+returns trigger
+language plpgsql
+as $$
+begin
+  if new.region is distinct from old.region then
+    if current_setting('request.jwt.claims', true) is not null
+       or current_user in ('authenticated', 'anon') then
+      raise exception
+        'patients.region is immutable from the client path (data-residency attribute); change it only via an admin/service connection'
+        using errcode = 'check_violation';
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+create trigger patients_region_immutable
+  before update on public.patients
+  for each row execute function public.enforce_patient_region_immutable();
+
+-- Authoritative resolver: the region a patient's data belongs to. Storage
+-- routing (Backblaze bucket, Supabase key prefix) and any region-scoped
+-- query should call this, so there is exactly one source of truth.
+create or replace function public.region_of_patient(p_patient_id uuid)
+returns text
+language sql
+stable
+as $$
+  select region from public.patients where id = p_patient_id;
+$$;
 
 create trigger patients_set_updated_at
   before update on public.patients
