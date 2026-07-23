@@ -135,6 +135,57 @@ async def test_upload_patient_photo_png_extension(fake_httpx) -> None:
 
 
 @pytest.mark.asyncio
+async def test_upload_patient_photo_in_region_is_prefixed(fake_httpx) -> None:
+    # Data-residency: an India patient's avatar key gets an `IN/` prefix so
+    # the object is isolated + liftable. The stored key (returned here) is
+    # reused verbatim for read/sign/delete, so the prefix must be in it.
+    fake_httpx["responses"].append(httpx.Response(200, text="ok"))
+    patient_id = uuid4()
+    key = await upload_patient_photo(
+        patient_id=patient_id,
+        image_bytes=b"\xff\xd8\xff\xe0" + b"\x00" * 1024,
+        content_type="image/jpeg",
+        settings=_settings(),
+        region="IN",
+    )
+    assert key == f"IN/{patient_id}.jpg"
+    assert (
+        fake_httpx["captured"][0]["url"]
+        == f"https://example.supabase.co/storage/v1/object/patient-photos/IN/{patient_id}.jpg"
+    )
+
+
+@pytest.mark.asyncio
+async def test_upload_clip_in_region_is_prefixed(fake_httpx) -> None:
+    # Same for incident clips: IN → `IN/events/...`; US stays unprefixed.
+    fake_httpx["responses"].append(httpx.Response(200))
+    event_id = uuid4()
+    key = await storage_module.upload_clip(
+        event_id=event_id,
+        mp4_bytes=b"\x00" * 256,
+        settings=_settings(),
+        region="IN",
+    )
+    assert key == f"IN/events/{event_id}.mp4"
+    assert f"/incident-clips/IN/events/{event_id}.mp4" in fake_httpx["captured"][0]["url"]
+
+
+@pytest.mark.asyncio
+async def test_upload_patient_photo_us_region_is_unprefixed(fake_httpx) -> None:
+    # US path must be unchanged (no prefix, no migration).
+    fake_httpx["responses"].append(httpx.Response(200))
+    patient_id = uuid4()
+    key = await upload_patient_photo(
+        patient_id=patient_id,
+        image_bytes=b"\xff\xd8\xff\xe0" + b"\x00" * 1024,
+        content_type="image/jpeg",
+        settings=_settings(),
+        region="US",
+    )
+    assert key == f"{patient_id}.jpg"
+
+
+@pytest.mark.asyncio
 async def test_upload_patient_photo_rejects_unsupported_content_type(fake_httpx) -> None:
     with pytest.raises(StorageError, match="unsupported content type 'image/gif'"):
         await upload_patient_photo(
