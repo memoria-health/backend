@@ -342,15 +342,6 @@ class Settings(BaseSettings):
     # OTHER. Higher = slower OTHER locks but fewer wrong-OTHER calls
     # if the patient was briefly face-occluded early in the tick.
     reid_face_checks_for_other: int = Field(ge=1, le=20, default=5)
-    # Per-frame Re-ID annotation of archived event clips. Display-only
-    # post-processing; the detector pipeline never reads these. When
-    # enabled, every event clip uploaded to Supabase Storage has a
-    # thin green box tracking the patient body bbox on every native
-    # frame so caregivers always see who triggered the alert. Adds
-    # ~25-35s to the archive path (already async/fire-and-forget) —
-    # the trade-off for matching nemara-reid-experiment's visual
-    # quality.
-    reid_clip_annotation_enabled: bool = Field(default=True)
 
     # ── Cross-clip body Re-ID gallery (Phase 2) ─────────────────
     # In-memory, per-patient. See cross_clip_body_gallery.py for the

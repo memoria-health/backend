@@ -112,7 +112,6 @@ async def run_vlm(
                 result = await gemini_provider(
                     mp4=mp4, detectors=detectors, log_tag=log_tag, settings=settings,
                     patient_in_clip=identity.patient_in_clip,
-                    patient_bbox=identity.patient_bbox,
                     model=gmodel,
                 )
                 return "gemini", result
@@ -124,9 +123,7 @@ async def run_vlm(
             result = await fn(
                 mp4=mp4, detectors=detectors, log_tag=log_tag, settings=settings,
                 patient_in_clip=identity.patient_in_clip,
-                patient_bbox=identity.patient_bbox,
                 pre_extracted_frames=identity.extracted_frames,
-                per_frame_bboxes=identity.per_frame_bboxes,
                 sample_fps=identity.sample_fps,
             )
             return prov, result

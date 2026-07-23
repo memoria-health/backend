@@ -9,12 +9,10 @@ The OpenAI path does NOT include the Gemini-only speech fields —
 no audio surface.
 """
 
-import asyncio
 from collections.abc import Sequence
 
 from openai import AsyncOpenAI
 
-from src.services.detection.frame_annotate import annotate_base64_async
 from src.services.detection.frame_extraction import ExtractedFrame, extract_frames
 from src.services.detection.prompt import (
     DetectorSpec,
@@ -26,15 +24,6 @@ from src.services.detection.providers.types import ProviderResult
 from src.settings import Settings
 
 
-async def _maybe_annotate(
-    data_b64: str,
-    bbox: tuple[float, float, float, float] | None,
-) -> str:
-    if bbox is None:
-        return data_b64
-    return await annotate_base64_async(data_b64, bbox)
-
-
 async def openai_provider(
     *,
     mp4: bytes,
@@ -42,9 +31,7 @@ async def openai_provider(
     log_tag: str,
     settings: Settings,
     patient_in_clip: bool = False,
-    patient_bbox: tuple[float, float, float, float] | None = None,
     pre_extracted_frames: list[ExtractedFrame] | None = None,
-    per_frame_bboxes: list[tuple[float, float, float, float] | None] | None = None,
     sample_fps: int | None = None,
 ) -> ProviderResult:
     if not settings.openai_api_key:
@@ -65,30 +52,9 @@ async def openai_provider(
         fps = settings.openai_frames_fps
         frames = await extract_frames(mp4, fps=fps, max_width=480)
 
-    # Burn a thin green rectangle around the patient. Per-frame bboxes
-    # from Re-ID let the box follow the patient as they move — the
-    # caregiver's archived clip uses the same per-frame approach
-    # (`clip_annotate.py`), so the LLM literally sees what the
-    # caregiver sees later. Frames without a locked PATIENT track get
-    # passed through unannotated. When Re-ID didn't produce per-frame
-    # boxes (fallback path), we draw a static box at `patient_bbox`
-    # on every frame instead.
     frame_payloads: list[tuple[str, str]] = [
         (f.data_base64, f.mime_type) for f in frames
     ]
-    if per_frame_bboxes is not None and len(per_frame_bboxes) == len(frames):
-        annotated = await asyncio.gather(
-            *(
-                _maybe_annotate(b64, bbox)
-                for (b64, _mime), bbox in zip(frame_payloads, per_frame_bboxes)
-            ),
-        )
-        frame_payloads = [(b64, mime) for b64, (_, mime) in zip(annotated, frame_payloads)]
-    elif patient_in_clip and patient_bbox is not None:
-        annotated = await asyncio.gather(
-            *(annotate_base64_async(b64, patient_bbox) for b64, _mime in frame_payloads),
-        )
-        frame_payloads = [(b64, mime) for b64, (_, mime) in zip(annotated, frame_payloads)]
 
     image_parts = [
         {

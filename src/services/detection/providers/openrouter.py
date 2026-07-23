@@ -15,13 +15,11 @@ unchanged, so the result is the same `ProviderResult` every other provider
 returns. (Mirrors nemara-vlm-benchmark/scripts/benchmark/provider_openrouter.)
 """
 
-import asyncio
 import logging
 from collections.abc import Sequence
 
 from openai import AsyncOpenAI
 
-from src.services.detection.frame_annotate import annotate_base64_async
 from src.services.detection.frame_extraction import ExtractedFrame, extract_frames
 from src.services.detection.prompt import (
     DetectorSpec,
@@ -48,15 +46,6 @@ def _strip_fences(raw: str) -> str:
     return s.strip()
 
 
-async def _maybe_annotate(
-    data_b64: str,
-    bbox: tuple[float, float, float, float] | None,
-) -> str:
-    if bbox is None:
-        return data_b64
-    return await annotate_base64_async(data_b64, bbox)
-
-
 async def openrouter_provider(
     *,
     mp4: bytes,
@@ -64,9 +53,7 @@ async def openrouter_provider(
     log_tag: str,
     settings: Settings,
     patient_in_clip: bool = False,
-    patient_bbox: tuple[float, float, float, float] | None = None,
     pre_extracted_frames: list[ExtractedFrame] | None = None,
-    per_frame_bboxes: list[tuple[float, float, float, float] | None] | None = None,
     sample_fps: int | None = None,
 ) -> ProviderResult:
     if not settings.openrouter_api_key:
@@ -75,9 +62,8 @@ async def openrouter_provider(
     built = build_prompt_and_schema(detectors)
     identity_addendum = build_identity_addendum(patient_in_clip)
 
-    # Reuse Re-ID's already-decoded frames + per-frame boxes when present
-    # (same fps/width the frame path needs); else extract fresh. Identical
-    # to the OpenAI provider so the model literally sees the same frames.
+    # Reuse Re-ID's already-decoded frames when present (same fps/width the
+    # frame path needs); else extract fresh.
     if pre_extracted_frames is not None and sample_fps is not None:
         frames = pre_extracted_frames
         fps = sample_fps
@@ -88,19 +74,6 @@ async def openrouter_provider(
     frame_payloads: list[tuple[str, str]] = [
         (f.data_base64, f.mime_type) for f in frames
     ]
-    if per_frame_bboxes is not None and len(per_frame_bboxes) == len(frames):
-        annotated = await asyncio.gather(
-            *(
-                _maybe_annotate(b64, bbox)
-                for (b64, _mime), bbox in zip(frame_payloads, per_frame_bboxes)
-            ),
-        )
-        frame_payloads = [(b64, mime) for b64, (_, mime) in zip(annotated, frame_payloads)]
-    elif patient_in_clip and patient_bbox is not None:
-        annotated = await asyncio.gather(
-            *(annotate_base64_async(b64, patient_bbox) for b64, _mime in frame_payloads),
-        )
-        frame_payloads = [(b64, mime) for b64, (_, mime) in zip(annotated, frame_payloads)]
 
     image_parts = [
         {

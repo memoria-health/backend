@@ -46,7 +46,6 @@ from uuid import UUID
 from src.db.event import Event
 from src.db.patient import Patient
 from src.services import storage
-from src.services.clip_annotate import annotate_clip_for_display
 from src.services.detection.mp4_remux import Mp4RemuxError, frames_to_mp4
 
 if TYPE_CHECKING:
@@ -76,8 +75,7 @@ async def archive_event(
     settings: "Settings",
 ) -> None:
     """Capture the post-event window, concat with the pre-event MP4
-    handed in, burn a green bbox tracking the patient through the
-    ±15s window, upload the result, and flip `has_clip=true` on the
+    handed in, upload the result, and flip `has_clip=true` on the
     events row.
 
     Errors are caught and logged. The events row stays without a clip
@@ -95,9 +93,7 @@ async def archive_event(
     pre's last frame and post's first frame, which surfaces as a
     visible scene jump at the concat boundary.
 
-    `patient_id` drives the Re-ID gallery lookup at annotation time.
-    Annotation is best-effort: if it fails, the un-annotated clip is
-    uploaded so caregivers never lose a clip to display-layer issues.
+    `patient_id` is used only for the privacy re-check before upload.
     """
     try:
         await _archive_one(
@@ -167,20 +163,6 @@ async def _archive_one(
 
     combined_mp4 = await concat_mp4s(pre_event_mp4, post_event_mp4)
 
-    # Single encode keeps timestamps monotonic so iOS AVPlayer accepts
-    # the file. The reset-at-boundary hint tells the annotator to
-    # rebuild its BoT-SORT tracker at the 15s cut so the post half
-    # re-identifies the patient independently — otherwise the
-    # patient's motion across the boundary breaks BoT-SORT's
-    # IoU/Kalman matching and the post half never re-locks.
-    annotated_mp4 = await annotate_clip_for_display(
-        combined_mp4,
-        patient_id=patient_id,
-        sessionmaker=sessionmaker,
-        settings=settings,
-        reset_at_seconds=float(settings.clip_post_event_wait_seconds),
-    )
-
     # Privacy re-check at the upload boundary. The caller already skips
     # spawning this task when privacy is on at promotion time, but privacy
     # can also flip ON during the post-event wait window above — so re-read
@@ -211,7 +193,7 @@ async def _archive_one(
             return
 
     final_key = await storage.upload_clip(
-        event_id=event_id, mp4_bytes=annotated_mp4, settings=settings,
+        event_id=event_id, mp4_bytes=combined_mp4, settings=settings,
         region=patient_region,
     )
 
@@ -230,7 +212,7 @@ async def _archive_one(
 
     log.info(
         "clip_archival.done event_id=%s key=%s bytes=%d",
-        event_id, final_key, len(annotated_mp4),
+        event_id, final_key, len(combined_mp4),
     )
 
 
