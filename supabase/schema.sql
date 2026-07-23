@@ -101,6 +101,17 @@ create table public.caregivers (
   -- true (everyone sees it); flip false to hide it for specific accounts
   -- (e.g. demo logins). Web reads it from /v1/me and gates the section.
   show_live_analyses boolean not null default true,
+  -- Data-residency region for this account: 'US' | 'IN'. This is the
+  -- "India key" — the single authoritative axis for splitting all tenant
+  -- data by geography. Every sensitive row (patients, cameras, analyses,
+  -- patient_face_embeddings, events, gateways) resolves ITS region through
+  -- this column via its caregiver_id/patient_id FK, so the tag lives only
+  -- here. It makes three future operations one query (`where region = ?`):
+  -- lifting a region's data to in-region infra, scoping a breach
+  -- notification, and answering a data-subject access request. Residency is
+  -- trust-sensitive: it is set by the backend/admin and is IMMUTABLE from
+  -- the client path (see the caregivers_region_immutable trigger below).
+  region       text not null default 'US' check (region in ('US', 'IN')),
   created_at   timestamptz not null default now(),
   updated_at   timestamptz not null default now()
 );
@@ -108,6 +119,49 @@ create table public.caregivers (
 create trigger caregivers_set_updated_at
   before update on public.caregivers
   for each row execute function public.set_updated_at();
+
+-- Data-residency guard: `region` must never change once set — moving it
+-- would silently strand an account's data in the wrong geography. Clients
+-- reach caregivers only through the backend, but as defence-in-depth we
+-- hard-block any region change arriving on the RLS/PostgREST client path
+-- (which carries JWT claims / runs as authenticated|anon). A direct
+-- admin/service connection (no JWT claims, bypasses RLS) may still set or
+-- correct it — that is the authoritative path used to tag India accounts
+-- until the onboarding flow sets region at insert time. Fires before
+-- caregivers_set_updated_at (alphabetical order), which is harmless.
+create or replace function public.enforce_caregiver_region_immutable()
+returns trigger
+language plpgsql
+as $$
+begin
+  if new.region is distinct from old.region then
+    if current_setting('request.jwt.claims', true) is not null
+       or current_user in ('authenticated', 'anon') then
+      raise exception
+        'caregivers.region is immutable from the client path (data-residency attribute); change it only via an admin/service connection'
+        using errcode = 'check_violation';
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+create trigger caregivers_region_immutable
+  before update on public.caregivers
+  for each row execute function public.enforce_caregiver_region_immutable();
+
+-- Authoritative resolver: the region a caregiver's data belongs to. Every
+-- downstream residency decision (storage-key prefixing, region-scoped
+-- queries, breach/DSAR scoping) should call this rather than re-deriving
+-- the join, so there is exactly one source of truth. STABLE ⇒ usable in
+-- read queries and index expressions.
+create or replace function public.region_of(p_caregiver_id uuid)
+returns text
+language sql
+stable
+as $$
+  select region from public.caregivers where id = p_caregiver_id;
+$$;
 
 -- email-sync trigger fires on auth.users; one trigger here, not per-row.
 drop trigger if exists sync_caregiver_email on auth.users;
