@@ -17,6 +17,11 @@ __pycache__/
 # Local-start.sh runtime state (PIDs + log files for backend + ngrok)
 .dev/
 
+# Pipeline / soak output (clips, id-frames, analyses dumps) — local debug
+# artifacts, never source. (58 id_frames JPEGs were previously tracked;
+# untracked 2026-07-23.)
+out/
+
 # Supabase local
 supabase/.branches
 supabase/.temp
