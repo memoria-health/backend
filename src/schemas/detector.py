@@ -100,6 +100,12 @@ class DetectorResponse(BaseModel):
     # Wandering only: the caregiver's saved exit-door choice, so the picker can
     # pre-highlight it. {box:[x,y,w,h]|null, label, source, no_exit_door}.
     door_config: dict | None = None
+    # True for detectors that read FINE visual detail — small motion
+    # (seizure/choking) or small objects (medication/stove). Their
+    # accuracy varies with camera distance, lighting, and angle, so the
+    # caregiver UI shows an expectations notice at enroll + in detail.
+    # Server-computed (see api.detectors._accuracy_caveat); never stored.
+    accuracy_caveat: bool = False
     created_at: datetime
     updated_at: datetime
 
@@ -227,6 +233,9 @@ class DetectorLibraryEntry(BaseModel):
     cohort: str                 # "child" | "adult" | "both"
     recommended: bool
     already_added: bool
+    # Fine-detail detector → the add flow shows the accuracy notice
+    # before the caregiver enrolls it. See api.detectors._accuracy_caveat.
+    accuracy_caveat: bool = False
 
 
 class AddFromLibraryRequest(BaseModel):

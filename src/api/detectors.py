@@ -237,8 +237,34 @@ async def list_wandering_doors(
     ]
 
 
+# Fine-detail detectors — accuracy varies with distance and lighting,
+# so the caregiver UI surfaces an expectations notice. Two signals so
+# BOTH the catalog (key only, no bucket) and compiled detectors (bucket
+# known) resolve through one policy:
+#   - identifier set: the fine-detail presets (small motion + small
+#     object). Also matches catalog keys, since key == identifier.
+#   - recipe buckets: catches CUSTOM detectors compiled to fine-motion
+#     or rapid whose identifier is custom_<hex>.
+_CAVEAT_BUCKETS = frozenset({"fine_motion", "rapid"})
+_CAVEAT_IDENTIFIERS = frozenset({
+    "seizure", "choking", "medication", "stove_left_on",
+})
+
+
+def _accuracy_caveat(identifier: str | None, bucket: str | None) -> bool:
+    """Whether a detector should carry the accuracy-expectations notice.
+    Pure (unit-tested); the single policy point for the caveat, shared
+    by the detector response and the library catalog."""
+    if bucket in _CAVEAT_BUCKETS:
+        return True
+    return identifier in _CAVEAT_IDENTIFIERS
+
+
 def _to_response(d: Detector) -> DetectorResponse:
-    return DetectorResponse.model_validate(d, from_attributes=True)
+    resp = DetectorResponse.model_validate(d, from_attributes=True)
+    return resp.model_copy(update={
+        "accuracy_caveat": _accuracy_caveat(d.identifier, d.bucket),
+    })
 
 
 @router.get(
@@ -299,6 +325,8 @@ async def list_detector_library(
             cohort=e.cohort,
             recommended=e.recommended,
             already_added=e.key in existing,
+            # key == identifier for presets; catalog has no bucket.
+            accuracy_caveat=_accuracy_caveat(e.key, None),
         )
         for e in entries
     ]
