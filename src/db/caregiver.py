@@ -54,3 +54,15 @@ class Caregiver(Base):
     show_live_analyses: Mapped[bool] = mapped_column(
         Boolean, server_default=text("true"), default=True,
     )
+
+    # Terms of Service + Privacy Notice acceptance. `tos_accepted_at` is the
+    # server-stamped moment the caregiver accepted (NULL = never accepted →
+    # the signup gate blocks the app until they do). `tos_version` is the
+    # document version they accepted, so a later material update can bump the
+    # version and re-prompt. Mirrors the patient data-collection consent
+    # (data_collection_decided_at); accepted_at is never client-writable —
+    # the API stamps it when tos_version is sent.
+    tos_accepted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None,
+    )
+    tos_version: Mapped[str | None] = mapped_column(String(40), default=None)

@@ -101,6 +101,14 @@ create table public.caregivers (
   -- true (everyone sees it); flip false to hide it for specific accounts
   -- (e.g. demo logins). Web reads it from /v1/me and gates the section.
   show_live_analyses boolean not null default true,
+  -- Terms of Service + Privacy Notice acceptance. tos_accepted_at is the
+  -- server-stamped moment the caregiver accepted (NULL = never accepted -> the
+  -- signup gate blocks the app until they do); tos_version is the document
+  -- version they accepted, so a later material update can bump it and re-prompt.
+  -- Mirrors the patient data-collection consent. Existing rows come out NULL
+  -- (re-prompted on next login) -- do not backfill as accepted.
+  tos_accepted_at timestamptz,
+  tos_version     text,
   created_at   timestamptz not null default now(),
   updated_at   timestamptz not null default now()
 );

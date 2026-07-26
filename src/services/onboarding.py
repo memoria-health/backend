@@ -52,6 +52,8 @@ def to_response(cg: Caregiver) -> CaregiverResponse:
         onboarded_web=cg.onboarded_web,
         timezone=cg.timezone,
         show_live_analyses=cg.show_live_analyses,
+        tos_accepted_at=cg.tos_accepted_at,
+        tos_version=cg.tos_version,
     )
 
 
@@ -78,6 +80,12 @@ async def provision_caregiver(
         created_at=now,
         updated_at=now,
         phone=body.phone,
+        # iOS gates account creation on ToS acceptance, so a version arrives
+        # here → stamp the acceptance time. Web omits it (accepts later via
+        # the PATCH gate), so the row is born un-accepted and the web gate
+        # blocks the app until it PATCHes a version.
+        tos_version=body.tos_version,
+        tos_accepted_at=now if body.tos_version else None,
     )
     return await caregiver_repo.insert(session, cg)
 
@@ -94,6 +102,12 @@ async def update_caregiver(
     # from explicit `null` (clear the column). `phone=null` clears phone;
     # omitting `phone` leaves it as-is.
     fields = body.model_dump(exclude_unset=True)
+    # ToS acceptance: when the client sends the version it accepted (via the
+    # web accept-terms gate), stamp the acceptance time server-side. Mirrors
+    # the patient data-collection consent (data_collection_decided_at); the
+    # timestamp is never client-writable.
+    if "tos_version" in fields:
+        fields["tos_accepted_at"] = datetime.now(timezone.utc)
     return await caregiver_repo.update_partial(session, auth.id, fields=fields)
 
 

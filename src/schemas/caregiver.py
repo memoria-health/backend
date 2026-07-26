@@ -60,6 +60,13 @@ class CaregiverResponse(BaseModel):
     # Per-account visibility of the dashboard's "Live analyses" feed.
     # Defaults true; flip false to hide it for specific accounts.
     show_live_analyses: bool
+    # Terms of Service + Privacy Notice acceptance. `tos_accepted_at` is null
+    # until the caregiver accepts (the signup gate blocks the app while null);
+    # `tos_version` is the document version they accepted. Clients read these
+    # to decide whether to show the blocking accept-terms gate (null, or a
+    # version older than the current one → re-prompt).
+    tos_accepted_at: datetime | None
+    tos_version: str | None
 
 
 class CreateCaregiverRequest(BaseModel):
@@ -71,6 +78,12 @@ class CreateCaregiverRequest(BaseModel):
 
     display_name: DisplayName
     phone: Phone | None = None
+    # The ToS/Privacy version the caregiver accepted at signup. The iOS app
+    # gates account creation on acceptance and sends it, so the row is born
+    # consented. Optional because the web provisions the row lazily on first
+    # load and captures acceptance via the PATCH gate instead. When present,
+    # provisioning stamps tos_accepted_at server-side.
+    tos_version: str | None = Field(default=None, max_length=40)
 
 
 class UpdateCaregiverRequest(BaseModel):
@@ -94,3 +107,8 @@ class UpdateCaregiverRequest(BaseModel):
     # IANA timezone (e.g. "America/New_York"). Auto-set by the web
     # client from the browser's resolved timezone.
     timezone: str | None = Field(default=None, max_length=64)
+    # The ToS/Privacy version the caregiver accepted via the web accept-terms
+    # gate (the web provisions the row before acceptance, so it records consent
+    # here). When present, the server stamps tos_accepted_at; the timestamp is
+    # never client-writable.
+    tos_version: str | None = Field(default=None, max_length=40)
