@@ -60,6 +60,8 @@ from uuid import UUID
 
 import numpy as np
 
+from src.services.reid import trace
+
 if TYPE_CHECKING:
     from src.settings import Settings
 
@@ -113,6 +115,14 @@ class CrossClipBodyGallery:
         # patient_id → label → list[_PooledEmbedding] (insertion order
         # = harvest order; FIFO eviction pops index 0).
         self._pools: dict[UUID, dict[str, list[_PooledEmbedding]]] = {}
+        # MOT re-bind lane (2026-07-23): the patient's MOST-RECENT body
+        # embeddings, populated every tick they're matched, SHORT-TTL. On a
+        # track break + re-entry, a returning body matches THIS (temporal
+        # locality → high cosine) instead of re-climbing the stale harvest
+        # pool for ~6 ticks. patient_id → deque-like list (FIFO cap, TTL).
+        # Kills the re-acquire trail for short breaks; a cold long-absence
+        # re-entry (buffer expired) still climbs the pool, as before.
+        self._recent: dict[UUID, list[_PooledEmbedding]] = {}
         # (patient_id, label) → (window_start, accepted_count). The
         # hygiene rate cap is BURST-AWARE: one lock event may deposit
         # up to `reid_gallery_harvest_burst` poses (the multi-pose
@@ -141,8 +151,25 @@ class CrossClipBodyGallery:
             pools = self._pools.get(patient_id, {})
             now = time.monotonic()
 
-            def score_pool(label: str) -> tuple[float, float, int]:
-                pool = pools.get(label, [])
+            # MOT re-bind: the patient's short-TTL recent embeddings join the
+            # PATIENT scoring set, so a returning body matches its last-seen
+            # self (high cosine) instead of re-climbing the harvest pool.
+            # Prune by TTL here (match is the hot path). Empty lane => this is
+            # byte-for-byte the pre-MOT behaviour.
+            ttl_r = float(getattr(s, "reid_reacquire_recent_ttl_s", 120.0))
+            recent = [
+                e for e in self._recent.get(patient_id, [])
+                if (now - e.harvested_at) < ttl_r
+            ]
+            self._recent[patient_id] = recent
+            # Lean eval rig: the recent-lane is a re-acquire optimization
+            # we're measuring the system WITHOUT. Score against the raw
+            # harvest pool only, so a returning body must earn its match.
+            if getattr(s, "reid_lean_eval_mode", False):
+                recent = []
+
+            def score_pool(label: str, extra=()) -> tuple[float, float, int]:
+                pool = list(pools.get(label, [])) + list(extra)
                 if not pool:
                     return 0.0, 0.0, 0
                 sims = sorted(
@@ -153,7 +180,7 @@ class CrossClipBodyGallery:
                 newest_at = max(at for _, at in sims)
                 return score, now - newest_at, len(pool)
 
-            p_score, p_age, p_n = score_pool(LABEL_PATIENT)
+            p_score, p_age, p_n = score_pool(LABEL_PATIENT, recent)
             o_score, o_age, o_n = score_pool(LABEL_OTHER)
 
         best_patient = (
@@ -188,6 +215,10 @@ class CrossClipBodyGallery:
             s.reid_body_match_other_threshold,
             (f"{verdict.label}@{verdict.score:.3f}" if verdict else "no_match"),
             p_n, o_n,
+        )
+        trace.body_score(
+            patient=p_score, other=o_score,
+            verdict=(f"{verdict.label}@{verdict.score:.3f}" if verdict else "no_match"),
         )
         return verdict
 
@@ -277,7 +308,32 @@ class CrossClipBodyGallery:
             "evicted=%d confidence=%.3f",
             label, patient_id, size, evicted, confidence,
         )
+        # Pool-write tap: a swap that harvests a guest poisons the pool and
+        # drives FPs later — logging every write lets the dashboard trace an
+        # FP back to the harvest (and the tick) that caused it.
+        trace.harvest(tid=0, pool=label, score=confidence)
         return True
+
+    def remember_recent(
+        self, *, patient_id: UUID, embedding: np.ndarray, confidence: float,
+    ) -> None:
+        """MOT re-bind lane: stash the patient's CURRENT body embedding as a
+        short-TTL recent view. Called every tick the patient is matched, so a
+        track that breaks and re-enters matches THIS (temporal locality) and
+        re-binds fast, instead of re-climbing the harvest pool for ~6 ticks.
+        FIFO-capped; TTL-pruned in match()/gc(). Additive: with an empty lane
+        match() is byte-for-byte the pre-MOT behaviour."""
+        cap = int(getattr(self._settings, "reid_reacquire_recent_max", 6))
+        normalized = embedding.astype(np.float32)
+        with self._lock:
+            lane = self._recent.setdefault(patient_id, [])
+            lane.append(_PooledEmbedding(
+                embedding=normalized,
+                harvested_at=time.monotonic(),
+                confidence=confidence,
+            ))
+            while len(lane) > cap:
+                lane.pop(0)
 
     # ── maintenance ────────────────────────────────────────────
 
@@ -293,11 +349,19 @@ class CrossClipBodyGallery:
 
     def _gc_locked(self, patient_id: UUID) -> int:
         s = self._settings
-        pools = self._pools.get(patient_id)
-        if not pools:
-            return 0
         now = time.monotonic()
         evicted = 0
+        # MOT recent (re-bind) lane — short TTL; prune even if pools empty so
+        # an idle patient's lane can't survive a clothing change.
+        ttl_r = float(getattr(s, "reid_reacquire_recent_ttl_s", 120.0))
+        lane = self._recent.get(patient_id)
+        if lane:
+            kept_r = [e for e in lane if (now - e.harvested_at) < ttl_r]
+            evicted += len(lane) - len(kept_r)
+            self._recent[patient_id] = kept_r
+        pools = self._pools.get(patient_id)
+        if not pools:
+            return evicted
         for label, pool in pools.items():
             # Negative (OTHER) entries are outfit-bound and deliberately
             # SHORT-LIVED (2h vs the patient pool's 4h): a stale guest
@@ -354,5 +418,7 @@ class CrossClipBodyGallery:
         with self._lock:
             if patient_id is None:
                 self._pools.clear()
+                self._recent.clear()
             else:
                 self._pools.pop(patient_id, None)
+                self._recent.pop(patient_id, None)

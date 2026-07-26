@@ -14,16 +14,18 @@ The boxmot `PyTorchBackend.get_features(xyxys, img)` already L2-
 normalizes the output embeddings, so consumers can compute cosine
 similarity as a dot product directly.
 
-Threading: the underlying torch model is not thread-safe, but our
-production code path drives this from inside `asyncio.to_thread` calls
-(one Re-ID pipeline run = one thread, not concurrent), so we don't
-need additional locking. Adding it would be a `threading.Lock`
-wrapping `get_features` if that assumption ever breaks.
+Threading: the underlying torch model is not thread-safe. The legacy
+Re-ID pipeline drove this from one `asyncio.to_thread` at a time, but
+the spine (2026-07-24) runs one worker thread PER CAMERA concurrently —
+so `get_features` is serialized behind `_BACKEND_LOCK` (the exact fix
+this docstring always anticipated). Contention is negligible: calls
+are sparse (identity batches only) and ~tens of ms each.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -33,6 +35,7 @@ log = logging.getLogger(__name__)
 
 
 _BACKEND_SINGLETON: Optional[object] = None
+_BACKEND_LOCK = threading.Lock()
 
 
 def _select_device():
@@ -93,7 +96,8 @@ def extract_body_embedding(
     # boxmot's get_features accepts an (N, 4) xyxy float array and an
     # HxWx3 BGR frame. It returns (N, D) L2-normalized embeddings.
     xyxys = np.array([[x1, y1, x2, y2]], dtype=np.float32)
-    embeddings = backend.get_features(xyxys, frame_bgr)
+    with _BACKEND_LOCK:
+        embeddings = backend.get_features(xyxys, frame_bgr)
     if embeddings is None or len(embeddings) == 0:
         return None
     return embeddings[0].astype(np.float32)

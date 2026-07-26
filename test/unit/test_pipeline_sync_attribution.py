@@ -3,8 +3,9 @@
 other test fakes the result upstream, so a regression to
 `attribution_ran=True` on gallery-less runs was invisible).
 
-BodyReIDPipeline is stubbed in the inference namespace; the frames are
-real tiny JPEGs so the decode loop runs for real.
+RemoteReplayPipeline (the only perception arm) is stubbed in the
+inference namespace; the frames are real tiny JPEGs so the decode loop
+runs for real.
 """
 
 from __future__ import annotations
@@ -30,7 +31,9 @@ def _jpeg_frame() -> ExtractedFrame:
 class _StubPipeline:
     """Just enough surface for _run_pipeline_sync's result assembly."""
 
-    def __init__(self, *, gallery, config, pre_match_callback=None) -> None:
+    def __init__(
+        self, *, observations=None, gallery, config, pre_match_callback=None,
+    ) -> None:
         self._tracks: dict = {}
         self.has_any_patient_track = False
         self.best_face_embedding = None
@@ -83,7 +86,7 @@ def _run(gallery: np.ndarray):
 
 
 def test_gallery_less_run_reports_no_attribution(monkeypatch) -> None:
-    monkeypatch.setattr(inf, "BodyReIDPipeline", _StubPipeline)
+    monkeypatch.setattr(inf, "RemoteReplayPipeline", _StubPipeline)
     result, harvest = _run(np.empty((0, 512), dtype=np.float32))
     assert result.reid_ran is True
     assert result.attribution_ran is False
@@ -93,7 +96,7 @@ def test_gallery_less_run_reports_no_attribution(monkeypatch) -> None:
 
 
 def test_gallery_run_reports_attribution(monkeypatch) -> None:
-    monkeypatch.setattr(inf, "BodyReIDPipeline", _StubPipeline)
+    monkeypatch.setattr(inf, "RemoteReplayPipeline", _StubPipeline)
     result, _ = _run(np.ones((2, 512), dtype=np.float32))
     assert result.reid_ran is True
     assert result.attribution_ran is True

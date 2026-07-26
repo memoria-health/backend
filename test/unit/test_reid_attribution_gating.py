@@ -23,7 +23,6 @@ def _settings(*, reid_enabled: bool, timeout: float = 5.0) -> SimpleNamespace:
     return SimpleNamespace(
         reid_enabled=reid_enabled,
         reid_timeout_seconds=timeout,
-        reid_pipeline_backend="legacy",
     )
 
 

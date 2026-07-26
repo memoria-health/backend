@@ -63,6 +63,9 @@ class RemoteObservations:
     `face_by_track_frame`: (tid, frame_idx) -> [FaceHit-compatible].
     """
 
+    # Pod session epoch — track ids are only comparable within one
+    # epoch; a pod restart recycles numbers (2026-07-25 T13 rebirth).
+    epoch: str = ""
     rows_by_frame: dict[int, np.ndarray] = field(default_factory=dict)
     face_obs: dict[tuple[int, int], list[RemoteFaceObs]] = field(
         default_factory=dict,

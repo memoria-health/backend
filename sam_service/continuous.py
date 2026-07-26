@@ -1,0 +1,537 @@
+"""Persistent per-camera continuous-tracking session — perception core of
+the EdgeTAM-continuous architecture (2026-07-22).
+
+Cascade per camera:
+  - SAM3 grounds "person" PERIODICALLY (every `reground_every` ticks, and on
+    the first tick). SAM3 multiplex needs ~6 frames of temporal context — a
+    single frame grounds nothing — so we ground over the tick's first frames
+    and take frame 0's masks.
+  - EdgeTAM PROPAGATES the tick's frames between grounds at ~36ms/frame.
+
+Track ids stay STABLE across ticks two ways:
+  1. mask-carry — a non-ground tick seeds EdgeTAM from the PREVIOUS tick's
+     final masks under the SAME ids (validated: 0 lost, ~0px drift when the
+     tick windows overlap by a frame).
+  2. IoU re-map — a ground tick maps SAM3's fresh masks back onto existing
+     persistent ids by IoU with the carried masks; unmatched masks get new
+     ids. So a re-ground refreshes geometry without renumbering anyone.
+
+One session per camera in a process-global store. Self-contained (sam3 +
+sam2/edgetam + torch + cv2 + numpy) so one pod process hosts both models.
+"""
+from __future__ import annotations
+
+import logging
+import os
+import shutil
+import tempfile
+import threading
+
+import numpy as np
+
+log = logging.getLogger("sam_service.continuous")
+
+_EDGE = None
+_edge_lock = threading.Lock()
+_SESSIONS: "dict[str, CameraSession]" = {}
+_sessions_lock = threading.Lock()
+
+_EDGE_CKPT = os.environ.get(
+    "NEMARA_EDGE_CKPT", "/workspace/edgetam/checkpoints/edgetam.pt",
+)
+_EDGE_CFG = os.environ.get("NEMARA_EDGE_CFG", "configs/edgetam.yaml")
+_EDGE_ROOT = os.environ.get("NEMARA_EDGE_ROOT", "/workspace/edgetam")
+# IoU floor to consider a re-grounded SAM3 mask the SAME person as a carried
+# id. Below it → a genuinely new person → new id.
+_REMAP_IOU = float(os.environ.get("NEMARA_EDGE_REMAP_IOU", "0.30"))
+# Optimization: EdgeTAM is built for small frames (16fps on an iPhone). The
+# per-tick cost is dominated by init_state RE-ENCODING every frame, so we
+# track at a reduced width and scale bboxes back to full res on output. The
+# face pass still uses the full-res crop (server mask_crop resizes the
+# track-res mask up), so identity quality is untouched. 0 disables.
+_TRACK_W = int(os.environ.get("NEMARA_EDGE_TRACK_W", "640"))
+# Ticks between SAM3 re-grounds. Higher = fewer expensive ground ticks, but
+# slower to catch a NEW person → keep modest until occupancy-triggered
+# re-ground lands.
+_REGROUND_EVERY = int(os.environ.get("NEMARA_EDGE_REGROUND", "5"))
+# Debug: if set, dump per-frame mask overlays for each tick to this dir so we
+# can SEE what EdgeTAM's mask does (follow the person, or drift to the sofa).
+_DEBUG_DIR = os.environ.get("NEMARA_EDGE_DEBUG_DIR", "")
+# Tracker backend: "edgetam" (default, the revert) = SAM3-ground + EdgeTAM-
+# carry; "sam3" = SAM3's own tracker over the WHOLE clip (swap-robust
+# within-clip ids from its memory) + IoU stitch across clips. Toggle with
+# env NEMARA_TRACKER; edgetam is the one-var revert.
+_TRACKER = os.environ.get("NEMARA_TRACKER", "edgetam").strip().lower()
+# sam3 mode: track every Nth clip frame. SAM3 propagation cost is ~linear in
+# frames tracked, and indoor motion is slow, so stride 2 on an 8-frame clip
+# (~4fps) roughly HALVES the ~2.2s/clip cost with negligible tracking loss.
+# Set NEMARA_SAM3_STRIDE=1 for max robustness. Output positions are remapped
+# to ORIGINAL frame indices so the server's per-frame face pass stays aligned.
+_SAM3_STRIDE = max(1, int(os.environ.get("NEMARA_SAM3_STRIDE", "1")))
+
+# NOTE: the 2026-07-22 drift guard (mask balloon/shape heuristics vs the
+# last ground's area) was PURGED 2026-07-24 — it mistook a person walking
+# toward the camera for a smear and killed live tracks. Regrounds are
+# the sole existence authority; a sticky-mask phantom dies at the next
+# ground (≤reground_every ticks) when the grounder finds nobody there.
+
+# Grounder selection (2026-07-24): "sam3" = concept-prompted masks (the
+# original); "yolo" = YOLO26 person BOXES seed EdgeTAM directly (box
+# prompt → EdgeTAM makes the mask). YOLO grounds in ~40ms vs SAM3's
+# ~10s — the fresh-look monopoly behind the 30-50s new-person latency.
+# SAM3 stays fully intact for switch-back and still runs the screens
+# concept pass regardless. YOLO-ground failures fall back to SAM3.
+_GROUNDER = os.environ.get("NEMARA_GROUNDER", "sam3").strip().lower()
+
+
+def _track_dims(w: int, h: int) -> tuple[int, int, float]:
+    """(track_w, track_h, scale) for a full-res frame. scale = track/orig."""
+    if _TRACK_W <= 0 or w <= _TRACK_W:
+        return w, h, 1.0
+    s = _TRACK_W / float(w)
+    return _TRACK_W, max(1, round(h * s)), s
+
+
+def _get_edge():
+    """Process-singleton EdgeTAM (sam2) video predictor."""
+    global _EDGE
+    if _EDGE is None:
+        with _edge_lock:
+            if _EDGE is None:
+                import sys
+                if _EDGE_ROOT not in sys.path:
+                    sys.path.insert(0, _EDGE_ROOT)
+                from sam2.build_sam import build_sam2_video_predictor
+                _EDGE = build_sam2_video_predictor(
+                    _EDGE_CFG, _EDGE_CKPT, device="cuda",
+                )
+                log.info("continuous.edgetam_loaded ckpt=%s", _EDGE_CKPT)
+    return _EDGE
+
+
+def _iou(a: np.ndarray, b: np.ndarray) -> float:
+    if a.shape != b.shape:
+        return 0.0
+    inter = np.logical_and(a, b).sum()
+    union = np.logical_or(a, b).sum()
+    return float(inter) / float(union) if union else 0.0
+
+
+def _box_iou(a, b) -> float:
+    """IoU of two xyxy boxes (pure)."""
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0.0:
+        return 0.0
+    area_a = (a[2] - a[0]) * (a[3] - a[1])
+    area_b = (b[2] - b[0]) * (b[3] - b[1])
+    return inter / max(1e-9, area_a + area_b - inter)
+
+
+def remap_boxes_to_ids(
+    boxes: list, carried_bboxes: "dict[int, tuple]", next_id: int,
+    iou_floor: float,
+) -> "tuple[dict[int, tuple], int]":
+    """Map fresh grounder boxes onto persistent ids by box-IoU against
+    the carried masks' bboxes — same contract as the SAM3 mask remap:
+    best overlap ≥ floor keeps the id, otherwise a new id. Pure."""
+    out: "dict[int, tuple]" = {}
+    used: set = set()
+    for bx in boxes:
+        best_id, best = None, iou_floor
+        for pid, pb in carried_bboxes.items():
+            if pid in used:
+                continue
+            i = _box_iou(bx, pb)
+            if i > best:
+                best_id, best = pid, i
+        if best_id is None:
+            best_id = next_id
+            next_id += 1
+        used.add(best_id)
+        out[best_id] = tuple(bx[:4])
+    return out, next_id
+
+
+def _mask_bbox(m: np.ndarray):
+    rows = np.any(m, axis=1)
+    cols = np.any(m, axis=0)
+    if not rows.any() or not cols.any():
+        return None
+    ys = np.where(rows)[0]
+    xs = np.where(cols)[0]
+    return (float(xs[0]), float(ys[0]), float(xs[-1]) + 1.0, float(ys[-1]) + 1.0)
+
+
+def _dump_overlay(frames, out, camera_id, tick, outdir) -> None:
+    """Debug: save per-frame mask overlays for one tick, so we can SEE what
+    EdgeTAM's mask does (follow the person vs drift onto the sofa)."""
+    import cv2
+
+    d = os.path.join(outdir, f"{str(camera_id)[:8]}_t{tick:04d}")
+    os.makedirs(d, exist_ok=True)
+    palette = [(0, 255, 0), (0, 165, 255), (255, 0, 255), (255, 255, 0)]
+    for fidx in sorted(out):
+        if fidx >= len(frames) or frames[fidx] is None:
+            continue
+        img = frames[fidx].copy()
+        h, w = img.shape[:2]
+        for oid, (bb, mm) in out[fidx].items():
+            m = mm
+            if m.shape[:2] != (h, w):
+                m = cv2.resize(
+                    m.astype(np.uint8), (w, h),
+                    interpolation=cv2.INTER_NEAREST,
+                ).astype(bool)
+            col = palette[(oid - 1) % len(palette)]
+            ov = img.copy()
+            ov[m] = col
+            img = cv2.addWeighted(img, 0.6, ov, 0.4, 0)
+            x0, y0, x1, y1 = (int(v) for v in bb)
+            cv2.rectangle(img, (x0, y0), (x1, y1), col, 2)
+            cv2.putText(img, f"id{oid}", (x0, max(20, y0 - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(img, f"t{tick} f{fidx}", (10, 34),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+        cv2.imwrite(os.path.join(d, f"{fidx:03d}.jpg"), img)
+
+
+class CameraSession:
+    """Per-camera continuous session: stable ids across ticks."""
+
+    def __init__(self, camera_id: str, *, reground_every: int = 5) -> None:
+        self.camera_id = camera_id
+        self.reground_every = reground_every
+        self.tick = 0
+        self.last_ground = -(10 ** 9)
+        self.next_id = 1
+        # Session epoch: track ids are only meaningful WITHIN one
+        # session lifetime — a server restart resets next_id and
+        # recycles numbers (live 2026-07-25: "how was I born again as
+        # T13?"). The service resets its state when this changes, so
+        # a recycled number can never inherit the patient seat.
+        import uuid as _uuid
+        self.epoch = _uuid.uuid4().hex[:12]
+        # persistent track_id -> last final mask (frame-0 resolution, bool)
+        self.last_masks: "dict[int, np.ndarray]" = {}
+        # consecutive carry ticks where the person trigger saw FEWER
+        # people than the carry (see person_trigger.should_force_reground)
+        self._under_streak = 0
+
+    # ── SAM3 grounding (periodic) ──────────────────────────────────
+    def _ground(self, frames, person_thr, sam_pred) -> "dict[int, np.ndarray]":
+        import cv2
+        import torch
+        from sam_service import sam_track
+
+        ctx = list(frames[: min(6, len(frames))])
+        got: list = []
+        with torch.inference_mode(), torch.autocast(
+            "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available(),
+        ):
+            for pos, dets in sam_track.track_stream(
+                sam_pred, ctx, concept="person", thr=person_thr,
+            ):
+                if pos == 0:
+                    got = dets
+                    break
+
+        h, w = frames[0].shape[:2]
+        tw, th, _scale = _track_dims(w, h)
+        seeded: "dict[int, np.ndarray]" = {}
+        used_ids: set[int] = set()
+        for (_tid, _bbox, mask, _prob) in got:
+            m = np.asarray(mask) > 0.5
+            # SAM3 mask -> TRACK res so it matches last_masks + what EdgeTAM
+            # sees (the whole session works in track-res space).
+            if m.shape != (th, tw):
+                m = cv2.resize(
+                    m.astype(np.uint8), (tw, th),
+                    interpolation=cv2.INTER_NEAREST,
+                ).astype(bool)
+            # Re-map to an existing persistent id by IoU (stable ids).
+            best_id, best_iou = None, _REMAP_IOU
+            for pid, pm in self.last_masks.items():
+                if pid in used_ids:
+                    continue
+                i = _iou(m, pm)
+                if i > best_iou:
+                    best_id, best_iou = pid, i
+            if best_id is None:
+                best_id = self.next_id
+                self.next_id += 1
+            used_ids.add(best_id)
+            seeded[best_id] = m
+        return seeded
+
+    # ── YOLO grounding (NEMARA_GROUNDER=yolo, 2026-07-24) ─────────
+    def _ground_yolo(self, frames):
+        """Person boxes from YOLO26 seed EdgeTAM directly (~40ms vs
+        SAM3's ~10s fresh look). Returns {id: ("box", xyxy_trackres)}
+        or None (detector dead → caller falls back to SAM3)."""
+        from sam_service import person_trigger
+
+        dets = person_trigger.person_boxes(frames[0])
+        if dets is None:
+            return None
+        h, w = frames[0].shape[:2]
+        _tw, _th, scale = _track_dims(w, h)
+        s = scale if scale else 1.0
+        boxes = [
+            (x1 * s, y1 * s, x2 * s, y2 * s)
+            for x1, y1, x2, y2, _c in dets
+        ]
+        carried = {}
+        for pid, pm in self.last_masks.items():
+            bb = _mask_bbox(pm)
+            if bb is not None:
+                carried[pid] = bb
+        seeded, self.next_id = remap_boxes_to_ids(
+            boxes, carried, self.next_id, _REMAP_IOU,
+        )
+        return {tid: ("box", bx) for tid, bx in seeded.items()}
+
+    # ── EdgeTAM propagation (every tick) ───────────────────────────
+    def _propagate(self, frames, seed) -> "dict[int, dict]":
+        import cv2
+        import torch
+
+        if not seed:
+            return {}
+        edge = _get_edge()
+        h, w = frames[0].shape[:2]
+        tw, th, scale = _track_dims(w, h)
+        inv = 1.0 / scale if scale else 1.0
+        tmp = tempfile.mkdtemp(prefix="edgesess_")
+        try:
+            for i, fr in enumerate(frames):
+                f = fr if (tw, th) == (w, h) else cv2.resize(fr, (tw, th))
+                cv2.imwrite(os.path.join(tmp, f"{i:05d}.jpg"), f)
+            out: "dict[int, dict]" = {}
+            with torch.inference_mode(), torch.autocast(
+                "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available(),
+            ):
+                state = edge.init_state(tmp)
+                for tid, m in seed.items():
+                    if isinstance(m, tuple) and m[0] == "box":
+                        # YOLO-ground seed: EdgeTAM builds the mask
+                        # from a box prompt (track-res coords).
+                        edge.add_new_points_or_box(
+                            state, frame_idx=0, obj_id=int(tid),
+                            box=np.asarray(m[1], dtype=np.float32),
+                        )
+                        continue
+                    edge.add_new_mask(
+                        state, frame_idx=0, obj_id=int(tid),
+                        mask=torch.from_numpy(
+                            np.ascontiguousarray(m)
+                        ).contiguous(),
+                    )
+                for fidx, obj_ids, logits in edge.propagate_in_video(state):
+                    fr_out: dict = {}
+                    for j, oid in enumerate(obj_ids):
+                        mm = (logits[j, 0] > 0).cpu().numpy()  # track res
+                        bb = _mask_bbox(mm)
+                        if bb is None:
+                            continue
+                        # bbox -> FULL res for rows + face crops; the mask
+                        # stays track-res (server mask_crop resizes it up).
+                        bb_full = (
+                            bb[0] * inv, bb[1] * inv, bb[2] * inv, bb[3] * inv,
+                        )
+                        fr_out[int(oid)] = (bb_full, mm)
+                    out[fidx] = fr_out
+            return out
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # ── SAM3-native tracking (NEMARA_TRACKER=sam3) ─────────────────
+    def _track_native(self, frames, person_thr, sam_pred) -> "dict[int, dict]":
+        """One tick, SAM3's own tracker over the WHOLE clip.
+
+        SAM3 grounds "person" on frame 0 and propagates across every frame
+        with swap-robust, clip-local ids from its memory (no EdgeTAM). We
+        STITCH those clip ids onto persistent session ids by IoU of each
+        id's first-appearance mask vs the previous clip's final masks — the
+        cross-clip binding brought back on purpose. No drift guard: SAM3
+        reports absence via its occlusion score, so the couch phantom never
+        arises. Same return contract as observe()/_propagate():
+        {frame_pos: {track_id: (bbox_xyxy_fullres, mask)}}."""
+        import torch
+        from sam_service import sam_track
+
+        clip = list(frames)[::_SAM3_STRIDE]  # subsample; remap pos below
+        per_pos: "dict[int, list]" = {}
+        with torch.inference_mode(), torch.autocast(
+            "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available(),
+        ):
+            for pos, dets in sam_track.track_stream(
+                sam_pred, clip, concept="person", thr=person_thr,
+            ):
+                # Remap subsampled position -> original clip frame index so
+                # the server's pos->orig frame mapping stays correct.
+                per_pos[int(pos) * _SAM3_STRIDE] = [
+                    (int(stid), np.asarray(mask) > 0.5)
+                    for (stid, _bbox, mask, _prob) in dets
+                ]
+
+        # Stitch clip-local ids onto persistent ids by first-appearance IoU.
+        first_mask: "dict[int, np.ndarray]" = {}
+        for pos in sorted(per_pos):
+            for stid, m in per_pos[pos]:
+                first_mask.setdefault(stid, m)
+        id_map: "dict[int, int]" = {}
+        used: "set[int]" = set()
+        for stid, m0 in first_mask.items():
+            best_id, best_iou = None, _REMAP_IOU
+            for pid, pm in self.last_masks.items():
+                if pid in used:
+                    continue
+                i = _iou(m0, pm)
+                if i > best_iou:
+                    best_id, best_iou = pid, i
+            if best_id is None:
+                best_id = self.next_id
+                self.next_id += 1
+            used.add(best_id)
+            id_map[stid] = best_id
+
+        out: "dict[int, dict]" = {}
+        for pos, dets in per_pos.items():
+            fr: dict = {}
+            for stid, m in dets:
+                bb = _mask_bbox(m)
+                if bb is not None:
+                    fr[id_map[stid]] = (bb, m)
+            out[pos] = fr
+
+        # Shared tail (mirrors observe()): last_masks carries to the next
+        # clip; cleared empty when nobody is tracked so no mask lingers.
+        if out:
+            last_pos = max(out)
+            self.last_masks = {
+                tid: mm for tid, (_bb, mm) in out[last_pos].items() if mm.any()
+            }
+        else:
+            self.last_masks = {}
+        self.last_ground = self.tick  # every clip is authoritative on existence
+        if _DEBUG_DIR:
+            try:
+                _dump_overlay(frames, out, self.camera_id, self.tick, _DEBUG_DIR)
+            except Exception:  # noqa: BLE001
+                log.exception("continuous.debug_dump_failed")
+        log.info(
+            "continuous.tick cam=%s tick=%d mode=sam3 seeded=%d live=%d drift=0",
+            self.camera_id, self.tick, len(first_mask), len(self.last_masks),
+        )
+        self.tick += 1
+        return out
+
+    def observe(self, frames, *, person_thr: float, sam_pred) -> "dict[int, dict]":
+        """One tick. Returns {frame_pos: {track_id: (bbox_xyxy, mask)}} with
+        STABLE track ids across ticks. NEMARA_TRACKER=sam3 routes to SAM3's
+        own whole-clip tracker; default 'edgetam' = SAM3-ground+EdgeTAM-carry."""
+        if _TRACKER == "sam3":
+            return self._track_native(frames, person_thr, sam_pred)
+        reground = (
+            self.tick == 0
+            or (self.tick - self.last_ground) >= self.reground_every
+            or not self.last_masks
+        )
+        if reground:
+            seed = None
+            mode = "ground"
+            if _GROUNDER == "yolo":
+                seed = self._ground_yolo(frames)
+                if seed is None:
+                    log.warning(
+                        "continuous.yolo_ground_failed cam=%s tick=%d "
+                        "— SAM3 fallback", self.camera_id, self.tick,
+                    )
+                else:
+                    mode = "ground_y"
+            if seed is None:
+                seed = self._ground(frames, person_thr, sam_pred)
+            self.last_ground = self.tick
+        else:
+            seed = dict(self.last_masks)
+            mode = "carry"
+
+        out = self._propagate(frames, seed)
+
+        # NO drift guard (purged 2026-07-24, Aryaman's call): its area
+        # heuristic could not tell a person approaching the camera from a
+        # mask smearing onto the couch, and it killed real walking tracks
+        # (live: drift_dropped ids=[8],[9] mid-walk) — a renumber + seat
+        # re-bind, worse than the phantom it shortened. SAM3 regrounds
+        # remain the sole existence authority: a genuine phantom gets no
+        # detection at the next ground (≤reground_every ticks) and dies
+        # there.
+
+        # last_masks reflects THIS tick's result. Crucially it is CLEARED to
+        # empty when the tick produced no tracks — a ground that found nobody
+        # (SAM3 seeded=0) or a carry that lost the person. Without this,
+        # EdgeTAM (sticky by design) carries a departed person's mask forever
+        # — the "green box on the empty sofa" phantom. A ground is
+        # authoritative on existence: if SAM3 says nobody's here, nobody is.
+        if out:
+            last_pos = max(out)
+            self.last_masks = {
+                tid: mm for tid, (_bb, mm) in out[last_pos].items() if mm.any()
+            }
+        else:
+            self.last_masks = {}
+
+        # Reground trigger (2026-07-24): a cheap YOLO26 person count on
+        # the newest frame of every CARRY tick. Count disagreement with
+        # the carry forces a SAM3 reground next tick — new entries appear
+        # in ~1 tick instead of waiting out the reground interval (~50s
+        # blind spot, measured live). The trigger never touches tracks.
+        dets = None
+        if frames:
+            from sam_service import person_trigger
+
+            # Run on EVERY tick (not just carry): ground ticks pair the
+            # YOLO count with SAM3's authoritative verdict on the same
+            # scene — the passive agreement dataset that decides whether
+            # YOLO earns grounding duty (and the GPU-rental endgame).
+            dets = person_trigger.count_persons(frames[-1])
+        if mode == "carry":
+            force, self._under_streak = person_trigger.should_force_reground(
+                dets, len(self.last_masks), self._under_streak,
+            )
+            if force:
+                self.last_ground = -(10 ** 9)
+                log.info(
+                    "continuous.trigger cam=%s tick=%d dets=%s live=%d "
+                    "— forcing reground", self.camera_id, self.tick,
+                    dets, len(self.last_masks),
+                )
+        if _DEBUG_DIR:
+            try:
+                _dump_overlay(frames, out, self.camera_id, self.tick, _DEBUG_DIR)
+            except Exception:  # noqa: BLE001
+                log.exception("continuous.debug_dump_failed")
+        log.info(
+            "continuous.tick cam=%s tick=%d mode=%s seeded=%d live=%d dets=%s",
+            self.camera_id, self.tick, mode, len(seed), len(self.last_masks),
+            dets,
+        )
+        self.tick += 1
+        return out
+
+
+def get_session(camera_id: str, *, reground_every: int = _REGROUND_EVERY) -> CameraSession:
+    with _sessions_lock:
+        s = _SESSIONS.get(camera_id)
+        if s is None:
+            s = CameraSession(camera_id, reground_every=reground_every)
+            _SESSIONS[camera_id] = s
+        return s
+
+
+def drop_session(camera_id: str) -> None:
+    with _sessions_lock:
+        _SESSIONS.pop(camera_id, None)

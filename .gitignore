@@ -51,3 +51,7 @@ yolo11n.pt
 # files (see CLAUDE.md cloud-sync note). Ignore them so they never
 # clutter git status or get committed by accident.
 * [2-9].*
+
+# Pod lifecycle secrets (scripts/pod.sh) — never commit
+.pod.env
+.pod/

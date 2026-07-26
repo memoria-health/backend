@@ -30,6 +30,12 @@ services:
       # Re-ID off locally — the dev image skips the ML model bake.
       NEMARA_REID_ENABLED: "true"
       PORT: "8002"
+      # glibc grows one malloc arena per contending thread (default cap
+      # 8x cores) — with torch/cv2 hammering the allocator from pool
+      # threads every tick, freed pages strand across arenas and RSS
+      # ratchets ~0.3GB/hr (2026-07-19 soak). Two arenas bound the
+      # fragmentation; the standard fix for CPU-inference services.
+      MALLOC_ARENA_MAX: "2"
       # uvicorn --reload's watcher (watchfiles) does NOT receive inotify
       # events across the macOS Docker bind-mount, so source edits were
       # silently never reloaded — the running process kept executing stale
@@ -37,6 +43,11 @@ services:
       # the online/offline bug). Force polling so --reload actually fires,
       # mirroring the web container's WATCHPACK/CHOKIDAR polling above.
       WATCHFILES_FORCE_POLLING: "true"
+    # Laptop-comfort cap (2026-07-19): dual-room analysis burst to 900%+
+    # CPU and spun the fans. 5 cores keeps single-room analysis at full
+    # cadence; simultaneous multi-room occupancy sheds ticks (the W1
+    # valve) instead of cooking the Mac. Remove for dedicated hardware.
+    cpus: "5.0"
     ports:
       - "8002:8002"
     # Lets the container resolve host.docker.internal on Linux too (Docker

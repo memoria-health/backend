@@ -75,10 +75,54 @@ class SamServiceClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def faces(
+        self,
+        jpeg: bytes,
+        boxes: list[tuple[int, float, float, float, float]],
+        *,
+        full: bool = False,
+    ) -> list[tuple[int, "np.ndarray", float, float, float, float]]:
+        """Out-of-band face embeddings for KNOWN person boxes (the
+        2026-07-24 decoupling — tracking batches never pay for
+        identity). `full=True` also detects faces on the whole frame
+        (track_id=-1, caller assigns) — lag-immune for close faces.
+        Returns (track_id, embedding, face_px, det, cx, cy) with cx/cy
+        the face center in the sent frame's pixel space."""
+        import json as _json
+
+        resp = await self._client.post(
+            f"{self._base}/faces",
+            data={
+                "boxes": _json.dumps([list(b) for b in boxes]),
+                "full": "1" if full else "0",
+            },
+            files=[("frame", ("f.jpg", jpeg, "image/jpeg"))],
+        )
+        resp.raise_for_status()
+        j = resp.json()
+        if j.get("contract") != "faces-v1":
+            raise RuntimeError(
+                f"sam wire: wrong /faces contract {j.get('contract')!r}",
+            )
+        out = []
+        for f in j.get("faces", [])[:64]:
+            emb = np.frombuffer(
+                base64.b64decode(f["emb"]), dtype=np.float32,
+            )
+            if emb.shape != (_EMB_DIM,):
+                continue
+            out.append((
+                int(f["track_id"]), emb,
+                float(f["face_px"]), float(f["det"]),
+                float(f.get("cx", 0.0)), float(f.get("cy", 0.0)),
+            ))
+        return out
+
     async def observe(
         self,
         jpegs_by_index: list[tuple[int, bytes]],
         *,
+        camera_id: str,
         person_thr: float,
         face_interval: int,
         face_cap: int,
@@ -96,6 +140,7 @@ class SamServiceClient:
         resp = await self._client.post(
             f"{self._base}/observe",
             data={
+                "camera_id": camera_id,
                 "person_thr": str(person_thr),
                 "face_interval": str(face_interval),
                 "face_cap": str(face_cap),
@@ -193,6 +238,7 @@ def _parse_observe(j: dict) -> RemoteObservations:
             screen_regions.append(vals)
     stats = j.get("stats", {})
     return RemoteObservations(
+        epoch=str(j.get("epoch", "")),
         rows_by_frame={
             k: np.asarray(v, dtype=np.float32)
             for k, v in rows_by_frame.items()

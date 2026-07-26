@@ -1070,7 +1070,7 @@ class CameraIngest:
             # local to match so "mode=full" in the log is honest proof the
             # confounder is off (the governor if/else above still ran for
             # its presence-tracking side effects; only the label changes).
-            if self._settings.reid_lean_eval_mode:
+            if getattr(self._settings, "reid_lean_eval_mode", False):
                 reid_mode = "full"
             # Real capture time (window end ≈ now, BEFORE processing). One
             # value, reused for the label_clip trace ctx AND the ledger ctx
@@ -1087,7 +1087,8 @@ class CameraIngest:
                     # heartbeat once everyone is bound. Lean eval forces
                     # FULL cadence so a real face always gets its chance.
                     face_evidence=(
-                        True if self._settings.reid_lean_eval_mode
+                        True
+                        if getattr(self._settings, "reid_lean_eval_mode", False)
                         else self._identity_lock.wants_face_evidence()
                     ),
                     # Face-afterglow harvest hint (pool learns far/

@@ -41,7 +41,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 
 from sam_service.face_worker import FaceWorker
-from sam_service import sam_track
+from sam_service import continuous, sam_track
 
 log = logging.getLogger("sam_service")
 logging.basicConfig(
@@ -71,6 +71,12 @@ _ready = False
 # threading.Lock makes the SAM/face single-flight invariant explicit
 # for the to_thread hop (the semaphore alone already guarantees it).
 _busy = asyncio.Semaphore(1)
+# How long a 2nd camera waits for the single GPU slot before 429. MUST
+# exceed one observe's service time or a concurrent camera always 429s
+# (2026-07-23: a ~5s living-room observe > the old 4s window starved the
+# bedroom — 183 429s). Env-tunable; the durable fix is keeping observe
+# service < this via the frame budget (fewer SAM frames).
+_ACQUIRE_TIMEOUT_S = float(os.environ.get("NEMARA_PERCEPTION_ACQUIRE_S", "10.0"))
 _perception_lock = threading.Lock()
 
 # Upload sanity caps (review S4): reject absurd requests before they
@@ -184,6 +190,7 @@ def _observe_sync(
     face_interval: int,
     face_cap: int,
     detect_screens: bool = False,
+    camera_id: str = "default",
 ) -> dict:
     """The whole perception pass, run in a worker thread under
     `_perception_lock` so /health stays responsive while SAM grinds
@@ -247,18 +254,24 @@ def _observe_sync(
 
         pred = sam_track.get_sam(_CKPT)
         t_loop = time.time()
-        # Pass `imgs` ITSELF (no copy): track_stream reads every frame
-        # once while writing the temp mp4 (before the first yield), so
-        # None-ing entries after processing genuinely frees them — a
-        # filtered copy would pin every frame until request end.
-        for pos, dets in sam_track.track_stream(
-            pred, imgs, concept="person", thr=person_thr,
-        ):
+        # CONTINUOUS SESSION (EdgeTAM-continuous arch): one persistent
+        # per-camera session yields STABLE track ids across ticks (SAM3
+        # periodic re-ground + EdgeTAM carry-propagate). Replaces the
+        # stateless per-clip track_stream whose fresh ids renumbered the
+        # subject across ticks and stranded the backend binding into a
+        # ghost. Masks are held in `session_out` for this tick; frame
+        # pixels (`imgs[pos]`) are still released after the face pass.
+        session = continuous.get_session(camera_id)
+        session_out = session.observe(
+            imgs, person_thr=person_thr, sam_pred=pred,
+        )
+        for pos in sorted(session_out):
             if pos >= len(pos_to_orig):
                 continue
             orig = pos_to_orig[pos]
             img = imgs[pos]
-            for tid, bbox, mask, prob in dets:
+            for tid, (bbox, mask) in session_out[pos].items():
+                prob = 1.0
                 det_count += 1
                 prob_sum += prob
                 if prob > max_prob:
@@ -383,6 +396,7 @@ def _observe_sync(
 
         payload = {
             "contract": "observe-v2",
+        "epoch": session.epoch,
             "frames_seen": len(decoded),
             "frame_indices": pos_to_orig,
             "tracks": [
@@ -433,6 +447,94 @@ def _observe_sync(
         return payload
 
 
+@app.post("/faces")
+async def faces(
+    frame: UploadFile = File(...),
+    boxes: str = Form(...),
+    full: str = Form("0"),
+) -> JSONResponse:
+    """Out-of-band face embedding on KNOWN person boxes (2026-07-24
+    decoupling): no SAM, no session, no single-flight semaphore — the
+    tracking cadence never pays for identity. `boxes` is JSON
+    [[track_id, x1, y1, x2, y2], ...] in the sent frame's pixel space.
+    ~25ms/crop on GPU. No mask-clean crop and no countersign here: a
+    plain padded bbox crop is fine for SCORING (garbage crops score
+    below the calibrated ramps); harvesting stays gated backend-side.
+
+    `full=1` ADDITIONALLY detects faces on the WHOLE frame, returned
+    with track_id=-1 (caller assigns). Why: the caller's boxes ride the
+    tracking pipeline, which lags the world by 5-13s — during a close
+    walk-past the box points at where the person WAS and the crop can
+    miss the face entirely (live 2026-07-24). Full-frame detection is
+    lag-immune for CLOSE faces (the detector's internal resize makes
+    distant faces invisible full-frame — that's what the crops cover).
+    Every hit carries cx/cy (face center, frame space) for assignment.
+    """
+    import json as _json
+
+    if not _ready:
+        raise HTTPException(503, "service warming up")
+    raw = await frame.read()
+    img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        raise HTTPException(400, "undecodable frame")
+    t0 = time.time()
+    out = []
+    h, w = img.shape[:2]
+    for row in _json.loads(boxes)[:16]:
+        tid, x1, y1, x2, y2 = row[:5]
+        px, py = (x2 - x1) * 0.1, (y2 - y1) * 0.1
+        cx1, cy1 = max(0, int(x1 - px)), max(0, int(y1 - py))
+        cx2, cy2 = min(w, int(x2 + px)), min(h, int(y2 + py))
+        crop = img[cy1:cy2, cx1:cx2]
+        if crop.size == 0:
+            continue
+        hits, _ms = _face.embed(crop)
+        # STRICT attribution (2026-07-24): a padded crop of adjacent
+        # people can catch the NEIGHBOR's head at its edge, and every
+        # face found here used to be credited to this crop's track —
+        # a wrong-person identity donation. Keep only faces whose
+        # center lies inside the UNPADDED person box, and only the
+        # largest such face (one person box = one face, at most).
+        best = None
+        for emb, det, (fx1, fy1, fx2, fy2) in hits:
+            fcx, fcy = cx1 + (fx1 + fx2) * 0.5, cy1 + (fy1 + fy2) * 0.5
+            if not (x1 <= fcx <= x2 and y1 <= fcy <= y2):
+                continue
+            if best is None or (fy2 - fy1) > best[2]:
+                best = (emb, det, fy2 - fy1, fcx, fcy)
+        if best is not None:
+            emb, det, fpx, fcx, fcy = best
+            out.append({
+                "track_id": int(tid),
+                "det": float(det),
+                "face_px": float(fpx),
+                "cx": float(fcx),
+                "cy": float(fcy),
+                "emb": base64.b64encode(
+                    emb.astype(np.float32).tobytes(),
+                ).decode("ascii"),
+            })
+    if full == "1":
+        hits, _ms = _face.embed(img)
+        for emb, det, (fx1, fy1, fx2, fy2) in hits:
+            out.append({
+                "track_id": -1,
+                "det": float(det),
+                "face_px": float(fy2 - fy1),
+                "cx": float((fx1 + fx2) * 0.5),
+                "cy": float((fy1 + fy2) * 0.5),
+                "emb": base64.b64encode(
+                    emb.astype(np.float32).tobytes(),
+                ).decode("ascii"),
+            })
+    return JSONResponse({
+        "contract": "faces-v1",
+        "faces": out,
+        "ms": round((time.time() - t0) * 1000.0, 1),
+    })
+
+
 @app.post("/observe")
 async def observe(
     frames: list[UploadFile] = File(...),
@@ -440,6 +542,7 @@ async def observe(
     face_interval: int = Form(5),
     face_cap: int = Form(8),
     detect_screens: int = Form(0),
+    camera_id: str = Form("default"),
 ) -> JSONResponse:
     """Run SAM perception on one tick's frames and return raw
     observations. Frame files MUST be named "<origidx>.jpg" — all
@@ -459,7 +562,7 @@ async def observe(
         # The capacity fix lives on the backend (frame budget keeps
         # per-tick service below the tick period); this timeout sheds
         # genuine overload fast, preserving fail-open.
-        await asyncio.wait_for(_busy.acquire(), timeout=4.0)
+        await asyncio.wait_for(_busy.acquire(), timeout=_ACQUIRE_TIMEOUT_S)
     except asyncio.TimeoutError:
         raise HTTPException(429, "perception busy — retry next tick")
     try:
@@ -484,7 +587,7 @@ async def observe(
 
         payload = await asyncio.to_thread(
             _observe_sync, named_jpegs, person_thr, face_interval, face_cap,
-            bool(detect_screens),
+            bool(detect_screens), camera_id,
         )
     finally:
         global _last_request_ts

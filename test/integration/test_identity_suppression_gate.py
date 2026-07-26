@@ -113,59 +113,17 @@ async def _last_analysis(session: AsyncSession, patient_id) -> Analysis:
     return rows[-1]
 
 
-@pytest.mark.asyncio
-async def test_verified_other_with_attribution_suppresses_llm(
-    client: AsyncClient, auth_user, session: AsyncSession, monkeypatch,
-) -> None:
-    """The suppression path itself: attribution ran, every track is
-    VERIFIED not-patient (has_only_verified_other_tracks), enrollment
-    exists, AND the patient is positively accounted for on another
-    camera (2026-07-19 patient-located guard) → LLM skipped, synthetic
-    row says identity_not_patient."""
-    patient_id, camera_id = await _setup_patient_with_camera(
-        client, auth_user, session,
-    )
-    await _seed_ready_enrollment(session, patient_id)
-
-    # A genuinely face-verified OTHER track — the ledger binds it OTHER
-    # and recomputes has_only_verified_other_tracks=True end-to-end
-    # (faking the flag no longer works: the ledger derives it).
-    other_track = TrackObservation(
-        track_id=1, label=LABEL_OTHER, confidence=0.0,
-        bbox_series=(
-            (0, (10.0, 10.0, 50.0, 90.0)),
-            (2, (10.0, 10.0, 50.0, 90.0)),
-            (4, (10.0, 10.0, 50.0, 90.0)),
-        ),
-        face_locked=True, pre_labeled=False, face_px_max=40.0,
-    )
-    identity = IdentityResult(
-        reid_ran=True,
-        patient_in_clip=False,
-        confidence=0.21,
-        best_frame_index=None,
-        face_count=3,
-        people_present_reid=True,
-        people_count_reid=1,
-        attribution_ran=True,
-        tracks=(other_track,),
-        faces_enrolled=True,
-    )
-    # The patient is positively held by ANOTHER camera.
-    presence = PatientPresence()
-    presence.claim(uuid4(), tier=TIER_FACE, confidence=0.9)
-    main = FakeVLM()
-    ingest = _make_ingest(camera_id, patient_id, monkeypatch,
-                          identity=identity, main=main,
-                          patient_presence=presence)
-    _push_still_frames(ingest)
-
-    await ingest._run_tick_inner(_RecorderDecision())
-
-    assert main.calls == [], "verified not-patient must skip the LLM"
-    row = await _last_analysis(session, patient_id)
-    assert row.provider == "skipped"
-    assert row.detector_fields["skipped_reason"] == "identity_not_patient"
+# REMOVED 2026-07-22 (bind-once-hold purge): the old
+# test_verified_other_with_attribution_suppresses_llm asserted that a
+# face-verified OTHER track makes the ledger derive
+# has_only_verified_other_tracks=True and SKIP the LLM. The bind-once-hold
+# ledger has no OTHER label — everyone not-patient is UNKNOWN — so that
+# flag is always False and the cross-camera "verified not-patient"
+# suppression gate no longer fires: an occupied room always analyzes
+# (the safe direction; it fixes the "living room went dark while the
+# patient sat in the bedroom" bug). The three tests below still guard the
+# invariant that we NEVER suppress on unknowns / an unlocated patient /
+# no-attribution.
 
 
 @pytest.mark.asyncio

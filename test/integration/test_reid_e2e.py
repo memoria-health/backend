@@ -275,12 +275,7 @@ async def test_tick_writes_identity_into_analyses(
         return [_Frame(_TINY_JPEG) for _ in range(3)]
     monkeypatch.setattr(frame_extraction, "extract_frames", fake_extract)
 
-    settings = get_settings().model_copy(update={
-        "reid_enabled": True,
-        # This test mocks _run_pipeline_sync; the SAM wire hop
-        # (env-selected on the soak box) must not run for real.
-        "reid_pipeline_backend": "legacy",
-    })
+    settings = get_settings().model_copy(update={"reid_enabled": True})
     sm = get_sessionmaker()
     reid = ReIDInference(sessionmaker=sm, settings=settings)
 
@@ -304,6 +299,13 @@ async def test_tick_writes_identity_into_analyses(
             None,  # no harvest payload
         )
     monkeypatch.setattr(reid, "_run_pipeline_sync", fake_pipeline_sync)
+
+    # SAM pod is the only perception arm now; with _run_pipeline_sync
+    # mocked, stub the wire fetch too so no real pod round-trip happens
+    # (the mock ignores the observations anyway).
+    async def fake_fetch(*_a, **_k):
+        return None
+    monkeypatch.setattr(reid, "_fetch_remote_observations", fake_fetch)
 
     result = await reid.label_clip(
         mp4_bytes=b"fake-mp4",

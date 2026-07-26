@@ -42,6 +42,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -55,6 +56,7 @@ from src.services.detection import frame_extraction
 from src.services.detection.frame_extraction import ExtractedFrame
 from src.services.reid import body_embeddings, embeddings as reid_embeddings
 from src.services.reid import harvester
+from src.services.reid import trace
 from src.services.reid.body_pipeline import (
     LABEL_OTHER,
     LABEL_PATIENT,
@@ -63,7 +65,10 @@ from src.services.reid.body_pipeline import (
     PipelineConfig,
     TrackObservation,
 )
-from src.services.reid.cross_clip_body_gallery import CrossClipBodyGallery
+from src.services.reid.cross_clip_body_gallery import (
+    CrossClipBodyGallery,
+    LABEL_PATIENT,
+)
 from src.services.reid.remote_replay import (
     RemoteObservations,
     RemoteReplayPipeline,
@@ -289,6 +294,11 @@ class ReIDInference:
     ) -> None:
         self._sessionmaker = sessionmaker
         self._settings = settings
+        # Tracker-eval trace tap (idempotent; no-op unless enabled).
+        trace.configure(
+            enabled=getattr(settings, "reid_trace_enabled", False),
+            path=getattr(settings, "reid_trace_path", "out/track_trace.jsonl"),
+        )
         self._gallery_cache: dict[UUID, tuple[float, np.ndarray]] = {}
         self._cache_lock = asyncio.Lock()
         # Shared cross-clip body gallery. None = disable cross-clip
@@ -318,6 +328,8 @@ class ReIDInference:
         face_evidence: bool = True,
         harvest_hint: tuple | None = None,
         mode: str = "full",
+        tick_seq: int = 0,
+        capture_ts: float | None = None,
     ) -> IdentityResult:
         """Run body tracking (+ optional face attribution) on a tick
         clip. Returns the empty result on timeout or infra error.
@@ -344,6 +356,22 @@ class ReIDInference:
         pipeline is heavier than the face-only path; calibrate that
         setting accordingly.
         """
+        # Trace: stamp this tick so every downstream emit (body scores,
+        # ledger IDEVENTs in the pipeline thread, latency) inherits the
+        # same (cam, tick, arm, capture_ts) key without threading it.
+        trace.begin_tick(
+            cam=str(camera_id) if camera_id else "?",
+            tick=tick_seq,
+            arm=os.environ.get("NEMARA_TRACKER", "edgetam"),
+            capture_ts=capture_ts if capture_ts is not None else time.time(),
+        )
+        # Lean eval rig: strip the governor. Always full fidelity so the
+        # SAM3 vs SAM3+EdgeTAM comparison isn't confounded by adaptive
+        # sampling or throttled faces — the tracker is the only variable.
+        # getattr: test fakes stub Settings with SimpleNamespace — same
+        # defensive read as every other lean-eval call site.
+        if getattr(self._settings, "reid_lean_eval_mode", False):
+            mode = "full"
         # The gallery is fetched (cached, TTL) only when the flag is
         # on — with the flag off we don't touch the DB and simply run
         # attribution-less. Eligibility is decided up front so the
@@ -387,8 +415,6 @@ class ReIDInference:
         means reid quietly reads 'nobody present' while the pod or
         tunnel is down — someone has to notice. Detection itself is
         never affected (the fail-open invariant)."""
-        if self._settings.reid_pipeline_backend != "sam":
-            return
         self._sam_fail_streak += 1
         if self._sam_fail_streak >= 5 and self._sam_fail_streak % 5 == 0:
             log.error(
@@ -425,7 +451,14 @@ class ReIDInference:
         # verifiably isn't in never spends compute identifying guests
         # (Aryaman: "find the patient, waste nothing anywhere else").
         base = self._settings.reid_inference_sample_fps
-        if mode == "minimal":
+        if getattr(self._settings, "reid_lean_eval_mode", False):
+            # Denser frames for the tracker (the "sampling is everything"
+            # lever), but bounded so observe stays under the tick budget —
+            # see reid_lean_eval_sample_fps for the frames↔latency tradeoff.
+            sample_fps = getattr(
+                self._settings, "reid_lean_eval_sample_fps", base,
+            )
+        elif mode == "minimal":
             face_evidence = False
             sample_fps = 1
         elif mode == "lean":
@@ -457,12 +490,14 @@ class ReIDInference:
         # failure raises here and label_clip's wrapper returns empty —
         # the Re-ID-never-silences-detection invariant holds across
         # the wire too.
-        remote_obs: RemoteObservations | None = None
-        if self._settings.reid_pipeline_backend == "sam":
-            remote_obs = await self._fetch_remote_observations(
-                frames, faces_enrolled=faces_enrolled,
-                camera_id=camera_id, face_evidence=face_evidence,
-            )
+        # SAM pod is the only perception arm: always fetch remote
+        # observations. A transport/pod failure raises here and
+        # label_clip's wrapper returns IdentityResult.empty — fail-open,
+        # detection unaffected.
+        remote_obs = await self._fetch_remote_observations(
+            frames, faces_enrolled=faces_enrolled,
+            camera_id=camera_id, face_evidence=face_evidence,
+        )
 
         # The whole pipeline (decode + YOLO + BoT-SORT + face checks +
         # state machine) is sync work — hop into a thread once so the
@@ -566,6 +601,7 @@ class ReIDInference:
                 want_screens = True
         obs = await self._get_sam_client().observe(
             jpegs,
+            camera_id=str(camera_id) if camera_id is not None else "default",
             person_thr=s.reid_sam_person_thr,
             face_interval=s.reid_face_check_interval,
             face_cap=face_cap,
@@ -633,6 +669,15 @@ class ReIDInference:
                 )
                 if match is None:
                     return (None, "gallery")
+                # MOT re-bind lane: whenever THIS body matches the patient,
+                # stash its embedding as a recent view so a later track break
+                # + re-entry re-binds by temporal locality instead of
+                # re-climbing the harvest pool for ~6 ticks. Bounded by the
+                # same 0.72 gate that produced the match — no new FP path.
+                if match.label == LABEL_PATIENT:
+                    gallery_ref.remember_recent(
+                        patient_id=pid, embedding=emb, confidence=match.score,
+                    )
                 log.info(
                     "reid.pre_match_hit patient=%s label=%s score=%.3f age=%.0fs",
                     pid, match.label, match.score, match.source_age_s,
@@ -643,7 +688,6 @@ class ReIDInference:
 
         pipeline_config = PipelineConfig(
             sample_fps=sample_fps,
-            yolo_model=s.reid_yolo_model,
             yolo_confidence=s.reid_yolo_confidence,
             face_check_interval=s.reid_face_check_interval,
             hits_to_lock=s.reid_hits_to_lock,
@@ -651,29 +695,20 @@ class ReIDInference:
             face_checks_for_other=s.reid_face_checks_for_other,
             match_threshold_base=s.reid_match_threshold_base,
             insightface_model=s.reid_insightface_model,
-            yolo_detect_floor=s.reid_yolo_detect_floor,
-            track_birth_confidence=s.reid_track_birth_confidence,
             face_lock_min_px=s.reid_face_lock_min_px,
             face_lock_min_det=s.reid_face_lock_min_det,
             face_lock_score_single=s.reid_face_lock_score_single,
             face_lock_score_multi=s.reid_face_lock_score_multi,
             face_lock_margin=s.reid_face_lock_margin,
         )
-        if remote_obs is not None:
-            # SAM arm: same brain, remote eyes — every decision below
-            # this line is the identical code path the legacy arm runs.
-            pipeline = RemoteReplayPipeline(
-                observations=remote_obs,
-                gallery=gallery,
-                config=pipeline_config,
-                pre_match_callback=pre_match_cb,
-            )
-        else:
-            pipeline = BodyReIDPipeline(
-                gallery=gallery,
-                config=pipeline_config,
-                pre_match_callback=pre_match_cb,
-            )
+        # SAM pod is the only perception arm (legacy YOLO+BoT-SORT removed
+        # 2026-07-22): remote eyes, the same unchanged brain below.
+        pipeline = RemoteReplayPipeline(
+            observations=remote_obs,
+            gallery=gallery,
+            config=pipeline_config,
+            pre_match_callback=pre_match_cb,
+        )
 
         # One bbox slot per input frame, aligned by index. Slots stay
         # None when the frame decode fails or no PATIENT track is
@@ -938,6 +973,26 @@ class ReIDInference:
                 t.get("sam", 0.0), t.get("face", 0.0), t.get("total", 0.0),
                 elapsed_ms, len(frames), remote_obs.frames_seen,
                 remote_obs.det_count, remote_obs.max_prob,
+            )
+            # Latency tap: real wall-clock per stage, capture -> result.
+            # The POST ("wire") BLOCKS on the pod, so wire already CONTAINS
+            # the pod's decode+sam+face. e2e is therefore wire + replay —
+            # adding pod_total would double-count the ~15s of SAM. We report
+            # wire_overhead (wire minus the pod's own clock = ship + single-
+            # flight wait) so the stages stay additive:
+            #   decode + track + face + wire_overhead + replay = e2e.
+            _wire = t.get("wire", 0.0)
+            _pod = t.get("total", 0.0)
+            trace.latency(
+                frames=len(frames),
+                e2e_ms=_wire + elapsed_ms,
+                stages={
+                    "decode_ms": t.get("decode", 0.0),
+                    "track_ms": t.get("sam", 0.0),
+                    "face_ms": t.get("face", 0.0),
+                    "wire_overhead_ms": max(0.0, _wire - _pod),
+                    "replay_ms": elapsed_ms,
+                },
             )
         # Separate line for YOLO telemetry so the parser can group
         # detection-quality metrics independently of identity outcome.
