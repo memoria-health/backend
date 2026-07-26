@@ -106,7 +106,10 @@ async def update_caregiver(
     # web accept-terms gate), stamp the acceptance time server-side. Mirrors
     # the patient data-collection consent (data_collection_decided_at); the
     # timestamp is never client-writable.
-    if "tos_version" in fields:
+    # Only a truthy version stamps acceptance — a null must not record a
+    # meaningless "accepted with no version". The value is allowlist-checked by
+    # TosVersion on the request model, so it's a known version if present.
+    if fields.get("tos_version"):
         fields["tos_accepted_at"] = datetime.now(timezone.utc)
     return await caregiver_repo.update_partial(session, auth.id, fields=fields)
 

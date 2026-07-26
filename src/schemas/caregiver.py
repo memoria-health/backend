@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Annotated
 from uuid import UUID
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
+from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, Field
 
 DisplayName = Annotated[str, Field(min_length=1, max_length=80)]
 Email = Annotated[str, Field(min_length=3, max_length=255)]
@@ -37,6 +37,28 @@ def _to_e164(value: object) -> object:
 # E.164: leading +, then 1–15 digits. Input is normalized first (so a plain
 # 10-digit number from the iOS app is accepted and stored as +1XXXXXXXXXX).
 Phone = Annotated[str, BeforeValidator(_to_e164), Field(pattern=r"^\+[1-9]\d{1,14}$")]
+
+
+# Accepted ToS/Privacy document versions. The client sends the version string
+# it displayed; anything else (or null) is rejected so the stored consent
+# record can only ever be a real, published version — a client cannot fabricate
+# acceptance of a version that was never shipped. Add past versions here when
+# you bump the current one so old-but-still-valid acceptances keep passing.
+KNOWN_TOS_VERSIONS = frozenset({"2026-07-26-placeholder"})
+
+
+def _known_tos_version(v: str | None) -> str | None:
+    if v is not None and v not in KNOWN_TOS_VERSIONS:
+        raise ValueError("unknown_tos_version")
+    return v
+
+
+# ToS/Privacy version accepted by the caregiver: optional, but if present it
+# MUST be a known published version — validated server-side, never trusting the
+# client's string (a fabricated version would corrupt the consent record).
+TosVersion = Annotated[
+    str | None, Field(max_length=40), AfterValidator(_known_tos_version)
+]
 
 
 class CaregiverResponse(BaseModel):
@@ -81,9 +103,9 @@ class CreateCaregiverRequest(BaseModel):
     # The ToS/Privacy version the caregiver accepted at signup. The iOS app
     # gates account creation on acceptance and sends it, so the row is born
     # consented. Optional because the web provisions the row lazily on first
-    # load and captures acceptance via the PATCH gate instead. When present,
-    # provisioning stamps tos_accepted_at server-side.
-    tos_version: str | None = Field(default=None, max_length=40)
+    # load and captures acceptance via the PATCH gate instead. When present
+    # (and a known version), provisioning stamps tos_accepted_at server-side.
+    tos_version: TosVersion = None
 
 
 class UpdateCaregiverRequest(BaseModel):
@@ -109,6 +131,6 @@ class UpdateCaregiverRequest(BaseModel):
     timezone: str | None = Field(default=None, max_length=64)
     # The ToS/Privacy version the caregiver accepted via the web accept-terms
     # gate (the web provisions the row before acceptance, so it records consent
-    # here). When present, the server stamps tos_accepted_at; the timestamp is
-    # never client-writable.
-    tos_version: str | None = Field(default=None, max_length=40)
+    # here). When present (and a known version), the server stamps
+    # tos_accepted_at; the timestamp is never client-writable.
+    tos_version: TosVersion = None
