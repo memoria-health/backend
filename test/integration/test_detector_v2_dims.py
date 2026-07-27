@@ -30,7 +30,7 @@ async def test_seeded_presets_carry_v2_dims(
         dims = catalog_v2.DIMS[r.identifier]
         assert r.severity == dims.severity, r.identifier
         assert r.bucket == dims.bucket, r.identifier
-        assert r.evidence_branch == dims.evidence_branch, r.identifier
+        assert r.requires_motion == dims.requires_motion, r.identifier
         assert r.subject_scope == dims.subject_scope, r.identifier
         assert r.needs_audio == dims.needs_audio, r.identifier
         assert r.evidence_unit == dims.evidence_unit, r.identifier

@@ -111,7 +111,7 @@ def resolve_dims(row: "Detector") -> EffectiveDims:
         entry_m=ev.entry_m, entry_t_seconds=ev.entry_t_seconds,
     )
     catalog_dims = catalog_v2.dims_for(row.identifier or "")
-    if row.evidence_branch and row.subject_scope and row.bucket and row.duty_cycle:
+    if row.requires_motion is not None and row.subject_scope and row.bucket and row.duty_cycle:
         if row.severity is not None:
             severity = row.severity
         elif catalog_dims is not None:
@@ -119,9 +119,7 @@ def resolve_dims(row: "Detector") -> EffectiveDims:
         else:
             severity = _LEGACY_DEFAULT["severity"]
         return EffectiveDims(
-            # The DB column keeps the old enum; only person_motion
-            # means "apply the motion floor".
-            requires_motion=(row.evidence_branch == "person_motion"),
+            requires_motion=bool(row.requires_motion),
             subject_scope=row.subject_scope,
             bucket=_normalize_bucket(row.bucket),
             duty_cycle=_normalize_duty(row.duty_cycle),
@@ -133,7 +131,7 @@ def resolve_dims(row: "Detector") -> EffectiveDims:
         )
     if catalog_dims is not None:
         return EffectiveDims(
-            requires_motion=(catalog_dims.evidence_branch == "person_motion"),
+            requires_motion=catalog_dims.requires_motion,
             subject_scope=catalog_dims.subject_scope,
             bucket=_normalize_bucket(catalog_dims.bucket),
             duty_cycle=_normalize_duty(catalog_dims.duty_cycle),

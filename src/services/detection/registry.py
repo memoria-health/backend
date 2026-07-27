@@ -75,7 +75,7 @@ async def get_enabled_loadout_for_camera(
     `get_enabled_detectors_for_camera`, but returns each spec PAIRED
     with its `Detector` row. The detection-v2 scheduler
     (`scheduling/`) needs the row's dimension columns
-    (evidence_branch / subject_scope / bucket / duty_cycle / shape …)
+    (requires_motion / subject_scope / bucket / duty_cycle / shape …)
     alongside the compiled spec; keeping one query + one wandering
     specialization here means the two paths can never drift.
     """

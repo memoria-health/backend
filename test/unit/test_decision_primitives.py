@@ -59,7 +59,7 @@ def test_cooldown_row_wins_null_and_zero_fall_back() -> None:
 def test_dims_carry_confirm_config_from_row_eventing() -> None:
     row = SimpleNamespace(
         identifier="fall", alert_trigger="leading",
-        evidence_branch=None, subject_scope=None, bucket=None,
+        requires_motion=None, subject_scope=None, bucket=None,
         duty_cycle=None, needs_audio=False, severity=None,
         eventing={"confirm": {"k": 2, "n": 3}},
     )

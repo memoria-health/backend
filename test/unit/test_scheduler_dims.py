@@ -3,8 +3,8 @@
 Three-step fallback: row columns → catalog_v2 by identifier → the
 legacy default that behaves exactly like today's monolithic call.
 
-2026-07-18 collapse: EffectiveDims carries `requires_motion` (the one
-real bit of the old evidence_branch enum — person_motion ⇒ True) and
+2026-07-26 collapse: EffectiveDims carries `requires_motion` (the
+single live bit of the old evidence_branch enum) and
 legacy 'snapshot' buckets normalize to 'scene' (the packer always
 routed them to the wide call anyway; stills are retired).
 """
@@ -20,7 +20,7 @@ from src.services.detection.scheduling.dims import resolve_dims
 def _row(**over) -> SimpleNamespace:
     base = dict(
         identifier="fall", alert_trigger="leading",
-        evidence_branch=None, subject_scope=None, bucket=None,
+        requires_motion=None, subject_scope=None, bucket=None,
         duty_cycle=None, needs_audio=False, severity=None,
     )
     base.update(over)
@@ -29,7 +29,7 @@ def _row(**over) -> SimpleNamespace:
 
 def test_row_columns_win_over_catalog() -> None:
     row = _row(
-        evidence_branch="environment", subject_scope="environment",
+        requires_motion=False, subject_scope="environment",
         bucket="snapshot", duty_cycle="thinned", needs_audio=True,
         severity=33,
     )
@@ -43,7 +43,7 @@ def test_row_columns_win_over_catalog() -> None:
 
 def test_classified_row_with_null_severity_falls_back_to_catalog() -> None:
     row = _row(
-        evidence_branch="person_motion", subject_scope="patient",
+        requires_motion=True, subject_scope="patient",
         bucket="scene", duty_cycle="every_eligible_tick", severity=None,
     )
     d = resolve_dims(row)
@@ -54,7 +54,7 @@ def test_classified_row_with_null_severity_falls_back_to_catalog() -> None:
 
 def test_person_still_row_does_not_require_motion() -> None:
     row = _row(
-        evidence_branch="person_still", subject_scope="patient",
+        requires_motion=False, subject_scope="patient",
         bucket="person", duty_cycle="thinned",
     )
     d = resolve_dims(row)
@@ -68,7 +68,7 @@ def test_unbackfilled_builtin_resolves_from_catalog() -> None:
     assert (d.subject_scope, d.bucket, d.severity) == (
         dims.subject_scope, dims.bucket, dims.severity,
     )
-    assert d.requires_motion is (dims.evidence_branch == "person_motion")
+    assert d.requires_motion == dims.requires_motion
 
 
 def test_pre_p5_custom_gets_legacy_default_like_today() -> None:

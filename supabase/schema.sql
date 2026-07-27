@@ -491,7 +491,7 @@ create table public.detectors (
   -- NULL = not yet classified (pre-backfill rows / legacy customs).
   -- Nothing before P3 reads these except severity (promotion prefers the
   -- row value, falls back to the in-code catalog map when NULL).
-  evidence_branch text check (evidence_branch in ('environment', 'person_motion', 'person_still')),
+  requires_motion boolean,   -- collapse of evidence_branch: does the per-track motion floor apply
   subject_scope   text check (subject_scope in ('patient', 'anyone', 'environment')),
   bucket          text check (bucket in ('scene', 'person', 'fine_motion', 'rapid', 'face', 'snapshot')),
   needs_audio     boolean not null default false,

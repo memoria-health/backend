@@ -118,7 +118,9 @@ class Detector(Base):
     # NULL = not yet classified (pre-backfill rows / legacy customs).
     # Nothing before P3 reads these except `severity` (event promotion
     # prefers the row value, falls back to the catalog map when NULL).
-    evidence_branch: Mapped[str | None] = mapped_column(String(20), default=None)
+    # Whether the per-track motion floor applies (collapse of the old
+    # evidence_branch enum, 2026-07-26). NULL = not yet classified.
+    requires_motion: Mapped[bool | None] = mapped_column(Boolean, default=None)
     subject_scope: Mapped[str | None] = mapped_column(String(20), default=None)
     bucket: Mapped[str | None] = mapped_column(String(20), default=None)
     needs_audio: Mapped[bool] = mapped_column(Boolean, default=False)

@@ -14,7 +14,7 @@ detection loss; the P6 soak re-litigates any rule with golden data):
   2. RESERVED-FIELD CHECK — backend-stamped analyses keys can never
      be claimed by a custom schema (silent-overwrite guard; P2/P3
      review carry-over).
-  3. DIMS CLASSIFICATION — evidence_branch / subject_scope / bucket /
+  3. DIMS CLASSIFICATION — requires_motion / subject_scope / bucket /
      duty_cycle / needs_audio / eventing / degradation_warning for
      the row, so the scheduler treats a compiled custom exactly like
      a built-in. Unclassifiable text falls back to the legacy default
@@ -220,7 +220,9 @@ def classify_custom_dims(
     eventing = _entry_confidence_for(is_sustained, bucket, degradation, category)
 
     return {
-        "evidence_branch": branch,
+        # Only person_motion vs not is read downstream (the motion floor);
+        # environment/person_still collapse to requires_motion=False.
+        "requires_motion": branch == "person_motion",
         "subject_scope": subject,
         "bucket": bucket,
         "duty_cycle": duty,

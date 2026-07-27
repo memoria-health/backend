@@ -26,13 +26,13 @@ def test_severity_lockstep_with_catalog_map() -> None:
 def test_load_bearing_dims_pinned() -> None:
     d = catalog_v2.DIMS
     assert d["seizure"].bucket == "rapid"                       # the P0 recipe
-    assert d["seizure"].evidence_branch == "person_motion"
-    assert d["stove_left_on"].evidence_branch == "environment"  # no person needed
+    assert d["seizure"].requires_motion is True
+    assert d["stove_left_on"].requires_motion is False  # no person needed
     assert d["stove_left_on"].bucket == "scene"  # snapshot retired 2026-07-18
     assert d["agitation"].needs_audio is True                   # tone matters
     assert d["possible_intruder"].subject_scope == "anyone"     # concealment, not identity
     assert d["fall"].subject_scope == "patient"                 # Aryaman: patient-scoped
-    assert d["child_device_usage"].evidence_branch == "person_still"
+    assert d["child_device_usage"].requires_motion is False
     # The distance-degradation class carries its perpetual warning.
     assert d["env_hazard_glass"].degradation_warning == "distance_class"
 

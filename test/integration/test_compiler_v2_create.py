@@ -107,9 +107,11 @@ async def test_background_compile_writes_v2_dims(
         select(Detector).where(Detector.id == det_id)
     )).scalar_one()
     assert row.identifier == "custom_ab12"
-    assert row.evidence_branch == "person_still"
+    assert row.requires_motion is False
     assert row.subject_scope == "patient"
     assert row.bucket == "person"
     assert row.duty_cycle == "thinned"
-    assert row.eventing == {"entry": {"m": 5, "t_seconds": 900}}
+    # Easy-to-see sustained state (TV) → no M-of-N gate (P1: eventing is
+    # confidence-by-difficulty, no longer duration-parsed).
+    assert row.eventing is None
     assert row.degradation_warning == "none"

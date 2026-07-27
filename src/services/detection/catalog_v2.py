@@ -19,7 +19,6 @@ from dataclasses import asdict, dataclass
 
 from src.services.detection import catalog
 
-EVIDENCE_BRANCHES = ("environment", "person_motion", "person_still")
 SUBJECT_SCOPES = ("patient", "anyone", "environment")
 BUCKETS = ("scene", "person", "fine_motion", "rapid", "face")
 EVIDENCE_UNITS = ("verdict", "instance", "sample")
@@ -32,7 +31,10 @@ class DetectorDims:
     """One built-in's v2 dimension values, column-named 1:1 with the
     `detectors` row so `row_kwargs()` can splat straight into inserts."""
 
-    evidence_branch: str
+    # Whether the per-track motion floor applies (True) or a still person is
+    # the whole point (False) — the collapse of the old evidence_branch enum
+    # (2026-07-26): only person_motion vs not was ever read downstream.
+    requires_motion: bool
     subject_scope: str
     bucket: str
     severity: int
@@ -41,58 +43,53 @@ class DetectorDims:
     duty_cycle: str = "every_eligible_tick"
     degradation_warning: str = "none"
 
-
-_ENV = "environment"
-_MOTION = "person_motion"
-_STILL = "person_still"
-
 DIMS: dict[str, DetectorDims] = {
     # ── Seeded presets ──────────────────────────────────────────────
-    "fall":        DetectorDims(_MOTION, "patient", "scene", 95),
-    "agitation":   DetectorDims(_MOTION, "patient", "scene", 60,
+    "fall":        DetectorDims(True, "patient", "scene", 95),
+    "agitation":   DetectorDims(True, "patient", "scene", 60,
                                 needs_audio=True, evidence_unit="sample",
                                 duty_cycle="thinned"),
-    "seizure":     DetectorDims(_MOTION, "patient", "rapid", 96),
-    "wandering":   DetectorDims(_MOTION, "patient", "scene", 55),
-    "medication":  DetectorDims(_MOTION, "patient", "person", 20),
-    "climbing":    DetectorDims(_MOTION, "patient", "scene", 66,
+    "seizure":     DetectorDims(True, "patient", "rapid", 96),
+    "wandering":   DetectorDims(True, "patient", "scene", 55),
+    "medication":  DetectorDims(True, "patient", "person", 20),
+    "climbing":    DetectorDims(True, "patient", "scene", 66,
                                 evidence_unit="sample"),
-    "distress":    DetectorDims(_MOTION, "patient", "scene", 82,
+    "distress":    DetectorDims(True, "patient", "scene", 82,
                                 needs_audio=True, evidence_unit="sample"),
     # ── Child library ───────────────────────────────────────────────
-    "child_crib_exit":         DetectorDims(_MOTION, "patient", "scene", 65),
-    "child_cord_entanglement": DetectorDims(_MOTION, "patient", "person", 97,
+    "child_crib_exit":         DetectorDims(True, "patient", "scene", 65),
+    "child_cord_entanglement": DetectorDims(True, "patient", "person", 97,
                                             degradation_warning="distance_class"),
-    "child_stairs":            DetectorDims(_MOTION, "patient", "scene", 73),
-    "child_hazard_reach":      DetectorDims(_MOTION, "patient", "scene", 70),
-    "child_head_impact":       DetectorDims(_MOTION, "patient", "scene", 93),
-    "child_wandering":         DetectorDims(_MOTION, "patient", "scene", 55),
-    "child_device_usage":      DetectorDims(_STILL, "patient", "person", 25,
+    "child_stairs":            DetectorDims(True, "patient", "scene", 73),
+    "child_hazard_reach":      DetectorDims(True, "patient", "scene", 70),
+    "child_head_impact":       DetectorDims(True, "patient", "scene", 93),
+    "child_wandering":         DetectorDims(True, "patient", "scene", 55),
+    "child_device_usage":      DetectorDims(False, "patient", "person", 25,
                                             evidence_unit="sample",
                                             duty_cycle="thinned"),
     # ── Adult library ───────────────────────────────────────────────
-    "calling_for_help": DetectorDims(_MOTION, "patient", "scene", 88,
+    "calling_for_help": DetectorDims(True, "patient", "scene", 88,
                                      needs_audio=True),
-    "choking":          DetectorDims(_MOTION, "patient", "person", 100),
-    "meal_eaten":       DetectorDims(_MOTION, "patient", "person", 22),
-    "stove_left_on":    DetectorDims(_ENV, "environment", "scene", 74,
+    "choking":          DetectorDims(True, "patient", "person", 100),
+    "meal_eaten":       DetectorDims(True, "patient", "person", 22),
+    "stove_left_on":    DetectorDims(False, "environment", "scene", 74,
                                      evidence_unit="sample",
                                      duty_cycle="thinned",
                                      degradation_warning="distance_class"),
     # ── Both cohorts ────────────────────────────────────────────────
-    "emergency":         DetectorDims(_MOTION, "patient", "scene", 80),
+    "emergency":         DetectorDims(True, "patient", "scene", 80),
     # Intruder = visible concealment (mask), never "unenrolled person" —
     # only the patient is enrolled, so identity can't be the trigger.
-    "possible_intruder": DetectorDims(_MOTION, "anyone", "scene", 78),
-    "env_hazard_glass":  DetectorDims(_ENV, "environment", "scene", 62,
+    "possible_intruder": DetectorDims(True, "anyone", "scene", 78),
+    "env_hazard_glass":  DetectorDims(False, "environment", "scene", 62,
                                       duty_cycle="thinned",
                                       degradation_warning="distance_class"),
-    "env_hazard_water":  DetectorDims(_ENV, "environment", "scene", 56,
+    "env_hazard_water":  DetectorDims(False, "environment", "scene", 56,
                                       duty_cycle="thinned",
                                       degradation_warning="distance_class"),
-    "fire_smoke":        DetectorDims(_ENV, "environment", "scene", 98),
+    "fire_smoke":        DetectorDims(False, "environment", "scene", 98),
     # ── Internal ────────────────────────────────────────────────────
-    "setup_test":        DetectorDims(_MOTION, "anyone", "scene", 200),
+    "setup_test":        DetectorDims(True, "anyone", "scene", 200),
 }
 
 
@@ -120,7 +117,6 @@ def _validate() -> None:
         )
     for key, d in DIMS.items():
         for value, legal in (
-            (d.evidence_branch, EVIDENCE_BRANCHES),
             (d.subject_scope, SUBJECT_SCOPES),
             (d.bucket, BUCKETS),
             (d.evidence_unit, EVIDENCE_UNITS),

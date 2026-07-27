@@ -80,23 +80,23 @@ def _dims(name, text, shape="point_in_time", category="safety"):
 
 def test_environment_subject_classifies_env_scene() -> None:
     d = _dims("Stove check", "tell me if the stove is left on")
-    assert (d["evidence_branch"], d["subject_scope"], d["bucket"]) == (
-        "environment", "environment", "scene",
+    assert (d["requires_motion"], d["subject_scope"], d["bucket"]) == (
+        False, "environment", "scene",
     )
 
 
 def test_still_activity_classifies_person_still() -> None:
     d = _dims("TV time", "she is watching tv", shape="state", category="routine")
-    assert (d["evidence_branch"], d["subject_scope"], d["bucket"]) == (
-        "person_still", "patient", "person",
+    assert (d["requires_motion"], d["subject_scope"], d["bucket"]) == (
+        False, "patient", "person",
     )
     assert d["duty_cycle"] == "thinned"      # routine state
 
 
 def test_default_is_todays_behavior() -> None:
     d = _dims("Dancing", "alert me when he starts dancing")
-    assert (d["evidence_branch"], d["subject_scope"], d["bucket"]) == (
-        "person_motion", "patient", "scene",
+    assert (d["requires_motion"], d["subject_scope"], d["bucket"]) == (
+        True, "patient", "scene",
     )
     assert d["duty_cycle"] == "every_eligible_tick"
     assert d["eventing"] is None
@@ -124,7 +124,7 @@ def test_env_wins_over_anyone_with_genuinely_matching_text() -> None:
 def test_still_wins_over_env_with_genuinely_matching_text() -> None:
     d = _dims("TV sleeper", "falls asleep with the tv left on, watching tv",
               shape="state", category="routine")
-    assert d["evidence_branch"] == "person_still"
+    assert d["requires_motion"] is False
 
 
 def test_exit_verbs_keep_wandering_asks_person_scoped() -> None:
@@ -133,12 +133,12 @@ def test_exit_verbs_keep_wandering_asks_person_scoped() -> None:
     OUTSIDE person boxes post-soak, skipping exactly the tick that
     matters (P5 review F4)."""
     d = _dims("Front door", "alert me if dad leaves through the front door")
-    assert (d["evidence_branch"], d["subject_scope"], d["bucket"]) == (
-        "person_motion", "patient", "scene",
+    assert (d["requires_motion"], d["subject_scope"], d["bucket"]) == (
+        True, "patient", "scene",
     )
     d2 = _dims("Visitor", "a visitor knocks on the door")
     assert d2["subject_scope"] == "anyone"
-    assert d2["evidence_branch"] == "person_motion"
+    assert d2["requires_motion"] is True
     # Pure door-STATE phrasing stays environment.
     d3 = _dims("Door ajar", "the front door is left open at night")
     assert d3["subject_scope"] == "environment"
