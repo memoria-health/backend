@@ -23,17 +23,17 @@ _V2 = SimpleNamespace(detection_v2_decision_enabled=True)
 
 async def _add_detector(
     session: AsyncSession, patient_id, ident: str, *,
-    shape: str = "state", eventing: dict | None = None,
+    is_sustained: bool = True, eventing: dict | None = None,
     cooldown_seconds: int | None = None, gap: int = 300,
 ) -> Detector:
     now = datetime.now(timezone.utc)
     det = Detector(
         id=uuid4(), patient_id=patient_id, name=ident, icon_name="x",
         description=ident, category="routine", source="custom",
-        shape=shape, where_scope="ALL ROOMS", when_scope="ALWAYS",
+        alert_trigger="leading", is_sustained=is_sustained, when_scope="ALWAYS",
         sensitivity="standard", is_on=True, created_at=now, updated_at=now,
         identifier=ident, prompt_fragment=None, schema_json=None,
-        always_on=False, episode_gap_seconds=gap if shape == "state" else None,
+        always_on=False, episode_gap_seconds=gap if is_sustained else None,
         eventing=eventing, cooldown_seconds=cooldown_seconds,
     )
     session.add(det)
@@ -140,7 +140,7 @@ async def test_per_detector_cooldown_replaces_global_dedup_flag_on(
     )
     ident = "custom_doorslam"
     await _add_detector(
-        session, patient_id, ident, shape="point_in_time",
+        session, patient_id, ident, is_sustained=False,
         cooldown_seconds=5,
     )
     await session.commit()
@@ -166,7 +166,7 @@ async def test_per_detector_cooldown_replaces_global_dedup_flag_on(
     # Same shape, flag OFF: 10 s later is deduped by the global 30 s.
     ident2 = "custom_doorslam2"
     await _add_detector(
-        session, patient_id, ident2, shape="point_in_time",
+        session, patient_id, ident2, is_sustained=False,
         cooldown_seconds=5,
     )
     await session.commit()
@@ -232,7 +232,7 @@ async def test_repeat_inside_row_cooldown_is_still_deduped(
     )
     ident = "custom_fastfire"
     await _add_detector(
-        session, patient_id, ident, shape="point_in_time",
+        session, patient_id, ident, is_sustained=False,
         cooldown_seconds=20,
     )
     await session.commit()

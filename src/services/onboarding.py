@@ -162,7 +162,7 @@ async def seed_detectors_for_patient(
             alert_trigger=e.alert_trigger,
             is_sustained=e.is_sustained,
             duration_seconds=e.duration_seconds,
-            where_scope=e.where_scope,
+            where_rooms=(None if e.where_scope == "ALL ROOMS" else [e.where_scope]),
             when_scope=e.when_scope,
             sensitivity="standard",
             is_on=True,

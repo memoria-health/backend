@@ -31,7 +31,6 @@ class Detector(Base):
     description: Mapped[str] = mapped_column(String(500))
     category: Mapped[str] = mapped_column(DetectorCategoryEnum)
     source: Mapped[str] = mapped_column(DetectorSourceEnum)
-    where_scope: Mapped[str] = mapped_column(String(80))
     when_scope: Mapped[str] = mapped_column(String(80))
     sensitivity: Mapped[str] = mapped_column(DetectorSensitivityEnum)
     is_on: Mapped[bool] = mapped_column(Boolean)

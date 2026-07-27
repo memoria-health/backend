@@ -101,7 +101,7 @@ async def assign_detector_to_cameras(
     filtered by room name.
 
     - `room=None` → every camera under the patient (used when the
-      detector's where_scope is "ALL ROOMS").
+      detector's where_rooms is empty / every room).
     - `room="Kitchen"` → every camera whose `room` column matches
       exactly. Multiple cameras can share a room name (e.g. two
       angles in the kitchen) — they all get assigned.

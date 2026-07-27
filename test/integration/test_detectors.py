@@ -25,7 +25,7 @@ _CUSTOM_DETECTOR_BODY = {
     "description": "Kitchen activity between 11 PM and 6 AM.",
     "category": "safety",
     "shape": "point_in_time",
-    "where_scope": "KITCHEN",
+    "where_rooms": ["KITCHEN"],
     "when_scope": "11 PM – 6 AM",
     "custom_prompt": "Trigger when motion is detected in the kitchen between 11pm and 6am.",
 }

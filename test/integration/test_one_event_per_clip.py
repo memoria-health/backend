@@ -56,7 +56,6 @@ async def _two_firing_detectors(
             source="custom",
             alert_trigger="leading",
             is_sustained=False,
-            where_scope="ALL ROOMS",
             when_scope="ALWAYS",
             sensitivity="standard",
             is_on=True,

@@ -428,11 +428,10 @@ create table public.detectors (
   description     text not null,
   category        detector_category    not null,
   source          detector_source      not null,
-  where_scope     text not null,
-  -- Multi-room intent (2026-07-26). JSON array of room names the detector
-  -- is scoped to; null or ["ALL ROOMS"] = every room. where_scope stays in
-  -- sync as a back-compat scalar; where_rooms is the source of truth for
-  -- the rooms selector + camera auto-assignment.
+  -- Room scope (canonical). JSON array of room names the detector is scoped
+  -- to; null or ["ALL ROOMS"] = every room. Source of truth for the rooms
+  -- selector + camera auto-assignment. The legacy where_scope scalar is
+  -- derived from this on serialize (2026-07-26 collapse), not stored.
   where_rooms     jsonb,
   when_scope      text not null,
   sensitivity     detector_sensitivity not null default 'standard',

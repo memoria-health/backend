@@ -269,24 +269,14 @@ def _to_response(d: Detector) -> DetectorResponse:
     resp = DetectorResponse.model_validate(d, from_attributes=True)
     return resp.model_copy(update={
         "accuracy_caveat": _accuracy_caveat(d.identifier, d.bucket),
+        # where_scope is no longer stored — derived from the canonical rooms.
+        "where_scope": _scalar_where_scope(d.where_rooms),
     })
 
 
-def _resolve_rooms(
-    where_rooms: list[str] | None, where_scope: str,
-) -> list[str] | None:
-    """The authoritative room set for a create/patch. `where_rooms` (the
-    multi-select) wins; otherwise fall back to the legacy single
-    `where_scope` ("ALL ROOMS" → None, meaning every room)."""
-    if where_rooms is not None:
-        return where_rooms
-    return None if where_scope == "ALL ROOMS" else [where_scope]
-
-
 def _scalar_where_scope(rooms: list[str] | None) -> str:
-    """Keep the legacy scalar `where_scope` in sync with the room set for
-    back-compat display: "ALL ROOMS" for every-room, else the joined room
-    names bounded to the column width (80)."""
+    """The legacy `where_scope` display scalar, DERIVED from the room set:
+    "ALL ROOMS" for every-room, else the joined room names bounded to 80."""
     if camera_detector_repo.rooms_mean_all(rooms):
         return "ALL ROOMS"
     return ", ".join(rooms)[:80]
@@ -418,6 +408,8 @@ async def add_detectors_from_library(
                 detail=f"unknown_detector_key:{key}",
             )
         ts = now + timedelta(microseconds=i)
+        # Catalog scope → the canonical where_rooms (where_scope is gone).
+        preset_rooms = None if e.where_scope == "ALL ROOMS" else [e.where_scope]
         det = Detector(
             id=uuid4(),
             patient_id=patient_id,
@@ -429,7 +421,7 @@ async def add_detectors_from_library(
             alert_trigger=e.alert_trigger,
             is_sustained=e.is_sustained,
             duration_seconds=e.duration_seconds,
-            where_scope=e.where_scope,
+            where_rooms=preset_rooms,
             when_scope=e.when_scope,
             sensitivity="standard",
             is_on=True,
@@ -668,9 +660,8 @@ async def create_detector(
         )
 
     now = datetime.now(timezone.utc)
-    # Multi-room scope: where_rooms (the multi-select) is authoritative;
-    # where_scope is kept as a synced back-compat scalar.
-    resolved_rooms = _resolve_rooms(body.where_rooms, body.where_scope)
+    # where_rooms is the canonical room scope (None = every room).
+    resolved_rooms = body.where_rooms
     det = Detector(
         id=uuid4(),
         patient_id=patient_id,
@@ -679,14 +670,12 @@ async def create_detector(
         description=body.description,
         category=body.category.value,
         source="custom",
-        # Alerting spine; shape is the derived (authoritative) bridge.
         alert_trigger=body.alert_trigger.value,
         is_sustained=body.is_sustained,
         duration_seconds=(
             body.duration_seconds
             if body.alert_trigger == AlertTrigger.duration else None
         ),
-        where_scope=_scalar_where_scope(resolved_rooms),
         where_rooms=resolved_rooms,
         when_scope=body.when_scope,
         sensitivity=body.sensitivity.value,
@@ -833,14 +822,10 @@ async def patch_detector(
 ) -> DetectorResponse:
     fields = body.model_dump(exclude_unset=True)
     # Enum → string for the ORM string columns.
-    for k in ("category", "shape", "sensitivity", "alert_trigger"):
+    for k in ("category", "sensitivity", "alert_trigger"):
         if k in fields and fields[k] is not None:
             fields[k] = fields[k].value
-    # Re-scoping rooms: keep the legacy scalar where_scope in lockstep so
-    # any code path that still reads it stays correct.
     rescope_rooms = "where_rooms" in fields
-    if rescope_rooms:
-        fields["where_scope"] = _scalar_where_scope(fields["where_rooms"])
     det = await detector_repo.update_partial(
         session, detector_id, caregiver_id=auth.id, fields=fields
     )

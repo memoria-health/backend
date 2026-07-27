@@ -92,9 +92,11 @@ class DetectorResponse(BaseModel):
     # user-meaningful "has it gone on too long" bar. Distinct from
     # episode_gap_seconds (hysteresis) and from the internal M-of-N.
     duration_seconds: int | None = None
-    where_scope: Scope
-    # Rooms the detector is scoped to. None → every room (back-compat with
-    # rows created before multi-room existed, and the "ALL ROOMS" default).
+    # Legacy display scalar — DERIVED on serialize from where_rooms (no longer
+    # stored). "ALL ROOMS" for every-room, else the joined room names.
+    where_scope: Scope = "ALL ROOMS"
+    # Rooms the detector is scoped to (the canonical stored rep). None → every
+    # room (back-compat with rows created before multi-room existed).
     where_rooms: Rooms | None = None
     when_scope: Scope
     sensitivity: DetectorSensitivity
@@ -156,9 +158,8 @@ class CreateDetectorRequest(BaseModel):
     is_sustained: bool = False
     duration_seconds: DurationSeconds | None = None
     icon_name: IconName = "eye"
-    where_scope: Scope = "ALL ROOMS"
     # Rooms the caregiver picked (multi-select). None / ["ALL ROOMS"] = every
-    # room. Drives the camera auto-assignment; where_scope is kept in sync.
+    # room. The canonical scope — drives camera auto-assignment.
     where_rooms: Rooms | None = None
     when_scope: Scope = "ALWAYS"
     sensitivity: DetectorSensitivity = DetectorSensitivity.standard
@@ -236,7 +237,6 @@ class UpdateDetectorRequest(BaseModel):
     alert_trigger: AlertTrigger | None = None
     is_sustained: bool | None = None
     duration_seconds: DurationSeconds | None = None
-    where_scope: Scope | None = None
     # Re-scope the detector's rooms; the endpoint replaces its camera
     # assignments to match. ["ALL ROOMS"] or null-via-omit = every room.
     where_rooms: Rooms | None = None
