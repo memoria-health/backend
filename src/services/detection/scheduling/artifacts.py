@@ -48,7 +48,7 @@ from src.services.detection.rapid_artifact import crop_i420, union_box
 from src.services.detection.rapid_call import scale_bbox_to_frame
 
 if TYPE_CHECKING:
-    from src.services.reid.body_pipeline import TrackObservation
+    from src.services.reid.observations import TrackObservation
 
 log = logging.getLogger(__name__)
 

@@ -44,7 +44,7 @@ import time
 from typing import TYPE_CHECKING
 
 from src.services.reid import trace
-from src.services.reid.body_pipeline import LABEL_PATIENT, LABEL_UNKNOWN
+from src.services.reid.observations import LABEL_PATIENT, LABEL_UNKNOWN
 from src.services.detection.patient_presence import (
     TIER_BODY,
     TIER_FACE,
@@ -52,7 +52,7 @@ from src.services.detection.patient_presence import (
 )
 
 if TYPE_CHECKING:
-    from src.services.reid.inference import IdentityResult
+    from src.services.reid.result import IdentityResult
 
 log = logging.getLogger(__name__)
 

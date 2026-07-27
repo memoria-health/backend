@@ -78,7 +78,8 @@ from src.services.detection.registry import (
 )
 from src.services.detection.state_machine import apply_tick_update
 from src.repos.face_embedding_repo import has_ready_enrollment
-from src.services.reid.inference import IdentityResult, ReIDInference
+from src.services.reid.inference import ReIDInference
+from src.services.reid.result import IdentityResult
 from src.services.data_collection.gate import should_collect
 from src.services.data_collection.session import RecorderCtx
 

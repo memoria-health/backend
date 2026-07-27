@@ -60,7 +60,7 @@ from src.services.detection.signals.rapid_energy import (
 
 if TYPE_CHECKING:
     from src.services.detection.frame_buffer import FrameSnapshot
-    from src.services.reid.inference import IdentityResult
+    from src.services.reid.result import IdentityResult
     from src.settings import Settings
 
 log = logging.getLogger(__name__)

@@ -16,7 +16,8 @@ from uuid import uuid4
 import numpy as np
 import pytest
 
-from src.services.reid.inference import IdentityResult, ReIDInference
+from src.services.reid.inference import ReIDInference
+from src.services.reid.result import IdentityResult
 
 
 def _settings(*, reid_enabled: bool, timeout: float = 5.0) -> SimpleNamespace:

@@ -57,10 +57,10 @@ from src.services.detection.signals.rapid_energy import (
     _MIN_FRAMES,
     _PERSIST_RATIO,
 )
-from src.services.reid.body_pipeline import LABEL_PATIENT
+from src.services.reid.observations import LABEL_PATIENT
 
 if TYPE_CHECKING:
-    from src.services.reid.body_pipeline import TrackObservation
+    from src.services.reid.observations import TrackObservation
 
 # Full-frame diff map width. Wider than rapid_energy's 160 crop width
 # because a person box occupies only part of the frame here — at 320

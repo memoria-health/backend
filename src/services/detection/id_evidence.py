@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from src.services.reid.inference import IdentityResult
+    from src.services.reid.result import IdentityResult
     from src.settings import Settings
 
 log = logging.getLogger(__name__)

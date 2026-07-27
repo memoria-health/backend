@@ -36,13 +36,13 @@ from uuid import UUID
 
 import httpx
 
-from src.services.reid.body_pipeline import (
+from src.services.reid.observations import (
     LABEL_PATIENT,
     LABEL_UNKNOWN,
     TrackObservation,
 )
 from identity.contract import STATE_CONTRACT
-from src.services.reid.inference import IdentityResult
+from src.services.reid.result import IdentityResult
 
 log = logging.getLogger(__name__)
 
