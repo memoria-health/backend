@@ -55,3 +55,7 @@ yolo11n.pt
 # Pod lifecycle secrets (scripts/pod.sh) — never commit
 .pod.env
 .pod/
+
+# Accidental env backups (contain production keys) — never commit
+.env.bak.*
+.env.bak*
