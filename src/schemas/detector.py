@@ -23,9 +23,33 @@ class DetectorSource(str, Enum):
 
 
 class DetectorShape(str, Enum):
-    point_in_time = "point_in_time"  # momentary — fires the moment it's seen
-    state = "state"          # continuous/ongoing activity — one event per session
-    scheduled = "scheduled"  # absence detector — fires if signal absent in window
+    # DEPRECATED (2026-07-26): being removed. The 3-way shape munged two
+    # ideas the taxonomy separates — the alert TRIGGER (now `AlertTrigger`)
+    # and the temporal NATURE (now an internal `is_sustained` bool).
+    # `scheduled` folds into alert_trigger=schedule. Kept only until every
+    # runtime reader is migrated off it, then deleted (no interim divergence
+    # in the final state).
+    point_in_time = "point_in_time"
+    state = "state"
+    scheduled = "scheduled"
+
+
+class AlertTrigger(str, Enum):
+    """USER-FACING spine (2026-07-26): which moment in the detection stream
+    fires the alert. Derived from the caregiver's words; the only manual
+    choice is leading↔trailing (↔duration) on a sustained positive."""
+
+    leading = "leading"    # the moment it starts / happens
+    trailing = "trailing"  # when the activity ends (sustained only)
+    duration = "duration"  # once it's held >= duration_seconds (sustained only)
+    schedule = "schedule"  # relative to a clock window/deadline (see polarity)
+
+
+class SchedulePolarity(str, Enum):
+    """For alert_trigger == schedule: fire on presence or on absence."""
+
+    positive = "positive"  # fire if it DID happen in the window
+    negative = "negative"  # fire if it did NOT happen by the deadline (absence)
 
 
 class DetectorSensitivity(str, Enum):
@@ -40,10 +64,11 @@ class ScheduleCadence(str, Enum):
 
 
 class ScheduleConfig(BaseModel):
-    """Window an `scheduled` detector evaluates. All fields optional so
+    """Window a `schedule`-trigger detector evaluates. All fields optional so
     the LLM can return a partial inference (blanks the user fills in on
     the review screen). Times are local "HH:MM" 24h strings;
-    days_of_week is 0=Mon..6=Sun (weekly only)."""
+    days_of_week is 0=Mon..6=Sun (weekly only). `polarity` chooses fire-on-
+    presence vs fire-on-absence (default absence — the common "missed X" case)."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -52,6 +77,7 @@ class ScheduleConfig(BaseModel):
     window_start: str | None = None
     window_end: str | None = None
     deadline: str | None = None
+    polarity: SchedulePolarity = SchedulePolarity.negative
 
 
 Name = Annotated[str, Field(min_length=1, max_length=120)]
@@ -76,6 +102,15 @@ class DetectorResponse(BaseModel):
     description: Description
     category: DetectorCategory
     source: DetectorSource
+    # Alerting spine (2026-07-26): which moment fires. is_sustained is the
+    # internal temporal nature. shape is the DEPRECATED bridge (derived from
+    # these) kept only until the runtime is migrated off it.
+    alert_trigger: AlertTrigger = AlertTrigger.leading
+    is_sustained: bool = False
+    # Duration threshold (seconds) for alert_trigger == duration — the
+    # user-meaningful "has it gone on too long" bar. Distinct from
+    # episode_gap_seconds (hysteresis) and from the internal M-of-N.
+    duration_seconds: int | None = None
     shape: DetectorShape
     where_scope: Scope
     # Rooms the detector is scoped to. None → every room (back-compat with
@@ -136,6 +171,11 @@ class CreateDetectorRequest(BaseModel):
     custom_prompt: Prompt
     description: Description = "Custom detector"
     category: DetectorCategory = DetectorCategory.safety
+    # Alerting spine (client sends the confirmed inference). shape is the
+    # deprecated bridge, derived server-side from alert_trigger + is_sustained.
+    alert_trigger: AlertTrigger = AlertTrigger.leading
+    is_sustained: bool = False
+    duration_seconds: int | None = None
     shape: DetectorShape = DetectorShape.point_in_time
     icon_name: IconName = "eye"
     where_scope: Scope = "ALL ROOMS"
@@ -185,13 +225,16 @@ class InferDetectorResponse(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
+    alert_trigger: AlertTrigger
+    is_sustained: bool
+    duration_seconds: int | None = None
     shape: DetectorShape
     category: DetectorCategory
     icon_name: IconName
     sensitivity: DetectorSensitivity
     schedule_config: ScheduleConfig | None = None
-    # Set when shape == 'state': the inferred rising-edge episode gap
-    # (seconds). The review screen may show/adjust it; null otherwise.
+    # Set when is_sustained: the inferred rising-edge episode gap (seconds).
+    # The review screen may show/adjust it; null otherwise.
     episode_gap_seconds: int | None = None
     # Compiled-behavior preview (pure classification, no extra LLM
     # spend). Null only if composition fails — the review screen then
@@ -212,6 +255,10 @@ class UpdateDetectorRequest(BaseModel):
     icon_name: IconName | None = None
     description: Description | None = None
     category: DetectorCategory | None = None
+    # Alerting spine (the toggle the picker sets). shape stays server-derived.
+    alert_trigger: AlertTrigger | None = None
+    is_sustained: bool | None = None
+    duration_seconds: int | None = None
     shape: DetectorShape | None = None
     where_scope: Scope | None = None
     # Re-scope the detector's rooms; the endpoint replaces its camera

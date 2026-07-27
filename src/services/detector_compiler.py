@@ -123,21 +123,22 @@ _FEW_SHOT_EXAMPLE_ROUTINE_REACTIVE = (
 
 def _meta_prompt(
     *, identifier: str, name: str, description: str, user_text: str,
-    scheduled: bool, category: str,
+    absence: bool, category: str,
 ) -> str:
     """The instructions the compiler sends to the LLM. `identifier` is
     interpolated everywhere the runtime block needs the stable key.
 
-    Inclusivity is chosen by STAKES, not just shape:
-      - scheduled (absence) → conservative: only a clear positive counts, so a
-        real miss surfaces the absence alert instead of being swallowed.
+    Inclusivity is chosen by STAKES, not by the trigger alone:
+      - absence (schedule / negative) → conservative: only a clear positive
+        counts, so a real miss surfaces the absence alert instead of being
+        swallowed.
       - reactive + safety  → inclusive: a missed emergency is far worse than a
         false alarm, so fire on borderline signs.
       - reactive + routine → conservative: a false alarm is just noise, so only
         a clear, sustained occurrence fires (this is the "watching TV fired on a
         glance" fix). The LLM is told to calibrate strictness to the stakes.
     """
-    if scheduled:
+    if absence:
         detected_guidance = (
             "Be CONSERVATIVE — set TRUE ONLY when the thing is CLEARLY and "
             "unmistakably happening. On any ambiguity, partial view, or "
@@ -251,7 +252,7 @@ def _clean_fragment(raw: str, identifier: str) -> str:
 
 async def _compile_with_gemini(
     *, identifier: str, name: str, description: str, user_text: str,
-    scheduled: bool, category: str, settings: Settings,
+    absence: bool, category: str, settings: Settings,
 ) -> str:
     """One Gemini call. Returns the cleaned prompt_fragment string."""
     if not settings.gemini_api_key:
@@ -267,7 +268,7 @@ async def _compile_with_gemini(
                     name=name,
                     description=description,
                     user_text=user_text,
-                    scheduled=scheduled,
+                    absence=absence,
                     category=category,
                 ))],
             ),
@@ -285,7 +286,7 @@ async def _compile_with_gemini(
 
 async def _compile_with_openai(
     *, identifier: str, name: str, description: str, user_text: str,
-    scheduled: bool, category: str, settings: Settings,
+    absence: bool, category: str, settings: Settings,
 ) -> str:
     """One OpenAI call. Returns the cleaned prompt_fragment string.
 
@@ -303,7 +304,7 @@ async def _compile_with_openai(
                 name=name,
                 description=description,
                 user_text=user_text,
-                scheduled=scheduled,
+                absence=absence,
                 category=category,
             )},
         ],
@@ -319,7 +320,7 @@ async def compile_custom_detector(
     name: str,
     description: str,
     user_text: str,
-    scheduled: bool = False,
+    absence: bool = False,
     category: str = "safety",
     settings: Settings,
     identifier: str | None = None,
@@ -338,8 +339,8 @@ async def compile_custom_detector(
     `user_text` is the caregiver's raw "what to detect" string. `name` +
     `description` are passed separately so the model can disambiguate.
 
-    `scheduled` + `category` tune the firing bias: scheduled (absence) and
-    routine reactive detectors are conservative (only a clear, sustained
+    `absence` + `category` tune the firing bias: absence (schedule/negative)
+    and routine reactive detectors are conservative (only a clear, sustained
     positive fires); safety reactive detectors stay inclusive (a missed
     emergency is worse than a false alarm).
     """
@@ -359,7 +360,7 @@ async def compile_custom_detector(
     try:
         fragment = await _compile_with_openai(
             identifier=identifier, name=name, description=description,
-            user_text=user_text, scheduled=scheduled, category=category,
+            user_text=user_text, absence=absence, category=category,
             settings=settings,
         )
         log.info(
@@ -380,7 +381,7 @@ async def compile_custom_detector(
     try:
         fragment = await _compile_with_gemini(
             identifier=identifier, name=name, description=description,
-            user_text=user_text, scheduled=scheduled, category=category,
+            user_text=user_text, absence=absence, category=category,
             settings=settings,
         )
         log.info(
@@ -425,15 +426,30 @@ _GAP_BUCKET_SECONDS: dict[str, int] = {
 _DEFAULT_GAP_BUCKET = "moderate"
 
 
+def _shape_from(alert_trigger: str, is_sustained: bool) -> str:
+    """DEPRECATED bridge: derive the legacy 3-way shape from the alerting
+    spine, so runtime that still reads `shape` stays correct until Phase B
+    migrates it off. schedule → scheduled; sustained → state; else instant."""
+    if alert_trigger == "schedule":
+        return "scheduled"
+    return "state" if is_sustained else "point_in_time"
+
+
 @dataclass(frozen=True)
 class InferredConfig:
-    shape: str                       # "point_in_time" | "state" | "scheduled"
+    # Alerting spine (2026-07-26).
+    alert_trigger: str               # "leading"|"trailing"|"duration"|"schedule"
+    is_sustained: bool               # instant vs sustained
     category: str                    # "safety" | "routine"
     icon_name: str
     sensitivity: str                 # "low" | "standard" | "high"
-    schedule: dict | None = field(default=None)  # None unless scheduled
-    # Set only for shape == "state": the rising-edge episode gap (seconds).
+    # DEPRECATED bridge, derived from (alert_trigger, is_sustained).
+    shape: str = "point_in_time"
+    schedule: dict | None = field(default=None)  # None unless alert_trigger=schedule
+    # Set only when is_sustained: the rising-edge episode gap (seconds).
     episode_gap_seconds: int | None = field(default=None)
+    # Set only when alert_trigger == "duration": the "too long" threshold.
+    duration_seconds: int | None = field(default=None)
 
 
 def _infer_meta_prompt(*, name: str | None, prompt: str) -> str:
@@ -443,27 +459,34 @@ def _infer_meta_prompt(*, name: str | None, prompt: str) -> str:
         "structured settings. Return ONLY JSON (no markdown).\n\n"
         f"Caregiver's request:\n  Name: {name or '(none given)'}\n"
         f"  What to detect: '''{prompt}'''\n\n"
-        "Decide `shape`:\n"
-        "  - 'scheduled' if the request is about whether something happens "
-        "(or FAILS to happen) within a recurring time window — e.g. "
-        "'check she takes her meds between 11am and 5pm daily', 'alert me "
-        "if she doesn't get up by 10am'. These fire on ABSENCE at a "
-        "deadline.\n"
-        "  - 'state' for an ONGOING activity that stays true for a sustained "
-        "stretch rather than happening in an instant — watching TV, sleeping, "
-        "sitting/resting, being on the phone, pacing/restlessness. We collapse "
-        "a whole session of these into ONE event, so you must also pick "
-        "'episode_gap' below.\n"
-        "  - 'point_in_time' for a momentary reactive event that happens in an "
-        "instant — a fall, leaving the house, choking, a visitor arriving.\n\n"
+        "STEP 1 — `alert_trigger`: which MOMENT does the caregiver want to be "
+        "told about?\n"
+        "  - 'leading' (the default): the moment it STARTS or happens — a "
+        "fall, choking, she starts pacing, a visitor arrives.\n"
+        "  - 'trailing': when a sustained activity ENDS — 'when she's done "
+        "eating', 'once she's finished her bath'.\n"
+        "  - 'duration': once something has gone on TOO LONG — 'if the stove's "
+        "been on more than 10 minutes', 'if she's on the floor over 5 "
+        "minutes', 'prolonged stillness'. Put the stated length in "
+        "duration_seconds.\n"
+        "  - 'schedule': tied to a CLOCK window or deadline — 'if she doesn't "
+        "take her meds by 5pm' (absent), 'confirm she ate between 11 and 2' "
+        "(present). Non-occurrence is only knowable at a deadline, so any "
+        "'doesn't / hasn't happen by <time>' request is 'schedule'.\n\n"
+        "STEP 2 — `is_sustained`: true if the thing unfolds over a stretch "
+        "(watching TV, pacing, eating, bathing, agitation, lying still); false "
+        "if it's instantaneous (a fall, choking, arriving, leaving). "
+        "'trailing' and 'duration' are always sustained.\n\n"
         "JSON fields:\n"
-        '  "shape": "point_in_time" | "state" | "scheduled"\n'
+        '  "alert_trigger": "leading" | "trailing" | "duration" | "schedule"\n'
+        '  "is_sustained": true | false\n'
+        '  "duration_seconds": integer seconds — REQUIRED when '
+        'alert_trigger="duration" (else null). Convert the stated time '
+        '("10 minutes" -> 600, "an hour" -> 3600). Null if no length is given.\n'
         '  "episode_gap": "brief" | "moderate" | "extended" | null. REQUIRED '
-        'when shape="state" (null otherwise): how long the activity must be '
-        'ABSENT before a return counts as a NEW, separate event. Pick by the '
-        'activity:\n'
-        '     - "brief" (~1 min): pacing / restlessness / agitation — a short '
-        'lull is a distinct episode.\n'
+        'when is_sustained (null otherwise): how long the activity must be '
+        'ABSENT before a return counts as a NEW, separate event.\n'
+        '     - "brief" (~1 min): pacing / restlessness / agitation.\n'
         '     - "moderate" (~5 min): eating, on the phone, reading.\n'
         '     - "extended" (~15 min): watching TV, sleeping, sitting — a brief '
         'break (e.g. a bathroom trip) should NOT split the session.\n'
@@ -474,32 +497,40 @@ def _infer_meta_prompt(*, name: str | None, prompt: str) -> str:
         'When bodily harm or a health risk is plausible, choose "safety".\n'
         '     - "routine" = everyday, non-emergency behaviour where a false '
         'alarm is merely annoying noise: watching TV, using a phone or tablet, '
-        'a visitor arriving, eating a snack, reading, sitting on the couch, '
-        'ordinary daily activity.\n'
+        'a visitor arriving, eating a snack, reading, sitting on the couch.\n'
         f'  "icon_name": one of {_ALLOWED_ICONS}\n'
         '  "sensitivity": "low" | "standard" | "high" (default "standard"). '
-        'Lower it for low-stakes routine behaviours where a false alarm is just '
-        'noise (e.g. watching TV -> "low"); raise it for high-stakes safety '
-        'events where a miss is dangerous (e.g. a fall -> "high").\n'
-        '  "schedule": null if point_in_time. If scheduled, an object:\n'
-        '     {"cadence":"daily"|"weekly",'
+        'Lower it for low-stakes routine behaviours (e.g. watching TV -> '
+        '"low"); raise it for high-stakes safety events (e.g. a fall -> '
+        '"high").\n'
+        '  "schedule": null unless alert_trigger="schedule". Else an object:\n'
+        '     {"polarity":"negative"|"positive"'
+        ' ("negative" = alert if it did NOT happen; "positive" = if it DID),'
+        ' "cadence":"daily"|"weekly",'
         ' "days_of_week":[0..6 or null] (0=Mon..6=Sun, weekly only),'
         ' "window_start":"HH:MM" 24h,'
         ' "window_end":"HH:MM",'
         ' "deadline":"HH:MM" (usually = window_end)}\n\n'
-        "IMPORTANT: leave any field you cannot confidently infer as null "
-        "(for schedule sub-fields) — do NOT guess times. The user will "
-        "fill blanks. Always pick a shape, category, icon, sensitivity."
+        "IMPORTANT: leave any TIME or DURATION you cannot confidently infer "
+        "as null — do NOT guess. The user fills blanks. Always pick "
+        "alert_trigger, is_sustained, category, icon, sensitivity."
     )
 
 
 def _coerce_inferred(raw: dict) -> InferredConfig:
     """Validate/normalize the model's JSON into an InferredConfig.
     Unknown enum values fall back to safe defaults; out-of-set icons
-    fall back to 'eye'."""
-    shape = raw.get("shape")
-    if shape not in ("point_in_time", "state", "scheduled"):
-        shape = "point_in_time"
+    fall back to 'eye'. Derives the deprecated `shape` bridge."""
+    alert_trigger = raw.get("alert_trigger")
+    if alert_trigger not in ("leading", "trailing", "duration", "schedule"):
+        alert_trigger = "leading"
+    is_sustained = bool(raw.get("is_sustained"))
+    # trailing / duration are sustained by definition; schedule is neither.
+    if alert_trigger in ("trailing", "duration"):
+        is_sustained = True
+    elif alert_trigger == "schedule":
+        is_sustained = False
+
     category = raw.get("category")
     if category not in ("safety", "routine"):
         category = "safety"
@@ -511,9 +542,10 @@ def _coerce_inferred(raw: dict) -> InferredConfig:
         icon = "eye"
 
     schedule: dict | None = None
-    if shape == "scheduled":
+    if alert_trigger == "schedule":
         s = raw.get("schedule") or {}
         cadence = s.get("cadence") if s.get("cadence") in ("daily", "weekly") else None
+        polarity = s.get("polarity") if s.get("polarity") in ("positive", "negative") else "negative"
         days = s.get("days_of_week")
         if not isinstance(days, list):
             days = None
@@ -524,6 +556,7 @@ def _coerce_inferred(raw: dict) -> InferredConfig:
             return v if isinstance(v, str) and re.fullmatch(r"\d{2}:\d{2}", v) else None
 
         schedule = {
+            "polarity": polarity,
             "cadence": cadence,
             "days_of_week": days,
             "window_start": _hhmm(s.get("window_start")),
@@ -531,21 +564,33 @@ def _coerce_inferred(raw: dict) -> InferredConfig:
             "deadline": _hhmm(s.get("deadline")),
         }
 
-    # Continuous detectors always get a gap (default bucket if the model
-    # omitted/garbled it) so a 'state' detector can never be left without a
-    # rising-edge window. None for point_in_time / scheduled.
+    # Sustained detectors always get a gap (default bucket if the model
+    # omitted/garbled it) so they can never be left without a rising-edge
+    # window. None for instant / schedule.
     episode_gap_seconds: int | None = None
-    if shape == "state":
+    if is_sustained:
         bucket = raw.get("episode_gap")
         episode_gap_seconds = _GAP_BUCKET_SECONDS.get(
             bucket if isinstance(bucket, str) else "",
             _GAP_BUCKET_SECONDS[_DEFAULT_GAP_BUCKET],
         )
 
+    # Duration threshold: only for the duration trigger; null if not stated
+    # (the review screen then prompts for it — never guessed).
+    duration_seconds: int | None = None
+    if alert_trigger == "duration":
+        d = raw.get("duration_seconds")
+        if isinstance(d, (int, float)) and d > 0:
+            duration_seconds = int(d)
+
     return InferredConfig(
-        shape=shape, category=category, icon_name=icon,
+        alert_trigger=alert_trigger,
+        is_sustained=is_sustained,
+        shape=_shape_from(alert_trigger, is_sustained),
+        category=category, icon_name=icon,
         sensitivity=sensitivity, schedule=schedule,
         episode_gap_seconds=episode_gap_seconds,
+        duration_seconds=duration_seconds,
     )
 
 

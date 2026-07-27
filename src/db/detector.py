@@ -78,6 +78,18 @@ class Detector(Base):
     door_config: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
     always_on: Mapped[bool] = mapped_column(Boolean, default=False)
 
+    # ── Alerting spine (2026-07-26) ─────────────────────────────────
+    # `alert_trigger` is which moment fires (leading/trailing/duration/
+    # schedule); `is_sustained` is the internal temporal nature. Together
+    # they replace `shape` — which is now a DEPRECATED derived bridge kept
+    # only until every runtime reader is migrated (Phase B), then dropped.
+    alert_trigger: Mapped[str] = mapped_column(String(12), default="leading")
+    is_sustained: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Duration threshold (seconds) for alert_trigger == 'duration' — the
+    # user-meaningful "has it gone on too long" bar (stove left on, on the
+    # floor too long). Distinct from episode_gap_seconds and from M-of-N.
+    duration_seconds: Mapped[int | None] = mapped_column(Integer, default=None)
+
     # ── Scheduled ("absence") detectors ─────────────────────────────
     # Null for reactive (point_in_time / state) detectors. When shape
     # == 'scheduled', holds the window the runtime scheduler evaluates:

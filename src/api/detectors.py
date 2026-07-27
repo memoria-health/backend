@@ -28,10 +28,10 @@ from src.db.session import get_sessionmaker
 from src.repos import camera_detector_repo, detector_repo, patient_repo
 from src.schemas.detector import (
     AddFromLibraryRequest,
+    AlertTrigger,
     CreateDetectorRequest,
     DetectorLibraryEntry,
     DetectorResponse,
-    DetectorShape,
     InferDetectorRequest,
     InferDetectorResponse,
     RefineDetectorRequest,
@@ -42,6 +42,7 @@ from src.services.detection import catalog, catalog_v2
 from src.services.detection.door_detection import detect_doors
 from src.services.detection.scheduling import compiler_v2
 from src.services.detector_compiler import (
+    _shape_from,
     compile_custom_detector,
     infer_detector_config,
     summarize_detector_prompt,
@@ -426,7 +427,11 @@ async def add_detectors_from_library(
             description=e.description,
             category=e.category,
             source="preset",
+            # Bridge from the catalog's shape until Phase D gives catalog
+            # entries an explicit alert_trigger.
             shape=e.shape,
+            alert_trigger="schedule" if e.shape == "scheduled" else "leading",
+            is_sustained=(e.shape == "state"),
             where_scope=e.where_scope,
             when_scope=e.when_scope,
             sensitivity="standard",
@@ -493,6 +498,9 @@ async def infer_detector(
             detail="detector_inference_unavailable",
         ) from e
     return InferDetectorResponse(
+        alert_trigger=inferred.alert_trigger,  # type: ignore[arg-type]
+        is_sustained=inferred.is_sustained,
+        duration_seconds=inferred.duration_seconds,
         shape=inferred.shape,            # type: ignore[arg-type]
         category=inferred.category,      # type: ignore[arg-type]
         icon_name=inferred.icon_name,
@@ -506,6 +514,25 @@ async def infer_detector(
             shape=str(inferred.shape), category=str(inferred.category),
         ),
     )
+
+
+def _is_absence(
+    alert_trigger: object, schedule_config: dict | ScheduleConfig | None,
+) -> bool:
+    """Whether a detector fires on ABSENCE (schedule trigger + negative
+    polarity) — the case that takes the conservative compile bias. Default
+    polarity is negative, so a schedule trigger with no explicit polarity is
+    absence. Accepts alert_trigger/polarity as either enum or raw string."""
+    if str(getattr(alert_trigger, "value", alert_trigger)) != "schedule":
+        return False
+    if schedule_config is None:
+        return True
+    pol = (
+        schedule_config.polarity
+        if isinstance(schedule_config, ScheduleConfig)
+        else schedule_config.get("polarity")
+    )
+    return str(getattr(pol, "value", pol)) != "positive"
 
 
 def _fmt_time(hhmm: str) -> str:
@@ -648,7 +675,14 @@ async def create_detector(
         description=body.description,
         category=body.category.value,
         source="custom",
-        shape=body.shape.value,
+        # Alerting spine; shape is the derived (authoritative) bridge.
+        alert_trigger=body.alert_trigger.value,
+        is_sustained=body.is_sustained,
+        duration_seconds=(
+            body.duration_seconds
+            if body.alert_trigger == AlertTrigger.duration else None
+        ),
+        shape=_shape_from(body.alert_trigger.value, body.is_sustained),
         where_scope=_scalar_where_scope(resolved_rooms),
         where_rooms=resolved_rooms,
         when_scope=body.when_scope,
@@ -664,11 +698,11 @@ async def create_detector(
         prompt_fragment=None,
         schema_json=None,
         always_on=False,
-        # Null for reactive; the evaluation window for `scheduled`.
+        # Null for reactive; the evaluation window for a schedule trigger.
         schedule_config=(
             body.schedule_config.model_dump() if body.schedule_config else None
         ),
-        # Null unless shape == 'state'; the rising-edge episode gap.
+        # Null unless sustained; the rising-edge episode gap.
         episode_gap_seconds=body.episode_gap_seconds,
     )
     await detector_repo.insert(session, det)
@@ -693,8 +727,8 @@ async def create_detector(
             name=body.name,
             description=body.description,
             user_text=body.custom_prompt,
-            scheduled=body.shape == DetectorShape.scheduled,
-            shape=body.shape.value,
+            absence=_is_absence(body.alert_trigger.value, body.schedule_config),
+            shape=det.shape,
             category=det.category,
             settings=settings,
         )
@@ -709,7 +743,7 @@ async def _compile_and_update_detector(
     name: str,
     description: str,
     user_text: str,
-    scheduled: bool,
+    absence: bool,
     shape: str,
     category: str,
     settings: Settings,
@@ -727,7 +761,7 @@ async def _compile_and_update_detector(
     try:
         compiled = await compile_custom_detector(
             name=name, description=description,
-            user_text=user_text, scheduled=scheduled, category=category,
+            user_text=user_text, absence=absence, category=category,
             settings=settings,
             identifier=identifier, refinements=refinements,
         )
@@ -795,7 +829,7 @@ async def patch_detector(
 ) -> DetectorResponse:
     fields = body.model_dump(exclude_unset=True)
     # Enum → string for the ORM string columns.
-    for k in ("category", "shape", "sensitivity"):
+    for k in ("category", "shape", "sensitivity", "alert_trigger"):
         if k in fields and fields[k] is not None:
             fields[k] = fields[k].value
     # Re-scoping rooms: keep the legacy scalar where_scope in lockstep so
@@ -811,6 +845,13 @@ async def patch_detector(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="detector_not_found",
         )
+    # Keep the derived shape bridge in lockstep when the alerting spine moves
+    # (the edge picker patches alert_trigger / is_sustained). No recompile —
+    # the detection fragment is unchanged; only the firing edge shifts.
+    if "alert_trigger" in fields or "is_sustained" in fields:
+        new_shape = _shape_from(str(det.alert_trigger), det.is_sustained)
+        if det.shape != new_shape:
+            det.shape = new_shape
     # Replace the camera assignments to match the new room set (atomic:
     # deselected rooms stop, newly-selected rooms start). Custom detectors
     # only — presets (esp. wandering) carry per-camera door_config on their
@@ -838,7 +879,7 @@ async def patch_detector(
                 name=det.name,
                 description=det.description or "Custom detector",
                 user_text=det.custom_prompt,
-                scheduled=det.shape == "scheduled",
+                absence=_is_absence(det.alert_trigger, det.schedule_config),
                 shape=det.shape,
                 category=det.category,
                 settings=settings,
@@ -892,7 +933,7 @@ async def refine_detector(
                 name=det.name,
                 description=det.description or "Custom detector",
                 user_text=det.custom_prompt,
-                scheduled=det.shape == "scheduled",
+                absence=_is_absence(det.alert_trigger, det.schedule_config),
                 category=det.category,
                 settings=settings,
                 identifier=det.identifier,
@@ -921,7 +962,7 @@ async def refine_detector(
             name=det.name,
             description=det.description or "Custom detector",
             user_text=det.custom_prompt,
-            scheduled=det.shape == "scheduled",
+            absence=_is_absence(det.alert_trigger, det.schedule_config),
             shape=det.shape,
             category=det.category,
             settings=settings,

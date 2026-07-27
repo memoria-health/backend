@@ -445,6 +445,14 @@ create table public.detectors (
   sensitivity     detector_sensitivity not null default 'standard',
   is_on           boolean not null default true,
   custom_prompt   text,                              -- only meaningful when source = 'custom'
+  -- Alerting spine (2026-07-26): which moment fires + internal temporal
+  -- nature. Replaces `shape` (deprecated bridge below, dropped after the
+  -- runtime is migrated). duration_seconds is the "too long" threshold for
+  -- alert_trigger='duration'.
+  alert_trigger   text not null default 'leading'
+                  check (alert_trigger in ('leading','trailing','duration','schedule')),
+  is_sustained    boolean not null default false,
+  duration_seconds integer,
   -- Scheduled-detector config (null for reactive detectors). Shape:
   --   { "cadence": "daily"|"weekly",
   --     "days_of_week": [0..6],     -- weekly only; 0=Mon..6=Sun
