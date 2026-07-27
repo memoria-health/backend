@@ -313,6 +313,17 @@ async def _run_livekit(
 
     reader_tasks: dict[str, asyncio.Task] = {}
 
+    @room.on("disconnected")
+    def _on_disconnected(*_a):  # noqa: ANN001
+        # RESILIENCE (2026-07-27 wifi-glitch lesson): the SDK gives up
+        # after ~10 reconnect attempts and leaves a roomless zombie —
+        # the seat provider for the whole backend, silently dead. Die
+        # instead: the supervisor restarts us in 3s, forever, and a
+        # fresh boot rebuilds LiveKit + pod client + galleries from
+        # scratch. The supervisor IS the infinite reconnection loop.
+        log.error("identity.room_disconnected — exiting for supervisor restart")
+        os._exit(1)
+
     @room.on("track_subscribed")
     def _on_sub(track, pub, participant):  # noqa: ANN001
         if track.kind != rtc.TrackKind.KIND_VIDEO:
@@ -428,6 +439,29 @@ async def _amain(args: argparse.Namespace) -> None:
             cam_names = {r.c8: r.room for r in rows}
     except Exception:                        # noqa: BLE001 — names are
         log.exception("identity.cam_names_failed")  # cosmetic; ids ok
+    async def _pod_progress_watchdog(home_ref):
+        """Frames arriving but ZERO successful pod round-trips for
+        POD_WEDGE_S ⇒ the HTTP path is wedged (poisoned pool after a
+        tunnel death, dead pod, ...) — exit; the supervisor restart
+        rebuilds the client. Complements the disconnect exit: this
+        catches the failures that DON'T fire an event."""
+        POD_WEDGE_S = 120.0
+        while True:
+            await asyncio.sleep(15.0)
+            now = time.time()
+            frames_fresh = any(
+                getattr(lp, "_raw_hud_at", 0) > now - 30
+                for lp in home_ref.cameras.values()
+            )
+            last_ok = getattr(home_ref, "last_pod_ok", None)
+            if frames_fresh and last_ok is not None and now - last_ok > POD_WEDGE_S:
+                log.error(
+                    "identity.pod_wedged — frames flowing but no pod "
+                    "success for %.0fs; exiting for supervisor restart",
+                    now - last_ok,
+                )
+                os._exit(4)
+
     home = IdentityHome(
         patient_id=patient_id,
         sam=sam,
@@ -436,6 +470,7 @@ async def _amain(args: argparse.Namespace) -> None:
         journal=EventJournal(Path("out/identity_soak")),
         cam_names=cam_names,
     )
+    home.last_pod_ok = time.time()   # watchdog baseline: boot counts
     _HOME = home
     log.info(
         "identity.up room=%s pod=%s gallery=%d refs — http://localhost:%d/",
@@ -448,6 +483,7 @@ async def _amain(args: argparse.Namespace) -> None:
         ),
         _refresh_gallery(home),
         _timeline_sampler(),
+        _pod_progress_watchdog(home),
     )
 
 

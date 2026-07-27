@@ -530,6 +530,7 @@ class CameraLoop:
                 face_cap=0,
                 detect_screens=want_screens,
             )
+            self.home.last_pod_ok = time.time()  # pod-progress watchdog feed
         self.pod_ms = (time.time() - t0) * 1000.0
         self.queue_ms = (t0 - t_q) * 1000.0  # other cameras' turn ahead of us
         # Epoch guard (2026-07-25 "born again as T13"): pod restarts
