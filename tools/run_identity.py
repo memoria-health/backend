@@ -225,8 +225,11 @@ def _mint_token(key: str, secret: str, room: str) -> str:
     )
 
 
-INTAKE_FPS = 10.0    # convert/push at most this many frames per second
-INTAKE_MAX_W = 1280  # resize cap at intake (0 = native, no resize)
+INTAKE_FPS = 15.0    # consume the stream fully (~66ms strides); the
+                     # 3fps batch decimation downstream picks evenly
+                     # from a dense ring — production value, soaked
+INTAKE_MAX_W = 0     # native at intake (Aryaman 2026-07-26: resolution
+                     # is not the cost lever; frame count is)
 MOTION_SAMPLE_S = 0.5   # motion-latch sampling cadence (CPU, ~free)
 MOTION_DIFF_THR = 3.0   # mean abs diff on a 64px gray thumbnail; static-
                         # camera noise floor is ~1-2, a person entering
@@ -461,83 +464,14 @@ def main() -> None:
     ap.add_argument("--only-cam", default="",
                     help="substring filter: subscribe ONLY matching cameras "
                          "(e.g. 9271358c to pause all others)")
-    ap.add_argument("--preset", choices=["yesterday"], default=None,
-                    help="'yesterday' = faithful replica of the 2026-07-23 "
-                         "breakthrough run: 40-frame/12fps batches, ZERO "
-                         "face/identity work, full-res frames. Use with the "
-                         "pod at NEMARA_EDGE_TRACK_W=640. One-lever baseline.")
     ap.add_argument("--port", type=int, default=8012)
-    ap.add_argument("--track-width", type=int, default=None,
-                    help="ship TRACKING batch frames at this width "
-                         "(applied AFTER --preset, so '--preset "
-                         "yesterday --track-width 640' = yesterday with "
-                         "downsampled identity shipping as the ONLY "
-                         "change). Face probes always ship full-res on "
-                         "their own path — identity quality unaffected. "
-                         "Measured 2026-07-26: cuts wire/encode ~9x but "
-                         "GPU only ~10% (EdgeTAM encodes at fixed "
-                         "internal res) — frame COUNT is the GPU lever.")
-    ap.add_argument("--queue-cap", type=int, default=None,
-                    help="SDK frame queue bound (applied AFTER --preset; "
-                         "the preset's 0=unbounded is OOM-prone on long "
-                         "runs — 2 is the production default)")
-    ap.add_argument("--batch-fps", type=float, default=None,
-                    help="in-batch frame rate (applied AFTER --preset). "
-                         "GPU cost is ~200ms x frames regardless of "
-                         "resolution, so this is THE duty-cycle lever: "
-                         "3fps ≈ 60%% of the footage-second cost of the "
-                         "preset's 12fps(→~5 effective). Trade-off is "
-                         "carry stride (330ms gaps at 3fps) — watch "
-                         "fast-walk tracking.")
-    ap.add_argument("--faces", action="store_true",
-                    help="ladder step 3a: keep the parity tracking knobs "
-                         "but re-enable out-of-band identity probes "
-                         "(face/body scoring, seat, harvest)")
     args = ap.parse_args()
-
-    if args.preset == "yesterday":
-        global INTAKE_FPS, INTAKE_MAX_W, STREAM_CAPACITY
-        from src.services.identity import loop as loop_mod
-        loop_mod.TARGET_FPS = 12.0
-        loop_mod.MAX_BATCH = 40
-        loop_mod.FACES_ENABLED = False       # zero identity work
-        loop_mod.TRACK_SEND_W = 10**9        # never downscale (full res)
-        loop_mod.ACTIVE_INTERVAL_S = 0.6
-        INTAKE_FPS = 15.0                    # consume everything (83ms strides)
-        INTAKE_MAX_W = 0                     # native resolution
-        STREAM_CAPACITY = 0                  # unbounded queue: perfectly
-        # smooth deliveries, accepted OOM risk FOR THIS TEST ONLY
-        loop_mod.CameraLoop.RING_MAX = 300   # the viewer's 20s ring — the
-        # 45-frame production ring overflowed once/session at 15fps
-        # (each overflow silently breaks the carry chain)
-        loop_mod.BATCH_MAX_SPAN_S = 1e9      # span guard OFF — the viewer
-        # has none. At native res the pod runs ~165ms/frame, so steady
-        # state is 40-frame/~7s batches; an 8s guard fires EVERY cycle
-        # and tail-ships (the exact blind-gap bug). Contiguity > latency.
-        if args.faces:
-            loop_mod.FACES_ENABLED = True    # step 3a: identity rides the
-            # proven tracking spine, out-of-band (/faces + local OSNet)
-        print(f"[preset] YESTERDAY replica: 40f/12fps, "
-              f"faces={'ON' if args.faces else 'off'}, native res, "
-              f"unbounded queue, 15fps intake", flush=True)
-
-    if args.track_width:
-        from src.services.identity import loop as loop_mod
-        loop_mod.TRACK_SEND_W = args.track_width
-        print(f"[override] tracking batches ship at {args.track_width}px "
-              f"wide (downsample-for-identity experiment, 2026-07-26)",
-              flush=True)
-    if args.batch_fps:
-        from src.services.identity import loop as loop_mod
-        loop_mod.TARGET_FPS = args.batch_fps
-        print(f"[override] in-batch frame rate {args.batch_fps}fps "
-              f"(cadence/duty experiment, 2026-07-26)", flush=True)
-    if args.queue_cap is not None:
-        STREAM_CAPACITY = args.queue_cap
-        print(f"[override] SDK frame queue capacity {args.queue_cap} "
-              f"(preset's unbounded queue OOM-killed the service after "
-              f"~10h on 2026-07-26; the replication test it served is "
-              f"long validated)", flush=True)
+    # Production config is the ONLY config (2026-07-26): every
+    # experiment flag (--preset/--faces/--track-width/--batch-fps/
+    # --queue-cap) was deleted once its winning value was baked into
+    # the constants (loop.py + the intake constants above). The
+    # experiments and their measurements live in git history and
+    # docs/plans/2026-07-26-identity-productionization.md.
 
     threading.Thread(
         target=lambda: uvicorn.run(

@@ -52,7 +52,7 @@ from src.services.identity.state import CameraState
 log = logging.getLogger(__name__)
 
 # ── Cadence + identity constants (pilot-calibration targets) ─────────
-ACTIVE_INTERVAL_S = 0.7        # batch cadence while the room is occupied
+ACTIVE_INTERVAL_S = 0.6        # batch cadence while the room is occupied
 NONPATIENT_INTERVAL_S = 4.0    # tiny scheduler v1: a camera with people
                                # but NOT the patient seat runs light —
                                # guests don't need dense tracking; the
@@ -82,27 +82,27 @@ EMPTY_INTERVAL_S = 20.0        # poll cadence for an empty room. Each
                                # (smoke 2026-07-24). 20s = worst-case
                                # pickup for a person entering an empty
                                # room, then active cadence takes over.
-BATCH_MAX_SPAN_S = 8.0         # reseed ONLY on true stalls. At 3.0 this
-                               # fired on ordinary pod latency — 39
-                               # times in minutes — and every firing
-                               # dropped the overlap seed EdgeTAM's
-                               # carry needs → THE 2026-07-24 churn.
-                               # Normal batches (incl. post-ground) are
-                               # 2-5s spans and must pass untouched.
-RESEED_SPAN_S = 3.0            # on a genuine stall, keep a window big
-                               # enough to stay dense
+# NOTE: the batch-span reseed guard was DELETED in the 2026-07-26
+# productionization. It fired on ordinary pod latency (39 times in
+# minutes at 3.0s; disabled for the entire proven soak), and every
+# firing dropped the overlap seed EdgeTAM's carry needs — THE
+# 2026-07-24 churn. Contiguity beats latency; genuinely dead intake is
+# STALE_INTAKE_S's job.
 # STABILITY IS THE PRODUCT; LATENCY IS SACRIFICIAL (Aryaman,
 # 2026-07-24): identity is ASYNC — detection ticks ride the published
-# Patient State, so tracking lag costs nothing downstream. The
-# bedroom-replica experiment (2026-07-24) showed churn is driven by
-# ROOM GEOMETRY (close-range motion), not batch shape — so production
-# runs a moderated load per camera and leans on fast re-binding:
-TARGET_FPS = 8.0               # dense enough (stride isn't the churn
-                               # driver); halves pod load vs 12
-MAX_BATCH = 24                 # spans self-regulate under load: stride
-                               # stretches toward ~300-400ms instead of
-                               # lag compounding — graceful degradation
-                               # when both rooms are occupied
+# Patient State, so tracking lag costs nothing downstream.
+TARGET_FPS = 3.0               # THE GPU-duty lever (measured
+                               # 2026-07-26: pod cost ≈ 200-250ms x
+                               # FRAMES, near-independent of
+                               # resolution). 3fps → 10-19 frame
+                               # batches, ~5s cadence, 3-5s state
+                               # freshness, 60-80% duty per occupied
+                               # room; the overnight soak held identity
+                               # with zero wrong locks at this stride
+MAX_BATCH = 40                 # ceiling only — batches self-pace to
+                               # 10-19 frames at 3fps; under multi-room
+                               # load stride stretches instead of lag
+                               # compounding (graceful degradation)
 JPEG_QUALITY = 80
 SCREEN_REFRESH_S = 120.0       # screens are furniture
 SEAT_FLOOR = 0.4               # combined-score floor to take an empty seat
@@ -127,9 +127,13 @@ FACES_ENABLED = True           # False = pure tracking (the "yesterday"
 STALE_INTAKE_S = 10.0          # no fresh frames this long → clear tracks
                                # (a dead LiveKit reader must not leave a
                                # frozen track holding the seat forever)
-TRACK_SEND_W = 640             # tracking-only batches ship at the pod's
-                               # internal track width (half the upload +
-                               # decode); face/screen batches ship full-res
+TRACK_SEND_W = 10 ** 9         # NATIVE ship resolution (Aryaman,
+                               # 2026-07-26). Measured: 640px shipping
+                               # cut wire/encode ~9x but GPU only ~10%
+                               # (EdgeTAM encodes at its own fixed
+                               # internal res) — not worth the small-
+                               # distant-person detection risk. Frame
+                               # COUNT (TARGET_FPS) is the cost lever.
 
 
 def newest_bboxes(obs: RemoteObservations) -> dict[int, tuple]:
@@ -389,10 +393,12 @@ class CameraLoop:
         self.motion_pending = True
 
     # ── intake side (called from the LiveKit consumer) ───────────────
-    # Ring depth: ~4.5s at INTAKE_FPS=10. BGR at ≤1280-wide 720p is
-    # ~2.8MB/frame → ~125MB/camera. A deeper stall CANNOT be silently
-    # absorbed — see push_frame + the batch-span guard.
-    RING_MAX = 45
+    # Ring depth: ~20s at INTAKE_FPS=15 (the production intake). The
+    # 45-frame ring overflowed roughly once per session at 15fps, and
+    # every overflow silently broke the carry chain — the churn class
+    # of 2026-07-24. ~300 native 720p BGR frames ≈ 800MB/camera peak;
+    # bounded, and the STREAM_CAPACITY=2 SDK queue caps what feeds it.
+    RING_MAX = 300
 
     def push_frame(self, ts: float, bgr: np.ndarray) -> None:
         self._next_idx += 1
@@ -476,21 +482,9 @@ class CameraLoop:
             )
         if not batch:
             return
-        # Saturation guard: when the pod falls behind, a "batch" can
-        # span many seconds — frames that far apart aren't continuity
-        # (EdgeTAM carry breaks between them → renumbering, observed
-        # live 2026-07-24). Better a clean bounded reseed than fake
-        # continuity across a gap.
-        if batch[-1][1] - batch[0][1] > BATCH_MAX_SPAN_S:
-            cutoff = batch[-1][1] - RESEED_SPAN_S
-            self._last_shipped = None
-            batch = [f for f in self.ring if f[1] >= cutoff][-MAX_BATCH:]
-            log.warning(
-                "identity.batch_span_reseed cam=%s — pod behind; shipping "
-                "newest %.1fs only", self.camera_id, RESEED_SPAN_S,
-            )
-            if not batch:
-                return
+        # (Span guard deleted 2026-07-26 — see the constants block: it
+        # broke the carry chain on ordinary latency and ran disabled
+        # through the whole proven soak. STALE_INTAKE_S owns stalls.)
         want_screens = now - self._screens_at >= SCREEN_REFRESH_S
 
         # DECOUPLED (2026-07-24): tracking batches are ALWAYS identity-
