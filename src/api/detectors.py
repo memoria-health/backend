@@ -35,9 +35,6 @@ from src.schemas.detector import (
     InferDetectorRequest,
     InferDetectorResponse,
     RefineDetectorRequest,
-    RetypeApplyRequest,
-    RetypePreviewRequest,
-    RetypePreviewResponse,
     ScheduleConfig,
     UpdateDetectorRequest,
 )
@@ -544,24 +541,6 @@ def _fires_phrase(shape: str, dims: dict, schedule: dict | None) -> str:
     return "Right away, the moment it's noticed"
 
 
-def _effective_dims_text(
-    custom_prompt: str | None, timing_instruction: str | None,
-) -> str:
-    """The text dims-classification reads: the original ask plus (if the
-    caregiver has changed the type) the latest timing directive. Folding the
-    directive in here is what keeps the re-derived shape + eventing stable
-    across every future recompile — otherwise a later semantic refine would
-    reclassify from the base prompt alone and drop the type change."""
-    base = (custom_prompt or "").strip()
-    timing = (timing_instruction or "").strip()
-    if not timing:
-        return base
-    return (
-        f"{base}\n\nHow it should alert "
-        f"(caregiver's timing/type change): {timing}"
-    )
-
-
 def _compose_plan(
     *, name: str, prompt: str, shape: str, category: str,
 ):
@@ -736,14 +715,8 @@ async def _compile_and_update_detector(
     settings: Settings,
     identifier: str | None = None,
     refinements: list[str] | None = None,
-    dims_text: str | None = None,
 ) -> None:
     """Background task: run Gemini compile + UPDATE the detector row.
-
-    `dims_text` is the text v2-dims classification reads (original ask +
-    any type/timing directive). Defaults to `user_text` — only the type-
-    change (/retype) path passes the folded text so the re-derived shape +
-    eventing survive later semantic recompiles.
 
     Owns its own AsyncSession (the request's session is gone by now).
     If compile fails, the row stays with NULL `identifier` — the
@@ -771,8 +744,7 @@ async def _compile_and_update_detector(
         # scheduler treats this custom exactly like a built-in.
         compiler_v2.validate_schema_fields(compiled.schema_json)
         dims = compiler_v2.classify_custom_dims(
-            name=name, user_text=(dims_text or user_text),
-            shape=shape, category=category,
+            name=name, user_text=user_text, shape=shape, category=category,
         )
     except compiler_v2.DetectorRejected as e:
         log.error(
@@ -872,9 +844,6 @@ async def patch_detector(
                 settings=settings,
                 identifier=det.identifier,
                 refinements=list(det.refinements or []),
-                dims_text=_effective_dims_text(
-                    det.custom_prompt, det.timing_instruction,
-                ),
             )
         )
     return _to_response(det)
@@ -958,171 +927,6 @@ async def refine_detector(
             settings=settings,
             identifier=det.identifier,
             refinements=refinements,
-            dims_text=_effective_dims_text(
-                det.custom_prompt, det.timing_instruction,
-            ),
-        )
-    )
-    return _to_response(det)
-
-
-def _schedule_deadline(schedule: dict | ScheduleConfig | None) -> str | None:
-    """The effective firing time for a scheduled detector — the explicit
-    deadline, else the window end. None if neither is set (undetermined)."""
-    if schedule is None:
-        return None
-    if isinstance(schedule, ScheduleConfig):
-        return schedule.deadline or schedule.window_end
-    return schedule.get("deadline") or schedule.get("window_end")
-
-
-@router.post(
-    "/detectors/{detector_id}/retype/preview",
-    response_model=RetypePreviewResponse,
-)
-async def preview_retype(
-    detector_id: UUID,
-    auth: CaregiverAuth,
-    body: RetypePreviewRequest,
-    session: SessionDep,
-    settings: SettingsDep,
-) -> RetypePreviewResponse:
-    """Project a plain-words TYPE/timing change WITHOUT persisting it.
-
-    Distinct from /refine (which changes WHAT the detector looks for): this
-    re-runs the same shape inference the create flow uses, over the original
-    ask + this directive, so "only alert if it's been going 10 minutes"
-    flips a point-in-time detector into a sustained one. Returns the
-    projected firing behavior; the caregiver commits it via /retype on Save.
-    Customs only — preset timing is curated."""
-    det = await detector_repo.find_by_id(
-        session, detector_id, caregiver_id=auth.id,
-    )
-    if det is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="detector_not_found",
-        )
-    if det.source != "custom" or not det.custom_prompt:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="preset_not_refinable",
-        )
-
-    combined = _effective_dims_text(det.custom_prompt, body.instruction)
-    try:
-        inferred = await infer_detector_config(
-            name=det.name, prompt=combined, settings=settings,
-        )
-    except RuntimeError as e:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="detector_preview_unavailable",
-        ) from e
-
-    shape = str(inferred.shape)
-    schedule = inferred.schedule  # dict | None
-    dims = compiler_v2.classify_custom_dims(
-        name=det.name, user_text=combined, shape=shape, category=det.category,
-    )
-    fires = _fires_phrase(shape, dims, schedule)
-    needs_schedule = shape == "scheduled" and _schedule_deadline(schedule) is None
-
-    # Did the type actually move? (so the UI can say "no change" vs a no-op).
-    changed = shape != det.shape
-    if not changed and shape == "state":
-        changed = inferred.episode_gap_seconds != det.episode_gap_seconds
-    if not changed and shape == "scheduled":
-        changed = (schedule or None) != (det.schedule_config or None)
-
-    return RetypePreviewResponse(
-        shape=shape,  # type: ignore[arg-type]  # pydantic coerces str -> enum
-        fires=fires,
-        schedule_config=ScheduleConfig(**schedule) if schedule else None,
-        episode_gap_seconds=inferred.episode_gap_seconds,
-        needs_schedule=needs_schedule,
-        changed=changed,
-    )
-
-
-@router.post(
-    "/detectors/{detector_id}/retype",
-    response_model=DetectorResponse,
-)
-async def apply_retype(
-    detector_id: UUID,
-    auth: CaregiverAuth,
-    body: RetypeApplyRequest,
-    session: SessionDep,
-    settings: SettingsDep,
-) -> DetectorResponse:
-    """Commit a previewed type change. Rewrites the scheduling contract
-    (shape + schedule_config / episode_gap_seconds), persists the raw
-    directive as `timing_instruction`, and recompiles — the identifier is
-    preserved so analyses history stays keyed, and the shape change flips
-    the compile bias (scheduled → conservative) and re-derives dims from the
-    ask + directive. What commits is the projection the caregiver previewed;
-    no second inference that could drift."""
-    det = await detector_repo.find_by_id(
-        session, detector_id, caregiver_id=auth.id,
-    )
-    if det is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="detector_not_found",
-        )
-    if det.source != "custom" or not det.custom_prompt:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="preset_not_refinable",
-        )
-
-    shape = body.shape.value
-    # A scheduled detector fires on ABSENCE by a deadline — never guess when
-    # to alarm. If the words didn't pin a time, refuse and let the UI ask the
-    # caregiver to state one (rather than silently choosing an alert time).
-    if shape == "scheduled" and _schedule_deadline(body.schedule_config) is None:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={
-                "code": "schedule_required",
-                "reason": "Add a specific time (e.g. “by 5pm”) so I "
-                "know the deadline to alert on if it doesn't happen.",
-            },
-        )
-
-    fields: dict = {
-        "shape": shape,
-        "timing_instruction": body.instruction.strip(),
-        # Only the relevant timing column is populated; the other is cleared
-        # so a shape change never leaves a stale window / gap behind.
-        "schedule_config": (
-            body.schedule_config.model_dump()
-            if shape == "scheduled" and body.schedule_config
-            else None
-        ),
-        "episode_gap_seconds": (
-            body.episode_gap_seconds if shape == "state" else None
-        ),
-    }
-    det = await detector_repo.update_partial(
-        session, detector_id, caregiver_id=auth.id, fields=fields,
-    )
-    await session.commit()
-
-    asyncio.create_task(
-        _compile_and_update_detector(
-            detector_id=det.id,
-            name=det.name,
-            description=det.description or "Custom detector",
-            user_text=det.custom_prompt,
-            scheduled=shape == "scheduled",
-            shape=shape,
-            category=det.category,
-            settings=settings,
-            identifier=det.identifier,
-            refinements=list(det.refinements or []),
-            dims_text=_effective_dims_text(
-                det.custom_prompt, det.timing_instruction,
-            ),
         )
     )
     return _to_response(det)

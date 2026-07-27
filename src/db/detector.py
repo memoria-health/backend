@@ -69,15 +69,6 @@ class Detector(Base):
     # "reset to original" stays possible.
     refinements: Mapped[list[str] | None] = mapped_column(JSONB, default=None)
 
-    # Plain-words TYPE/timing directive from /retype, distinct from the
-    # semantic refinements above (2026-07-26). Holds the caregiver's latest
-    # "how it should alert" instruction (e.g. "only alert if it's been going
-    # for 10 minutes"). Overwritten — the newest directive fully restates the
-    # timing — and appended to custom_prompt when classifying dims so the
-    # re-derived shape/eventing stay stable across future recompiles. NULL =
-    # type has never been changed post-creation.
-    timing_instruction: Mapped[str | None] = mapped_column(String(2000), default=None)
-
     # ── Wandering exit-door selection ───────────────────────────────
     # Only meaningful on the 'wandering' detector. The caregiver's choice
     # from the setup picker: {box:[x,y,w,h]|null, label, source:'vlm'|'manual',

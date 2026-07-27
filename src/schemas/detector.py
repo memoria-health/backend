@@ -103,10 +103,6 @@ class DetectorResponse(BaseModel):
     user_criteria: list[str] | None = None
     # Plain-words change requests accumulated via /refine, oldest first.
     refinements: list[str] | None = None
-    # The caregiver's latest plain-words TYPE/timing directive from /retype
-    # ("only alert if it's been going 10 min"). Distinct from `refinements`
-    # (semantic). Null = the type has never been changed post-creation.
-    timing_instruction: str | None = None
     # Wandering only: the caregiver's saved exit-door choice, so the picker can
     # pre-highlight it. {box:[x,y,w,h]|null, label, source, no_exit_door}.
     door_config: dict | None = None
@@ -243,54 +239,6 @@ class RefineDetectorRequest(BaseModel):
 
     feedback: Prompt
     preview: bool = False
-
-
-class RetypePreviewRequest(BaseModel):
-    """Body of POST /v1/detectors/{id}/retype/preview — a plain-words TYPE/
-    timing change ("only alert if it's been going for 10 minutes"). Distinct
-    from /refine (which changes WHAT it looks for): this re-derives the
-    detector's shape + timing by re-running the same inference the create
-    flow uses over the original ask + this directive. Persists nothing — the
-    caller previews the projected firing behavior, then commits via /retype."""
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    instruction: Prompt
-
-
-class RetypePreviewResponse(BaseModel):
-    """Projection of what a type change would produce — shown to the
-    caregiver BEFORE it commits. `shape` is the enum (the client owns the
-    caregiver-facing label); `fires` is the one-line plain-English firing
-    behavior. `needs_schedule` is true when the re-derivation makes it a
-    scheduled (absence) detector but no deadline could be pinned from the
-    words — the UI then asks the caregiver to state a specific time before
-    Save. `changed` is false when the instruction didn't actually alter the
-    type (so the UI can say so instead of a no-op Save)."""
-
-    model_config = ConfigDict(frozen=True)
-
-    shape: DetectorShape
-    fires: str
-    schedule_config: ScheduleConfig | None = None
-    episode_gap_seconds: int | None = None
-    needs_schedule: bool = False
-    changed: bool = True
-
-
-class RetypeApplyRequest(BaseModel):
-    """Body of POST /v1/detectors/{id}/retype — commit a previewed type
-    change. Carries the projection the caregiver saw (shape + schedule +
-    gap) so what commits is exactly what was previewed (no second inference
-    that could drift), plus the raw `instruction` (persisted as
-    `timing_instruction` and folded into future dims classification)."""
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    instruction: Prompt
-    shape: DetectorShape
-    schedule_config: ScheduleConfig | None = None
-    episode_gap_seconds: int | None = None
 
 
 class DetectorLibraryEntry(BaseModel):

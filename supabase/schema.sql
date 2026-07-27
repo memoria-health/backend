@@ -445,11 +445,6 @@ create table public.detectors (
   sensitivity     detector_sensitivity not null default 'standard',
   is_on           boolean not null default true,
   custom_prompt   text,                              -- only meaningful when source = 'custom'
-  -- Plain-words TYPE/timing directive from /retype (2026-07-26), distinct
-  -- from the semantic `refinements`. The caregiver's latest "how it should
-  -- alert" instruction; appended to custom_prompt when re-deriving shape +
-  -- eventing so the type stays stable across recompiles. NULL = unchanged.
-  timing_instruction text,
   -- Scheduled-detector config (null for reactive detectors). Shape:
   --   { "cadence": "daily"|"weekly",
   --     "days_of_week": [0..6],     -- weekly only; 0=Mon..6=Sun
