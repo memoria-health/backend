@@ -41,6 +41,7 @@ from src.services.reid.body_pipeline import (
     LABEL_UNKNOWN,
     TrackObservation,
 )
+from identity.contract import STATE_CONTRACT
 from src.services.reid.inference import IdentityResult
 
 log = logging.getLogger(__name__)
@@ -82,6 +83,10 @@ class SidecarReID:
             path=getattr(settings, "reid_trace_path", "out/track_trace.jsonl"),
         )
         self._url = settings.identity_state_url.rstrip("/")
+        token = getattr(settings, "identity_state_token", "")
+        self._auth_headers = (
+            {"Authorization": f"Bearer {token}"} if token else {}
+        )
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(STATE_TIMEOUT_S),
         )
@@ -95,11 +100,21 @@ class SidecarReID:
         if self._cache is not None and now - self._cache[0] < STATE_CACHE_S:
             return self._cache[1]
         try:
-            resp = await self._client.get(f"{self._url}/state")
+            resp = await self._client.get(
+                f"{self._url}/state", headers=self._auth_headers,
+            )
             resp.raise_for_status()
             j = resp.json()
         except Exception:  # noqa: BLE001 — fail-open by design
             log.warning("sidecar.state_unreachable url=%s", self._url)
+            return None
+        # Contract guard (gpu/identity/contract.py): a version-mismatched
+        # service reads as "no verdict", never a silent misparse.
+        if j.get("contract") != STATE_CONTRACT:
+            log.warning(
+                "sidecar.wrong_contract got=%r want=%s",
+                j.get("contract"), STATE_CONTRACT,
+            )
             return None
         if not j.get("ready"):
             return None

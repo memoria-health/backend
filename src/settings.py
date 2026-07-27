@@ -213,6 +213,10 @@ class Settings(BaseSettings):
     identity_provider: str = Field(default="legacy")
     # Base URL of the identity service (tools/run_identity.py).
     identity_state_url: str = Field(default="http://host.docker.internal:8012")
+    # Bearer token for /state (gpu/identity/contract.py). Empty = no
+    # auth (local dev, host-only traffic); production sets
+    # NEMARA_IDENTITY_TOKEN on the service and this on the backend.
+    identity_state_token: str = Field(default="")
     # Per-track motion floor for the person_motion branch gate.
     # 0.0 = parity (any present track qualifies).
     scheduler_person_motion_floor: float = Field(ge=0.0, le=1.0, default=0.0)

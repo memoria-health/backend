@@ -20,6 +20,10 @@ services:
     # All config + secrets come straight from the local .env.
     env_file: ../.env
     environment:
+      # gpu/ holds the GPU-host deployables; the backend shares exactly
+      # ONE module with that side (gpu/identity/contract.py — the
+      # versioned+authed /state seam). Mounted read-only below.
+      PYTHONPATH: "/app:/app/gpu"
       # .env points the DB at 127.0.0.1:54342 — inside the container that is
       # the container itself. Reach the host-published Supabase DB instead.
       NEMARA_DB_URL: "postgresql+asyncpg://postgres:postgres@host.docker.internal:54342/postgres"
@@ -57,6 +61,8 @@ services:
     # Bind-mount source for hot reload (uvicorn --reload watches /app/src).
     volumes:
       - ../src:/app/src
+      # The one shared module with the GPU side (identity.contract).
+      - ../gpu:/app/gpu:ro
       # Soak observability: identity-evidence frames + out/ artifacts the
       # backend writes must be readable from the host (dashboard, review).
       - ../out:/app/out

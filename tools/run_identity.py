@@ -26,13 +26,17 @@ import time
 from pathlib import Path
 from uuid import UUID
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+_repo = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_repo))
+# gpu/ holds the shared /state contract (identity.contract) — same
+# top-level module name here as on the GPU host (PYTHONPATH there).
+sys.path.insert(0, str(_repo / "gpu"))
 
 import cv2
 import livekit.api as lkapi
 import numpy as np
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from livekit import rtc
 
@@ -52,6 +56,10 @@ _HOME: IdentityHome | None = None   # set in main; read by the HTTP layer
 
 app = FastAPI()
 
+# /state auth (contract.py): empty = no auth (local dev). Production
+# sets NEMARA_IDENTITY_TOKEN on both sides of the seam.
+_STATE_TOKEN = os.environ.get("NEMARA_IDENTITY_TOKEN", "")
+
 
 @app.get("/")
 def index() -> HTMLResponse:
@@ -68,11 +76,18 @@ def index() -> HTMLResponse:
 
 
 @app.get("/state")
-def state() -> JSONResponse:
+def state(request: Request) -> JSONResponse:
+    from identity.contract import STATE_CONTRACT, auth_ok
+
+    if not auth_ok(
+        request.headers.get("authorization"), _STATE_TOKEN,
+    ):
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
     if _HOME is None:
-        return JSONResponse({"ready": False})
+        return JSONResponse({"contract": STATE_CONTRACT, "ready": False})
     seat = _HOME.seat
     return JSONResponse({
+        "contract": STATE_CONTRACT,
         "ready": True,
         "seat": None if seat is None else {
             "camera": seat.camera_id,
