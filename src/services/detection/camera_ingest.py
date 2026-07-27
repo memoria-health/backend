@@ -1115,12 +1115,41 @@ class CameraIngest:
             # feeding the real binding logic, not a primitive raw-label path.
             # The ledger runs HERE, outside label_clip's begin_tick scope, so
             # re-stamp the trace ctx or its IDEVENTs silently no-op.
+            _sidecar_mode = (
+                getattr(self._settings, "identity_provider", "legacy")
+                == "sidecar"
+            )
             trace.begin_tick(
                 cam=str(self.camera_id), tick=self._tick_counter,
-                arm=os.environ.get("NEMARA_TRACKER", "edgetam"),
+                # Honest arm label: in sidecar mode the identity arm IS
+                # the sidecar (the env var describes the pod tracker the
+                # LEGACY brain replayed through — stale here).
+                arm=(
+                    "sidecar" if _sidecar_mode
+                    else os.environ.get("NEMARA_TRACKER", "edgetam")
+                ),
                 capture_ts=_capture_ts,
             )
             identity = self._identity_lock.apply(identity, tick_mono=tick_mono)
+            # Sidecar mode: the legacy brain's per-tick latency rows
+            # don't exist, so the tracker-eval card had no tick anchor.
+            # Emit one per tick carrying the identity service's REAL
+            # measured stage timings (capture→processed lag, pod time,
+            # face-probe wire) — never the backend's ~5ms /state read
+            # masquerading as e2e. `sidecar_ms` records that overhead
+            # separately, honestly labeled. No-op when trace disabled;
+            # legacy mode keeps its own richer emission.
+            if _sidecar_mode:
+                _timing_fn = getattr(self._reid, "timing", None)
+                _t = (_timing_fn(self.camera_id) or {}) if callable(_timing_fn) else {}
+                _sidecar_ms = (time.time() - _capture_ts) * 1000.0
+                trace.latency(
+                    frames=len(identity.tracks or ()),
+                    e2e_ms=_t.get("e2e_ms", _sidecar_ms),
+                    stages={
+                        k: v for k, v in _t.items() if k != "e2e_ms"
+                    } | {"sidecar_ms": _sidecar_ms},
+                )
             # Governor heartbeat: occupancy for every camera; and when
             # THIS camera holds the seat, whether the patient was
             # actually seen this tick (other rooms escalate out of
@@ -1693,6 +1722,13 @@ class CameraIngest:
                 present_src = "reid_unavailable_llm"
             result.detector_fields["people_present_src"] = present_src
             result.detector_fields["people_count_reid"] = identity.people_count_reid
+            # The GATE verdict, stashed explicitly. Historically this
+            # key only ever arrived via the VLM provider's response
+            # fields, so with VLM off (reid_soak_only) the dashboard
+            # showed ppl=n on ticks where the patient was plainly
+            # present (live 2026-07-26). The union above is the value
+            # the tick actually gates on — record that, always.
+            result.detector_fields["people_present"] = gate_people_present
             # W3: feed the LLM's presence verdict back to the lock (one
             # tick of lag vs a 45 s grace — fine) and stash lock state.
             self._identity_lock.note_scene_presence(bool(result.people_present))

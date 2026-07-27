@@ -119,16 +119,31 @@ class DetectorWorker:
         # every RoomWorker's per-tick Re-ID pipeline shares one cache.
         # Lost on backend restart (rebuilds itself).
         self._body_gallery = CrossClipBodyGallery(settings=settings)
-        # Single Re-ID inference instance shared across every RoomWorker.
-        # The InsightFace model is lazy-singleton'd at module level so a
-        # second instance here would be wasted; we share the instance to
-        # also share the gallery cache and avoid duplicate DB reads when
-        # multiple cameras of the same patient tick concurrently.
-        self._reid = ReIDInference(
-            sessionmaker=sessionmaker,
-            settings=settings,
-            body_gallery=self._body_gallery,
-        )
+        # Single identity provider shared across every RoomWorker.
+        # "sidecar" (implementation A, 2026-07-26): per-tick identity is
+        # synthesized from the standalone identity service's /state —
+        # no in-process video reid at all. "legacy": the BodyReID brain
+        # (InsightFace is lazy-singleton'd at module level; sharing the
+        # instance also shares the gallery cache and avoids duplicate
+        # DB reads when multiple cameras tick concurrently).
+        if getattr(settings, "identity_provider", "legacy") == "sidecar":
+            from src.services.reid.sidecar import SidecarReID
+
+            self._reid = SidecarReID(
+                sessionmaker=sessionmaker,
+                settings=settings,
+                body_gallery=self._body_gallery,
+            )
+            log.info(
+                "identity provider: sidecar url=%s",
+                settings.identity_state_url,
+            )
+        else:
+            self._reid = ReIDInference(
+                sessionmaker=sessionmaker,
+                settings=settings,
+                body_gallery=self._body_gallery,
+            )
         self._rooms: dict[str, RoomWorker] = {}
         self._lock = asyncio.Lock()
         self._started = False

@@ -201,6 +201,18 @@ class Settings(BaseSettings):
     # calls — including the always-on scene call — so identity continuity
     # can be validated for ~$0. Default off; set NEMARA_REID_SOAK_ONLY=true.
     reid_soak_only: bool = Field(default=False)
+    # Identity provider (2026-07-26, implementation A): "legacy" = the
+    # in-process BodyReID brain (ReIDInference.label_clip over the tick
+    # mp4); "sidecar" = synthesize the per-tick IdentityResult from the
+    # standalone identity service's /state (the continuous seat/fusion
+    # stack) — no mp4 reid processing in the backend at all. Fail-open:
+    # an unreachable sidecar yields IdentityResult.empty() (reid_ran=
+    # False), which bypasses identity-based suppression exactly like a
+    # legacy pipeline crash. Flip back to "legacy" is a restart, not a
+    # code change.
+    identity_provider: str = Field(default="legacy")
+    # Base URL of the identity service (tools/run_identity.py).
+    identity_state_url: str = Field(default="http://host.docker.internal:8012")
     # Per-track motion floor for the person_motion branch gate.
     # 0.0 = parity (any present track qualifies).
     scheduler_person_motion_floor: float = Field(ge=0.0, le=1.0, default=0.0)
