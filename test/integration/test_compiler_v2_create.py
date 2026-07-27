@@ -35,7 +35,6 @@ async def test_measured_zero_ask_is_rejected_at_create(
             "name": "Eye twitch watch",
             "description": "eye twitching",
             "category": "safety",
-            "shape": "point_in_time",
             "custom_prompt": "alert me when her eye twitches",
         },
     )
@@ -90,7 +89,7 @@ async def test_background_compile_writes_v2_dims(
             "name": "TV too long",
             "description": "tv",
             "category": "routine",
-            "shape": "state",
+            "is_sustained": True,
             "custom_prompt": "watching tv for more than 15 minutes",
         },
     )
@@ -100,7 +99,7 @@ async def test_background_compile_writes_v2_dims(
     await detectors_api._compile_and_update_detector(
         detector_id=det_id, name="TV too long", description="tv",
         user_text="watching tv for more than 15 minutes",
-        scheduled=False, shape="state", category="routine",
+        absence=False, is_sustained=True, category="routine",
         settings=get_settings(),
     )
 

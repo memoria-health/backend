@@ -426,15 +426,6 @@ _GAP_BUCKET_SECONDS: dict[str, int] = {
 _DEFAULT_GAP_BUCKET = "moderate"
 
 
-def _shape_from(alert_trigger: str, is_sustained: bool) -> str:
-    """DEPRECATED bridge: derive the legacy 3-way shape from the alerting
-    spine, so runtime that still reads `shape` stays correct until Phase B
-    migrates it off. schedule → scheduled; sustained → state; else instant."""
-    if alert_trigger == "schedule":
-        return "scheduled"
-    return "state" if is_sustained else "point_in_time"
-
-
 @dataclass(frozen=True)
 class InferredConfig:
     # Alerting spine (2026-07-26).
@@ -443,8 +434,6 @@ class InferredConfig:
     category: str                    # "safety" | "routine"
     icon_name: str
     sensitivity: str                 # "low" | "standard" | "high"
-    # DEPRECATED bridge, derived from (alert_trigger, is_sustained).
-    shape: str = "point_in_time"
     schedule: dict | None = field(default=None)  # None unless alert_trigger=schedule
     # Set only when is_sustained: the rising-edge episode gap (seconds).
     episode_gap_seconds: int | None = field(default=None)
@@ -520,7 +509,7 @@ def _infer_meta_prompt(*, name: str | None, prompt: str) -> str:
 def _coerce_inferred(raw: dict) -> InferredConfig:
     """Validate/normalize the model's JSON into an InferredConfig.
     Unknown enum values fall back to safe defaults; out-of-set icons
-    fall back to 'eye'. Derives the deprecated `shape` bridge."""
+    fall back to 'eye'."""
     alert_trigger = raw.get("alert_trigger")
     if alert_trigger not in ("leading", "trailing", "duration", "schedule"):
         alert_trigger = "leading"
@@ -586,7 +575,6 @@ def _coerce_inferred(raw: dict) -> InferredConfig:
     return InferredConfig(
         alert_trigger=alert_trigger,
         is_sustained=is_sustained,
-        shape=_shape_from(alert_trigger, is_sustained),
         category=category, icon_name=icon,
         sensitivity=sensitivity, schedule=schedule,
         episode_gap_seconds=episode_gap_seconds,
@@ -641,13 +629,13 @@ async def infer_detector_config(
     RuntimeError if both fail (caller maps to 503)."""
     try:
         raw = await _infer_with_gemini(name=name, prompt=prompt, settings=settings)
-        log.info("detector_infer.gemini_ok name=%r shape=%s", name, raw.get("shape"))
+        log.info("detector_infer.gemini_ok name=%r trigger=%s", name, raw.get("alert_trigger"))
         return _coerce_inferred(raw)
     except Exception as gemini_err:
         log.warning("detector_infer.gemini_failed name=%r err=%s — trying openai", name, gemini_err)
     try:
         raw = await _infer_with_openai(name=name, prompt=prompt, settings=settings)
-        log.info("detector_infer.openai_ok name=%r shape=%s", name, raw.get("shape"))
+        log.info("detector_infer.openai_ok name=%r trigger=%s", name, raw.get("alert_trigger"))
         return _coerce_inferred(raw)
     except Exception as openai_err:
         log.error("detector_infer.both_failed name=%r err=%s", name, openai_err)

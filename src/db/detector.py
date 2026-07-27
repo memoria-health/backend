@@ -17,7 +17,6 @@ from src.db.base import Base
 from src.db.enums import (
     DetectorCategoryEnum,
     DetectorSensitivityEnum,
-    DetectorShapeEnum,
     DetectorSourceEnum,
 )
 
@@ -32,7 +31,6 @@ class Detector(Base):
     description: Mapped[str] = mapped_column(String(500))
     category: Mapped[str] = mapped_column(DetectorCategoryEnum)
     source: Mapped[str] = mapped_column(DetectorSourceEnum)
-    shape: Mapped[str] = mapped_column(DetectorShapeEnum)
     where_scope: Mapped[str] = mapped_column(String(80))
     when_scope: Mapped[str] = mapped_column(String(80))
     sensitivity: Mapped[str] = mapped_column(DetectorSensitivityEnum)

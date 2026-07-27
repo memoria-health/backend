@@ -42,7 +42,6 @@ from src.services.detection import catalog, catalog_v2
 from src.services.detection.door_detection import detect_doors
 from src.services.detection.scheduling import compiler_v2
 from src.services.detector_compiler import (
-    _shape_from,
     compile_custom_detector,
     infer_detector_config,
     summarize_detector_prompt,
@@ -427,9 +426,8 @@ async def add_detectors_from_library(
             description=e.description,
             category=e.category,
             source="preset",
-            # Bridge from the catalog's shape until Phase D gives catalog
+            # Derived from the catalog's shape until Phase D gives catalog
             # entries an explicit alert_trigger.
-            shape=e.shape,
             alert_trigger="schedule" if e.shape == "scheduled" else "leading",
             is_sustained=(e.shape == "state"),
             where_scope=e.where_scope,
@@ -501,7 +499,6 @@ async def infer_detector(
         alert_trigger=inferred.alert_trigger,  # type: ignore[arg-type]
         is_sustained=inferred.is_sustained,
         duration_seconds=inferred.duration_seconds,
-        shape=inferred.shape,            # type: ignore[arg-type]
         category=inferred.category,      # type: ignore[arg-type]
         icon_name=inferred.icon_name,
         sensitivity=inferred.sensitivity,  # type: ignore[arg-type]
@@ -702,7 +699,6 @@ async def create_detector(
             body.duration_seconds
             if body.alert_trigger == AlertTrigger.duration else None
         ),
-        shape=_shape_from(body.alert_trigger.value, body.is_sustained),
         where_scope=_scalar_where_scope(resolved_rooms),
         where_rooms=resolved_rooms,
         when_scope=body.when_scope,
@@ -866,13 +862,6 @@ async def patch_detector(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="detector_not_found",
         )
-    # Keep the derived shape bridge in lockstep when the alerting spine moves
-    # (the edge picker patches alert_trigger / is_sustained). No recompile —
-    # the detection fragment is unchanged; only the firing edge shifts.
-    if "alert_trigger" in fields or "is_sustained" in fields:
-        new_shape = _shape_from(str(det.alert_trigger), det.is_sustained)
-        if det.shape != new_shape:
-            det.shape = new_shape
     # Replace the camera assignments to match the new room set (atomic:
     # deselected rooms stop, newly-selected rooms start). Custom detectors
     # only — presets (esp. wandering) carry per-camera door_config on their

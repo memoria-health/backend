@@ -22,18 +22,6 @@ class DetectorSource(str, Enum):
     custom = "custom"
 
 
-class DetectorShape(str, Enum):
-    # DEPRECATED (2026-07-26): being removed. The 3-way shape munged two
-    # ideas the taxonomy separates — the alert TRIGGER (now `AlertTrigger`)
-    # and the temporal NATURE (now an internal `is_sustained` bool).
-    # `scheduled` folds into alert_trigger=schedule. Kept only until every
-    # runtime reader is migrated off it, then deleted (no interim divergence
-    # in the final state).
-    point_in_time = "point_in_time"
-    state = "state"
-    scheduled = "scheduled"
-
-
 class AlertTrigger(str, Enum):
     """USER-FACING spine (2026-07-26): which moment in the detection stream
     fires the alert. Derived from the caregiver's words; the only manual
@@ -103,15 +91,13 @@ class DetectorResponse(BaseModel):
     category: DetectorCategory
     source: DetectorSource
     # Alerting spine (2026-07-26): which moment fires. is_sustained is the
-    # internal temporal nature. shape is the DEPRECATED bridge (derived from
-    # these) kept only until the runtime is migrated off it.
+    # internal temporal nature.
     alert_trigger: AlertTrigger = AlertTrigger.leading
     is_sustained: bool = False
     # Duration threshold (seconds) for alert_trigger == duration — the
     # user-meaningful "has it gone on too long" bar. Distinct from
     # episode_gap_seconds (hysteresis) and from the internal M-of-N.
     duration_seconds: int | None = None
-    shape: DetectorShape
     where_scope: Scope
     # Rooms the detector is scoped to. None → every room (back-compat with
     # rows created before multi-room existed, and the "ALL ROOMS" default).
@@ -171,12 +157,10 @@ class CreateDetectorRequest(BaseModel):
     custom_prompt: Prompt
     description: Description = "Custom detector"
     category: DetectorCategory = DetectorCategory.safety
-    # Alerting spine (client sends the confirmed inference). shape is the
-    # deprecated bridge, derived server-side from alert_trigger + is_sustained.
+    # Alerting spine (client sends the confirmed inference).
     alert_trigger: AlertTrigger = AlertTrigger.leading
     is_sustained: bool = False
     duration_seconds: int | None = None
-    shape: DetectorShape = DetectorShape.point_in_time
     icon_name: IconName = "eye"
     where_scope: Scope = "ALL ROOMS"
     # Rooms the caregiver picked (multi-select). None / ["ALL ROOMS"] = every
@@ -228,7 +212,6 @@ class InferDetectorResponse(BaseModel):
     alert_trigger: AlertTrigger
     is_sustained: bool
     duration_seconds: int | None = None
-    shape: DetectorShape
     category: DetectorCategory
     icon_name: IconName
     sensitivity: DetectorSensitivity
@@ -255,11 +238,10 @@ class UpdateDetectorRequest(BaseModel):
     icon_name: IconName | None = None
     description: Description | None = None
     category: DetectorCategory | None = None
-    # Alerting spine (the toggle the picker sets). shape stays server-derived.
+    # Alerting spine (the toggle the picker sets).
     alert_trigger: AlertTrigger | None = None
     is_sustained: bool | None = None
     duration_seconds: int | None = None
-    shape: DetectorShape | None = None
     where_scope: Scope | None = None
     # Re-scope the detector's rooms; the endpoint replaces its camera
     # assignments to match. ["ALL ROOMS"] or null-via-omit = every room.

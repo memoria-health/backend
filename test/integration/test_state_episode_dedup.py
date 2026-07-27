@@ -32,7 +32,8 @@ async def _add_state_detector(session: AsyncSession, patient_id) -> Detector:
     det = Detector(
         id=uuid4(), patient_id=patient_id, name="Watching TV", icon_name="tv",
         description="Watching TV", category="routine", source="custom",
-        shape="state", where_scope="ALL ROOMS", when_scope="ALWAYS",
+        alert_trigger="leading", is_sustained=True,
+        where_scope="ALL ROOMS", when_scope="ALWAYS",
         sensitivity="standard", is_on=True, created_at=now, updated_at=now,
         identifier=_IDENT, prompt_fragment=None, schema_json=None,
         always_on=False, episode_gap_seconds=_GAP,

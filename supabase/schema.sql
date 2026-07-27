@@ -21,7 +21,6 @@ create type detector_source      as enum ('preset', 'custom');
 -- deadline and fires if the signal was never seen. 'state' stays in
 -- the enum for the agitation preset but is no longer offered in the
 -- create UI; everything reactive is point_in_time.
-create type detector_shape       as enum ('point_in_time', 'state', 'scheduled');
 create type detector_sensitivity as enum ('low', 'standard', 'high');
 create type review_choice        as enum ('correct', 'wrong', 'unsure');
 create type patient_state        as enum ('calm', 'critical', 'offline');
@@ -434,7 +433,6 @@ create table public.detectors (
   description     text not null,
   category        detector_category    not null,
   source          detector_source      not null,
-  shape           detector_shape       not null,
   where_scope     text not null,
   -- Multi-room intent (2026-07-26). JSON array of room names the detector
   -- is scoped to; null or ["ALL ROOMS"] = every room. where_scope stays in
