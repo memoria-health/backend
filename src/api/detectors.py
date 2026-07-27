@@ -904,18 +904,78 @@ async def refine_detector(
         )
     refinements = [*(det.refinements or []), body.feedback.strip()]
 
+    # Re-infer the alert TYPE from the original ask PLUS every refinement, so a
+    # plain-words change that implies a different trigger ("alert me when he
+    # FINISHES eating, not when he starts" -> trailing) actually moves the
+    # detector's type, not just its detection criteria. That's the whole point
+    # of NL refine being flexible. Best-effort: if the re-inference call fails
+    # we keep the current trigger rather than block the refine.
+    combined_ask = (
+        f"{det.custom_prompt}\n\nChanges the caregiver has asked for:\n"
+        + "\n".join(f"- {r}" for r in refinements)
+    )
+    try:
+        reinf = await infer_detector_config(
+            name=det.name, prompt=combined_ask, settings=settings,
+        )
+        new_trigger = str(getattr(reinf.alert_trigger, "value", reinf.alert_trigger))
+        new_sustained = bool(reinf.is_sustained)
+        new_duration = reinf.duration_seconds if new_trigger == "duration" else None
+        new_gap = reinf.episode_gap_seconds if new_sustained else None
+        new_schedule = reinf.schedule if new_trigger == "absence" else None
+        new_when = reinf.when_scope        # None if nothing usable was inferred
+        new_where_hint = reinf.where_hint  # None if no place was named
+    except Exception:  # noqa: BLE001 — trigger re-inference is best-effort
+        log.debug("refine: trigger re-inference failed; keeping current trigger", exc_info=True)
+        new_trigger = det.alert_trigger
+        new_sustained = det.is_sustained
+        new_duration = det.duration_seconds
+        new_gap = det.episode_gap_seconds
+        new_schedule = det.schedule_config
+        new_when = None
+        new_where_hint = None
+
+    # WHEN: apply the inferred window only when the model gave one; otherwise
+    # keep the detector's current window (never blow away a user-set scope).
+    when_scope = new_when if new_when else det.when_scope
+
+    # WHERE: if the caregiver named a place ("only in the kitchen"), match it to
+    # one of THIS patient's real camera rooms (exact, then a loose contains
+    # fallback). Only re-scope when it maps to an actual room, since a detector
+    # can't run where there's no camera; otherwise keep the current rooms.
+    where_rooms = det.where_rooms
+    if new_where_hint:
+        patient_rooms = (
+            await session.execute(
+                select(Camera.room).where(
+                    Camera.patient_id == det.patient_id,
+                    Camera.room.isnot(None),
+                )
+            )
+        ).scalars().all()
+        hint = new_where_hint.strip().lower()
+        match = next(
+            (r for r in patient_rooms if r and r.strip().lower() == hint), None,
+        ) or next(
+            (r for r in patient_rooms
+             if r and (hint in r.strip().lower() or r.strip().lower() in hint)),
+            None,
+        )
+        if match:
+            where_rooms = [match]
+
     # Dry-run ("Re-generate"): compile WITH this feedback applied and hand
-    # back the resulting criteria, but write nothing — no refinement stored,
-    # no row update, so the live detector keeps running its current
-    # instructions until the caregiver hits Save (a non-preview submit).
-    # Synchronous (the user is waiting), ~3-5s.
+    # back the resulting criteria + the re-inferred trigger, but write nothing
+    # — no refinement stored, no row update, so the live detector keeps running
+    # its current instructions until the caregiver hits Save.
+    # Synchronous (the user is waiting).
     if body.preview:
         try:
             compiled = await compile_custom_detector(
                 name=det.name,
                 description=det.description or "Custom detector",
                 user_text=det.custom_prompt,
-                absence=_is_absence(det.alert_trigger),
+                absence=_is_absence(new_trigger),
                 category=det.category,
                 settings=settings,
                 identifier=det.identifier,
@@ -929,14 +989,37 @@ async def refine_detector(
         criteria = await summarize_detector_prompt(
             fragment=compiled.prompt_fragment, settings=settings,
         )
-        # Return the unchanged row with the PREVIEWED criteria swapped in;
-        # persistence is skipped entirely.
-        return _to_response(det).model_copy(update={"user_criteria": criteria})
+        # Return the unchanged row with the PREVIEWED criteria + re-inferred
+        # trigger swapped in; persistence is skipped entirely.
+        return _to_response(det).model_copy(update={
+            "user_criteria": criteria,
+            "alert_trigger": AlertTrigger(new_trigger),
+            "is_sustained": new_sustained,
+            "duration_seconds": new_duration,
+            "when_scope": when_scope,
+            "where_rooms": where_rooms,
+            "where_scope": _scalar_where_scope(where_rooms),
+        })
 
+    old_rooms = det.where_rooms
     det = await detector_repo.update_partial(
         session, detector_id, caregiver_id=auth.id,
-        fields={"refinements": refinements},
+        fields={
+            "refinements": refinements,
+            "alert_trigger": new_trigger,
+            "is_sustained": new_sustained,
+            "duration_seconds": new_duration,
+            "episode_gap_seconds": new_gap,
+            "schedule_config": new_schedule,
+            "when_scope": when_scope,
+            "where_rooms": where_rooms,
+        },
     )
+    # Re-assign cameras when the NL refine re-scoped the rooms.
+    if where_rooms != old_rooms:
+        await camera_detector_repo.set_detector_rooms(
+            session, det.id, det.patient_id, where_rooms,
+        )
     await session.commit()
     asyncio.create_task(
         _compile_and_update_detector(
@@ -944,8 +1027,8 @@ async def refine_detector(
             name=det.name,
             description=det.description or "Custom detector",
             user_text=det.custom_prompt,
-            absence=_is_absence(det.alert_trigger),
-            is_sustained=det.is_sustained,
+            absence=_is_absence(new_trigger),
+            is_sustained=new_sustained,
             category=det.category,
             settings=settings,
             identifier=det.identifier,

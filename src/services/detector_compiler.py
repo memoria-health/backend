@@ -439,6 +439,12 @@ class InferredConfig:
     episode_gap_seconds: int | None = field(default=None)
     # Set only when alert_trigger == "duration": the "too long" threshold.
     duration_seconds: int | None = field(default=None)
+    # General active window (ANY trigger): "HH:MM-HH:MM" 24h or "ALWAYS".
+    # None when the model gave nothing usable (caller keeps the current value).
+    when_scope: str | None = field(default=None)
+    # A room/place the caregiver named ("kitchen"); the caller matches it to a
+    # real camera room. None if no place was named.
+    where_hint: str | None = field(default=None)
 
 
 def _infer_meta_prompt(*, name: str | None, prompt: str) -> str:
@@ -501,6 +507,15 @@ def _infer_meta_prompt(*, name: str | None, prompt: str) -> str:
         ' "window_start":"HH:MM" 24h,'
         ' "window_end":"HH:MM",'
         ' "deadline":"HH:MM" (usually = window_end)}\n\n'
+        '  "when_scope": the active window the detector should WATCH during, '
+        'as "HH:MM-HH:MM" 24h, or "ALWAYS" for any time of day. This is WHEN '
+        'it is allowed to watch (separate from the absence deadline above). '
+        '"at night" -> "22:00-06:00", "in the mornings" -> "06:00-11:00", '
+        '"during the day" -> "08:00-18:00". Use "ALWAYS" if no time of day is '
+        'implied.\n'
+        '  "where_hint": a single room or place the caregiver named, like '
+        '"kitchen", "bedroom", "living room", "bathroom", or "garage", or null '
+        'if they did not name a place. Just the place name, nothing else.\n\n'
         "IMPORTANT: leave any TIME or DURATION you cannot confidently infer "
         "as null — do NOT guess. The user fills blanks. Always pick "
         "alert_trigger, is_sustained, category, icon, sensitivity."
@@ -571,12 +586,30 @@ def _coerce_inferred(raw: dict) -> InferredConfig:
         if isinstance(d, (int, float)) and d > 0:
             duration_seconds = int(d)
 
+    # General active window (any trigger). Accept "HH:MM-HH:MM" or "ALWAYS";
+    # anything else stays None so the caller keeps the current value.
+    when_scope: str | None = None
+    ws = raw.get("when_scope")
+    if isinstance(ws, str):
+        ws = ws.strip()
+        if ws.upper() == "ALWAYS":
+            when_scope = "ALWAYS"
+        elif re.fullmatch(r"\d{2}:\d{2}-\d{2}:\d{2}", ws):
+            when_scope = ws
+
+    # A place the caregiver named; the caller matches it to a real camera room.
+    where_hint: str | None = None
+    wh = raw.get("where_hint")
+    if isinstance(wh, str) and wh.strip():
+        where_hint = wh.strip()
+
     return InferredConfig(
         alert_trigger=alert_trigger,
         is_sustained=is_sustained,
         category=category, icon_name=icon,
         sensitivity=sensitivity, schedule=schedule,
         episode_gap_seconds=episode_gap_seconds,
+        when_scope=when_scope, where_hint=where_hint,
         duration_seconds=duration_seconds,
     )
 
