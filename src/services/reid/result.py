@@ -62,6 +62,12 @@ class IdentityResult:
     people_present_reid: bool = False
     people_count_reid: int = 0
     attribution_ran: bool = False
+    # Live tracks across the WHOLE home this instant (every camera),
+    # as reported by the identity service. Drives the scheduler's
+    # crowd fallback as a GLOBAL rule (Aryaman 2026-07-27): a packed
+    # living room disables per-person crops everywhere, not just on
+    # the crowded camera. 0 when unknown.
+    people_count_home: int = 0
     # One TrackObservation per live track — the signals layer scopes
     # motion per track with these. None iff the provider didn't run
     # (timeout/crash); empty tuple = ran, no people.

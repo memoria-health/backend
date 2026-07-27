@@ -116,7 +116,13 @@ def resolve_due(
     """
     tracks = identity.tracks
     n_tracks = len(tracks) if tracks else 0
-    crowd = tracks is not None and n_tracks > settings.scheduler_crowd_fallback_tracks
+    # GLOBAL crowd rule (Aryaman 2026-07-27): the threshold applies to
+    # the WHOLE home's concurrent tracks, not this camera's — a packed
+    # room disables crop targeting everywhere. Local count still
+    # counts (a home_count of 0 from an older provider degrades to the
+    # per-camera behavior).
+    n_home = max(n_tracks, getattr(identity, "people_count_home", 0))
+    crowd = tracks is not None and n_home > settings.scheduler_crowd_fallback_tracks
 
     # A window too short to measure (frames_used < 4 ⇒ tick_signals
     # returned zeros, not readings) must FAIL OPEN: motion floors are

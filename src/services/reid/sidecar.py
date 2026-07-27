@@ -179,6 +179,14 @@ class SidecarReID:
         state = await self._state()
         if state is None:
             return IdentityResult.empty(faces_enrolled=True)
+        # Home-wide live track count (crowd fallback is a GLOBAL rule):
+        # sum across every camera, same caps as per-camera parsing.
+        home_count = 0
+        for _cam in list((state.get("cameras") or {}).values())[:_MAX_CAMERAS]:
+            try:
+                home_count += min(len(_cam.get("tracks") or {}), _MAX_TRACKS)
+            except (TypeError, AttributeError):
+                continue
         entry = self._cam_entry(state, camera_id)
         if entry is None:
             # Service is up but doesn't know this camera (yet) — no
@@ -241,6 +249,7 @@ class SidecarReID:
             people_present_reid=bool(tracks),
             people_count_reid=len(tracks),
             attribution_ran=True,
+            people_count_home=home_count,
             tracks=tuple(tracks),
             # Conservative: the sidecar's seat model has one PATIENT
             # seat and UNKNOWN others — never "verified others", so

@@ -131,3 +131,22 @@ def test_outsized_payload_is_capped_not_allocated():
     r = _label(sc)
     assert r.reid_ran is True
     assert len(r.tracks) <= sc_mod._MAX_TRACKS
+
+
+def test_home_wide_track_count_sums_all_cameras():
+    """Crowd fallback is a GLOBAL rule: the sidecar reports live
+    tracks across the WHOLE home so a packed living room disables
+    crops on every camera, not just the crowded one."""
+    state = {
+        "ready": True,
+        "seat": None,
+        "cameras": {
+            CAM_KEY: {"tracks": {"1": {"bbox": [1, 2, 3, 4]}}},
+            "3c6570af": {"tracks": {
+                str(i): {"bbox": [1, 2, 3, 4]} for i in range(5)
+            }},
+        },
+    }
+    r = _label(_sidecar(state))
+    assert r.people_count_reid == 1          # this camera
+    assert r.people_count_home == 6          # whole home

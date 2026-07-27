@@ -456,3 +456,20 @@ def test_patient_seen_here_overrides_elsewhere() -> None:
         patient_confirmed_elsewhere=True,
     )
     assert _due_idents(ds) == ["fall"]
+
+
+def test_crowd_fallback_is_home_wide_not_per_camera() -> None:
+    """GLOBAL crowd rule (2026-07-27): one track on THIS camera but six
+    live across the home ⇒ crowd mode here too — per-person crops
+    disabled everywhere, every detector still runs full-scene."""
+    from dataclasses import replace
+
+    identity = replace(_identity((_track(1),)), people_count_home=6)
+    ds = resolve_due(
+        [_entry("medication", bucket="person"), _entry("fall")],
+        signals=_signals(), identity=identity,
+        settings=_settings(), tick_index=0,
+    )
+    assert ds.crowd_fallback is True
+    assert all(d.target_track_ids is None for d in ds.due)
+    assert len(ds.due) == 2
