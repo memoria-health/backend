@@ -75,16 +75,15 @@ _SAM3_STRIDE = max(1, int(os.environ.get("NEMARA_SAM3_STRIDE", "1")))
 # the sole existence authority; a sticky-mask phantom dies at the next
 # ground (≤reground_every ticks) when the grounder finds nobody there.
 
-# Grounder selection: "sam3" = concept-prompted masks (the original);
-# "yoloseg" (2026-07-25, active) = YOLO26-seg person MASKS seed EdgeTAM
-# via the exact same mask-IoU remap + add_new_mask path as SAM3 — same
-# matching currency, ~140ms vs SAM3's ~10s fresh look; "yolo"
-# (2026-07-24, retired) = person BOXES seed EdgeTAM — failed live
-# because rectangles are the wrong matching currency for adjacent
-# people (40-60% box overlap where silhouettes share ~5%), kept for
-# reference. SAM3 stays fully intact for switch-back and still runs
-# the screens concept pass regardless. Grounder failures (detector
-# dead, det-only weights) fall back to SAM3 per-tick.
+# Grounder selection: "sam3" (production — Aryaman's 2026-07-26
+# verdict after yoloseg fragmented a recumbent person into two
+# instances); "yoloseg" = YOLO26-seg person MASKS seed EdgeTAM via the
+# exact same mask-IoU remap + add_new_mask path — same matching
+# currency, ~140ms vs SAM3's ~2.4s fresh look — switchable pending a
+# containment-dedup pass. (A third mode that seeded BOXES was deleted
+# 2026-07-26: rectangles are the wrong matching currency for adjacent
+# people — 40-60% box overlap where silhouettes share ~5%; it swapped
+# ids live.) Grounder failures fall back to SAM3 per-tick.
 _GROUNDER = os.environ.get("NEMARA_GROUNDER", "sam3").strip().lower()
 
 
@@ -119,44 +118,6 @@ def _iou(a: np.ndarray, b: np.ndarray) -> float:
     inter = np.logical_and(a, b).sum()
     union = np.logical_or(a, b).sum()
     return float(inter) / float(union) if union else 0.0
-
-
-def _box_iou(a, b) -> float:
-    """IoU of two xyxy boxes (pure)."""
-    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
-    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
-    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
-    inter = iw * ih
-    if inter <= 0.0:
-        return 0.0
-    area_a = (a[2] - a[0]) * (a[3] - a[1])
-    area_b = (b[2] - b[0]) * (b[3] - b[1])
-    return inter / max(1e-9, area_a + area_b - inter)
-
-
-def remap_boxes_to_ids(
-    boxes: list, carried_bboxes: "dict[int, tuple]", next_id: int,
-    iou_floor: float,
-) -> "tuple[dict[int, tuple], int]":
-    """Map fresh grounder boxes onto persistent ids by box-IoU against
-    the carried masks' bboxes — same contract as the SAM3 mask remap:
-    best overlap ≥ floor keeps the id, otherwise a new id. Pure."""
-    out: "dict[int, tuple]" = {}
-    used: set = set()
-    for bx in boxes:
-        best_id, best = None, iou_floor
-        for pid, pb in carried_bboxes.items():
-            if pid in used:
-                continue
-            i = _box_iou(bx, pb)
-            if i > best:
-                best_id, best = pid, i
-        if best_id is None:
-            best_id = next_id
-            next_id += 1
-        used.add(best_id)
-        out[best_id] = tuple(bx[:4])
-    return out, next_id
 
 
 def _mask_bbox(m: np.ndarray):
@@ -314,33 +275,6 @@ class CameraSession:
                 ms.append(m)
         return self._remap_masks(ms)
 
-    # ── YOLO box grounding (NEMARA_GROUNDER=yolo, 2026-07-24) ─────
-    def _ground_yolo(self, frames):
-        """Person boxes from YOLO26 seed EdgeTAM directly (~40ms vs
-        SAM3's ~10s fresh look). Returns {id: ("box", xyxy_trackres)}
-        or None (detector dead → caller falls back to SAM3)."""
-        from perception import person_trigger
-
-        dets = person_trigger.person_boxes(frames[0])
-        if dets is None:
-            return None
-        h, w = frames[0].shape[:2]
-        _tw, _th, scale = _track_dims(w, h)
-        s = scale if scale else 1.0
-        boxes = [
-            (x1 * s, y1 * s, x2 * s, y2 * s)
-            for x1, y1, x2, y2, _c in dets
-        ]
-        carried = {}
-        for pid, pm in self.last_masks.items():
-            bb = _mask_bbox(pm)
-            if bb is not None:
-                carried[pid] = bb
-        seeded, self.next_id = remap_boxes_to_ids(
-            boxes, carried, self.next_id, _REMAP_IOU,
-        )
-        return {tid: ("box", bx) for tid, bx in seeded.items()}
-
     # ── EdgeTAM propagation (every tick) ───────────────────────────
     def _propagate(self, frames, seed) -> "dict[int, dict]":
         import cv2
@@ -362,15 +296,12 @@ class CameraSession:
                 "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available(),
             ):
                 state = edge.init_state(tmp)
+                # Seeds are ALWAYS masks — the one matching currency
+                # (SAM3 concept masks or YOLO-seg retina masks; the
+                # 2026-07-24 box-prompt path was deleted with its
+                # grounder: rectangles were the wrong currency for
+                # adjacent people).
                 for tid, m in seed.items():
-                    if isinstance(m, tuple) and m[0] == "box":
-                        # YOLO-ground seed: EdgeTAM builds the mask
-                        # from a box prompt (track-res coords).
-                        edge.add_new_points_or_box(
-                            state, frame_idx=0, obj_id=int(tid),
-                            box=np.asarray(m[1], dtype=np.float32),
-                        )
-                        continue
                     edge.add_new_mask(
                         state, frame_idx=0, obj_id=int(tid),
                         mask=torch.from_numpy(
@@ -500,15 +431,6 @@ class CameraSession:
                     )
                 else:
                     mode = "ground_ys"
-            elif _GROUNDER == "yolo":
-                seed = self._ground_yolo(frames)
-                if seed is None:
-                    log.warning(
-                        "continuous.yolo_ground_failed cam=%s tick=%d "
-                        "— SAM3 fallback", self.camera_id, self.tick,
-                    )
-                else:
-                    mode = "ground_y"
             if seed is None:
                 seed = self._ground(frames, person_thr, sam_pred)
             self.last_ground = self.tick

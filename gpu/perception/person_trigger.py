@@ -52,10 +52,7 @@ def _load():
 def person_boxes(bgr) -> "Optional[list]":
     """Person boxes [(x1,y1,x2,y2,conf), ...] on one BGR frame, or
     None if the detector is unavailable (callers treat None as 'no
-    signal'). Used by the trigger (counts) and, since 2026-07-24, by
-    YOLO-grounding (NEMARA_GROUNDER=yolo) as the box source that seeds
-    EdgeTAM — SAM3's fresh-look monopoly was the 30-50s new-person
-    latency."""
+    signal'). Feeds the reground trigger's counts."""
     global _dead
     if _dead:
         return None
