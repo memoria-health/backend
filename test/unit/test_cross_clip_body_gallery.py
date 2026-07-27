@@ -27,7 +27,7 @@ from uuid import uuid4
 import numpy as np
 import pytest
 
-from src.services.reid.cross_clip_body_gallery import (
+from identity.gallery import (
     LABEL_OTHER,
     LABEL_PATIENT,
     CrossClipBodyGallery,
@@ -275,7 +275,7 @@ def test_other_pool_has_shorter_ttl(monkeypatch) -> None:
     pid = uuid4()
     t = {"now": 1000.0}
     monkeypatch.setattr(
-        "src.services.reid.cross_clip_body_gallery.time",
+        "identity.gallery.time",
         SimpleNamespace(monotonic=lambda: t["now"]),
     )
     g.harvest(patient_id=pid, embedding=_unit(0), label=LABEL_PATIENT, confidence=0.6)

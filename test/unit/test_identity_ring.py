@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from src.services.identity.loop import CameraLoop
+from identity.loop import CameraLoop
 
 
 def _spine() -> CameraLoop:

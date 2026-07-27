@@ -1,4 +1,4 @@
-"""SidecarReID — implementation A adapter (2026-07-26).
+"""IdentityClient — implementation A adapter (2026-07-26).
 
 The adapter's whole job: translate the identity service's /state into
 the exact IdentityResult shape the TrackLedger can bind from, and
@@ -13,14 +13,14 @@ from uuid import UUID
 
 import pytest
 
-from src.services.reid.sidecar import SidecarReID
+from src.services.reid.identity_client import IdentityClient
 
 CAM = UUID("9271358c-0000-4000-8000-000000000000")
 CAM_KEY = "9271358c"
 
 
 def _sidecar(state):
-    sc = SidecarReID(settings=SimpleNamespace(
+    sc = IdentityClient(settings=SimpleNamespace(
         identity_state_url="http://x:1", identity_provider="sidecar",
     ))
 
@@ -124,7 +124,7 @@ def test_label_clip_never_raises_on_garbage_state():
 
 
 def test_outsized_payload_is_capped_not_allocated():
-    from src.services.reid import sidecar as sc_mod
+    from src.services.reid import identity_client as sc_mod
 
     tracks = {str(i): {"bbox": [1, 2, 3, 4]} for i in range(500)}
     sc = _sidecar(_state(tracks=tracks))

@@ -27,7 +27,7 @@ import logging
 import httpx
 import numpy as np
 
-from src.services.reid.remote_replay import RemoteFaceObs, RemoteObservations
+from identity.wire import RemoteFaceObs, RemoteObservations
 
 log = logging.getLogger(__name__)
 

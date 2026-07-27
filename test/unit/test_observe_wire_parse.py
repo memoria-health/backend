@@ -9,7 +9,7 @@ identity service's loop.
 
 import pytest
 
-from src.services.reid.sam_client import _parse_observe
+from identity.pod_client import _parse_observe
 
 import numpy as np
 

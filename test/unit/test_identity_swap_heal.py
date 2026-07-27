@@ -9,7 +9,7 @@ on silence, never on a single frame (the caller demands consecutive
 rounds).
 """
 
-from src.services.identity.seat import (
+from identity.seat import (
     Candidate,
     Seat,
     heal_seat,

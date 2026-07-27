@@ -25,7 +25,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 
-from src.services.identity.scoring import face_conf
+from identity.scoring import face_conf
 
 WINDOW = 12          # sightings remembered per track
 TOP_K = 3            # best-K aggregation (an outlier needs K-1 friends)

@@ -23,7 +23,7 @@ PORT="${NEMARA_IDENTITY_PORT:-8012}"
 
 echo "$(date -u +%FT%TZ) identity supervisor: start room=$ROOM port=$PORT" >> "$LOG"
 while true; do
-  uv run --directory "$REPO" python tools/run_identity.py \
+  uv run --directory "$REPO" python gpu/identity/service.py \
     --room "$ROOM" --port "$PORT" >> "$LOG" 2>&1
   echo "$(date -u +%FT%TZ) identity supervisor: service exited rc=$? — restart in 3s" >> "$LOG"
   sleep 3

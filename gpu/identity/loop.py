@@ -26,28 +26,28 @@ from uuid import UUID
 import cv2
 import numpy as np
 
-from src.services.reid.cross_clip_body_gallery import (
+from identity.gallery import (
     LABEL_PATIENT,
     CrossClipBodyGallery,
 )
-from src.services.reid.body_embeddings import extract_body_embedding
-from src.services.reid.display_veto import ScreenMap, apply_veto
-from src.services.reid.embeddings import topk_mean_cosine_match
-from src.services.reid.remote_replay import RemoteObservations
-from src.services.reid.sam_client import SamServiceClient
-from src.services.identity.batching import plan_batch
-from src.services.identity.fusion import SightingHistory
-from src.services.identity.harvest import harvest_eligible
-from src.services.identity.scoring import body_conf, face_conf
-from src.services.identity.journal import EventJournal
-from src.services.identity.seat import (
+from identity.body_embeddings import extract_body_embedding
+from identity.display_veto import ScreenMap, apply_veto
+from identity.matching import topk_mean_cosine_match
+from identity.wire import RemoteObservations
+from identity.pod_client import SamServiceClient
+from identity.batching import plan_batch
+from identity.fusion import SightingHistory
+from identity.harvest import harvest_eligible
+from identity.scoring import body_conf, face_conf
+from identity.journal import EventJournal
+from identity.seat import (
     Candidate,
     Seat,
     heal_seat,
     notary_contradiction,
     update_seat,
 )
-from src.services.identity.state import CameraState
+from identity.state import CameraState
 
 log = logging.getLogger(__name__)
 
@@ -236,7 +236,7 @@ class IdentityHome:
         JPEG writes must never sit inside the hot mutex)."""
         if self.journal is None or old == new:
             return
-        from src.services.identity.journal import annotate
+        from identity.journal import annotate
 
         if new is not None and (old is None or old.key != new.key):
             kind = "seat_locked" if old is None else "seat_moved"
@@ -560,7 +560,7 @@ class CameraLoop:
             # Unsupervised-soak journal: every birth/death, with the
             # picture — and the box of the track in question drawn on
             # it (image EVIDENCE, not a scene photo).
-            from src.services.identity.journal import annotate
+            from identity.journal import annotate
 
             snap = batch[-1][2]
             live_ctx = [

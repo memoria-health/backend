@@ -6,7 +6,7 @@ discarded (wrong-person assignment is the failure identity exists to
 prevent).
 """
 
-from src.services.identity.loop import _assign_face
+from identity.loop import _assign_face
 
 
 def test_t20_replay_no_single_track_shortcut():

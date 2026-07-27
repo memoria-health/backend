@@ -10,8 +10,8 @@ multi-person harvesting simply doesn't exist.
 
 from __future__ import annotations
 
-from src.services.identity.harvest import harvest_eligible
-from src.services.identity.seat import Seat
+from identity.harvest import harvest_eligible
+from identity.seat import Seat
 
 MIN_AGE = 3.0
 

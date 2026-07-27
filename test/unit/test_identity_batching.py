@@ -9,7 +9,7 @@ previous batch's final frame (the carry-seed overlap).
 
 from __future__ import annotations
 
-from src.services.identity.batching import plan_batch
+from identity.batching import plan_batch
 
 
 def _frames(n: int, fps: float = 15.0, t0: float = 100.0):

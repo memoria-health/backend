@@ -8,7 +8,7 @@ Two plausible candidates on an empty seat → lock neither.
 
 from __future__ import annotations
 
-from src.services.identity.seat import Candidate, update_seat
+from identity.seat import Candidate, update_seat
 
 FLOOR = 0.5
 DELTA = 0.1

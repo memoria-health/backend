@@ -60,7 +60,7 @@ _MAX_CAMERAS = 32
 _MAX_TRACKS = 64
 
 
-class SidecarReID:
+class IdentityClient:
     """`label_clip`-compatible provider backed by the identity service.
 
     Constructor kwargs mirror `ReIDInference` (worker.py and tests

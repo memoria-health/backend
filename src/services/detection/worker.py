@@ -37,7 +37,7 @@ from sqlalchemy import select, text
 
 from src.db.camera import Camera
 from src.db.session import get_engine
-from src.services.reid.sidecar import SidecarReID
+from src.services.reid.identity_client import IdentityClient
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncConnection, async_sessionmaker
@@ -117,7 +117,7 @@ class DetectorWorker:
         # GPU-host identity service's /state; the backend does zero
         # video identity processing. Fail-open on an unreachable
         # service is the sidecar's contract.
-        self._reid = SidecarReID(
+        self._reid = IdentityClient(
             sessionmaker=sessionmaker,
             settings=settings,
         )

@@ -26,11 +26,9 @@ import time
 from pathlib import Path
 from uuid import UUID
 
-_repo = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_repo))
-# gpu/ holds the shared /state contract (identity.contract) — same
-# top-level module name here as on the GPU host (PYTHONPATH there).
-sys.path.insert(0, str(_repo / "gpu"))
+_repo = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_repo))          # src.* (DB/repos/settings)
+sys.path.insert(0, str(_repo / "gpu"))  # identity.* (this package)
 
 import cv2
 import livekit.api as lkapi
@@ -42,11 +40,11 @@ from livekit import rtc
 
 from src.db.session import get_sessionmaker
 from src.repos import face_embedding_repo
-from src.services.reid.cross_clip_body_gallery import CrossClipBodyGallery
-from src.services.reid.embeddings import embedding_from_bytes
-from src.services.reid.sam_client import SamServiceClient
-from src.services.identity.journal import EventJournal
-from src.services.identity.loop import CameraLoop, IdentityHome
+from identity.gallery import CrossClipBodyGallery
+from identity.matching import embedding_from_bytes
+from identity.pod_client import SamServiceClient
+from identity.journal import EventJournal
+from identity.loop import CameraLoop, IdentityHome
 from src.settings import get_settings
 
 log = logging.getLogger("run_identity")

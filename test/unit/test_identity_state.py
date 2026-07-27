@@ -8,7 +8,7 @@ clears departed masks). Solo = exactly one live track on the camera.
 
 from __future__ import annotations
 
-from src.services.identity.state import CameraState
+from identity.state import CameraState
 
 
 def _batch(tracks: dict[int, tuple[float, float, float, float]]):

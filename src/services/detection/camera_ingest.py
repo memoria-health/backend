@@ -79,7 +79,7 @@ from src.services.detection.registry import (
 from src.services.detection.state_machine import apply_tick_update
 from src.repos.face_embedding_repo import has_ready_enrollment
 from src.services.reid.result import IdentityResult
-from src.services.reid.sidecar import SidecarReID
+from src.services.reid.identity_client import IdentityClient
 from src.services.data_collection.gate import should_collect
 from src.services.data_collection.session import RecorderCtx
 
@@ -192,7 +192,7 @@ class CameraIngest:
         motion_cache: MotionCache,
         patient_presence: "PatientPresence | None" = None,
         settings: "Settings",
-        reid: SidecarReID,
+        reid: IdentityClient,
         livekit_identity: str | None = None,
         recorder: "RecorderManager | None" = None,
     ) -> None:

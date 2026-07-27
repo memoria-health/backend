@@ -11,7 +11,7 @@ import asyncio
 from types import SimpleNamespace
 
 from identity.contract import STATE_CONTRACT, auth_ok
-from src.services.reid.sidecar import SidecarReID
+from src.services.reid.identity_client import IdentityClient
 
 
 def test_auth_disabled_when_no_token_configured():
@@ -48,7 +48,7 @@ class _Client:
 
 
 def _sidecar(payload, token=""):
-    sc = SidecarReID(settings=SimpleNamespace(
+    sc = IdentityClient(settings=SimpleNamespace(
         identity_state_url="http://x:1", identity_provider="sidecar",
         identity_state_token=token,
     ))

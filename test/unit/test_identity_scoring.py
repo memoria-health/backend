@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.services.identity.scoring import body_conf, combine, face_conf
+from identity.scoring import body_conf, combine, face_conf
 
 
 def test_face_conf_zero_below_pixel_floor():

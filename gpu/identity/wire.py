@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from src.services.reid.embeddings import FaceHit
+from identity.matching import FaceHit
 
 log = logging.getLogger(__name__)
 

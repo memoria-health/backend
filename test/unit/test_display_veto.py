@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from src.services.reid.display_veto import ScreenMap, apply_veto, containment
-from src.services.reid.remote_replay import RemoteObservations
+from identity.display_veto import ScreenMap, apply_veto, containment
+from identity.wire import RemoteObservations
 
 # The measured geometry from the 2026-07-21 8:44 incident: laptop
 # screen region ~[626,163,707,222]; phantom screen-person inside it

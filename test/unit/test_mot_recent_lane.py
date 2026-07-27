@@ -18,7 +18,7 @@ from uuid import uuid4
 
 import numpy as np
 
-from src.services.reid.cross_clip_body_gallery import (
+from identity.gallery import (
     LABEL_PATIENT,
     CrossClipBodyGallery,
 )

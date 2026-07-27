@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from src.services.identity.loop import EMPTY_POLL_FRAMES, CameraLoop
+from identity.loop import EMPTY_POLL_FRAMES, CameraLoop
 
 
 class _SamSpy:
@@ -52,7 +52,7 @@ def test_still_empty_room_skips_pod_entirely():
 
 
 def test_motion_poll_ships_handful_and_consumes_latch(monkeypatch):
-    import src.services.identity.loop as loop_mod
+    import identity.loop as loop_mod
 
     monkeypatch.setattr(loop_mod.time, "time", lambda: 1003.0)
     sam = _SamSpy()
@@ -65,7 +65,7 @@ def test_motion_poll_ships_handful_and_consumes_latch(monkeypatch):
 
 
 def test_pod_error_keeps_latch_armed(monkeypatch):
-    import src.services.identity.loop as loop_mod
+    import identity.loop as loop_mod
 
     monkeypatch.setattr(loop_mod.time, "time", lambda: 1003.0)
 

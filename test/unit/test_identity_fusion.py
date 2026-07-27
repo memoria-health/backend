@@ -11,9 +11,9 @@ The replay tests below use the ACTUAL numbers from both incidents'
 logs; the seat/harvest tests pin the gating defenses.
 """
 
-from src.services.identity.fusion import SightingHistory
-from src.services.identity.harvest import harvest_eligible
-from src.services.identity.seat import Candidate, Seat, update_seat
+from identity.fusion import SightingHistory
+from identity.harvest import harvest_eligible
+from identity.seat import Candidate, Seat, update_seat
 
 # T11's real sightings, 17:57-17:58 log (walk-around: genuine faces
 # interleaved with back-of-head detections the mean-fusion choked on).
@@ -181,7 +181,7 @@ def test_contested_position_is_nobodys_evidence():
     # the aunt, his face landed inside HER box's crop, and the hit was
     # credited to her track. A face position inside more than one
     # track's (padded) box must be discarded — whoever's crop found it.
-    from src.services.identity.loop import _contested
+    from identity.loop import _contested
     overlapped = [(1, 0, 0, 100, 200), (2, 30, 20, 130, 220)]
     assert _contested(60.0, 60.0, overlapped, own=2) is True
     assert _contested(60.0, 60.0, overlapped, own=1) is True

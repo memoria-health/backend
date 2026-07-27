@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from src.services.identity.seat import Seat
+from identity.seat import Seat
 
 
 def harvest_eligible(
