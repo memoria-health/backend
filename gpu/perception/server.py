@@ -37,7 +37,7 @@ import time
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Request
 from fastapi.responses import JSONResponse
 
 from perception.face_worker import FaceWorker
@@ -191,6 +191,7 @@ def _observe_sync(
     face_cap: int,
     detect_screens: bool = False,
     camera_id: str = "default",
+    client_stamp: str = "UNSTAMPED",
 ) -> dict:
     """The whole perception pass, run in a worker thread under
     `_perception_lock` so /health stays responsive while SAM grinds
@@ -431,9 +432,10 @@ def _observe_sync(
             "screen_regions": screen_regions,
         }
         log.info(
-            "perception.observe frames=%d tracks=%d dets=%d max_prob=%.2f "
+            "perception.observe client=%s frames=%d tracks=%d dets=%d max_prob=%.2f "
             "face_attempts=%d faces=%d | decode=%.0fms sam=%.0fms "
             "face=%.0fms total=%.0fms",
+            client_stamp,
             len(decoded), len(rows_by_track), det_count, max_prob,
             face_attempts, faces_found, decode_ms, sam_ms, face_ms_total,
             total_ms,
@@ -537,6 +539,7 @@ async def faces(
 
 @app.post("/observe")
 async def observe(
+    request: Request,
     frames: list[UploadFile] = File(...),
     person_thr: float = Form(0.4),
     face_interval: int = Form(5),
@@ -585,9 +588,10 @@ async def observe(
                 continue
             named_jpegs.append((orig_idx, raw))
 
+        client_stamp = request.headers.get("x-nemara-client", "UNSTAMPED")
         payload = await asyncio.to_thread(
             _observe_sync, named_jpegs, person_thr, face_interval, face_cap,
-            bool(detect_screens), camera_id,
+            bool(detect_screens), camera_id, client_stamp,
         )
     finally:
         global _last_request_ts
