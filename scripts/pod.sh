@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────
-# pod.sh — RunPod GPU lifecycle for the EdgeTAM-continuous sam_service.
+# pod.sh — RunPod GPU lifecycle for the EdgeTAM-continuous perception.
 #
 # ONE controlled entry point for spinning the perception pod up/down and
 # shipping code to it, so another engineer can operate it without
@@ -13,7 +13,7 @@
 #   scripts/pod.sh start             # resume a STOPPED pod (billing on)
 #   scripts/pod.sh stop              # stop the pod (billing off, disk kept)
 #   scripts/pod.sh ssh "<cmd>"       # run a command on the pod
-#   scripts/pod.sh deploy            # ship sam_service/ + relaunch server
+#   scripts/pod.sh deploy            # ship perception/ + relaunch server
 #   scripts/pod.sh logs [N]          # tail N lines of the sam server log
 #   scripts/pod.sh health            # recent continuous.tick cadence
 #
@@ -81,8 +81,8 @@ case "${1:-}" in
     # Ship the live perception code and relaunch the supervisor on the
     # edgetam venv (one env hosts sam2 + sam3 + faces). Mirrors
     # scripts/deploy_continuous_remote.sh, kept here so deploy is one cmd.
-    echo "shipping sam_service/ -> pod ..."
-    tar czf - -C "$HERE" sam_service 2>/dev/null \
+    echo "shipping perception/ -> pod ..."
+    tar czf - -C "$HERE/gpu" perception 2>/dev/null \
       | "${SSHC[@]}" "cd /workspace/nemara && tar xzf - && echo shipped" \
       2>&1 | grep -viE "Warning: Permanently added|post-quantum|store now"
     echo "relaunching continuous supervisor ..."

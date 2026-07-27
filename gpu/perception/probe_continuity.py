@@ -12,7 +12,7 @@ Answers two questions for the track-anchored identity design review:
      screen region while the real patient falls OUTSIDE?
 
 Run on the pod:
-  cd /workspace/nemara && python sam_service/probe_continuity.py \
+  cd /workspace/nemara && python perception/probe_continuity.py \
       out/ab_clips/probe_frames /workspace/probe_out
 
 Writes results.json + viz jpgs to the output dir. Delete after the
@@ -35,7 +35,7 @@ import numpy as np
 sys.path.insert(0, "/workspace/sam3")
 sys.path.insert(0, "/workspace/nemara")
 
-from sam_service import sam_track  # noqa: E402
+from perception import sam_track  # noqa: E402
 
 CKPT = os.environ.get(
     "NEMARA_SAM_CKPT", "/workspace/nemara/models/sam3.1_multiplex.pt",

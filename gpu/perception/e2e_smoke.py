@@ -13,7 +13,7 @@ frame COUNT is what drives latency, so the numbers are comparable
 even though wall-span differs.
 
 Run: PYTHONPATH=/workspace/sam3:/workspace/nemara \
-     python sam_service/e2e_smoke.py
+     python perception/e2e_smoke.py
 """
 import asyncio
 import glob

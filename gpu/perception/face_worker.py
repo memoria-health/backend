@@ -29,7 +29,7 @@ import time
 
 import numpy as np
 
-log = logging.getLogger("sam_service.face_worker")
+log = logging.getLogger("perception.face_worker")
 
 
 def _real_provider(app) -> str | None:

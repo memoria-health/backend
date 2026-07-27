@@ -21,7 +21,7 @@ if [ -f "$PIDFILE" ]; then
   rm -f "$PIDFILE"
   sleep 1
 fi
-pkill -f 'uvicorn sam_servic[e]' 2>/dev/null
+pkill -f 'uvicorn perceptio[n]' 2>/dev/null
 for i in $(seq 1 20); do
   ss -tlnp 2>/dev/null | grep -q ':8000 ' || break
   sleep 1
@@ -39,7 +39,7 @@ export SAM_RECYCLE_IDLE_S=${SAM_RECYCLE_IDLE_S:-300}
 setsid nohup bash -c '
   echo $$ > /workspace/sam_supervisor.pid
   while true; do
-    uvicorn sam_service.server:app --host 127.0.0.1 --port 8000 \
+    uvicorn perception.server:app --host 127.0.0.1 --port 8000 \
       --timeout-keep-alive 75 \
       >> /workspace/sam_server.log 2>&1
     echo "$(date -u +%FT%TZ) supervisor: server exited rc=$? — restart in 3s" \

@@ -9,7 +9,7 @@
 #
 #   scripts/pod.sh ssh "bash -s" < scripts/pod_bootstrap.sh
 #
-# Then from the Mac: scripts/pod.sh deploy   (ships sam_service + launches)
+# Then from the Mac: scripts/pod.sh deploy   (ships perception + launches)
 #
 # Layout it builds (PYTHONPATH order matters — see deploy script):
 #   /workspace/sam3      Meta SAM3 repo   (concept grounding)

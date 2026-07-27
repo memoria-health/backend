@@ -117,3 +117,7 @@ ignore = ["E501"]  # line length handled by formatter
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["test"]
+# gpu/ holds the GPU-host deployables (perception, identity). On the pod
+# they import as top-level modules (PYTHONPATH=/workspace/nemara); adding
+# gpu/ here keeps ONE module name in both worlds.
+pythonpath = [".", "gpu"]

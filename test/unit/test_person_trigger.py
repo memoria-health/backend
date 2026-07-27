@@ -6,7 +6,7 @@ person must not burn a 12s ground every cycle); None = trigger dead,
 never fires, never disturbs the streak.
 """
 
-from sam_service.person_trigger import should_force_reground
+from perception.person_trigger import should_force_reground
 
 
 def test_more_persons_fires_immediately():

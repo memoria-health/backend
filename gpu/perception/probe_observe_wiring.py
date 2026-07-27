@@ -16,7 +16,7 @@ os.environ.setdefault(
 import cv2
 import numpy as np
 
-from sam_service import server  # noqa: E402
+from perception import server  # noqa: E402
 
 CLIP = "/workspace/nemara/out/ab_clips/concat30s_clean.mp4"
 cap = cv2.VideoCapture(CLIP)

@@ -11,7 +11,7 @@ import numpy as np
 sys.path.insert(0, "/workspace/sam3")
 sys.path.insert(0, "/workspace/nemara")
 sys.path.insert(0, "/workspace/edgetam")
-from sam_service import continuous, sam_track  # noqa: E402
+from perception import continuous, sam_track  # noqa: E402
 
 CLIP = sys.argv[1] if len(sys.argv) > 1 else \
     "/workspace/nemara/out/ab_clips/concat30s_clean.mp4"

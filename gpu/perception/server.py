@@ -23,7 +23,7 @@ Contract:
 Run on the pod (self-contained — src/ NOT needed):
   NEMARA_SAM_CKPT=/workspace/nemara/models/sam3.1_multiplex.pt \
   PYTHONPATH=/workspace/sam3:/workspace/nemara \
-  uvicorn sam_service.server:app --host 0.0.0.0 --port 8000
+  uvicorn perception.server:app --host 0.0.0.0 --port 8000
 """
 
 from __future__ import annotations
@@ -40,10 +40,10 @@ import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 
-from sam_service.face_worker import FaceWorker
-from sam_service import continuous, sam_track
+from perception.face_worker import FaceWorker
+from perception import continuous, sam_track
 
-log = logging.getLogger("sam_service")
+log = logging.getLogger("perception")
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
 )
@@ -118,7 +118,7 @@ def _recycle_watchdog() -> None:
             and not _perception_lock.locked()
         ):
             log.info(
-                "sam_service.self_recycle uptime=%.0fs idle=%.0fs — "
+                "perception.self_recycle uptime=%.0fs idle=%.0fs — "
                 "exiting for supervisor restart (VRAM hygiene)",
                 up, idle,
             )
@@ -133,7 +133,7 @@ def _startup() -> None:
     try:
         provider = _face.start()
     except Exception:  # noqa: BLE001
-        log.exception("sam_service.face_worker_start_failed (CPU-less?)")
+        log.exception("perception.face_worker_start_failed (CPU-less?)")
         # A start-timeout can leave a child alive with a pending
         # 'ready' message — kill it or the pipe desyncs and one crop's
         # faces attach to the next crop (review C1).
@@ -148,11 +148,11 @@ def _startup() -> None:
         ):
             pass
     except Exception:  # noqa: BLE001
-        log.exception("sam_service.sam_warm_failed (will warm lazily)")
+        log.exception("perception.sam_warm_failed (will warm lazily)")
     threading.Thread(target=_recycle_watchdog, daemon=True).start()
     _ready = True
     log.info(
-        "sam_service.ready v2 warm=%.1fs ckpt=%s face_provider=%s",
+        "perception.ready v2 warm=%.1fs ckpt=%s face_provider=%s",
         time.time() - t0, _CKPT, provider,
     )
 
@@ -224,7 +224,7 @@ def _observe_sync(
             decoded = kept
         if dim_dropped or oversize:
             log.warning(
-                "sam_service.frames_dropped dims=%d oversize=%d",
+                "perception.frames_dropped dims=%d oversize=%d",
                 dim_dropped, oversize,
             )
         decode_ms = (time.time() - t0) * 1000.0
@@ -372,7 +372,7 @@ def _observe_sync(
                         )
                         fo.append(bool(confirmed))
             except Exception:  # noqa: BLE001
-                log.exception("sam_service.face_confirm_failed — claims "
+                log.exception("perception.face_confirm_failed — claims "
                               "ship unconfirmed (treated as true)")
             confirm_ms = (time.time() - t_fc) * 1000.0
 
@@ -390,7 +390,7 @@ def _observe_sync(
                             [*(float(v) for v in bbox), float(p)],
                         )
             except Exception:  # noqa: BLE001
-                log.exception("sam_service.screen_pass_failed")
+                log.exception("perception.screen_pass_failed")
             screens_ms = (time.time() - t_sc) * 1000.0
         total_ms = (time.time() - t_start) * 1000.0
 
@@ -431,7 +431,7 @@ def _observe_sync(
             "screen_regions": screen_regions,
         }
         log.info(
-            "sam_service.observe frames=%d tracks=%d dets=%d max_prob=%.2f "
+            "perception.observe frames=%d tracks=%d dets=%d max_prob=%.2f "
             "face_attempts=%d faces=%d | decode=%.0fms sam=%.0fms "
             "face=%.0fms total=%.0fms",
             len(decoded), len(rows_by_track), det_count, max_prob,
@@ -579,7 +579,7 @@ async def observe(
             raw = await f.read()
             if len(raw) > _MAX_FILE_BYTES:
                 log.warning(
-                    "sam_service.frame_too_big idx=%d bytes=%d — skipped",
+                    "perception.frame_too_big idx=%d bytes=%d — skipped",
                     orig_idx, len(raw),
                 )
                 continue

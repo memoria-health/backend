@@ -24,7 +24,7 @@ from typing import Iterator
 
 import numpy as np
 
-log = logging.getLogger("sam_service.track")
+log = logging.getLogger("perception.track")
 
 _SAM = None
 

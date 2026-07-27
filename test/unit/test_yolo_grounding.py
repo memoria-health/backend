@@ -6,7 +6,7 @@ detection set clears everyone (grounds stay authoritative on
 existence regardless of which model grounds).
 """
 
-from sam_service.continuous import _box_iou, remap_boxes_to_ids
+from perception.continuous import _box_iou, remap_boxes_to_ids
 
 IOU = 0.30
 
@@ -51,7 +51,7 @@ def test_box_iou_sane():
 
 import numpy as np
 
-from sam_service.continuous import CameraSession
+from perception.continuous import CameraSession
 
 
 def _m(y0, y1, x0, x1, h=36, w=64):
@@ -91,7 +91,7 @@ def test_remap_masks_adjacent_silhouettes_do_not_swap():
 
 
 def test_ground_yoloseg_none_signals_sam3_fallback(monkeypatch):
-    from sam_service import person_trigger
+    from perception import person_trigger
 
     monkeypatch.setattr(person_trigger, "person_masks", lambda _f: None)
     s = CameraSession(camera_id="cam-t")
@@ -100,7 +100,7 @@ def test_ground_yoloseg_none_signals_sam3_fallback(monkeypatch):
 
 
 def test_ground_yoloseg_empty_is_authoritative_nobody(monkeypatch):
-    from sam_service import person_trigger
+    from perception import person_trigger
 
     monkeypatch.setattr(person_trigger, "person_masks", lambda _f: [])
     s = CameraSession(camera_id="cam-t")
@@ -110,7 +110,7 @@ def test_ground_yoloseg_empty_is_authoritative_nobody(monkeypatch):
 
 
 def test_ground_yoloseg_masks_flow_through_shared_remap(monkeypatch):
-    from sam_service import person_trigger
+    from perception import person_trigger
 
     monkeypatch.setattr(
         person_trigger, "person_masks", lambda _f: [_m(6, 31, 11, 26)],

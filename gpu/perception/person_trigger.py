@@ -25,7 +25,7 @@ import logging
 import os
 from typing import Optional
 
-log = logging.getLogger("sam_service")
+log = logging.getLogger("perception")
 
 _WEIGHTS = os.environ.get("NEMARA_TRIGGER_WEIGHTS", "yolo26x.pt")
 _IMGSZ = int(os.environ.get("NEMARA_TRIGGER_IMGSZ", "1280"))

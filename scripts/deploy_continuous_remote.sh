@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Runs ON THE POD — piped in by `scripts/pod.sh deploy`. Stops the old
 # supervisor + server, (re)writes the FILE-BASED supervisor, and
-# relaunches it via setsid. sam_service/ must already be shipped to
-# /workspace/nemara/sam_service/ (pod.sh deploy ships it first).
+# relaunches it via setsid. perception/ must already be shipped to
+# /workspace/nemara/perception/ (pod.sh deploy ships it first).
 #
 # WHY a supervisor FILE + setsid (runbook "operational traps"): the
 # previous inline `nohup bash -c '...'` launch lost its exported env
@@ -22,7 +22,11 @@ pkill -f 'start_continuous.sh' 2>/dev/null || true
   && mv /workspace/start_continuous.sh /workspace/start_continuous.sh.disabled
 pkill -f 'start_sam_superviso[r]' 2>/dev/null || true
 pkill -f 'sam_supervisor.pi[d]' 2>/dev/null || true
+pkill -f 'uvicorn perceptio[n]' 2>/dev/null || true
+# Transitional (2026-07-26 sam_service→perception rename): kill a server
+# still running under the OLD module name; remove after one clean deploy.
 pkill -f 'uvicorn sam_servic[e]' 2>/dev/null || true
+rm -rf /workspace/nemara/sam_service
 sleep 3
 
 # (Re)write the supervisor file — the single source of runtime env.
@@ -56,7 +60,7 @@ while true; do
   # SYSTEM python — /workspace/edgetam/.venv no longer exists; the
   # phantom path made this loop rc=127 forever while the legacy
   # supervisor actually served (2026-07-24).
-  /usr/bin/python3 -m uvicorn sam_service.server:app \
+  /usr/bin/python3 -m uvicorn perception.server:app \
     --host 127.0.0.1 --port 8000 --timeout-keep-alive 75 \
     >> /workspace/sam_server.log 2>&1
   echo "$(date -u +%FT%TZ) supervisor: exited rc=$? restart 3s" \
@@ -70,6 +74,6 @@ chmod +x /workspace/start_sam_supervisor.sh
 # session contains no kill-pattern strings to self-match later.
 setsid --fork /workspace/start_sam_supervisor.sh </dev/null >/dev/null 2>&1
 sleep 2
-pgrep -f 'uvicorn sam_servic[e]' >/dev/null \
+pgrep -f 'uvicorn perceptio[n]' >/dev/null \
   && echo "continuous supervisor launched (file-based)" \
   || echo "WARNING: uvicorn not up yet — check /workspace/sam_server.log"

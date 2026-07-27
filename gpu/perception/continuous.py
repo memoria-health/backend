@@ -29,7 +29,7 @@ import threading
 
 import numpy as np
 
-log = logging.getLogger("sam_service.continuous")
+log = logging.getLogger("perception.continuous")
 
 _EDGE = None
 _edge_lock = threading.Lock()
@@ -228,7 +228,7 @@ class CameraSession:
     def _ground(self, frames, person_thr, sam_pred) -> "dict[int, np.ndarray]":
         import cv2
         import torch
-        from sam_service import sam_track
+        from perception import sam_track
 
         ctx = list(frames[: min(6, len(frames))])
         got: list = []
@@ -296,7 +296,7 @@ class CameraSession:
         YOLO saw nobody."""
         import cv2
 
-        from sam_service import person_trigger
+        from perception import person_trigger
 
         masks = person_trigger.person_masks(frames[0])
         if masks is None:
@@ -319,7 +319,7 @@ class CameraSession:
         """Person boxes from YOLO26 seed EdgeTAM directly (~40ms vs
         SAM3's ~10s fresh look). Returns {id: ("box", xyxy_trackres)}
         or None (detector dead → caller falls back to SAM3)."""
-        from sam_service import person_trigger
+        from perception import person_trigger
 
         dets = person_trigger.person_boxes(frames[0])
         if dets is None:
@@ -408,7 +408,7 @@ class CameraSession:
         arises. Same return contract as observe()/_propagate():
         {frame_pos: {track_id: (bbox_xyxy_fullres, mask)}}."""
         import torch
-        from sam_service import sam_track
+        from perception import sam_track
 
         clip = list(frames)[::_SAM3_STRIDE]  # subsample; remap pos below
         per_pos: "dict[int, list]" = {}
@@ -548,7 +548,7 @@ class CameraSession:
         # blind spot, measured live). The trigger never touches tracks.
         dets = None
         if frames:
-            from sam_service import person_trigger
+            from perception import person_trigger
 
             # Run on EVERY tick (not just carry): ground ticks pair the
             # YOLO count with SAM3's authoritative verdict on the same
