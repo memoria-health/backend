@@ -132,6 +132,53 @@ async def assign_detector_to_cameras(
     return result.rowcount or 0
 
 
+def rooms_mean_all(rooms: Sequence[str] | None) -> bool:
+    """True when a room set means 'every room' — None, empty, or the
+    "ALL ROOMS" sentinel present (case/space-insensitive). The single
+    place that decision is made, shared by the endpoint + assignment."""
+    if not rooms:
+        return True
+    return any((r or "").strip().upper() == "ALL ROOMS" for r in rooms)
+
+
+async def set_detector_rooms(
+    session: AsyncSession,
+    detector_id: UUID,
+    patient_id: UUID,
+    rooms: Sequence[str] | None,
+) -> int:
+    """Replace `detector_id`'s camera assignments so it runs on exactly the
+    cameras in `rooms` — or every camera when `rooms` means ALL ROOMS.
+
+    Atomic replace: the detector's prior assignments are cleared and
+    rebuilt from the cameras currently in the selected rooms, so
+    deselecting a room stops it there and selecting a new one starts it in
+    one operation. Returns the assignment count after the replace.
+
+    Custom-detector room scoping only — it does a blanket delete of the
+    detector's rows, which is safe because customs carry no per-camera
+    `door_config` (that's the preset wandering picker, never room-scoped
+    through here).
+    """
+    stmt = select(Camera.id).where(Camera.patient_id == patient_id)
+    if not rooms_mean_all(rooms):
+        stmt = stmt.where(Camera.room.in_(list(rooms)))
+    cam_ids = (await session.execute(stmt)).scalars().all()
+
+    await session.execute(
+        delete(CameraDetector).where(CameraDetector.detector_id == detector_id)
+    )
+    if cam_ids:
+        now = datetime.now(timezone.utc)
+        await session.execute(
+            insert(CameraDetector),
+            [{"camera_id": c, "detector_id": detector_id, "created_at": now}
+             for c in cam_ids],
+        )
+    await session.flush()
+    return len(cam_ids)
+
+
 async def assign_preset_detectors_of_patient_to_camera(
     session: AsyncSession, camera_id: UUID, patient_id: UUID,
 ) -> int:

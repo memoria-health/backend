@@ -35,6 +35,9 @@ from src.schemas.detector import (
     InferDetectorRequest,
     InferDetectorResponse,
     RefineDetectorRequest,
+    RetypeApplyRequest,
+    RetypePreviewRequest,
+    RetypePreviewResponse,
     ScheduleConfig,
     UpdateDetectorRequest,
 )
@@ -246,8 +249,13 @@ async def list_wandering_doors(
 #   - recipe buckets: catches CUSTOM detectors compiled to fine-motion
 #     or rapid whose identifier is custom_<hex>.
 _CAVEAT_BUCKETS = frozenset({"fine_motion", "rapid"})
+# Small-motion (seizure) / small-object (medication, stove) presets whose
+# accuracy genuinely degrades with distance + lighting. NOT choking: it's a
+# whole-person distress event (bucket="person", degradation_warning="none"),
+# so the "reads small, fine details" notice misdescribes it — its caveat was
+# manual, never a derived property.
 _CAVEAT_IDENTIFIERS = frozenset({
-    "seizure", "choking", "medication", "stove_left_on",
+    "seizure", "medication", "stove_left_on",
 })
 
 
@@ -265,6 +273,26 @@ def _to_response(d: Detector) -> DetectorResponse:
     return resp.model_copy(update={
         "accuracy_caveat": _accuracy_caveat(d.identifier, d.bucket),
     })
+
+
+def _resolve_rooms(
+    where_rooms: list[str] | None, where_scope: str,
+) -> list[str] | None:
+    """The authoritative room set for a create/patch. `where_rooms` (the
+    multi-select) wins; otherwise fall back to the legacy single
+    `where_scope` ("ALL ROOMS" → None, meaning every room)."""
+    if where_rooms is not None:
+        return where_rooms
+    return None if where_scope == "ALL ROOMS" else [where_scope]
+
+
+def _scalar_where_scope(rooms: list[str] | None) -> str:
+    """Keep the legacy scalar `where_scope` in sync with the room set for
+    back-compat display: "ALL ROOMS" for every-room, else the joined room
+    names bounded to the column width (80)."""
+    if camera_detector_repo.rooms_mean_all(rooms):
+        return "ALL ROOMS"
+    return ", ".join(rooms)[:80]
 
 
 @router.get(
@@ -483,6 +511,57 @@ async def infer_detector(
     )
 
 
+def _fmt_time(hhmm: str) -> str:
+    """"17:00" → "5:00 PM" for caregiver-facing firing copy. Passes the raw
+    string through unchanged if it isn't HH:MM."""
+    try:
+        h_str, m_str = hhmm.split(":")
+        h, m = int(h_str), int(m_str)
+        suffix = "AM" if h < 12 else "PM"
+        return f"{h % 12 or 12}:{m:02d} {suffix}"
+    except Exception:  # noqa: BLE001
+        return hhmm
+
+
+def _fires_phrase(shape: str, dims: dict, schedule: dict | None) -> str:
+    """The one-line plain-English firing behavior — the single place this
+    copy is derived, shared by the create-review plan and the type-change
+    preview so they can never disagree. Caregiver language only."""
+    entry = (dims.get("eventing") or {}).get("entry") or {}
+    m = int(entry.get("m", 1) or 1)
+    t = int(entry.get("t_seconds", 0) or 0)
+    if shape == "scheduled":
+        deadline = None
+        if schedule:
+            deadline = schedule.get("deadline") or schedule.get("window_end")
+        if deadline:
+            return f"Only if it doesn't happen by {_fmt_time(deadline)}"
+        return "Only if it doesn't happen during the scheduled window"
+    if m > 1 and t > 0:
+        return f"After it's noticed {m} times within {max(1, t // 60)} minutes"
+    if shape == "state":
+        return "One alert for the whole activity, not repeats"
+    return "Right away, the moment it's noticed"
+
+
+def _effective_dims_text(
+    custom_prompt: str | None, timing_instruction: str | None,
+) -> str:
+    """The text dims-classification reads: the original ask plus (if the
+    caregiver has changed the type) the latest timing directive. Folding the
+    directive in here is what keeps the re-derived shape + eventing stable
+    across every future recompile — otherwise a later semantic refine would
+    reclassify from the base prompt alone and drop the type change."""
+    base = (custom_prompt or "").strip()
+    timing = (timing_instruction or "").strip()
+    if not timing:
+        return base
+    return (
+        f"{base}\n\nHow it should alert "
+        f"(caregiver's timing/type change): {timing}"
+    )
+
+
 def _compose_plan(
     *, name: str, prompt: str, shape: str, category: str,
 ):
@@ -497,37 +576,28 @@ def _compose_plan(
         dims = compiler_v2.classify_custom_dims(
             name=name, user_text=prompt, shape=shape, category=category,
         )
+        # Caregiver-facing "who" — warm, name-free (the infer endpoint has
+        # no patient scope). "Your patient only" read clinically; "the
+        # person you care for" is the app's own voice. The "Sees a close-up
+        # of each person" media row was dropped entirely: how Memoria frames
+        # the shot is an internal detail a caregiver shouldn't have to parse
+        # (Aryaman 2026-07-26).
         watches = {
-            "patient": "Your patient only",
+            "patient": "Only the person you care for",
             "anyone": "Anyone in view",
             "environment": "The room itself (no person needed)",
         }[dims["subject_scope"]]
-        media = (
-            "A close-up of each person"
-            if dims["bucket"] in ("person", "fine_motion", "rapid", "face")
-            else "The whole room view"
-        )
-        entry = (dims.get("eventing") or {}).get("entry") or {}
-        m = int(entry.get("m", 1) or 1)
-        t = int(entry.get("t_seconds", 0) or 0)
         # Caregiver language only (Aryaman 2026-07-18): no internal
-        # vocabulary — a non-technical reader must understand every
-        # line without explanation.
-        if shape == "scheduled":
-            fires = "Only if it doesn't happen during the scheduled time"
-        elif m > 1 and t > 0:
-            fires = f"After it's noticed {m} times within {max(1, t // 60)} minutes"
-        elif shape == "state":
-            fires = "One alert for the whole activity, not repeats"
-        else:
-            fires = "Right away, the moment it's noticed"
+        # vocabulary — a non-technical reader must understand every line
+        # without explanation. Shared with the type-change preview.
+        fires = _fires_phrase(shape, dims, None)
         checks = (
             "Every few minutes"
             if dims["duty_cycle"] == "thinned"
             else "Continuously"
         )
         return DetectorPlan(
-            watches=watches, media=media, fires=fires, checks=checks,
+            watches=watches, fires=fires, checks=checks,
             listens=bool(dims.get("needs_audio")),
         )
     except Exception:  # noqa: BLE001 — preview must never block creation
@@ -588,6 +658,9 @@ async def create_detector(
         )
 
     now = datetime.now(timezone.utc)
+    # Multi-room scope: where_rooms (the multi-select) is authoritative;
+    # where_scope is kept as a synced back-compat scalar.
+    resolved_rooms = _resolve_rooms(body.where_rooms, body.where_scope)
     det = Detector(
         id=uuid4(),
         patient_id=patient_id,
@@ -597,10 +670,11 @@ async def create_detector(
         category=body.category.value,
         source="custom",
         shape=body.shape.value,
-        where_scope=body.where_scope,
+        where_scope=_scalar_where_scope(resolved_rooms),
+        where_rooms=resolved_rooms,
         when_scope=body.when_scope,
         sensitivity=body.sensitivity.value,
-        is_on=True,
+        is_on=body.is_on,
         created_at=now,
         updated_at=now,
         custom_prompt=body.custom_prompt,
@@ -620,22 +694,14 @@ async def create_detector(
     )
     await detector_repo.insert(session, det)
 
-    # Auto-assign based on the "Where" hint. Saves the caregiver from
-    # opening /cameras/[id] after creating each detector — they
-    # already told us which room(s) they want it on.
-    #   - "ALL ROOMS" → every camera under the patient
-    #   - "Kitchen"   → every camera whose room == "Kitchen"
-    # If `where_scope` is a legacy string that doesn't match any
-    # current camera room, no rows get inserted and the user can still
-    # assign manually from the cameras page.
-    if body.where_scope == "ALL ROOMS":
-        await camera_detector_repo.assign_detector_to_cameras(
-            session, det.id, patient_id, room=None,
-        )
-    else:
-        await camera_detector_repo.assign_detector_to_cameras(
-            session, det.id, patient_id, room=body.where_scope,
-        )
+    # Auto-assign to the cameras in the selected rooms. Saves the caregiver
+    # from opening /cameras/[id] after creating each detector — they already
+    # told us which room(s) they want it on. Rooms with no camera yet insert
+    # nothing (the intent is preserved on `where_rooms` and reapplied when a
+    # camera is paired into that room).
+    await camera_detector_repo.set_detector_rooms(
+        session, det.id, patient_id, resolved_rooms,
+    )
     await session.commit()
 
     # Kick off the compile. asyncio.create_task lets the request return
@@ -670,8 +736,14 @@ async def _compile_and_update_detector(
     settings: Settings,
     identifier: str | None = None,
     refinements: list[str] | None = None,
+    dims_text: str | None = None,
 ) -> None:
     """Background task: run Gemini compile + UPDATE the detector row.
+
+    `dims_text` is the text v2-dims classification reads (original ask +
+    any type/timing directive). Defaults to `user_text` — only the type-
+    change (/retype) path passes the folded text so the re-derived shape +
+    eventing survive later semantic recompiles.
 
     Owns its own AsyncSession (the request's session is gone by now).
     If compile fails, the row stays with NULL `identifier` — the
@@ -699,7 +771,8 @@ async def _compile_and_update_detector(
         # scheduler treats this custom exactly like a built-in.
         compiler_v2.validate_schema_fields(compiled.schema_json)
         dims = compiler_v2.classify_custom_dims(
-            name=name, user_text=user_text, shape=shape, category=category,
+            name=name, user_text=(dims_text or user_text),
+            shape=shape, category=category,
         )
     except compiler_v2.DetectorRejected as e:
         log.error(
@@ -753,6 +826,11 @@ async def patch_detector(
     for k in ("category", "shape", "sensitivity"):
         if k in fields and fields[k] is not None:
             fields[k] = fields[k].value
+    # Re-scoping rooms: keep the legacy scalar where_scope in lockstep so
+    # any code path that still reads it stays correct.
+    rescope_rooms = "where_rooms" in fields
+    if rescope_rooms:
+        fields["where_scope"] = _scalar_where_scope(fields["where_rooms"])
     det = await detector_repo.update_partial(
         session, detector_id, caregiver_id=auth.id, fields=fields
     )
@@ -760,6 +838,15 @@ async def patch_detector(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="detector_not_found",
+        )
+    # Replace the camera assignments to match the new room set (atomic:
+    # deselected rooms stop, newly-selected rooms start). Custom detectors
+    # only — presets (esp. wandering) carry per-camera door_config on their
+    # CameraDetector rows that a blanket replace would wipe, and rooms
+    # editing is a custom-detector affordance in the UI anyway.
+    if rescope_rooms and det.source == "custom":
+        await camera_detector_repo.set_detector_rooms(
+            session, det.id, det.patient_id, fields["where_rooms"],
         )
     await session.commit()
     # Recompile-on-edit (bug fix 2026-07-18): an edited custom_prompt
@@ -785,6 +872,9 @@ async def patch_detector(
                 settings=settings,
                 identifier=det.identifier,
                 refinements=list(det.refinements or []),
+                dims_text=_effective_dims_text(
+                    det.custom_prompt, det.timing_instruction,
+                ),
             )
         )
     return _to_response(det)
@@ -821,6 +911,36 @@ async def refine_detector(
             detail="preset_not_refinable",
         )
     refinements = [*(det.refinements or []), body.feedback.strip()]
+
+    # Dry-run ("Re-generate"): compile WITH this feedback applied and hand
+    # back the resulting criteria, but write nothing — no refinement stored,
+    # no row update, so the live detector keeps running its current
+    # instructions until the caregiver hits Save (a non-preview submit).
+    # Synchronous (the user is waiting), ~3-5s.
+    if body.preview:
+        try:
+            compiled = await compile_custom_detector(
+                name=det.name,
+                description=det.description or "Custom detector",
+                user_text=det.custom_prompt,
+                scheduled=det.shape == "scheduled",
+                category=det.category,
+                settings=settings,
+                identifier=det.identifier,
+                refinements=refinements,
+            )
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="detector_preview_unavailable",
+            ) from e
+        criteria = await summarize_detector_prompt(
+            fragment=compiled.prompt_fragment, settings=settings,
+        )
+        # Return the unchanged row with the PREVIEWED criteria swapped in;
+        # persistence is skipped entirely.
+        return _to_response(det).model_copy(update={"user_criteria": criteria})
+
     det = await detector_repo.update_partial(
         session, detector_id, caregiver_id=auth.id,
         fields={"refinements": refinements},
@@ -838,6 +958,171 @@ async def refine_detector(
             settings=settings,
             identifier=det.identifier,
             refinements=refinements,
+            dims_text=_effective_dims_text(
+                det.custom_prompt, det.timing_instruction,
+            ),
+        )
+    )
+    return _to_response(det)
+
+
+def _schedule_deadline(schedule: dict | ScheduleConfig | None) -> str | None:
+    """The effective firing time for a scheduled detector — the explicit
+    deadline, else the window end. None if neither is set (undetermined)."""
+    if schedule is None:
+        return None
+    if isinstance(schedule, ScheduleConfig):
+        return schedule.deadline or schedule.window_end
+    return schedule.get("deadline") or schedule.get("window_end")
+
+
+@router.post(
+    "/detectors/{detector_id}/retype/preview",
+    response_model=RetypePreviewResponse,
+)
+async def preview_retype(
+    detector_id: UUID,
+    auth: CaregiverAuth,
+    body: RetypePreviewRequest,
+    session: SessionDep,
+    settings: SettingsDep,
+) -> RetypePreviewResponse:
+    """Project a plain-words TYPE/timing change WITHOUT persisting it.
+
+    Distinct from /refine (which changes WHAT the detector looks for): this
+    re-runs the same shape inference the create flow uses, over the original
+    ask + this directive, so "only alert if it's been going 10 minutes"
+    flips a point-in-time detector into a sustained one. Returns the
+    projected firing behavior; the caregiver commits it via /retype on Save.
+    Customs only — preset timing is curated."""
+    det = await detector_repo.find_by_id(
+        session, detector_id, caregiver_id=auth.id,
+    )
+    if det is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="detector_not_found",
+        )
+    if det.source != "custom" or not det.custom_prompt:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="preset_not_refinable",
+        )
+
+    combined = _effective_dims_text(det.custom_prompt, body.instruction)
+    try:
+        inferred = await infer_detector_config(
+            name=det.name, prompt=combined, settings=settings,
+        )
+    except RuntimeError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="detector_preview_unavailable",
+        ) from e
+
+    shape = str(inferred.shape)
+    schedule = inferred.schedule  # dict | None
+    dims = compiler_v2.classify_custom_dims(
+        name=det.name, user_text=combined, shape=shape, category=det.category,
+    )
+    fires = _fires_phrase(shape, dims, schedule)
+    needs_schedule = shape == "scheduled" and _schedule_deadline(schedule) is None
+
+    # Did the type actually move? (so the UI can say "no change" vs a no-op).
+    changed = shape != det.shape
+    if not changed and shape == "state":
+        changed = inferred.episode_gap_seconds != det.episode_gap_seconds
+    if not changed and shape == "scheduled":
+        changed = (schedule or None) != (det.schedule_config or None)
+
+    return RetypePreviewResponse(
+        shape=shape,  # type: ignore[arg-type]  # pydantic coerces str -> enum
+        fires=fires,
+        schedule_config=ScheduleConfig(**schedule) if schedule else None,
+        episode_gap_seconds=inferred.episode_gap_seconds,
+        needs_schedule=needs_schedule,
+        changed=changed,
+    )
+
+
+@router.post(
+    "/detectors/{detector_id}/retype",
+    response_model=DetectorResponse,
+)
+async def apply_retype(
+    detector_id: UUID,
+    auth: CaregiverAuth,
+    body: RetypeApplyRequest,
+    session: SessionDep,
+    settings: SettingsDep,
+) -> DetectorResponse:
+    """Commit a previewed type change. Rewrites the scheduling contract
+    (shape + schedule_config / episode_gap_seconds), persists the raw
+    directive as `timing_instruction`, and recompiles — the identifier is
+    preserved so analyses history stays keyed, and the shape change flips
+    the compile bias (scheduled → conservative) and re-derives dims from the
+    ask + directive. What commits is the projection the caregiver previewed;
+    no second inference that could drift."""
+    det = await detector_repo.find_by_id(
+        session, detector_id, caregiver_id=auth.id,
+    )
+    if det is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="detector_not_found",
+        )
+    if det.source != "custom" or not det.custom_prompt:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="preset_not_refinable",
+        )
+
+    shape = body.shape.value
+    # A scheduled detector fires on ABSENCE by a deadline — never guess when
+    # to alarm. If the words didn't pin a time, refuse and let the UI ask the
+    # caregiver to state one (rather than silently choosing an alert time).
+    if shape == "scheduled" and _schedule_deadline(body.schedule_config) is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "code": "schedule_required",
+                "reason": "Add a specific time (e.g. “by 5pm”) so I "
+                "know the deadline to alert on if it doesn't happen.",
+            },
+        )
+
+    fields: dict = {
+        "shape": shape,
+        "timing_instruction": body.instruction.strip(),
+        # Only the relevant timing column is populated; the other is cleared
+        # so a shape change never leaves a stale window / gap behind.
+        "schedule_config": (
+            body.schedule_config.model_dump()
+            if shape == "scheduled" and body.schedule_config
+            else None
+        ),
+        "episode_gap_seconds": (
+            body.episode_gap_seconds if shape == "state" else None
+        ),
+    }
+    det = await detector_repo.update_partial(
+        session, detector_id, caregiver_id=auth.id, fields=fields,
+    )
+    await session.commit()
+
+    asyncio.create_task(
+        _compile_and_update_detector(
+            detector_id=det.id,
+            name=det.name,
+            description=det.description or "Custom detector",
+            user_text=det.custom_prompt,
+            scheduled=shape == "scheduled",
+            shape=shape,
+            category=det.category,
+            settings=settings,
+            identifier=det.identifier,
+            refinements=list(det.refinements or []),
+            dims_text=_effective_dims_text(
+                det.custom_prompt, det.timing_instruction,
+            ),
         )
     )
     return _to_response(det)

@@ -59,6 +59,9 @@ IconName = Annotated[str, Field(min_length=1, max_length=80)]
 Description = Annotated[str, Field(min_length=1, max_length=500)]
 Scope = Annotated[str, Field(min_length=1, max_length=80)]
 Prompt = Annotated[str, Field(min_length=1, max_length=2000)]
+# Multi-room scope: room names (or the "ALL ROOMS" sentinel). Bounded so a
+# client can't send an unbounded blob. None = every room (back-compat).
+Rooms = Annotated[list[Annotated[str, Field(min_length=1, max_length=80)]], Field(max_length=40)]
 
 
 class DetectorResponse(BaseModel):
@@ -75,6 +78,9 @@ class DetectorResponse(BaseModel):
     source: DetectorSource
     shape: DetectorShape
     where_scope: Scope
+    # Rooms the detector is scoped to. None → every room (back-compat with
+    # rows created before multi-room existed, and the "ALL ROOMS" default).
+    where_rooms: Rooms | None = None
     when_scope: Scope
     sensitivity: DetectorSensitivity
     is_on: bool
@@ -97,6 +103,10 @@ class DetectorResponse(BaseModel):
     user_criteria: list[str] | None = None
     # Plain-words change requests accumulated via /refine, oldest first.
     refinements: list[str] | None = None
+    # The caregiver's latest plain-words TYPE/timing directive from /retype
+    # ("only alert if it's been going 10 min"). Distinct from `refinements`
+    # (semantic). Null = the type has never been changed post-creation.
+    timing_instruction: str | None = None
     # Wandering only: the caregiver's saved exit-door choice, so the picker can
     # pre-highlight it. {box:[x,y,w,h]|null, label, source, no_exit_door}.
     door_config: dict | None = None
@@ -133,11 +143,19 @@ class CreateDetectorRequest(BaseModel):
     shape: DetectorShape = DetectorShape.point_in_time
     icon_name: IconName = "eye"
     where_scope: Scope = "ALL ROOMS"
+    # Rooms the caregiver picked (multi-select). None / ["ALL ROOMS"] = every
+    # room. Drives the camera auto-assignment; where_scope is kept in sync.
+    where_rooms: Rooms | None = None
     when_scope: Scope = "ALWAYS"
     sensitivity: DetectorSensitivity = DetectorSensitivity.standard
     schedule_config: ScheduleConfig | None = None
     # Set only for shape == 'state' (the rising-edge episode gap, seconds).
     episode_gap_seconds: int | None = None
+    # Create-as-draft: the review flow now creates the detector OFF, lands
+    # the caregiver on the detail editor to check the compiled criteria,
+    # and only then flips it on. Defaults True so any existing caller (and
+    # the "turn it on immediately" path) is unaffected.
+    is_on: bool = True
 
 
 class InferDetectorRequest(BaseModel):
@@ -158,8 +176,7 @@ class DetectorPlan(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    watches: str   # who: "Your patient only" / "Anyone in view" / room
-    media: str     # what pixels: whole-room view vs per-person crop
+    watches: str   # who: "Only the person you care for" / "Anyone in view" / room
     fires: str     # the fire rule as a sentence
     checks: str    # look cadence as a sentence
     listens: bool  # audio evidence used
@@ -201,6 +218,9 @@ class UpdateDetectorRequest(BaseModel):
     category: DetectorCategory | None = None
     shape: DetectorShape | None = None
     where_scope: Scope | None = None
+    # Re-scope the detector's rooms; the endpoint replaces its camera
+    # assignments to match. ["ALL ROOMS"] or null-via-omit = every room.
+    where_rooms: Rooms | None = None
     when_scope: Scope | None = None
     sensitivity: DetectorSensitivity | None = None
     is_on: bool | None = None
@@ -210,11 +230,67 @@ class UpdateDetectorRequest(BaseModel):
 class RefineDetectorRequest(BaseModel):
     """Body of POST /v1/detectors/{id}/refine — one plain-words change
     request from the caregiver ("don't count eating as choking"). The
-    compiler receives the FULL accumulated list on every recompile."""
+    compiler receives the FULL accumulated list on every recompile.
+
+    `preview` = dry-run: compile the detector WITH this feedback applied
+    and return the resulting criteria, but persist nothing (no refinement
+    appended, no row update). This backs the edit UI's "Re-generate"
+    button — the caregiver sees what the change would produce, and only a
+    real (non-preview) submit on Save commits it.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     feedback: Prompt
+    preview: bool = False
+
+
+class RetypePreviewRequest(BaseModel):
+    """Body of POST /v1/detectors/{id}/retype/preview — a plain-words TYPE/
+    timing change ("only alert if it's been going for 10 minutes"). Distinct
+    from /refine (which changes WHAT it looks for): this re-derives the
+    detector's shape + timing by re-running the same inference the create
+    flow uses over the original ask + this directive. Persists nothing — the
+    caller previews the projected firing behavior, then commits via /retype."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    instruction: Prompt
+
+
+class RetypePreviewResponse(BaseModel):
+    """Projection of what a type change would produce — shown to the
+    caregiver BEFORE it commits. `shape` is the enum (the client owns the
+    caregiver-facing label); `fires` is the one-line plain-English firing
+    behavior. `needs_schedule` is true when the re-derivation makes it a
+    scheduled (absence) detector but no deadline could be pinned from the
+    words — the UI then asks the caregiver to state a specific time before
+    Save. `changed` is false when the instruction didn't actually alter the
+    type (so the UI can say so instead of a no-op Save)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    shape: DetectorShape
+    fires: str
+    schedule_config: ScheduleConfig | None = None
+    episode_gap_seconds: int | None = None
+    needs_schedule: bool = False
+    changed: bool = True
+
+
+class RetypeApplyRequest(BaseModel):
+    """Body of POST /v1/detectors/{id}/retype — commit a previewed type
+    change. Carries the projection the caregiver saw (shape + schedule +
+    gap) so what commits is exactly what was previewed (no second inference
+    that could drift), plus the raw `instruction` (persisted as
+    `timing_instruction` and folded into future dims classification)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    instruction: Prompt
+    shape: DetectorShape
+    schedule_config: ScheduleConfig | None = None
+    episode_gap_seconds: int | None = None
 
 
 class DetectorLibraryEntry(BaseModel):

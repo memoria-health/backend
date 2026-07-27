@@ -42,6 +42,15 @@ class Detector(Base):
 
     custom_prompt: Mapped[str | None] = mapped_column(String(2000), default=None)
 
+    # Multi-room intent (2026-07-26). The caregiver can scope a detector to
+    # a SET of rooms, not just one. Authoritative when non-null; NULL or
+    # ["ALL ROOMS"] means every room. `where_scope` is kept in sync (joined
+    # names / "ALL ROOMS") for back-compat + legacy display fallback, but
+    # `where_rooms` is the source of truth for the rooms selector and the
+    # camera auto-assignment. The runtime still runs off CameraDetector
+    # rows — where_rooms only drives which of those rows get created.
+    where_rooms: Mapped[list[str] | None] = mapped_column(JSONB, default=None)
+
     # ── Runtime contract (detector pipeline) ────────────────────────
     # See `src/detectors/registry.py` for how these flow into LLM calls.
     # `identifier` is the stable key in the JSON-schema (e.g. "fall");
@@ -59,6 +68,15 @@ class Detector(Base):
     # Every recompile receives the full list — intent accumulates and
     # "reset to original" stays possible.
     refinements: Mapped[list[str] | None] = mapped_column(JSONB, default=None)
+
+    # Plain-words TYPE/timing directive from /retype, distinct from the
+    # semantic refinements above (2026-07-26). Holds the caregiver's latest
+    # "how it should alert" instruction (e.g. "only alert if it's been going
+    # for 10 minutes"). Overwritten — the newest directive fully restates the
+    # timing — and appended to custom_prompt when classifying dims so the
+    # re-derived shape/eventing stay stable across future recompiles. NULL =
+    # type has never been changed post-creation.
+    timing_instruction: Mapped[str | None] = mapped_column(String(2000), default=None)
 
     # ── Wandering exit-door selection ───────────────────────────────
     # Only meaningful on the 'wandering' detector. The caregiver's choice

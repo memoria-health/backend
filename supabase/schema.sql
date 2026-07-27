@@ -436,10 +436,20 @@ create table public.detectors (
   source          detector_source      not null,
   shape           detector_shape       not null,
   where_scope     text not null,
+  -- Multi-room intent (2026-07-26). JSON array of room names the detector
+  -- is scoped to; null or ["ALL ROOMS"] = every room. where_scope stays in
+  -- sync as a back-compat scalar; where_rooms is the source of truth for
+  -- the rooms selector + camera auto-assignment.
+  where_rooms     jsonb,
   when_scope      text not null,
   sensitivity     detector_sensitivity not null default 'standard',
   is_on           boolean not null default true,
   custom_prompt   text,                              -- only meaningful when source = 'custom'
+  -- Plain-words TYPE/timing directive from /retype (2026-07-26), distinct
+  -- from the semantic `refinements`. The caregiver's latest "how it should
+  -- alert" instruction; appended to custom_prompt when re-deriving shape +
+  -- eventing so the type stays stable across recompiles. NULL = unchanged.
+  timing_instruction text,
   -- Scheduled-detector config (null for reactive detectors). Shape:
   --   { "cadence": "daily"|"weekly",
   --     "days_of_week": [0..6],     -- weekly only; 0=Mon..6=Sun
