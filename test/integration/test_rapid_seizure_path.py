@@ -68,7 +68,8 @@ async def _seed_seizure(session: AsyncSession, patient_id, camera_id) -> Detecto
     det = Detector(
         id=uuid4(), created_at=now, updated_at=now, patient_id=patient_id,
         name=entry.name, icon_name=entry.icon_name, description=entry.description,
-        category=entry.category, source="preset", shape=entry.shape,
+        category=entry.category, source="preset",
+        alert_trigger=entry.alert_trigger, is_sustained=entry.is_sustained,
         where_scope=entry.where_scope, when_scope=entry.when_scope,
         sensitivity="standard", is_on=True, custom_prompt=None,
         identifier=entry.key, prompt_fragment=entry.prompt_fragment,

@@ -159,10 +159,9 @@ async def seed_detectors_for_patient(
             description=e.description,
             category=e.category,
             source="preset",
-            # Derived from the catalog's shape until Phase D gives catalog
-            # entries an explicit alert_trigger.
-            alert_trigger="schedule" if e.shape == "scheduled" else "leading",
-            is_sustained=(e.shape == "state"),
+            alert_trigger=e.alert_trigger,
+            is_sustained=e.is_sustained,
+            duration_seconds=e.duration_seconds,
             where_scope=e.where_scope,
             when_scope=e.when_scope,
             sensitivity="standard",

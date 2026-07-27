@@ -818,7 +818,6 @@ class CatalogEntry:
     icon_name: str
     description: str
     category: str       # "safety" | "routine"
-    shape: str          # "point_in_time" | "state" | "scheduled"
     cohort: str         # "child" | "adult" | "both"
     recommended: bool   # the library's "Recommended" UI group — only `fall`
     prompt_fragment: str
@@ -829,6 +828,12 @@ class CatalogEntry:
     promotion_threshold: float = 0.70
     where_scope: str = "ALL ROOMS"
     when_scope: str = "ALWAYS"
+    # Alerting spine (2026-07-26): which moment fires + internal temporal
+    # nature. Most built-ins are leading; agitation is sustained; stove is a
+    # duration ("on & unattended > duration_seconds").
+    alert_trigger: str = "leading"   # leading | trailing | duration | schedule
+    is_sustained: bool = False
+    duration_seconds: int | None = None
     # Most detectors use `<key>_detected`. Medication is the exception
     # (`medication_taken`), matching its prompt + the legacy schema.
     detected_field: str | None = None
@@ -887,35 +892,35 @@ CATALOG: tuple[CatalogEntry, ...] = (
     CatalogEntry(
         key="fall", name="Falls", icon_name="figure.fall",
         description="Sudden fall events across all rooms.",
-        category="safety", shape="point_in_time", cohort="both",
+        category="safety", cohort="both",
         recommended=True, seeded=True, prompt_fragment=_FALL_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
     CatalogEntry(
         key="agitation", name="Agitation", icon_name="figure.walk.motion",
         description="Pacing or restless body language sustained over time.",
-        category="safety", shape="state", cohort="adult",
+        category="safety", is_sustained=True, cohort="adult",
         recommended=False, seeded=True, prompt_fragment=_AGITATION_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
     CatalogEntry(
         key="seizure", name="Convulsion", icon_name="bolt.heart",
         description="Convulsive shaking — rhythmic, repetitive limb or whole-body jerking.",
-        category="safety", shape="point_in_time", cohort="both",
+        category="safety", cohort="both",
         recommended=False, seeded=False, prompt_fragment=_SEIZURE_PROMPT_FRAGMENT,
         promotion_threshold=0.65,
     ),
     CatalogEntry(
         key="wandering", name="Wandering", icon_name="door.left.hand.open",
         description="Main door opening — front entry only.",
-        category="safety", shape="point_in_time", cohort="adult",
+        category="safety", cohort="adult",
         recommended=False, seeded=True, prompt_fragment=_WANDERING_PROMPT_FRAGMENT,
         promotion_threshold=0.70, where_scope="HALLWAY",
     ),
     CatalogEntry(
         key="medication", name="Medication adherence", icon_name="pills",
         description="Confirms the morning and evening pill routine at the kitchen counter.",
-        category="routine", shape="point_in_time", cohort="adult",
+        category="routine", cohort="adult",
         recommended=False, seeded=True, prompt_fragment=_MEDICATION_PROMPT_FRAGMENT,
         promotion_threshold=0.70, where_scope="KITCHEN", when_scope="8 AM, 8 PM ±1H",
         detected_field="medication_taken",
@@ -923,14 +928,14 @@ CATALOG: tuple[CatalogEntry, ...] = (
     CatalogEntry(
         key="climbing", name="Climbing", icon_name="figure.climbing",
         description="Climbing onto furniture or elevated surfaces.",
-        category="safety", shape="state", cohort="child",
+        category="safety", is_sustained=True, cohort="child",
         recommended=False, seeded=True, prompt_fragment=_CLIMBING_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
     CatalogEntry(
         key="distress", name="Distress", icon_name="exclamationmark.bubble",
         description="Sustained crying or visible distress.",
-        category="safety", shape="state", cohort="child",
+        category="safety", is_sustained=True, cohort="child",
         recommended=False, seeded=True, prompt_fragment=_DISTRESS_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
@@ -938,21 +943,21 @@ CATALOG: tuple[CatalogEntry, ...] = (
     CatalogEntry(
         key="child_crib_exit", name="Crib exit", icon_name="bed.double",
         description="A child climbing out of a crib over the rail.",
-        category="safety", shape="point_in_time", cohort="child",
+        category="safety", cohort="child",
         recommended=False, prompt_fragment=_CHILD_CRIB_EXIT_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
     CatalogEntry(
         key="child_cord_entanglement", name="Cord / blind risk", icon_name="scribble",
         description="A cord or blind string around a child's neck.",
-        category="safety", shape="point_in_time", cohort="child",
+        category="safety", cohort="child",
         recommended=False, prompt_fragment=_CHILD_CORD_ENTANGLEMENT_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
     CatalogEntry(
         key="child_stairs", name="Near stairs", icon_name="figure.stairs",
         description="A child at a staircase unsupervised.",
-        category="safety", shape="point_in_time", cohort="child",
+        category="safety", cohort="child",
         recommended=False, prompt_fragment=_CHILD_STAIRS_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
@@ -960,28 +965,28 @@ CATALOG: tuple[CatalogEntry, ...] = (
         key="child_hazard_reach", name="Reaching for a hazard",
         icon_name="exclamationmark.triangle",
         description="A child reaching for a knife, an outlet, or a stove (only these three).",
-        category="safety", shape="point_in_time", cohort="child",
+        category="safety", cohort="child",
         recommended=False, prompt_fragment=_CHILD_HAZARD_REACH_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
     CatalogEntry(
         key="child_head_impact", name="Head impact", icon_name="brain.head.profile",
         description="An impact specifically to a child's head.",
-        category="safety", shape="point_in_time", cohort="child",
+        category="safety", cohort="child",
         recommended=False, prompt_fragment=_CHILD_HEAD_IMPACT_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
     CatalogEntry(
         key="child_wandering", name="Wandering", icon_name="door.left.hand.open",
         description="A child leaving the room through a doorway unsupervised.",
-        category="safety", shape="point_in_time", cohort="child",
+        category="safety", cohort="child",
         recommended=False, prompt_fragment=_CHILD_WANDERING_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
     CatalogEntry(
         key="child_device_usage", name="Electronic device usage", icon_name="ipad",
         description="A child using a phone or tablet for a sustained period.",
-        category="routine", shape="point_in_time", cohort="child",
+        category="routine", cohort="child",
         recommended=False, prompt_fragment=_CHILD_DEVICE_USAGE_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
@@ -990,43 +995,46 @@ CATALOG: tuple[CatalogEntry, ...] = (
         key="calling_for_help", name="Calling for help",
         icon_name="megaphone",
         description="The person calling out for help in distress.",
-        category="safety", shape="point_in_time", cohort="adult",
+        category="safety", cohort="adult",
         recommended=False, prompt_fragment=_CALLING_FOR_HELP_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
     CatalogEntry(
         key="choking", name="Choking", icon_name="lungs",
         description="Signs of choking — hands to the throat, unable to breathe.",
-        category="safety", shape="point_in_time", cohort="adult",
+        category="safety", cohort="adult",
         recommended=False, prompt_fragment=_CHOKING_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
     CatalogEntry(
         key="meal_eaten", name="Meal eaten", icon_name="fork.knife",
         description="Confirms the person ate a meal.",
-        category="routine", shape="point_in_time", cohort="adult",
+        category="routine", cohort="adult",
         recommended=False, prompt_fragment=_MEAL_EATEN_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
     CatalogEntry(
         key="stove_left_on", name="Stove left on", icon_name="flame.fill",
         description="A lit, unattended stove with nothing cooking on it.",
-        category="safety", shape="point_in_time", cohort="adult",
+        category="safety", cohort="adult",
         recommended=False, prompt_fragment=_STOVE_LEFT_ON_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
+        # "Left on" is a duration threshold, not an instant — fire once a lit
+        # unattended stove has persisted past this bar (10 min).
+        alert_trigger="duration", is_sustained=True, duration_seconds=600,
     ),
     # ── both cohorts (not recommended) ──
     CatalogEntry(
         key="emergency", name="General Emergency", icon_name="cross.case",
         description="Severe emergencies — unconsciousness, serious bleeding, seizure.",
-        category="safety", shape="point_in_time", cohort="both",
+        category="safety", cohort="both",
         recommended=False, prompt_fragment=_EMERGENCY_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
     CatalogEntry(
         key="possible_intruder", name="Possible Intruder", icon_name="person.fill.questionmark",
         description="A person with a deliberately concealed (masked) face.",
-        category="safety", shape="point_in_time", cohort="both",
+        category="safety", cohort="both",
         recommended=False, prompt_fragment=_POSSIBLE_INTRUDER_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
@@ -1034,7 +1042,7 @@ CATALOG: tuple[CatalogEntry, ...] = (
         key="env_hazard_glass", name="Environmental hazard — Glass",
         icon_name="wineglass",
         description="Broken glass / scattered shards.",
-        category="safety", shape="point_in_time", cohort="both",
+        category="safety", cohort="both",
         recommended=False, prompt_fragment=_ENV_HAZARD_GLASS_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
@@ -1042,14 +1050,14 @@ CATALOG: tuple[CatalogEntry, ...] = (
         key="env_hazard_water", name="Environmental hazard — Spilled water",
         icon_name="drop",
         description="Water or liquid spilled on the floor — a slip hazard.",
-        category="safety", shape="point_in_time", cohort="both",
+        category="safety", cohort="both",
         recommended=False, prompt_fragment=_ENV_HAZARD_WATER_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
     CatalogEntry(
         key="fire_smoke", name="Fire / smoke", icon_name="flame",
         description="Visible flames or smoke.",
-        category="safety", shape="point_in_time", cohort="both",
+        category="safety", cohort="both",
         recommended=False, prompt_fragment=_FIRE_SMOKE_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
@@ -1060,7 +1068,7 @@ CATALOG: tuple[CatalogEntry, ...] = (
     CatalogEntry(
         key="setup_test", name="Setup test", icon_name="hand.raised.fingers.spread",
         description="Internal one-time alert self-test.",
-        category="routine", shape="point_in_time", cohort="both",
+        category="routine", cohort="both",
         recommended=False, seeded=True, hidden=True, fire_once=True,
         prompt_fragment=_SETUP_TEST_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
@@ -1083,8 +1091,10 @@ def _validate_catalog() -> None:
             raise ValueError(f"[catalog] {e.key}: bad cohort {e.cohort!r}")
         if e.category not in ("safety", "routine"):
             raise ValueError(f"[catalog] {e.key}: bad category {e.category!r}")
-        if e.shape not in ("point_in_time", "state", "scheduled"):
-            raise ValueError(f"[catalog] {e.key}: bad shape {e.shape!r}")
+        if e.alert_trigger not in ("leading", "trailing", "duration", "schedule"):
+            raise ValueError(f"[catalog] {e.key}: bad alert_trigger {e.alert_trigger!r}")
+        if e.alert_trigger == "duration" and not e.duration_seconds:
+            raise ValueError(f"[catalog] {e.key}: duration trigger needs duration_seconds")
         for field in e.schema_json:
             if field in seen_fields:
                 raise ValueError(
@@ -1161,7 +1171,7 @@ def promotion_rules() -> dict[str, tuple[str, str, float]]:
     return {
         e.key: (e.detected_key, e.confidence_key, e.promotion_threshold)
         for e in CATALOG
-        if e.shape != "scheduled"
+        if e.alert_trigger != "schedule"
     }
 
 
