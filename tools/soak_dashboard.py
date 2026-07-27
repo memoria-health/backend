@@ -135,9 +135,28 @@ async def _hourly(s) -> list:
     return out
 
 
+async def _cam_names(s=None) -> dict:
+    """8-hex camera prefix → room name (cached). Every card shows the
+    NAME; ids are hover/debug detail (Aryaman: names all over)."""
+    global _CAM_NAMES
+    if _CAM_NAMES is None:
+        if s is not None:
+            cam_rows = (await s.execute(text(
+                "select substr(id::text, 1, 8) as c8, room from cameras"
+            ))).all()
+            _CAM_NAMES = {r.c8: r.room for r in cam_rows}
+        else:
+            sm = get_sessionmaker()
+            async with sm() as s2:
+                cam_rows = (await s2.execute(text(
+                    "select substr(id::text, 1, 8) as c8, room from cameras"
+                ))).all()
+                _CAM_NAMES = {r.c8: r.room for r in cam_rows}
+    return _CAM_NAMES
+
+
 @app.get("/data")
 async def data() -> JSONResponse:
-    global _CAM_NAMES
     settings = get_settings()
     sm = get_sessionmaker()
     async with sm() as s:
@@ -145,11 +164,7 @@ async def data() -> JSONResponse:
             select(Analysis).where(Analysis.captured_at >= _SINCE)
             .order_by(Analysis.captured_at.desc()).limit(400)
         )).scalars().all()
-        if _CAM_NAMES is None:
-            cam_rows = (await s.execute(text(
-                "select substr(id::text, 1, 8) as c8, room from cameras"
-            ))).all()
-            _CAM_NAMES = {r.c8: r.room for r in cam_rows}
+        await _cam_names(s)
         events = (await s.execute(
             select(Event, Detector.identifier)
             .join(Detector, Event.detector_id == Detector.id, isouter=True)
@@ -407,7 +422,14 @@ def _read_trace(limit_bytes: int = 900_000) -> dict:
         if t == "reset":
             resets.append(r)
             continue
-        tk = ticks.setdefault((cam, r.get("tick")), {
+        # Bucket by (cam, capture_ts) — NOT tick number. The backend's
+        # tick counter resets on every restart/hot-reload, so number-
+        # keyed buckets merge rows from different runs and freeze the
+        # card at the oldest generation's timestamps (live 2026-07-26:
+        # "the ticks aren't flowing" while rows appended fine). Every
+        # row of one tick inherits the identical capture_ts from the
+        # trace context, so ts IS the tick's identity.
+        tk = ticks.setdefault((cam, r.get("ts")), {
             "cam": cam, "tick": r.get("tick"), "ts": r.get("ts"),
             "body": [], "idev": [], "harvest": [], "lat": None, "arm": None,
         })
@@ -453,7 +475,15 @@ def _read_trace(limit_bytes: int = 900_000) -> dict:
 
 @app.get("/trace")
 async def trace_data():
-    return JSONResponse(_read_trace())
+    out = _read_trace()
+    try:
+        names = await _cam_names()
+        for tk in out.get("ticks", []):
+            c8 = str(tk.get("cam", ""))[:8]
+            tk["cam_name"] = names.get(c8, c8)
+    except Exception:  # noqa: BLE001 — names are cosmetic, never 500
+        pass
+    return JSONResponse(out)
 
 
 @app.get("/identity_timeline")
@@ -551,7 +581,7 @@ _PAGE = """<!doctype html><html><head><meta charset="utf-8">
   .tlt{font-size:10.5px;flex:0 0 auto}
   .tl{display:flex;height:14px;border-radius:3px;overflow:hidden;flex:1;min-width:0;
     border:1px solid var(--line);background:var(--logbg)}
-  .tl i{flex:1;min-width:2px}
+  .tl i{flex:1;min-width:1px}
   .tl i.ok{background:var(--ok)} .tl i.warn{background:var(--warn)}
   .tl i.emp{background:var(--line)} .tl i.skp{background:var(--chipbg)}
   .tl i.oth{background:var(--crit)}
@@ -610,7 +640,7 @@ _PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <div id="idevents" class="logwin" style="max-height:520px;overflow-y:auto"></div></div>
 <div class="card"><h2>Tracker eval — live trace <span id="tarm" class="mut" style="font-weight:400;font-size:12px"></span></h2>
 <p class="mut" style="font-size:11.5px;margin:0 0 8px">SAM3 vs SAM3+EdgeTAM rig. Metrics that are computable without ground truth (per-stage latency, body-score distribution, event counts, contamination). The panel is the raw per-tick timeline: <span class="ok">body/BOUND</span> = patient signal · <span class="warn">amber</span> = unmatched/kept · <span class="crit">UNBOUND</span> = lost. Label tids yourself for acquire/FP.</p>
-<div id="traceoff" class="mut">tracing off — set <span class="mono">reid_trace_enabled=true</span> + <span class="mono">reid_lean_eval_mode=true</span> and restart</div>
+<div id="traceoff" class="mut">tracing off — set <span class="mono">NEMARA_REID_TRACE_ENABLED=true</span> and restart the backend (armed automatically by both identity providers)</div>
 <div id="tracebody" style="display:none">
 <div id="tresets"></div>
 <div id="tmetrics" class="mono" style="font-size:12px;margin:6px 0 10px"></div>
@@ -622,7 +652,7 @@ _PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <div id="hourtotals" class="mono" style="margin:0 0 8px"></div>
 <div id="hourly" class="mono mut">no calls yet — waiting for the first analyzed tick</div></div>
 <div class="card"><h2>Tick log — newest first</h2>
-<p class="mut" style="font-size:11.5px;margin:0 0 8px">How to read a line: every detector in the loadout is asked on every analyzed tick, grouped into the calls shown — <span class="mono">key·Ndet</span> = one Gemini call carrying N detectors. Silence = every detector answered no; <span class="mono">⚑ name</span> = that detector answered YES. <span class="mono">⛔closed</span> = that call was pre-gated and never sent ($0) — today only the convulsion bucket has a pre-gate (<span class="mono">rapid_gateAF</span> is its motion evidence), which is why gate chatter looks convulsion-specific. Absence/scheduled detectors don't ride calls; they evaluate from coverage at their deadline. <span class="mono">fps=A→B</span> = LiveKit delivered A fps to the backend (stream health; want ≥8) → buffer kept B for analysis (capped at the 4fps target by design; ~3.4 is normal, NOT a problem); <span class="mono">gap</span> = worst frame silence in the window.</p>
+<p class="mut" style="font-size:11.5px;margin:0 0 8px">How to read a line: every detector in the loadout is asked on every analyzed tick, grouped into the calls shown — <span class="mono">key·Ndet</span> = one Gemini call carrying N detectors. Silence = every detector answered no; <span class="mono">⚑ name</span> = that detector answered YES. <span class="mono">⛔closed</span> = that call was pre-gated and never sent ($0) — today only the convulsion bucket has a pre-gate (<span class="mono">rapid-gate-motion</span> is its motion evidence), which is why gate chatter looks convulsion-specific. Absence/scheduled detectors don't ride calls; they evaluate from coverage at their deadline. <span class="mono">ingest-fps=A→kept B</span> = LiveKit delivered A fps to the backend (stream health; want ≥8) → buffer kept B for analysis (capped at the 4fps target by design; ~3.4 is normal, NOT a problem); <span class="mono">worst-frame-gap</span> = longest frame silence in the window. <span class="mono">track-motion</span> = largest per-track motion fraction this tick; <span class="mono">env-motion</span> = scene motion outside any track.</p>
 <div class="logwin" id="log"></div></div>
 <div class="card"><h2>Compiler acceptance — ran Jul 14 (pure-rules half; pinned by 22 unit goldens)</h2>
 <div class="tblwrap"><table>
@@ -643,16 +673,16 @@ _PAGE = """<!doctype html><html><head><meta charset="utf-8">
 const $=id=>document.getElementById(id);
 function esc(s){return String(s??"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]))}
 function tickLine(t){
-  const fps=t.rfps!=null?` fps=${t.rfps}→${t.kfps??"?"} gap=${t.gap??"?"}ms`:"";
+  const fps=t.rfps!=null?` ingest-fps=${t.rfps}→kept ${t.kfps??"?"} · worst-frame-gap=${t.gap??"?"}ms`:"";
   if(t.skip==="tick_failed")
     return `<span class="crit">⛔ TICK FAILED · ${esc(t.err??"?")}: ${esc(t.emsg??"")}</span>${fps}`;
   if(t.skip) return `skipped · ${esc(t.skip)}${fps}`;
-  let b=`${t.woke?'<span class="ok">⚡ WOKE</span> ':""}motion=${esc(t.motion??"—")} ppl=${t.ppl?"Y":"n"}(${esc(t.psrc??"—")}) trk=${t.tracks}`;
-  if(t.amount!=null) b+=` amt=${t.amount}`;
-  if(t.env!=null) b+=` env=${t.env}`;
+  let b=`${t.woke?'<span class="ok">⚡ WOKE</span> ':""}motion=${esc(t.motion??"—")} people=${t.ppl?"YES":"no"} (via ${esc(t.psrc??"—")}) tracks=${t.tracks}`;
+  if(t.amount!=null) b+=` track-motion=${t.amount}`;
+  if(t.env!=null) b+=` env-motion=${t.env}`;
   if(t.calls.length) b+=` calls=[${t.calls.map(c=>
     esc(c.k)+"·"+c.n+"det"+(c.g?" ⛔"+esc(c.g):"")).join(" | ")}]`;
-  if(t.gaf!=null) b+=` rapid_gateAF=${t.gaf}`;
+  if(t.gaf!=null) b+=` rapid-gate-motion=${t.gaf}`;
   b+=fps;
   if(t.fired.length) b+=` ⚑ ${t.fired.map(esc).join(", ")}`;
   return b;
@@ -802,10 +832,10 @@ async function pollTrace(){
     const off=document.getElementById('traceoff'),body=document.getElementById('tracebody');
     if(!t.on){off.style.display='';body.style.display='none';return;}
     off.style.display='none';body.style.display='';
-    document.getElementById('tarm').textContent='· arm='+(t.arm||'?');
+    document.getElementById('tarm').textContent='· identity arm: '+(t.arm||'?');
     const m=t.metrics;
     document.getElementById('tmetrics').innerHTML=
-      '<b>latency</b> e2e p50 '+tfmt(m.e2e_p50)+'ms · max '+tfmt(m.e2e_max)+'ms (n='+m.e2e_n+') · track p50 '+tfmt(m.track_p50)+'ms · face p50 '+tfmt(m.face_p50)+'ms<br>'+
+      '<b>latency (measured)</b> capture→processed p50 '+tfmt(m.e2e_p50)+'ms · max '+tfmt(m.e2e_max)+'ms (n='+m.e2e_n+') · pod tracking p50 '+tfmt(m.track_p50)+'ms · face probe p50 '+tfmt(m.face_p50)+'ms<br>'+
       '<b>body scores</b> nonzero '+m.body_nz+'/'+m.body_n+' · min '+tf3(m.body_min)+' · median '+tf3(m.body_med)+' · max '+tf3(m.body_max)+'<br>'+
       '<b>events</b> '+(Object.entries(m.events).map(function(e){return e[0]+'='+e[1];}).join(' · ')||'none');
     document.getElementById('tresets').innerHTML=t.resets>0?
@@ -813,8 +843,8 @@ async function pollTrace(){
     var h='';
     (t.ticks||[]).forEach(function(tk){
       var when=new Date((tk.ts||0)*1000).toLocaleTimeString();
-      h+='<div class="lr"><b>tick '+(tk.tick==null?'?':tk.tick)+'</b> <span class="mut">'+when+' · '+String(tk.cam).slice(0,8)+(tk.arm?' · '+tk.arm:'')+'</span>';
-      if(tk.lat)h+=' <span class="mut">e2e '+tfmt(tk.lat.e2e_ms)+'ms · track '+tfmt(tk.lat.track_ms)+'ms · '+tk.lat.frames+'f</span>';
+      h+='<div class="lr"><b>tick '+(tk.tick==null?'?':tk.tick)+'</b> <span class="mut">'+when+' · '+esc(tk.cam_name||String(tk.cam).slice(0,8))+(tk.arm?' · '+tk.arm:'')+'</span>';
+      if(tk.lat)h+=' <span class="mut">capture→processed '+tfmt(tk.lat.e2e_ms)+'ms · pod '+tfmt(tk.lat.track_ms)+'ms · face probe '+tfmt(tk.lat.face_ms)+'ms'+(tk.lat.sidecar_ms!=null?' · backend fold '+tfmt(tk.lat.sidecar_ms)+'ms':'')+' · '+tk.lat.frames+(tk.arm==='sidecar'?' tracks':' frames')+'</span>';
       h+='</div>';
       (tk.body||[]).forEach(function(b){var cls=String(b.verdict).indexOf('PATIENT')===0?'ok':(b.patient>0?'warn':'mut');
         h+='<div class="lr" style="padding-left:18px"><span class="'+cls+'">body '+tf3(b.patient)+'</span> <span class="mut">other '+tf3(b.other)+' → '+b.verdict+'</span></div>';});
@@ -886,16 +916,12 @@ async function pollIdTimeline(){
     const j=await (await fetch('/identity_timeline')).json();
     let samples=j.samples||[];
     if(!samples.length){$("idtl").innerHTML='';return;}
-    // 30s max-priority buckets (patient > people > empty)
-    const PRI={patient:2,people:1,empty:0};
-    const bucketed=[]; let cur=null;
-    for(const [ts,row] of samples){
-      const b=Math.floor(ts/30)*30;
-      if(!cur||cur[0]!==b){cur=[b,{...row}];bucketed.push(cur);}
-      else{for(const [c,st] of Object.entries(row)){
-        if((PRI[st]||0)>(PRI[cur[1][c]]||0))cur[1][c]=st;}}
-    }
-    samples=bucketed;
+    // NATIVE 10s samples — no bucketing. The old 30s max-priority
+    // buckets (patient > people > empty) swallowed real transitions:
+    // live 2026-07-26 02:19, a seat death + 35s of empty/people + a
+    // face re-lock rendered as solid green because each bucket also
+    // contained one patient sample. Every sample is a cell now; a
+    // lost lock is VISIBLE as the empty/yellow sliver it really was.
     const cams=[...new Set(samples.flatMap(s=>Object.keys(s[1])))].sort();const tnm=c=>(j.names||{})[c.slice(0,8)]||((window._camnames||{})[c.slice(0,8)])||c.slice(0,8);
     const t0=new Date(samples[0][0]*1000),t1=new Date(samples[samples.length-1][0]*1000);
     const hm=d=>`${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
@@ -913,7 +939,7 @@ async function pollIdTimeline(){
     }).join('')+`<div class="mut" style="font-size:10.5px;margin-top:2px">last 2h · one cell ≈ 10s · <span class="ok">green</span> patient · <span class="warn">amber</span> people, unidentified · light = empty</div>`;
   }catch(e){}
 }
-pollIdTimeline(); setInterval(pollIdTimeline, 30000);
+pollIdTimeline(); setInterval(pollIdTimeline, 10000);
 </script></div></body></html>"""
 
 
