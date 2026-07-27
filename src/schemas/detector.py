@@ -76,6 +76,9 @@ Prompt = Annotated[str, Field(min_length=1, max_length=2000)]
 # Multi-room scope: room names (or the "ALL ROOMS" sentinel). Bounded so a
 # client can't send an unbounded blob. None = every room (back-compat).
 Rooms = Annotated[list[Annotated[str, Field(min_length=1, max_length=80)]], Field(max_length=40)]
+# Bounded client-supplied durations (seconds): 1s .. 24h. Guards the
+# duration-trigger threshold against negative / absurd values from the client.
+DurationSeconds = Annotated[int, Field(ge=1, le=86400)]
 
 
 class DetectorResponse(BaseModel):
@@ -160,7 +163,7 @@ class CreateDetectorRequest(BaseModel):
     # Alerting spine (client sends the confirmed inference).
     alert_trigger: AlertTrigger = AlertTrigger.leading
     is_sustained: bool = False
-    duration_seconds: int | None = None
+    duration_seconds: DurationSeconds | None = None
     icon_name: IconName = "eye"
     where_scope: Scope = "ALL ROOMS"
     # Rooms the caregiver picked (multi-select). None / ["ALL ROOMS"] = every
@@ -241,7 +244,7 @@ class UpdateDetectorRequest(BaseModel):
     # Alerting spine (the toggle the picker sets).
     alert_trigger: AlertTrigger | None = None
     is_sustained: bool | None = None
-    duration_seconds: int | None = None
+    duration_seconds: DurationSeconds | None = None
     where_scope: Scope | None = None
     # Re-scope the detector's rooms; the endpoint replaces its camera
     # assignments to match. ["ALL ROOMS"] or null-via-omit = every room.
