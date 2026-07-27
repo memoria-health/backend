@@ -55,7 +55,7 @@ class _CapturingUploader:
         self.dest = dest
         self.calls: list[tuple[str, dict]] = []
 
-    async def __call__(self, path, key, *, metadata, settings) -> str:
+    async def __call__(self, path, key, *, metadata, settings, region=None) -> str:
         shutil.copy(path, self.dest)
         self.calls.append((key, dict(metadata)))
         return key

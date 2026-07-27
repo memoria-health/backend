@@ -14,6 +14,7 @@ from __future__ import annotations
 from uuid import UUID
 
 from src.errors import StorageError
+from src.services import region as region_routing
 from src.services import storage as base_storage
 from src.settings import Settings
 
@@ -34,6 +35,7 @@ async def upload_face_photo(
     image_bytes: bytes,
     content_type: str,
     settings: Settings,
+    region: str | None = None,
 ) -> str:
     """Upload one enrollment photo, returning the bucket-relative key.
 
@@ -42,9 +44,16 @@ async def upload_face_photo(
     upload_patient_photo's behavior), so this just dispatches the
     upload. We don't expose `_validate_image_payload` publicly to keep
     the storage module's surface tight.
+
+    India patients' face photos are region-prefixed (``IN/patient-faces/...``)
+    so this biometric-adjacent media is isolated + liftable; US unchanged. The
+    returned key is persisted on the embedding row (`source_path`) and reused
+    for download/delete, so reads need no region knowledge.
     """
     extension = _ext_for_content_type(content_type)
-    key = face_storage_key(patient_id, embedding_id, extension)
+    key = region_routing.storage_key(
+        region, face_storage_key(patient_id, embedding_id, extension),
+    )
     # Hand off to the shared primitive so the auth/retry/timeout logic
     # stays in one place. The face-photo cap matches the avatar cap;
     # iOS downsamples to <1MB before upload.

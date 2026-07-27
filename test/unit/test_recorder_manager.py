@@ -64,10 +64,12 @@ class _FakeMuxer:
 class _FakeUploader:
     def __init__(self, fail_times: int = 0) -> None:
         self.calls: list[tuple[Path, str, dict]] = []
+        self.regions: list[str] = []
         self.fail_times = fail_times
 
-    async def __call__(self, path, key, *, metadata, settings) -> str:
+    async def __call__(self, path, key, *, metadata, settings, region="US") -> str:
         self.calls.append((Path(path), key, dict(metadata)))
+        self.regions.append(region)
         if len(self.calls) <= self.fail_times:
             raise RuntimeError("transient upload error")
         return key
@@ -121,6 +123,48 @@ def _ctx(room="Living Room", gate="poi", conf=0.9) -> RecorderCtx:
         gate=gate,
         confidence=conf,
     )
+
+
+@pytest.mark.asyncio
+async def test_upload_routes_to_patient_region(tmp_path) -> None:
+    """Data-residency wiring: the recorder resolves the patient's region via
+    the injected region_lookup and threads it to the uploader, so an India
+    patient's research clip lands in the India bucket. This exercises the
+    patient-row → upload call path end-to-end through the manager."""
+    clock = _Clock()
+    muxer, uploader = _FakeMuxer(), _FakeUploader()
+
+    async def _region_in(_patient_id) -> str:
+        return "IN"
+
+    mgr = RecorderManager(
+        settings=_settings(),
+        temp_dir=tmp_path,
+        encoder_factory=_Factory(),
+        muxer=muxer,
+        uploader=uploader,
+        clock=clock,
+        utcnow=lambda: _UTC,
+        roll_seconds=900.0,
+        linger_seconds=45.0,
+        retry_base_delay=0.0,
+        sleep=_noop_sleep,
+        region_lookup=_region_in,
+    )
+    cam = uuid4()
+    ctx = _ctx()
+    lead = [FrameSnapshot(width=320, height=240, data=_blob(), captured_at=999.0)]
+
+    await mgr.on_tick(cam, True, ctx=ctx, lead_in_frames=lead, lead_in_audio=b"\x00\x00")
+    mgr.feed_video(cam, 320, 240, _blob())
+    mgr.feed_audio(cam, b"\x01\x02")
+    await mgr.on_tick(cam, False, ctx=ctx)  # lingering
+    clock.advance(46.0)
+    await mgr.on_tick(cam, False, ctx=ctx)  # finalize
+    await mgr.drain()
+
+    assert len(uploader.calls) == 1
+    assert uploader.regions == ["IN"]
 
 
 @pytest.mark.asyncio

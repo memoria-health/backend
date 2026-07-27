@@ -17,13 +17,11 @@ shared `parse_and_validate` enforces the schema regardless. Any error (HTTP
 or body-level) raises, so `run_vlm` falls back to OpenRouter.
 """
 
-import asyncio
 import logging
 from collections.abc import Sequence
 
 import httpx
 
-from src.services.detection.frame_annotate import annotate_base64_async
 from src.services.detection.frame_extraction import ExtractedFrame, extract_frames
 from src.services.detection.prompt import (
     DetectorSpec,
@@ -56,9 +54,7 @@ async def dashscope_provider(
     log_tag: str,
     settings: Settings,
     patient_in_clip: bool = False,
-    patient_bbox: tuple[float, float, float, float] | None = None,
     pre_extracted_frames: list[ExtractedFrame] | None = None,
-    per_frame_bboxes: list[tuple[float, float, float, float] | None] | None = None,
     sample_fps: int | None = None,
 ) -> ProviderResult:
     if not settings.dashscope_api_key:
@@ -83,14 +79,6 @@ async def dashscope_provider(
         frames = list(frames[-settings.dashscope_max_frames:])
 
     frame_b64 = [f.data_base64 for f in frames]
-    # Highlight the patient with the single tracked bbox when present
-    # (per-frame boxes don't align to this freshly-sampled set).
-    if patient_in_clip and patient_bbox is not None:
-        frame_b64 = list(
-            await asyncio.gather(
-                *(annotate_base64_async(b64, patient_bbox) for b64 in frame_b64)
-            )
-        )
 
     video_frames = [f"data:image/jpeg;base64,{b64}" for b64 in frame_b64]
     text = (

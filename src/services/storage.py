@@ -34,6 +34,7 @@ from uuid import UUID
 import httpx
 
 from src.errors import StorageError
+from src.services import region as region_routing
 from src.settings import Settings
 
 log = logging.getLogger(__name__)
@@ -146,11 +147,16 @@ async def upload_patient_photo(
     image_bytes: bytes,
     content_type: str,
     settings: Settings,
+    region: str | None = None,
 ) -> str:
     """Upload a patient avatar and return its bucket-relative storage key.
 
     The key is ``{patient_id}.{ext}`` in the patient-photos bucket;
-    re-uploading replaces the existing avatar (one photo per patient).
+    re-uploading replaces the existing avatar (one photo per patient). For
+    India patients the key is region-prefixed (``IN/{patient_id}.{ext}``) so
+    the object is isolated + liftable; US is unchanged. The returned
+    (prefixed) key is stored on the patient row and reused verbatim for
+    signed-URL / delete, so reads need no region knowledge.
 
     Raises:
         StorageError: payload validation failed or storage backend rejected.
@@ -158,7 +164,7 @@ async def upload_patient_photo(
     extension = _validate_image_payload(
         image_bytes, content_type, settings.storage_max_photo_bytes,
     )
-    key = f"{patient_id}.{extension}"
+    key = region_routing.storage_key(region, f"{patient_id}.{extension}")
     await upload_object(
         bucket=settings.storage_bucket_patient_photos,
         key=key,
@@ -175,6 +181,7 @@ async def upload_clip(
     mp4_bytes: bytes,
     settings: Settings,
     sub_key: str | None = None,
+    region: str | None = None,
 ) -> str:
     """Upload a clip MP4 and return its bucket-relative storage key.
 
@@ -198,7 +205,11 @@ async def upload_clip(
             f"mp4_bytes too large: {len(mp4_bytes)} bytes "
             f"(max {settings.storage_max_clip_bytes})"
         )
-    key = f"events/{event_id}/{sub_key}" if sub_key else f"events/{event_id}.mp4"
+    base_key = f"events/{event_id}/{sub_key}" if sub_key else f"events/{event_id}.mp4"
+    # India clips get an `IN/` prefix (isolated + liftable); US unchanged. The
+    # returned key is stored on events.clip_storage_key and reused for
+    # signed-URL / delete, so intermediates + final stay self-consistent.
+    key = region_routing.storage_key(region, base_key)
     await upload_object(
         bucket=settings.storage_bucket_incident_clips,
         key=key,

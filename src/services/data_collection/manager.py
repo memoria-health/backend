@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 _Muxer = Callable[..., Awaitable[Path]]
 _Uploader = Callable[..., Awaitable[str]]
 _PrivacyCheck = Callable[[UUID], Awaitable[bool]]
+_RegionLookup = Callable[[UUID], Awaitable[str]]
 
 
 def _default_encoder_factory(path: Path) -> StreamingMp4Writer:
@@ -51,6 +52,12 @@ async def _never_private(_patient_id: UUID) -> bool:
     """Default privacy check — used when no DB-backed check is injected
     (e.g. unit tests). Always permits the upload."""
     return False
+
+
+async def _always_us(_patient_id: UUID) -> str:
+    """Default region lookup — used when no DB-backed resolver is injected
+    (e.g. unit tests). Routes to the default (US) bucket."""
+    return "US"
 
 
 class RecorderManager:
@@ -70,9 +77,11 @@ class RecorderManager:
         retry_base_delay: float = 1.0,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         privacy_check: _PrivacyCheck = _never_private,
+        region_lookup: _RegionLookup = _always_us,
     ) -> None:
         self._settings = settings
         self._privacy_check = privacy_check
+        self._region_lookup = region_lookup
         self._temp_dir = Path(temp_dir)
         self._encoder_factory = encoder_factory
         self._muxer = muxer
@@ -282,18 +291,31 @@ class RecorderManager:
                     "data_collection: B2 not configured; discarding clip %s", key
                 )
                 return
-            await self._upload_with_retry(final_path, key, metadata)
+            # Data-residency: resolve the patient's region so India clips land
+            # in the India bucket. A lookup failure defaults to US (never block
+            # an upload on it), matching the fail-open posture for routing.
+            try:
+                region = await self._region_lookup(patient_id)
+            except Exception:
+                logger.exception(
+                    "data_collection: region lookup failed for %s; "
+                    "defaulting to US bucket for clip %s",
+                    patient_id, key,
+                )
+                region = "US"
+            await self._upload_with_retry(final_path, key, metadata, region)
         finally:
             self._cleanup(video_path, audio_path, final_path)
 
     async def _upload_with_retry(
-        self, final_path: Path, key: str, metadata: dict[str, str]
+        self, final_path: Path, key: str, metadata: dict[str, str], region: str,
     ) -> None:
         delay = self._retry_base_delay
         for attempt in range(1, self._upload_retries + 1):
             try:
                 await self._uploader(
-                    final_path, key, metadata=metadata, settings=self._settings
+                    final_path, key, metadata=metadata, settings=self._settings,
+                    region=region,
                 )
                 return
             except Exception:

@@ -281,7 +281,6 @@ async def run_scheduled_calls(
                     log_tag=log_tag,
                     settings=flash_settings,
                     patient_in_clip=identity.patient_in_clip,
-                    patient_bbox=None,
                 )
                 used_provider = "gemini"
             else:
@@ -424,7 +423,6 @@ async def run_scheduled_calls(
                             mp4=artifact, detectors=[vote_spec],
                             log_tag=f"{log_tag} confirm:{ident}:{i}",
                             settings=fs, patient_in_clip=identity.patient_in_clip,
-                            patient_bbox=None,
                         )
                     else:
                         _, res = await run_main_vlm(

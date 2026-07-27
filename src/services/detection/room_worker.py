@@ -239,6 +239,7 @@ class RoomWorker:
             settings=settings,
             temp_dir=recorder_temp_dir,
             privacy_check=self._patient_privacy_check,
+            region_lookup=self._patient_region,
         )
 
     async def _patient_privacy_check(self, patient_id) -> bool:
@@ -252,6 +253,15 @@ class RoomWorker:
             # we can't positively confirm is allowed to leave the box.
             return True
         return p.privacy_mode_enabled
+
+    async def _patient_region(self, patient_id) -> str:
+        """Data-residency lookup for the recorder: resolve the patient's
+        region so its research clip routes to the region's B2 bucket. A
+        vanished row defaults to US (fail-open on routing — the privacy
+        check above is what fails closed on whether to upload at all)."""
+        async with self._sessionmaker() as session:
+            p = await session.get(Patient, patient_id)
+        return p.region if p is not None else "US"
 
     # ── lifecycle ──────────────────────────────────────────────────
 

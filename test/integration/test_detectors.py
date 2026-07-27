@@ -24,7 +24,6 @@ _CUSTOM_DETECTOR_BODY = {
     "icon_name": "moon.stars",
     "description": "Kitchen activity between 11 PM and 6 AM.",
     "category": "safety",
-    "shape": "point_in_time",
     "where_rooms": ["KITCHEN"],
     "when_scope": "11 PM – 6 AM",
     "custom_prompt": "Trigger when motion is detected in the kitchen between 11pm and 6am.",
@@ -60,7 +59,7 @@ async def test_list_detectors_returns_four_presets_after_patient_create(
     assert falls["description"] == "Sudden fall events across all rooms."
     assert falls["category"] == "safety"
     assert falls["source"] == "preset"
-    assert falls["shape"] == "point_in_time"
+    assert falls["alert_trigger"] == "leading"
     assert falls["where_scope"] == "ALL ROOMS"
     assert falls["when_scope"] == "ALWAYS"
     assert falls["sensitivity"] == "standard"
@@ -96,7 +95,7 @@ async def test_create_custom_detector_full_field_assertion(
     assert d["description"] == _CUSTOM_DETECTOR_BODY["description"]
     assert d["category"] == "safety"
     assert d["source"] == "custom"                          # server-forced
-    assert d["shape"] == "point_in_time"
+    assert d["alert_trigger"] == "leading"
     assert d["where_scope"] == "KITCHEN"
     assert d["when_scope"] == "11 PM – 6 AM"
     assert d["sensitivity"] == "standard"                   # default
@@ -222,7 +221,7 @@ async def test_patch_partial_leaves_unspecified_fields_unchanged(
     assert d["name"] == "Falls"
     assert d["category"] == "safety"
     assert d["source"] == "preset"
-    assert d["shape"] == "point_in_time"
+    assert d["alert_trigger"] == "leading"
     assert d["is_on"] is True
 
 

@@ -96,13 +96,24 @@ create table public.caregivers (
   -- (e.g. demo logins). Web reads it from /v1/me and gates the section.
   show_live_analyses boolean not null default true,
   -- Terms of Service + Privacy Notice acceptance. tos_accepted_at is the
-  -- server-stamped moment the caregiver accepted (NULL = never accepted -> the
+  -- server-stamped moment the caregiver accepted (NULL = never accepted → the
   -- signup gate blocks the app until they do); tos_version is the document
-  -- version they accepted, so a later material update can bump it and re-prompt.
-  -- Mirrors the patient data-collection consent. Existing rows come out NULL
-  -- (re-prompted on next login) -- do not backfill as accepted.
+  -- version they accepted, so a later material update can bump it and
+  -- re-prompt. Mirrors the patient data-collection consent. Existing rows come
+  -- out NULL (re-prompted on next login) — do not backfill as accepted.
   tos_accepted_at timestamptz,
   tos_version     text,
+  -- Data-residency region for this account: 'US' | 'IN'. This is the
+  -- "India key" — the single authoritative axis for splitting all tenant
+  -- data by geography. Every sensitive row (patients, cameras, analyses,
+  -- patient_face_embeddings, events, gateways) resolves ITS region through
+  -- this column via its caregiver_id/patient_id FK, so the tag lives only
+  -- here. It makes three future operations one query (`where region = ?`):
+  -- lifting a region's data to in-region infra, scoping a breach
+  -- notification, and answering a data-subject access request. Residency is
+  -- trust-sensitive: it is set by the backend/admin and is IMMUTABLE from
+  -- the client path (see the caregivers_region_immutable trigger below).
+  region       text not null default 'US' check (region in ('US', 'IN')),
   created_at   timestamptz not null default now(),
   updated_at   timestamptz not null default now()
 );
@@ -110,6 +121,49 @@ create table public.caregivers (
 create trigger caregivers_set_updated_at
   before update on public.caregivers
   for each row execute function public.set_updated_at();
+
+-- Data-residency guard: `region` must never change once set — moving it
+-- would silently strand an account's data in the wrong geography. Clients
+-- reach caregivers only through the backend, but as defence-in-depth we
+-- hard-block any region change arriving on the RLS/PostgREST client path
+-- (which carries JWT claims / runs as authenticated|anon). A direct
+-- admin/service connection (no JWT claims, bypasses RLS) may still set or
+-- correct it — that is the authoritative path used to tag India accounts
+-- until the onboarding flow sets region at insert time. Fires before
+-- caregivers_set_updated_at (alphabetical order), which is harmless.
+create or replace function public.enforce_caregiver_region_immutable()
+returns trigger
+language plpgsql
+as $$
+begin
+  if new.region is distinct from old.region then
+    if current_setting('request.jwt.claims', true) is not null
+       or current_user in ('authenticated', 'anon') then
+      raise exception
+        'caregivers.region is immutable from the client path (data-residency attribute); change it only via an admin/service connection'
+        using errcode = 'check_violation';
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+create trigger caregivers_region_immutable
+  before update on public.caregivers
+  for each row execute function public.enforce_caregiver_region_immutable();
+
+-- Authoritative resolver: the region a caregiver's data belongs to. Every
+-- downstream residency decision (storage-key prefixing, region-scoped
+-- queries, breach/DSAR scoping) should call this rather than re-deriving
+-- the join, so there is exactly one source of truth. STABLE ⇒ usable in
+-- read queries and index expressions.
+create or replace function public.region_of(p_caregiver_id uuid)
+returns text
+language sql
+stable
+as $$
+  select region from public.caregivers where id = p_caregiver_id;
+$$;
 
 -- email-sync trigger fires on auth.users; one trigger here, not per-row.
 drop trigger if exists sync_caregiver_email on auth.users;
@@ -163,11 +217,58 @@ create table public.patients (
   -- fall back to initials while NULL. The signed URL is minted at
   -- read time by GET /v1/patients/{id}/photo-url.
   photo_storage_key text,
+  -- Data-residency region for THIS patient's data: 'US' | 'IN'. This is
+  -- the authoritative residency key — it follows the monitored home /
+  -- camera location, NOT the caregiver (a US-based caregiver can manage a
+  -- patient living in India, whose video/audio/biometrics are Indian
+  -- data). All heavy media (research clips → Backblaze, selfies + incident
+  -- clips → Supabase Storage) and every per-patient row route by this
+  -- column, so a region's data is liftable to in-region infra as one
+  -- `where region = ?` slice. Captured at patient onboarding (India → 'IN',
+  -- else 'US'); defaults 'US' so pre-region clients keep working. IMMUTABLE
+  -- from the client path (see patients_region_immutable trigger).
+  region          text not null default 'US' check (region in ('US', 'IN')),
   created_at      timestamptz not null default now(),
   updated_at      timestamptz not null default now()
 );
 
 create index patients_caregiver_id_idx on public.patients(caregiver_id);
+
+-- Same data-residency guard as caregivers.region: block any region change
+-- arriving on the RLS/PostgREST client path (JWT claims / authenticated|
+-- anon). The backend/admin (direct connection) may still set it at insert
+-- or correct it. Residency must not silently move.
+create or replace function public.enforce_patient_region_immutable()
+returns trigger
+language plpgsql
+as $$
+begin
+  if new.region is distinct from old.region then
+    if current_setting('request.jwt.claims', true) is not null
+       or current_user in ('authenticated', 'anon') then
+      raise exception
+        'patients.region is immutable from the client path (data-residency attribute); change it only via an admin/service connection'
+        using errcode = 'check_violation';
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+create trigger patients_region_immutable
+  before update on public.patients
+  for each row execute function public.enforce_patient_region_immutable();
+
+-- Authoritative resolver: the region a patient's data belongs to. Storage
+-- routing (Backblaze bucket, Supabase key prefix) and any region-scoped
+-- query should call this, so there is exactly one source of truth.
+create or replace function public.region_of_patient(p_patient_id uuid)
+returns text
+language sql
+stable
+as $$
+  select region from public.patients where id = p_patient_id;
+$$;
 
 create trigger patients_set_updated_at
   before update on public.patients
@@ -780,21 +881,63 @@ create index ui_events_occurred_idx on public.ui_events(occurred_at);
 -- caregiver's own rows. Without it, Realtime would broadcast every
 -- table change to every subscriber.
 
+-- ── Patient sharing (multi-caregiver membership) ──────────────────
+-- A caregiver's access to a patient is a row in patient_members, NOT the single
+-- patients.caregiver_id FK. `role` is unused in the MVP (every member has full
+-- access) but present so per-patient permission levels drop in later with NO
+-- migration. The original owner is mirrored as a role='owner' row (backfill).
+create table if not exists public.patient_members (
+  id           uuid primary key default gen_random_uuid(),
+  patient_id   uuid not null references public.patients(id)   on delete cascade,
+  caregiver_id uuid not null references public.caregivers(id) on delete cascade,
+  role         text not null default 'caregiver'
+                 check (role in ('owner','caregiver','viewer')),
+  invited_by   uuid references public.caregivers(id) on delete set null,
+  created_at   timestamptz not null default now(),
+  unique (patient_id, caregiver_id)
+);
+create index if not exists patient_members_caregiver_idx on public.patient_members(caregiver_id);
+create index if not exists patient_members_patient_idx   on public.patient_members(patient_id);
+
+-- Backfill: every existing patient's owner becomes an 'owner' membership row.
+insert into public.patient_members (patient_id, caregiver_id, role)
+select id, caregiver_id, 'owner' from public.patients
+on conflict (patient_id, caregiver_id) do nothing;
+
+-- Single source of truth for "can this caller access this patient?" Referenced
+-- by every patient-scoped RLS policy below. SECURITY DEFINER so the membership
+-- lookup isn't itself re-filtered by RLS on patient_members.
+create or replace function public.has_patient_access(pid uuid)
+returns boolean language sql stable security definer set search_path = public as $$
+  select exists (
+    select 1 from public.patient_members m
+    where m.patient_id = pid and m.caregiver_id = auth.uid()
+  );
+$$;
+
 alter table public.caregivers enable row level security;
 create policy caregivers_self on public.caregivers
   for all using (id = auth.uid()) with check (id = auth.uid());
 
+-- patient_members: a caregiver may READ membership rows for patients they can
+-- access. Inserts/deletes go through the owner-guarded service-role API, so the
+-- authed client only needs read.
+alter table public.patient_members enable row level security;
+create policy patient_members_read on public.patient_members
+  for select using (public.has_patient_access(patient_id));
+
+-- Patient + children: gated by MEMBERSHIP (has_patient_access), not ownership.
+-- The patients write-check stays caregiver_id = auth.uid() so a direct authed-
+-- client write can't reassign ownership (patient writes actually go through the
+-- service-role API).
 alter table public.patients enable row level security;
-create policy patients_owner on public.patients
-  for all using (caregiver_id = auth.uid()) with check (caregiver_id = auth.uid());
+create policy patients_member on public.patients
+  for all using (public.has_patient_access(id)) with check (caregiver_id = auth.uid());
 
 alter table public.cameras enable row level security;
-create policy cameras_owner on public.cameras
-  for all using (
-    patient_id in (select id from public.patients where caregiver_id = auth.uid())
-  ) with check (
-    patient_id in (select id from public.patients where caregiver_id = auth.uid())
-  );
+create policy cameras_member on public.cameras
+  for all using (public.has_patient_access(patient_id))
+  with check (public.has_patient_access(patient_id));
 
 -- gateways is backend-internal: ONLY the postgres/service role (which
 -- bypasses RLS) touches it, via the gateway roster/provision endpoints. No
@@ -814,55 +957,33 @@ alter table public.pi_discoveries enable row level security;
 revoke all on public.pi_discoveries from anon, authenticated;
 
 alter table public.detectors enable row level security;
-create policy detectors_owner on public.detectors
-  for all using (
-    patient_id in (select id from public.patients where caregiver_id = auth.uid())
-  ) with check (
-    patient_id in (select id from public.patients where caregiver_id = auth.uid())
-  );
+create policy detectors_member on public.detectors
+  for all using (public.has_patient_access(patient_id))
+  with check (public.has_patient_access(patient_id));
 
--- cameras_detectors: scoped through the camera's patient → caregiver.
--- Joining via cameras (not detectors) is fine — both FKs point to the
--- same patient by construction, and going through cameras matches the
--- pattern used by `cameras_owner` above.
+-- cameras_detectors: scoped through the camera's patient.
 alter table public.cameras_detectors enable row level security;
-create policy cameras_detectors_owner on public.cameras_detectors
+create policy cameras_detectors_member on public.cameras_detectors
   for all using (
-    camera_id in (
-      select c.id from public.cameras c
-      join public.patients p on p.id = c.patient_id
-      where p.caregiver_id = auth.uid()
-    )
+    camera_id in (select c.id from public.cameras c where public.has_patient_access(c.patient_id))
   ) with check (
-    camera_id in (
-      select c.id from public.cameras c
-      join public.patients p on p.id = c.patient_id
-      where p.caregiver_id = auth.uid()
-    )
+    camera_id in (select c.id from public.cameras c where public.has_patient_access(c.patient_id))
   );
 
 alter table public.events enable row level security;
-create policy events_owner on public.events
-  for all using (
-    patient_id in (select id from public.patients where caregiver_id = auth.uid())
-  ) with check (
-    patient_id in (select id from public.patients where caregiver_id = auth.uid())
-  );
+create policy events_member on public.events
+  for all using (public.has_patient_access(patient_id))
+  with check (public.has_patient_access(patient_id));
 
--- patient_face_embeddings: scoped through the embedding's patient → caregiver.
--- Mirrors the events_owner pattern: rows visible only to the caregiver who owns
--- the patient.
 alter table public.patient_face_embeddings enable row level security;
-create policy patient_face_embeddings_owner on public.patient_face_embeddings
-  for all using (
-    patient_id in (select id from public.patients where caregiver_id = auth.uid())
-  ) with check (
-    patient_id in (select id from public.patients where caregiver_id = auth.uid())
-  );
+create policy patient_face_embeddings_member on public.patient_face_embeddings
+  for all using (public.has_patient_access(patient_id))
+  with check (public.has_patient_access(patient_id));
 
 alter table public.analyses enable row level security;
-create policy analyses_owner on public.analyses
-  for all using (caregiver_id = auth.uid()) with check (caregiver_id = auth.uid());
+create policy analyses_member on public.analyses
+  for all using (public.has_patient_access(patient_id))
+  with check (public.has_patient_access(patient_id));
 
 alter table public.caregiver_devices enable row level security;
 create policy caregiver_devices_owner on public.caregiver_devices

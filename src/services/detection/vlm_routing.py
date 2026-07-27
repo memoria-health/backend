@@ -34,13 +34,15 @@ _VALID = ("gemini", "openai", "openrouter", "dashscope")
 # Chosen-first, then fallbacks — detection never goes dark if the primary
 # errors out.
 _CHAINS: dict[str, tuple[str, ...]] = {
-    # Sandbox cost guard: gemini falls back to Qwen (cheap), never to the
-    # expensive OpenAI, so a gemini 503/outage can't quietly run up an OpenAI
-    # bill. DashScope (Alibaba-direct Qwen, native video) sits before
-    # OpenRouter (Aryaman 2026-07-19: "fall back to dashscope locally, not
-    # just openrouter") — run_vlm skips it when no key is configured, so
-    # keyless environments behave exactly as before.
-    "gemini": ("gemini", "dashscope", "openrouter"),
+    # Gemini path: primary model (gemini_model, e.g. flash-lite) → fallback model
+    # (gemini_fallback_model, e.g. flash) on the SAME native-video path → DashScope
+    # (Alibaba-direct Qwen3-VL, ALSO native video) → OpenRouter (frame-based Qwen)
+    # only as a last-resort net so detection never goes fully dark. Immediate
+    # failover on first error, no retry. `gemini_fallback` is a chain-internal
+    # token (NOT a user choice); run_vlm reports it as "gemini". A keyless
+    # provider (e.g. DashScope) raises immediately, is caught, and the chain
+    # moves on — so keyless environments still fail through to openrouter.
+    "gemini": ("gemini", "gemini_fallback", "dashscope", "openrouter"),
     "openai": ("openai", "openrouter"),
     "openrouter": ("openrouter", "dashscope", "gemini"),
     # SANDBOX: Alibaba-direct Qwen3-VL (native video + fps) primary, OpenRouter
@@ -98,46 +100,44 @@ async def run_vlm(
     chain = _CHAINS.get(choice, _CHAINS["gemini"])
     errors: dict[str, str] = {}
     for prov in chain:
-        # A chain entry with no credentials configured is skipped
-        # silently rather than burning a guaranteed-failing attempt
-        # (and a warning line) on every tick.
-        if prov == "dashscope" and not settings.dashscope_api_key:
-            continue
         try:
-            if prov == "gemini":
+            if prov in ("gemini", "gemini_fallback"):
+                # Two gemini tiers on the SAME native-video path: primary model,
+                # then the fallback model. Reported as "gemini" either way — the
+                # analyses.provider CHECK constraint has no separate value and
+                # both ARE the gemini provider.
+                gmodel = (
+                    settings.gemini_fallback_model
+                    if prov == "gemini_fallback"
+                    else settings.gemini_model
+                )
                 result = await gemini_provider(
                     mp4=mp4, detectors=detectors, log_tag=log_tag, settings=settings,
                     patient_in_clip=identity.patient_in_clip,
-                    patient_bbox=identity.patient_bbox,
+                    model=gmodel,
                 )
-            else:
-                fn = {
-                    "openai": openai_provider,
-                    "openrouter": openrouter_provider,
-                    "dashscope": dashscope_provider,
-                }[prov]
-                # Frame reuse only when attribution ran: with always-on
-                # tracking (v2 P2) extracted_frames now populate on
-                # every successful tick, but Re-ID samples at 5 fps vs
-                # these providers' configured 4 — reusing for the
-                # attribution-less population would silently send ~25%
-                # more image tokens (and its per_frame_bboxes are all
-                # None, so the reuse's bbox-alignment benefit is moot).
-                # Attribution-less ticks keep their own extraction at
-                # the provider's own fps — the pre-P2 cost profile.
-                reuse = identity.attribution_ran
-                result = await fn(
-                    mp4=mp4, detectors=detectors, log_tag=log_tag, settings=settings,
-                    patient_in_clip=identity.patient_in_clip,
-                    patient_bbox=identity.patient_bbox,
-                    pre_extracted_frames=(
-                        identity.extracted_frames if reuse else None
-                    ),
-                    per_frame_bboxes=(
-                        identity.per_frame_bboxes if reuse else None
-                    ),
-                    sample_fps=identity.sample_fps if reuse else None,
-                )
+                return "gemini", result
+            fn = {
+                "openai": openai_provider,
+                "openrouter": openrouter_provider,
+                "dashscope": dashscope_provider,
+            }[prov]
+            # Frame reuse only when attribution ran: with always-on
+            # tracking (v2 P2) extracted_frames populate on every
+            # successful tick, but Re-ID samples at 5 fps vs these
+            # providers' configured 4 — reusing for the attribution-less
+            # population would silently send ~25% more image tokens.
+            # Attribution-less ticks keep their own extraction at the
+            # provider's own fps — the pre-P2 cost profile.
+            reuse = identity.attribution_ran
+            result = await fn(
+                mp4=mp4, detectors=detectors, log_tag=log_tag, settings=settings,
+                patient_in_clip=identity.patient_in_clip,
+                pre_extracted_frames=(
+                    identity.extracted_frames if reuse else None
+                ),
+                sample_fps=identity.sample_fps if reuse else None,
+            )
             return prov, result
         except Exception as e:  # noqa: BLE001
             errors[prov] = str(e)

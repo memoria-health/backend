@@ -13,6 +13,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from src.services import region as region_routing
+
 _CONTENT_TYPE = "video/mp4"
 
 
@@ -30,8 +32,15 @@ async def upload_file_to_b2(
     metadata: dict[str, Any],
     settings: Any,
     session: Any = None,
+    region: str | None = None,
 ) -> str:
-    """Upload the file at ``path`` to ``key`` in the B2 bucket.
+    """Upload the file at ``path`` to ``key`` in the region's B2 bucket.
+
+    ``region`` ('US' | 'IN') selects the bucket: India research clips route
+    to their own bucket (``settings.b2_bucket_in``) so India collected video
+    is isolated + liftable; US uses the default bucket. If the India bucket
+    isn't configured yet, `region.b2_bucket_for` falls back to the default
+    bucket with a warning (see that helper).
 
     ``metadata`` is attached as S3 object metadata with values
     stringified (S3 requires string metadata values). Returns ``key``
@@ -47,6 +56,7 @@ async def upload_file_to_b2(
 
         session = aioboto3.Session()
 
+    bucket = region_routing.b2_bucket_for(region, settings)
     async with session.client(
         "s3",
         endpoint_url=settings.b2_endpoint_url,
@@ -56,7 +66,7 @@ async def upload_file_to_b2(
     ) as s3:
         await s3.upload_file(
             Filename=str(path),
-            Bucket=settings.b2_bucket,
+            Bucket=bucket,
             Key=key,
             ExtraArgs={
                 "ContentType": _CONTENT_TYPE,

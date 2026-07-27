@@ -34,6 +34,15 @@ class Patient(Base):
     date_of_birth: Mapped[date | None] = mapped_column(Date, default=None)
     gender: Mapped[str | None] = mapped_column(String(40), default=None)
     home_address: Mapped[str | None] = mapped_column(String(500), default=None)
+
+    # Data-residency region for this patient's data: 'US' | 'IN'. The
+    # authoritative residency key — storage routing (Backblaze bucket,
+    # Supabase key prefix) and lift/breach/DSAR scoping key off it. Set at
+    # patient creation; immutable thereafter (DB trigger blocks client-path
+    # changes). server_default keeps pre-region rows/inserts valid.
+    region: Mapped[str] = mapped_column(
+        String, server_default=text("'US'"), default="US",
+    )
     last_event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     photo_storage_key: Mapped[str | None] = mapped_column(String, default=None)
 

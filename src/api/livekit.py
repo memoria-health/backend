@@ -28,6 +28,7 @@ from sqlalchemy import select
 from src.api.deps import SessionDep, SettingsDep, camera_auth, caregiver_auth
 from src.db.camera import Camera
 from src.db.patient import Patient
+from src.repos.access import accessible_patient_ids
 from src.schemas.livekit_io import MintTokenRequest, MintTokenResponse
 
 log = logging.getLogger(__name__)
@@ -216,8 +217,10 @@ async def _ensure_caregiver_can_join(
     except ValueError:
         raise _FORBIDDEN from None
 
+    # Membership, not ownership — a shared caregiver may join the room too.
     stmt = select(Patient.privacy_mode_enabled).where(
-        Patient.id == patient_id, Patient.caregiver_id == caregiver_id,
+        Patient.id == patient_id,
+        Patient.id.in_(accessible_patient_ids(caregiver_id)),
     )
     privacy = (await session.execute(stmt)).scalar_one_or_none()
     if privacy is None:

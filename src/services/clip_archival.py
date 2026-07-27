@@ -75,8 +75,7 @@ async def archive_event(
     settings: "Settings",
 ) -> None:
     """Capture the post-event window, concat with the pre-event MP4
-    handed in, burn a green bbox tracking the patient through the
-    ±15s window, upload the result, and flip `has_clip=true` on the
+    handed in, upload the result, and flip `has_clip=true` on the
     events row.
 
     Errors are caught and logged. The events row stays without a clip
@@ -94,9 +93,7 @@ async def archive_event(
     pre's last frame and post's first frame, which surfaces as a
     visible scene jump at the concat boundary.
 
-    `patient_id` drives the Re-ID gallery lookup at annotation time.
-    Annotation is best-effort: if it fails, the un-annotated clip is
-    uploaded so caregivers never lose a clip to display-layer issues.
+    `patient_id` is used only for the privacy re-check before upload.
     """
     try:
         await _archive_one(
@@ -181,12 +178,6 @@ async def _archive_one(
 
     combined_mp4 = await concat_mp4s(pre_event_mp4, post_event_mp4)
 
-    # Raw clip, no burned-in annotation — matches production main
-    # (2026-07-27): the brain-drawn patient box died with the legacy
-    # reid pipeline. Patient-box overlays, if they return, will come
-    # from the identity service's bbox stream, not a per-clip re-run.
-    annotated_mp4 = combined_mp4
-
     # Privacy re-check at the upload boundary. The caller already skips
     # spawning this task when privacy is on at promotion time, but privacy
     # can also flip ON during the post-event wait window above — so re-read
@@ -196,6 +187,10 @@ async def _archive_one(
     # caregiver — only the video is suppressed.
     async with sessionmaker() as session:
         patient = await session.get(Patient, patient_id)
+        # Capture region inside the session (attribute may expire after close).
+        # Missing patient defaults to US — the clip still uploads, just to the
+        # default region (a vanished patient is an edge case, not India data).
+        patient_region = patient.region if patient is not None else "US"
         if patient is not None and patient.privacy_mode_enabled:
             log.info(
                 "clip_archival.privacy_drop event_id=%s — clip discarded "
@@ -213,7 +208,8 @@ async def _archive_one(
             return
 
     final_key = await storage.upload_clip(
-        event_id=event_id, mp4_bytes=annotated_mp4, settings=settings,
+        event_id=event_id, mp4_bytes=combined_mp4, settings=settings,
+        region=patient_region,
     )
 
     async with sessionmaker() as session:
@@ -231,7 +227,7 @@ async def _archive_one(
 
     log.info(
         "clip_archival.done event_id=%s key=%s bytes=%d",
-        event_id, final_key, len(annotated_mp4),
+        event_id, final_key, len(combined_mp4),
     )
 
 

@@ -14,6 +14,7 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.patient import Patient
+from src.repos.access import accessible_patient_ids
 
 
 async def list_for_caregiver(
@@ -22,7 +23,7 @@ async def list_for_caregiver(
     """Return every patient owned by `caregiver_id`, newest first."""
     result = await session.execute(
         select(Patient)
-        .where(Patient.caregiver_id == caregiver_id)
+        .where(Patient.id.in_(accessible_patient_ids(caregiver_id)))
         .order_by(Patient.created_at.desc())
     )
     return result.scalars().all()
@@ -40,7 +41,7 @@ async def find_by_id(
     result = await session.execute(
         select(Patient).where(
             Patient.id == patient_id,
-            Patient.caregiver_id == caregiver_id,
+            Patient.id.in_(accessible_patient_ids(caregiver_id)),
         )
     )
     return result.scalar_one_or_none()
@@ -71,7 +72,7 @@ async def update_partial(
             update(Patient)
             .where(
                 Patient.id == patient_id,
-                Patient.caregiver_id == caregiver_id,
+                Patient.id.in_(accessible_patient_ids(caregiver_id)),
             )
             .values(**fields)
             .returning(Patient.id)
@@ -95,7 +96,7 @@ async def delete_by_id(
         delete(Patient)
         .where(
             Patient.id == patient_id,
-            Patient.caregiver_id == caregiver_id,
+            Patient.id.in_(accessible_patient_ids(caregiver_id)),
         )
         .returning(Patient.id)
     )

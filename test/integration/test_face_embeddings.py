@@ -77,7 +77,7 @@ def _patch_storage(monkeypatch) -> dict[str, bytes]:
     embedding pipeline without depending on bucket configuration."""
     store: dict[str, bytes] = {}
 
-    async def fake_upload(*, patient_id, embedding_id, image_bytes, content_type, settings):
+    async def fake_upload(*, patient_id, embedding_id, image_bytes, content_type, settings, region=None):
         key = f"patient-faces/{patient_id}/{embedding_id}.jpg"
         store[key] = image_bytes
         return key
