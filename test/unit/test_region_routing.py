@@ -26,6 +26,18 @@ def test_normalize_defaults_unknown_to_us() -> None:
     assert region.normalize("") == "US"
 
 
+def test_region_for_country_maps_india_only() -> None:
+    # India routes to the IN residency region; every other country (and
+    # unknown/empty) collapses to the default US — the only two we support.
+    assert region.region_for_country("IN") == "IN"
+    assert region.region_for_country("in") == "IN"  # case-insensitive
+    assert region.region_for_country("US") == "US"
+    assert region.region_for_country("GB") == "US"
+    assert region.region_for_country("FR") == "US"
+    assert region.region_for_country(None) == "US"
+    assert region.region_for_country("") == "US"
+
+
 def test_storage_key_us_is_unchanged() -> None:
     # US keeps its exact existing key (no prefix, no migration, no collision).
     assert region.storage_key("US", "abc.jpg") == "abc.jpg"

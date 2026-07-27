@@ -29,6 +29,7 @@ from src.schemas.patient import (
     UpdatePatientRequest,
 )
 from src.services import email, onboarding, storage
+from src.services import region as region_routing
 from src.services.livekit_privacy import enforce_privacy_for_room
 
 router = APIRouter(prefix="/v1/patients", tags=["patient"])
@@ -103,7 +104,10 @@ async def create_patient(
         date_of_birth=body.date_of_birth,
         gender=body.gender,
         home_address=body.home_address,
-        region=body.region.value,
+        # Record the picked country verbatim; the residency region collapses to
+        # what we physically support (region_for_country) — client never sets it.
+        country=body.country,
+        region=region_routing.region_for_country(body.country),
         last_event_at=None,
     )
     await patient_repo.insert(session, p)

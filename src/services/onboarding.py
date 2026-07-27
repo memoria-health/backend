@@ -32,6 +32,8 @@ from src.schemas.caregiver import (
     CreateCaregiverRequest,
     UpdateCaregiverRequest,
 )
+from src.schemas.patient import Region
+from src.services import region as region_routing
 from src.services.detection import catalog, catalog_v2
 
 _log = logging.getLogger(__name__)
@@ -54,6 +56,8 @@ def to_response(cg: Caregiver) -> CaregiverResponse:
         show_live_analyses=cg.show_live_analyses,
         tos_accepted_at=cg.tos_accepted_at,
         tos_version=cg.tos_version,
+        country=cg.country,
+        region=Region(cg.region),
     )
 
 
@@ -80,6 +84,10 @@ async def provision_caregiver(
         created_at=now,
         updated_at=now,
         phone=body.phone,
+        # Country picked at signup, recorded verbatim; the residency region is
+        # derived from it (region_for_country) — the "India key" for this account.
+        country=body.country,
+        region=region_routing.region_for_country(body.country),
         # iOS gates account creation on ToS acceptance, so a version arrives
         # here → stamp the acceptance time. Web omits it (accepts later via
         # the PATCH gate), so the row is born un-accepted and the web gate

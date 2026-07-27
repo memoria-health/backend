@@ -27,6 +27,20 @@ SUPPORTED_REGIONS = ("US", "IN")
 DEFAULT_REGION = "US"
 
 
+def region_for_country(country: str | None) -> str:
+    """Map an ISO 3166-1 alpha-2 country to a supported data-residency region.
+
+    Clients pick a full country; the residency contract only has two homes
+    today — India routes to 'IN', everything else (and unknown/empty) to the
+    default 'US'. This is the single place that decision lives, so adding a
+    third region later (e.g. an EU home) is a one-line change here and nowhere
+    else. The country is recorded verbatim on the row; only the *routing* region
+    collapses to what we physically support."""
+    if country and country.strip().upper() == "IN":
+        return "IN"
+    return DEFAULT_REGION
+
+
 def normalize(region: str | None) -> str:
     """Coerce to a supported region, defaulting to US. Never raises: an
     unexpected value must not break an upload — it degrades to US and logs."""

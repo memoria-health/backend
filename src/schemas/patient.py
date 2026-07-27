@@ -45,6 +45,11 @@ Name80 = Annotated[str, Field(min_length=1, max_length=80)]
 Address = Annotated[str, Field(min_length=1, max_length=500)]
 Gender = Annotated[str, Field(min_length=1, max_length=40)]
 Email = Annotated[str, Field(min_length=3, max_length=255)]
+# ISO 3166-1 alpha-2 country picked at onboarding (e.g. 'US', 'IN', 'GB').
+# Recorded verbatim on the row; the data-residency `region` (Region enum) is
+# DERIVED from it server-side via region_for_country() and is the only value
+# that drives storage routing / legal scoping.
+Country = Annotated[str, Field(min_length=2, max_length=2, pattern=r"^[A-Z]{2}$")]
 
 
 class PatientResponse(BaseModel):
@@ -60,8 +65,11 @@ class PatientResponse(BaseModel):
     gender: Gender | None
     relation: Relation
     home_address: Address | None
-    # Data-residency region for this patient's data ('US' | 'IN'). Set at
-    # onboarding, immutable thereafter. Drives storage routing + liftability.
+    # Country picked at onboarding (ISO alpha-2). The residency `region` below
+    # is derived from it; both are set once and immutable thereafter.
+    country: Country
+    # Data-residency region for this patient's data ('US' | 'IN'), DERIVED from
+    # `country`. Drives storage routing + liftability.
     region: Region
     state: PatientState
     status_line: str
@@ -115,11 +123,12 @@ class CreatePatientRequest(BaseModel):
     date_of_birth: date | None = None
     gender: Gender | None = None
     home_address: Address | None = None
-    # Data-residency region for this patient. Optional + defaults to 'US' so
-    # pre-region clients keep working during rollout; the onboarding UI sends
-    # 'IN' for India homes. Immutable after creation (not in UpdatePatientRequest,
-    # and the DB trigger blocks client-path changes).
-    region: Region = Region.us
+    # Country this home is in (ISO alpha-2). Optional + defaults to 'US' so
+    # pre-country clients keep working during rollout. The server DERIVES the
+    # data-residency `region` from it (region_for_country) — the client never
+    # sends region directly. Immutable after creation (not in
+    # UpdatePatientRequest, and the DB trigger blocks client-path changes).
+    country: Country = "US"
 
 
 class UpdatePatientRequest(BaseModel):

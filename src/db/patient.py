@@ -43,6 +43,12 @@ class Patient(Base):
     region: Mapped[str] = mapped_column(
         String, server_default=text("'US'"), default="US",
     )
+    # Country picked at onboarding (ISO alpha-2, e.g. 'US'/'IN'/'GB'), recorded
+    # verbatim. `region` above is DERIVED from it (region_for_country); this
+    # keeps the full pick for records/analytics. Set at creation, immutable.
+    country: Mapped[str] = mapped_column(
+        String, server_default=text("'US'"), default="US",
+    )
     last_event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     photo_storage_key: Mapped[str | None] = mapped_column(String, default=None)
 

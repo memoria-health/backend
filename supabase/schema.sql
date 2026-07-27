@@ -114,6 +114,11 @@ create table public.caregivers (
   -- trust-sensitive: it is set by the backend/admin and is IMMUTABLE from
   -- the client path (see the caregivers_region_immutable trigger below).
   region       text not null default 'US' check (region in ('US', 'IN')),
+  -- Country picked at signup (ISO 3166-1 alpha-2), recorded verbatim. `region`
+  -- is DERIVED from it (India → 'IN', else 'US'); this keeps the full pick for
+  -- records/analytics and for when more residency regions come online. Set at
+  -- signup, immutable from the client path (same guard as region).
+  country      text not null default 'US' check (country ~ '^[A-Z]{2}$'),
   created_at   timestamptz not null default now(),
   updated_at   timestamptz not null default now()
 );
@@ -136,11 +141,12 @@ returns trigger
 language plpgsql
 as $$
 begin
-  if new.region is distinct from old.region then
+  if new.region is distinct from old.region
+     or new.country is distinct from old.country then
     if current_setting('request.jwt.claims', true) is not null
        or current_user in ('authenticated', 'anon') then
       raise exception
-        'caregivers.region is immutable from the client path (data-residency attribute); change it only via an admin/service connection'
+        'caregivers.region/country are immutable from the client path (data-residency attributes); change them only via an admin/service connection'
         using errcode = 'check_violation';
     end if;
   end if;
@@ -228,6 +234,10 @@ create table public.patients (
   -- else 'US'); defaults 'US' so pre-region clients keep working. IMMUTABLE
   -- from the client path (see patients_region_immutable trigger).
   region          text not null default 'US' check (region in ('US', 'IN')),
+  -- Country this home is in (ISO 3166-1 alpha-2), recorded verbatim. `region`
+  -- is DERIVED from it (India → 'IN', else 'US'). Captured at onboarding;
+  -- immutable from the client path (same guard as region).
+  country         text not null default 'US' check (country ~ '^[A-Z]{2}$'),
   created_at      timestamptz not null default now(),
   updated_at      timestamptz not null default now()
 );
@@ -243,11 +253,12 @@ returns trigger
 language plpgsql
 as $$
 begin
-  if new.region is distinct from old.region then
+  if new.region is distinct from old.region
+     or new.country is distinct from old.country then
     if current_setting('request.jwt.claims', true) is not null
        or current_user in ('authenticated', 'anon') then
       raise exception
-        'patients.region is immutable from the client path (data-residency attribute); change it only via an admin/service connection'
+        'patients.region/country are immutable from the client path (data-residency attributes); change them only via an admin/service connection'
         using errcode = 'check_violation';
     end if;
   end if;

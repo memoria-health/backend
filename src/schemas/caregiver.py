@@ -10,6 +10,8 @@ from uuid import UUID
 
 from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, Field
 
+from src.schemas.patient import Country, Region
+
 DisplayName = Annotated[str, Field(min_length=1, max_length=80)]
 Email = Annotated[str, Field(min_length=3, max_length=255)]
 
@@ -89,6 +91,12 @@ class CaregiverResponse(BaseModel):
     # version older than the current one → re-prompt).
     tos_accepted_at: datetime | None
     tos_version: str | None
+    # Country picked at signup (ISO alpha-2). The residency `region` below is
+    # derived from it; both are set once at provisioning and immutable after.
+    country: Country
+    # Data-residency region for this account ('US' | 'IN'), DERIVED from
+    # `country`. The "India key" every downstream sensitive row resolves through.
+    region: Region
 
 
 class CreateCaregiverRequest(BaseModel):
@@ -100,6 +108,10 @@ class CreateCaregiverRequest(BaseModel):
 
     display_name: DisplayName
     phone: Phone | None = None
+    # Country this caregiver signed up from (ISO alpha-2). Optional + defaults
+    # to 'US' so pre-country clients keep working; the server derives the
+    # residency `region` from it (region_for_country). Immutable after signup.
+    country: Country = "US"
     # The ToS/Privacy version the caregiver accepted at signup. The iOS app
     # gates account creation on acceptance and sends it, so the row is born
     # consented. Optional because the web provisions the row lazily on first

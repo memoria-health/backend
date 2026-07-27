@@ -66,3 +66,15 @@ class Caregiver(Base):
         DateTime(timezone=True), default=None,
     )
     tos_version: Mapped[str | None] = mapped_column(String(40), default=None)
+
+    # Data-residency. `country` is the ISO alpha-2 the caregiver picked at
+    # signup (recorded verbatim); `region` is DERIVED from it (US/IN) and is the
+    # authoritative "India key" every downstream sensitive row resolves through
+    # (region_of). Both server_default 'US' so pre-country rows stay valid; set
+    # once at provisioning and immutable from the client path (DB trigger).
+    country: Mapped[str] = mapped_column(
+        String, server_default=text("'US'"), default="US",
+    )
+    region: Mapped[str] = mapped_column(
+        String, server_default=text("'US'"), default="US",
+    )
