@@ -129,7 +129,7 @@ def _meta_prompt(
     interpolated everywhere the runtime block needs the stable key.
 
     Inclusivity is chosen by STAKES, not by the trigger alone:
-      - absence (schedule / negative) → conservative: only a clear positive
+      - absence → conservative: only a clear positive
         counts, so a real miss surfaces the absence alert instead of being
         swallowed.
       - reactive + safety  → inclusive: a missed emergency is far worse than a
@@ -429,7 +429,7 @@ _DEFAULT_GAP_BUCKET = "moderate"
 @dataclass(frozen=True)
 class InferredConfig:
     # Alerting spine (2026-07-26).
-    alert_trigger: str               # "leading"|"trailing"|"duration"|"schedule"
+    alert_trigger: str               # "leading"|"trailing"|"duration"|"absence"
     is_sustained: bool               # instant vs sustained
     category: str                    # "safety" | "routine"
     icon_name: str
@@ -458,16 +458,18 @@ def _infer_meta_prompt(*, name: str | None, prompt: str) -> str:
         "been on more than 10 minutes', 'if she's on the floor over 5 "
         "minutes', 'prolonged stillness'. Put the stated length in "
         "duration_seconds.\n"
-        "  - 'schedule': tied to a CLOCK window or deadline — 'if she doesn't "
-        "take her meds by 5pm' (absent), 'confirm she ate between 11 and 2' "
-        "(present). Non-occurrence is only knowable at a deadline, so any "
-        "'doesn't / hasn't happen by <time>' request is 'schedule'.\n\n"
+        "  - 'absence': the thing did NOT happen within its window — 'if she "
+        "doesn't take her meds by 5pm', 'alert me if she hasn't gotten up by "
+        "10am'. Non-occurrence is only knowable at the window's end, so any "
+        "'doesn't / hasn't happened by <time>' request is 'absence'. (A "
+        "positive 'tell me WHEN she does X' is just 'leading' — use the active "
+        "window for the timing, not this.)\n\n"
         "STEP 2 — `is_sustained`: true if the thing unfolds over a stretch "
         "(watching TV, pacing, eating, bathing, agitation, lying still); false "
         "if it's instantaneous (a fall, choking, arriving, leaving). "
         "'trailing' and 'duration' are always sustained.\n\n"
         "JSON fields:\n"
-        '  "alert_trigger": "leading" | "trailing" | "duration" | "schedule"\n'
+        '  "alert_trigger": "leading" | "trailing" | "duration" | "absence"\n'
         '  "is_sustained": true | false\n'
         '  "duration_seconds": integer seconds — REQUIRED when '
         'alert_trigger="duration" (else null). Convert the stated time '
@@ -492,10 +494,9 @@ def _infer_meta_prompt(*, name: str | None, prompt: str) -> str:
         'Lower it for low-stakes routine behaviours (e.g. watching TV -> '
         '"low"); raise it for high-stakes safety events (e.g. a fall -> '
         '"high").\n'
-        '  "schedule": null unless alert_trigger="schedule". Else an object:\n'
-        '     {"polarity":"negative"|"positive"'
-        ' ("negative" = alert if it did NOT happen; "positive" = if it DID),'
-        ' "cadence":"daily"|"weekly",'
+        '  "schedule": null unless alert_trigger="absence". Else the window it '
+        'must have happened within:\n'
+        '     {"cadence":"daily"|"weekly",'
         ' "days_of_week":[0..6 or null] (0=Mon..6=Sun, weekly only),'
         ' "window_start":"HH:MM" 24h,'
         ' "window_end":"HH:MM",'
@@ -511,13 +512,13 @@ def _coerce_inferred(raw: dict) -> InferredConfig:
     Unknown enum values fall back to safe defaults; out-of-set icons
     fall back to 'eye'."""
     alert_trigger = raw.get("alert_trigger")
-    if alert_trigger not in ("leading", "trailing", "duration", "schedule"):
+    if alert_trigger not in ("leading", "trailing", "duration", "absence"):
         alert_trigger = "leading"
     is_sustained = bool(raw.get("is_sustained"))
-    # trailing / duration are sustained by definition; schedule is neither.
+    # trailing / duration are sustained by definition; absence is neither.
     if alert_trigger in ("trailing", "duration"):
         is_sustained = True
-    elif alert_trigger == "schedule":
+    elif alert_trigger == "absence":
         is_sustained = False
 
     category = raw.get("category")
@@ -531,10 +532,9 @@ def _coerce_inferred(raw: dict) -> InferredConfig:
         icon = "eye"
 
     schedule: dict | None = None
-    if alert_trigger == "schedule":
+    if alert_trigger == "absence":
         s = raw.get("schedule") or {}
         cadence = s.get("cadence") if s.get("cadence") in ("daily", "weekly") else None
-        polarity = s.get("polarity") if s.get("polarity") in ("positive", "negative") else "negative"
         days = s.get("days_of_week")
         if not isinstance(days, list):
             days = None
@@ -545,7 +545,6 @@ def _coerce_inferred(raw: dict) -> InferredConfig:
             return v if isinstance(v, str) and re.fullmatch(r"\d{2}:\d{2}", v) else None
 
         schedule = {
-            "polarity": polarity,
             "cadence": cadence,
             "days_of_week": days,
             "window_start": _hhmm(s.get("window_start")),

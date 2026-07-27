@@ -40,6 +40,20 @@ from src.services.detection import catalog
 
 _log = logging.getLogger(__name__)
 
+# Duration trigger (Phase E): fire once the activity has PERSISTED for
+# ~duration_seconds. Reuses the windowed-count crossing — require ~all ticks
+# in the D-window to qualify, so the window saturates (and fires, once) only
+# after the activity has genuinely been present that long. Assumes the ~60s
+# scheduler cadence; the exact m is soak-tunable.
+_DURATION_TICK_SECONDS = 60
+
+
+def _apply_duration_entry(cfg, duration_seconds: int):
+    """Override an EventingConfig's entry window with the duration threshold."""
+    from dataclasses import replace
+    m = max(2, duration_seconds // _DURATION_TICK_SECONDS)
+    return replace(cfg, entry_m=m, entry_t_seconds=duration_seconds)
+
 # Human-friendly event titles. Every preset is prefixed with "Possible"
 # so the lock-screen alert, the in-app event header, and the history
 # row never assert a definitive medical/safety judgment — the model
@@ -329,10 +343,11 @@ async def maybe_promote_analysis(
     for ident, det in detectors_by_id.items():
         if not det.is_on:
             continue
-        # Scheduled ("absence") detectors land their `<id>_detected` in analyses
-        # for the scheduler to read, but must NOT fire reactively here — they
-        # fire only via the ScheduledDetectorRunner at their deadline, on ABSENCE.
-        if det.alert_trigger == "schedule":
+        # Clock-driven triggers land their `<id>_detected` in analyses for the
+        # runner to read, but must NOT fire reactively here: schedule fires on
+        # ABSENCE at its deadline; trailing fires on the FALLING edge when the
+        # activity ends. Both are handled by the ScheduledDetectorRunner.
+        if det.alert_trigger in ("absence", "trailing"):
             continue
 
         detected_field, conf_field, base = _promotion_spec_for(det)
@@ -361,6 +376,10 @@ async def maybe_promote_analysis(
         # tick. Instant (non-sustained) detectors are unaffected.
         if det.is_sustained:
             cfg = parse_eventing(det.eventing) if v2_decisions else None
+            # Duration trigger: the entry window IS the duration threshold, so
+            # it fires on the crossing (present for ~D) and re-arms after a lull.
+            if cfg is not None and det.alert_trigger == "duration" and det.duration_seconds:
+                cfg = _apply_duration_entry(cfg, det.duration_seconds)
             if cfg is not None and cfg.entry_m > 1:
                 # v2 (P4) M>1: the count-crossing edge REPLACES the
                 # activity rising edge — prior qualifying ticks inside

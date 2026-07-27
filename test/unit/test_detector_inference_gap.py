@@ -47,7 +47,7 @@ def test_instant_and_schedule_have_no_gap() -> None:
     assert _coerce_inferred(_raw(alert_trigger="leading", is_sustained=False)).episode_gap_seconds is None
     # schedule forces is_sustained=False, so a stray bucket is ignored.
     assert _coerce_inferred(
-        _raw(alert_trigger="schedule", is_sustained=True, episode_gap="brief")
+        _raw(alert_trigger="absence", is_sustained=True, episode_gap="brief")
     ).episode_gap_seconds is None
 
 

@@ -1091,7 +1091,7 @@ def _validate_catalog() -> None:
             raise ValueError(f"[catalog] {e.key}: bad cohort {e.cohort!r}")
         if e.category not in ("safety", "routine"):
             raise ValueError(f"[catalog] {e.key}: bad category {e.category!r}")
-        if e.alert_trigger not in ("leading", "trailing", "duration", "schedule"):
+        if e.alert_trigger not in ("leading", "trailing", "duration", "absence"):
             raise ValueError(f"[catalog] {e.key}: bad alert_trigger {e.alert_trigger!r}")
         if e.alert_trigger == "duration" and not e.duration_seconds:
             raise ValueError(f"[catalog] {e.key}: duration trigger needs duration_seconds")
@@ -1171,7 +1171,7 @@ def promotion_rules() -> dict[str, tuple[str, str, float]]:
     return {
         e.key: (e.detected_key, e.confidence_key, e.promotion_threshold)
         for e in CATALOG
-        if e.alert_trigger != "schedule"
+        if e.alert_trigger != "absence"
     }
 
 

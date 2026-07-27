@@ -516,23 +516,11 @@ async def infer_detector(
     )
 
 
-def _is_absence(
-    alert_trigger: object, schedule_config: dict | ScheduleConfig | None,
-) -> bool:
-    """Whether a detector fires on ABSENCE (schedule trigger + negative
-    polarity) — the case that takes the conservative compile bias. Default
-    polarity is negative, so a schedule trigger with no explicit polarity is
-    absence. Accepts alert_trigger/polarity as either enum or raw string."""
-    if str(getattr(alert_trigger, "value", alert_trigger)) != "schedule":
-        return False
-    if schedule_config is None:
-        return True
-    pol = (
-        schedule_config.polarity
-        if isinstance(schedule_config, ScheduleConfig)
-        else schedule_config.get("polarity")
-    )
-    return str(getattr(pol, "value", pol)) != "positive"
+def _is_absence(alert_trigger: object) -> bool:
+    """Whether a detector fires on ABSENCE (not detected within its window) —
+    the case that takes the conservative compile bias. Accepts an enum or raw
+    string."""
+    return str(getattr(alert_trigger, "value", alert_trigger)) == "absence"
 
 
 def _fmt_time(hhmm: str) -> str:
@@ -554,7 +542,7 @@ def _fires_phrase(
     """The one-line plain-English firing behavior — the single place this
     copy is derived, so the create-review plan and any preview can never
     disagree. Caregiver language only, keyed on the alert trigger."""
-    if alert_trigger == "schedule":
+    if alert_trigger == "absence":
         deadline = None
         if schedule:
             deadline = schedule.get("deadline") or schedule.get("window_end")
@@ -742,7 +730,7 @@ async def create_detector(
             name=body.name,
             description=body.description,
             user_text=body.custom_prompt,
-            absence=_is_absence(body.alert_trigger.value, body.schedule_config),
+            absence=_is_absence(body.alert_trigger.value),
             is_sustained=det.is_sustained,
             category=det.category,
             settings=settings,
@@ -888,7 +876,7 @@ async def patch_detector(
                 name=det.name,
                 description=det.description or "Custom detector",
                 user_text=det.custom_prompt,
-                absence=_is_absence(det.alert_trigger, det.schedule_config),
+                absence=_is_absence(det.alert_trigger),
                 is_sustained=det.is_sustained,
                 category=det.category,
                 settings=settings,
@@ -942,7 +930,7 @@ async def refine_detector(
                 name=det.name,
                 description=det.description or "Custom detector",
                 user_text=det.custom_prompt,
-                absence=_is_absence(det.alert_trigger, det.schedule_config),
+                absence=_is_absence(det.alert_trigger),
                 category=det.category,
                 settings=settings,
                 identifier=det.identifier,
@@ -971,7 +959,7 @@ async def refine_detector(
             name=det.name,
             description=det.description or "Custom detector",
             user_text=det.custom_prompt,
-            absence=_is_absence(det.alert_trigger, det.schedule_config),
+            absence=_is_absence(det.alert_trigger),
             is_sustained=det.is_sustained,
             category=det.category,
             settings=settings,

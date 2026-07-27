@@ -48,6 +48,13 @@ log = logging.getLogger(__name__)
 
 _FALLBACK_TZ = "America/New_York"
 
+# Trailing trigger (Phase E): default hysteresis gap when a detector has no
+# episode_gap_seconds, and how far back the falling-edge sweep looks for the
+# episode's last sighting (bounded so a long-idle detector doesn't scan all
+# history each tick).
+_DEFAULT_TRAILING_GAP_SECONDS = 300
+_TRAILING_LOOKBACK_SECONDS = 6 * 3600
+
 
 def _parse_hhmm(value: object) -> time | None:
     if not isinstance(value, str):
@@ -92,10 +99,13 @@ class ScheduledDetectorRunner:
 
     async def _tick(self) -> None:
         async with self._sessionmaker() as session:
+            # Both clock-driven triggers: schedule fires on ABSENCE at a
+            # deadline; trailing fires on the FALLING edge (a sustained
+            # activity that has now ended). Neither fires per-tick reactively.
             stmt = (
                 select(Detector)
                 .where(
-                    Detector.alert_trigger == "schedule",
+                    Detector.alert_trigger.in_(("absence", "trailing")),
                     Detector.is_on.is_(True),
                     Detector.identifier.is_not(None),
                 )
@@ -103,7 +113,10 @@ class ScheduledDetectorRunner:
             detectors = (await session.execute(stmt)).scalars().all()
             for det in detectors:
                 try:
-                    await self._evaluate_one(session, det)
+                    if det.alert_trigger == "trailing":
+                        await self._evaluate_trailing(session, det)
+                    else:
+                        await self._evaluate_one(session, det)
                 except Exception:  # noqa: BLE001
                     log.exception("scheduled_runner.evaluate_failed detector=%s", det.id)
 
@@ -252,6 +265,83 @@ class ScheduledDetectorRunner:
         asyncio.create_task(email.dispatch_event_emails(
             sessionmaker=self._sessionmaker, event_ids=[event.id], settings=self._settings,
         ))
+
+    async def _evaluate_trailing(self, session: AsyncSession, det: Detector) -> None:
+        """Fire once a sustained activity has FINISHED — detected recently,
+        then ABSENT for >= its hysteresis gap. The falling-edge counterpart of
+        the rising-edge promotion. One-shot per episode: guarded by the last
+        trailing event vs the episode's last detection, so a whole session
+        yields exactly one "finished" alert, and a fresh session re-arms."""
+        patient = await session.get(Patient, det.patient_id)
+        if patient is None:
+            return
+        gap = det.episode_gap_seconds or _DEFAULT_TRAILING_GAP_SECONDS
+        now_utc = datetime.now(timezone.utc)
+        detected_key = f"{det.identifier}_detected"
+
+        # Most recent qualifying detection (bounded lookback so a long-dead
+        # detector doesn't scan all history every tick).
+        last_seen = (await session.execute(
+            select(func.max(Analysis.captured_at)).where(
+                Analysis.patient_id == patient.id,
+                Analysis.captured_at >= now_utc - timedelta(seconds=_TRAILING_LOOKBACK_SECONDS),
+                Analysis.detector_fields[detected_key].astext == "true",
+            )
+        )).scalar_one_or_none()
+        if last_seen is None:
+            return  # nothing ongoing recently
+        # Still within the gap since the last sighting → the episode hasn't
+        # ended yet; wait.
+        if (now_utc - last_seen).total_seconds() < gap:
+            return
+        # Episode ended. Skip if a trailing event already fired for it (any
+        # event for this detector dated at/after the episode's last sighting).
+        already = (await session.execute(
+            select(Event.id)
+            .where(Event.detector_id == det.id, Event.occurred_at >= last_seen)
+            .limit(1)
+        )).scalar_one_or_none()
+        if already is not None:
+            return
+
+        ended_at = last_seen + timedelta(seconds=gap)
+        event = self._build_trailing_event(det=det, patient=patient, ended_at=ended_at)
+        session.add(event)
+        await session.commit()
+        log.info(
+            "trailing_runner.fired detector=%s ended=%s event=%s",
+            det.id, ended_at.isoformat(), event.id,
+        )
+        asyncio.create_task(push.dispatch_event_pushes(
+            sessionmaker=self._sessionmaker, event_ids=[event.id], settings=self._settings,
+        ))
+        asyncio.create_task(email.dispatch_event_emails(
+            sessionmaker=self._sessionmaker, event_ids=[event.id], settings=self._settings,
+        ))
+
+    def _build_trailing_event(
+        self, *, det: Detector, patient: Patient, ended_at: datetime,
+    ) -> Event:
+        return Event(
+            id=uuid4(),
+            patient_id=patient.id,
+            detector_id=det.id,
+            camera_id=None,
+            category=det.category,
+            source=det.source,
+            icon_name=det.icon_name,
+            title=f"Finished: {det.name}",
+            location="Activity ended",
+            occurred_at=ended_at,
+            has_clip=False,
+            narrative=f"\"{det.name}\" has finished — no longer detected.",
+            opened=False,
+            reviewed=False,
+            review_choice=None,
+            review_notes=None,
+            reviewed_at=None,
+            created_at=datetime.now(timezone.utc),
+        )
 
     async def _uptime_pct(self, session, patient_id, start_utc, end_utc) -> int:
         """% of the window covered by ACTIVELY-ANALYZING ticks (provider

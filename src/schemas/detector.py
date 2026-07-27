@@ -30,14 +30,7 @@ class AlertTrigger(str, Enum):
     leading = "leading"    # the moment it starts / happens
     trailing = "trailing"  # when the activity ends (sustained only)
     duration = "duration"  # once it's held >= duration_seconds (sustained only)
-    schedule = "schedule"  # relative to a clock window/deadline (see polarity)
-
-
-class SchedulePolarity(str, Enum):
-    """For alert_trigger == schedule: fire on presence or on absence."""
-
-    positive = "positive"  # fire if it DID happen in the window
-    negative = "negative"  # fire if it did NOT happen by the deadline (absence)
+    absence = "absence"    # NOT detected within its active window (when_scope)
 
 
 class DetectorSensitivity(str, Enum):
@@ -52,11 +45,10 @@ class ScheduleCadence(str, Enum):
 
 
 class ScheduleConfig(BaseModel):
-    """Window a `schedule`-trigger detector evaluates. All fields optional so
-    the LLM can return a partial inference (blanks the user fills in on
-    the review screen). Times are local "HH:MM" 24h strings;
-    days_of_week is 0=Mon..6=Sun (weekly only). `polarity` chooses fire-on-
-    presence vs fire-on-absence (default absence — the common "missed X" case)."""
+    """Evaluation window for an `absence` detector — legacy fallback; the app
+    increasingly uses `when_scope` as THE window mechanism. All fields optional
+    so the LLM can return a partial inference (blanks the user fills in on the
+    review screen). Times are local "HH:MM" 24h; days_of_week 0=Mon..6=Sun."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -65,7 +57,6 @@ class ScheduleConfig(BaseModel):
     window_start: str | None = None
     window_end: str | None = None
     deadline: str | None = None
-    polarity: SchedulePolarity = SchedulePolarity.negative
 
 
 Name = Annotated[str, Field(min_length=1, max_length=120)]

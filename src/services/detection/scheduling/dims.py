@@ -95,7 +95,7 @@ def _fire_rule(alert_trigger: str | None, entry_m: int) -> str:
     schedule → window; everything else accumulates (M>1) or fires on-sight.
     Phase E adds dedicated 'trailing' / 'duration' rules; until then those
     triggers ride the leading path (no existing detector uses them)."""
-    if alert_trigger == "schedule":
+    if alert_trigger == "absence":
         return "window"
     return "accumulate" if entry_m > 1 else "instant"
 

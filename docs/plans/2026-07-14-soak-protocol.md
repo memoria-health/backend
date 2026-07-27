@@ -121,3 +121,35 @@ again in ~30 s. Nothing to migrate; analyses rows keep the soak data.
 Multi-day FP base rates, night/IR, >4-person crowds, k-of-N efficacy
 (configs deliberately zero), face/zone artifact buckets (P6), floor
 raising itself (post-soak, settings-only).
+
+## Detector-axis reconciliation — validation requirements (added 2026-07-26)
+
+The reconciliation replaced `shape` with `alert_trigger`
+(`leading`/`trailing`/`duration`/`absence`) + `is_sustained`, made M-of-N an
+internal confidence gate, and added two new firing paths. These MUST be
+validated before re-enabling detection — the soak is their correctness gate:
+
+- **Duration** (`alert_trigger=duration`, e.g. stove-left-on): fires **once**
+  after the activity has been continuously present ~`duration_seconds`
+  (windowed-count crossing in `event_promotion._apply_duration_entry`); does
+  **not** fire before the threshold; re-arms after a lull drains the window.
+  **Requires `detection_v2_decision_enabled=ON`** — with it off, duration falls
+  back to the rising edge (fires early). Tunable: `_DURATION_TICK_SECONDS` (60),
+  the `max(2, D//tick)` m.
+- **Trailing** (`alert_trigger=trailing`): fires **once** on the FALLING edge —
+  a sustained activity detected, then absent for `episode_gap_seconds`
+  (`ScheduledDetectorRunner._evaluate_trailing`). Verify: it does NOT
+  rising-edge fire (event_promotion skips it), fires exactly once per session,
+  and a fresh session re-arms. Tunable: `_DEFAULT_TRAILING_GAP_SECONDS` (300),
+  `_TRAILING_LOOKBACK_SECONDS` (6h).
+- **Absence** (renamed from `schedule`; positive-`schedule` folded into
+  `leading`): unchanged semantics — fire if NOT seen within its `when_scope`
+  window; 0%-coverage suppression still applies.
+- **M-of-N internal confidence** (`compiler_v2._entry_confidence_for`):
+  hard-to-detect sustained states (distance_class / rapid / fine_motion)
+  require 2–3 corroborating ticks; easy ones fire on-sight; safety caps
+  corroboration lower than routine. The `(m, t)` tiers are **placeholders to
+  calibrate on golden data**.
+- **Duration/absence with no time given**: a detector inferred as duration
+  (or absence) with a null threshold/deadline must be blocked in the UI until
+  the caregiver supplies one — never fire on a guessed time.

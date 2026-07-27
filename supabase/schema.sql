@@ -16,11 +16,6 @@ create extension if not exists pgcrypto;       -- gen_random_uuid()
 
 create type detector_category    as enum ('safety', 'routine');
 create type detector_source      as enum ('preset', 'custom');
--- 'scheduled' is the absence-style detector (e.g. "medication not
--- taken by 5pm"): the scheduler evaluates a daily/weekly window at a
--- deadline and fires if the signal was never seen. 'state' stays in
--- the enum for the agitation preset but is no longer offered in the
--- create UI; everything reactive is point_in_time.
 create type detector_sensitivity as enum ('low', 'standard', 'high');
 create type review_choice        as enum ('correct', 'wrong', 'unsure');
 create type patient_state        as enum ('calm', 'critical', 'offline');
@@ -448,7 +443,7 @@ create table public.detectors (
   -- runtime is migrated). duration_seconds is the "too long" threshold for
   -- alert_trigger='duration'.
   alert_trigger   text not null default 'leading'
-                  check (alert_trigger in ('leading','trailing','duration','schedule')),
+                  check (alert_trigger in ('leading','trailing','duration','absence')),
   is_sustained    boolean not null default false,
   duration_seconds integer,
   -- Scheduled-detector config (null for reactive detectors). Shape:
