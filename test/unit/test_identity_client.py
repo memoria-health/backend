@@ -13,7 +13,7 @@ from uuid import UUID
 
 import pytest
 
-from src.services.reid.identity_client import IdentityClient
+from src.services.identity.identity_client import IdentityClient
 
 CAM = UUID("9271358c-0000-4000-8000-000000000000")
 CAM_KEY = "9271358c"
@@ -124,7 +124,7 @@ def test_label_clip_never_raises_on_garbage_state():
 
 
 def test_outsized_payload_is_capped_not_allocated():
-    from src.services.reid import identity_client as sc_mod
+    from src.services.identity import identity_client as sc_mod
 
     tracks = {str(i): {"bbox": [1, 2, 3, 4]} for i in range(500)}
     sc = _sidecar(_state(tracks=tracks))

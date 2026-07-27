@@ -20,7 +20,7 @@ from src.services.detection.scheduling.artifacts import (
     build_person_crop_mp4,
     person_crop_box,
 )
-from src.services.reid.observations import TrackObservation
+from src.services.identity.observations import TrackObservation
 
 W, H = 160, 120
 

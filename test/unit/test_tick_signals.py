@@ -17,7 +17,7 @@ from src.services.detection.signals.tick_signals import (
     TickSignals,
     compute_tick_signals,
 )
-from src.services.reid.observations import TrackObservation
+from src.services.identity.observations import TrackObservation
 
 W, H = 160, 120
 _SAMPLE_WIDTH = 480  # > W ⇒ extracted width = min(480, 160) = 160

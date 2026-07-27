@@ -46,7 +46,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
     from src.services.detection.motion_cache import MotionCache
-    from src.services.reid.identity_client import IdentityClient
+    from src.services.identity.identity_client import IdentityClient
     from src.settings import Settings
 
 log = logging.getLogger(__name__)

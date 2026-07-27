@@ -7,7 +7,7 @@ service to identify the patient at detector tick time.
 Two row kinds, distinguished by `source`:
   - 'selfie': caregiver-uploaded during onboarding (10-15 angle-prompted
               captures). `source_path` is the Supabase Storage key.
-  - 'harvested': inserted by `services/reid/harvester.py` when Re-ID
+  - 'harvested': inserted by the identity pipeline's harvest (gpu/identity) when it
                  locks a track with very high confidence. Closes the
                  selfie-to-wall-cam domain gap over time. `source_path`
                  is NULL (we keep only the embedding, not the frame).

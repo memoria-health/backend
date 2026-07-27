@@ -36,13 +36,13 @@ from uuid import UUID
 
 import httpx
 
-from src.services.reid.observations import (
+from src.services.identity.observations import (
     LABEL_PATIENT,
     LABEL_UNKNOWN,
     TrackObservation,
 )
 from identity.contract import STATE_CONTRACT
-from src.services.reid.result import IdentityResult
+from src.services.identity.result import IdentityResult
 
 log = logging.getLogger(__name__)
 
@@ -76,7 +76,7 @@ class IdentityClient:
         # trace disabled and even the ledger's live idevent calls
         # no-op'd (live 2026-07-26: tracker-eval card starved). The
         # provider that replaces the brain inherits the arming duty.
-        from src.services.reid import trace
+        from src.services.identity import trace
 
         trace.configure(
             enabled=getattr(settings, "reid_trace_enabled", False),

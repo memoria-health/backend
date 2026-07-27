@@ -27,8 +27,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from src.errors import StorageError
 from src.repos import face_embedding_repo
-from src.services.reid import embeddings as reid_embeddings
-from src.services.reid import storage as reid_storage
+from src.services.identity import embeddings as reid_embeddings
+from src.services.identity import storage as reid_storage
 from src.settings import Settings
 
 log = logging.getLogger(__name__)

@@ -53,8 +53,8 @@ from src.services.detection.motion import (
 )
 from src.services.detection.motion_cache import MotionCache
 from src.services.detection.patient_presence import PatientPresence
-from src.services.reid import trace
-from src.services.reid.track_ledger import TrackLedger
+from src.services.identity import trace
+from src.services.identity.track_ledger import TrackLedger
 from src.services.detection.mp4_remux import Mp4RemuxError, frames_to_mp4
 from src.services.detection.providers.gemini import gemini_provider
 from src.services.detection.providers.types import ProviderResult
@@ -78,8 +78,8 @@ from src.services.detection.registry import (
 )
 from src.services.detection.state_machine import apply_tick_update
 from src.repos.face_embedding_repo import has_ready_enrollment
-from src.services.reid.result import IdentityResult
-from src.services.reid.identity_client import IdentityClient
+from src.services.identity.result import IdentityResult
+from src.services.identity.identity_client import IdentityClient
 from src.services.data_collection.gate import should_collect
 from src.services.data_collection.session import RecorderCtx
 

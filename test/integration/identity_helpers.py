@@ -15,7 +15,7 @@ import numpy as np
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.services.reid.embeddings import embedding_to_bytes
+from src.services.identity.embeddings import embedding_to_bytes
 from test.conftest import mint_test_jwt
 
 _PATIENT_BODY = {

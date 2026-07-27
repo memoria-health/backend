@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Sequence
 
 from src.services.detection.scheduling.dims import CROP_BUCKETS, EffectiveDims
 from src.services.detection.scheduling.when_scope import is_active
-from src.services.reid.observations import LABEL_OTHER, LABEL_PATIENT
+from src.services.identity.observations import LABEL_OTHER, LABEL_PATIENT
 
 # Emergency line (2026-07-18, the enacted-choking miss): detectors at
 # or above this severity are EXEMPT from every cost gate — cross-camera
@@ -49,7 +49,7 @@ if TYPE_CHECKING:
 
     from src.services.detection.prompt import DetectorSpec
     from src.services.detection.signals.tick_signals import TickSignals
-    from src.services.reid.result import IdentityResult
+    from src.services.identity.result import IdentityResult
     from src.settings import Settings
 
 

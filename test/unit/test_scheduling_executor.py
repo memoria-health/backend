@@ -20,8 +20,8 @@ from src.services.detection.prompt import DetectorSpec
 from src.services.detection.scheduling.dims import EffectiveDims
 from src.services.detection.scheduling.packer import pack_calls
 from src.services.detection.scheduling.scheduler import DueDetector, DueSet
-from src.services.reid.observations import TrackObservation
-from src.services.reid.result import IdentityResult
+from src.services.identity.observations import TrackObservation
+from src.services.identity.result import IdentityResult
 
 
 def _due(

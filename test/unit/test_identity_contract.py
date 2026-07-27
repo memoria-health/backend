@@ -11,7 +11,7 @@ import asyncio
 from types import SimpleNamespace
 
 from identity.contract import STATE_CONTRACT, auth_ok
-from src.services.reid.identity_client import IdentityClient
+from src.services.identity.identity_client import IdentityClient
 
 
 def test_auth_disabled_when_no_token_configured():

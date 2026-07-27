@@ -19,8 +19,8 @@ from src.services.detection.scheduling.scheduler import (
     resolve_due,
 )
 from src.services.detection.signals.tick_signals import TickSignals, TrackMotion
-from src.services.reid.observations import TrackObservation
-from src.services.reid.result import IdentityResult
+from src.services.identity.observations import TrackObservation
+from src.services.identity.result import IdentityResult
 
 
 def _settings(**over) -> SimpleNamespace:

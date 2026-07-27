@@ -19,9 +19,9 @@ from uuid import UUID
 import pytest
 from httpx import AsyncClient
 
-from src.services.reid import embeddings as reid_embeddings
-from src.services.reid import storage as reid_storage
-from src.services.reid.embeddings import FaceHit
+from src.services.identity import embeddings as reid_embeddings
+from src.services.identity import storage as reid_storage
+from src.services.identity.embeddings import FaceHit
 from test.conftest import mint_test_jwt
 
 

@@ -37,7 +37,7 @@ from sqlalchemy import select, text
 
 from src.db.camera import Camera
 from src.db.session import get_engine
-from src.services.reid.identity_client import IdentityClient
+from src.services.identity.identity_client import IdentityClient
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncConnection, async_sessionmaker

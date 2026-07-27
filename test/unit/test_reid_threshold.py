@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.services.reid.embeddings import effective_match_threshold
+from src.services.identity.embeddings import effective_match_threshold
 
 
 def test_clear_close_face_yields_tight_threshold():

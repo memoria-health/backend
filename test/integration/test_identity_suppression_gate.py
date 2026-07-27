@@ -32,8 +32,8 @@ from src.repos import face_embedding_repo
 from src.services.detection.camera_ingest import CameraIngest, _RecorderDecision
 from src.services.detection.motion_cache import MotionCache
 from src.services.detection.patient_presence import TIER_FACE, PatientPresence
-from src.services.reid.observations import LABEL_OTHER, TrackObservation
-from src.services.reid.result import IdentityResult
+from src.services.identity.observations import LABEL_OTHER, TrackObservation
+from src.services.identity.result import IdentityResult
 from src.settings import get_settings
 from test.fakes.fake_vlm import FakeVLM
 from test.integration.identity_helpers import (

@@ -5,7 +5,7 @@ the backend's enrollment writes vectors the GPU-host identity service
 must read (via the DB), so the codec + comparison live HERE, in the
 identity package, and the backend imports them back. The heavyweight
 face-embedding pipeline (insightface) stays backend-side in
-src/services/reid/embeddings.py — enrollment is a backend concern.
+src/services/identity/embeddings.py — enrollment is a backend concern.
 """
 
 from __future__ import annotations

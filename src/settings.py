@@ -358,7 +358,7 @@ class Settings(BaseSettings):
     # interval is 10s but the loop is fire-and-forget).
     reid_timeout_seconds: float = Field(gt=0, le=60, default=15.0)
     # Base cosine threshold for face matches. The adaptive curve in
-    # `services/reid/embeddings.py:effective_match_threshold` scales
+    # `services/identity/embeddings.py:effective_match_threshold` scales
     # this up for clear faces (~0.50) and down for unclear ones
     # (~0.24 floor); the value here is the "wall-cam normal" point.
     reid_match_threshold_base: float = Field(gt=0, lt=1, default=0.40)

@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from src.services.reid.observations import TrackObservation
+from src.services.identity.observations import TrackObservation
 
 if TYPE_CHECKING:
     from src.services.detection.frame_extraction import ExtractedFrame

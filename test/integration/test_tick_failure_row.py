@@ -19,7 +19,7 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.services.reid.result import IdentityResult
+from src.services.identity.result import IdentityResult
 
 from test.integration.identity_helpers import _setup_patient_with_camera
 

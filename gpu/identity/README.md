@@ -15,7 +15,7 @@ persistent EdgeTAM session; a three-rule identity layer sits on top.
 Entry point: `tools/run_identity.py` (MJPEG overlay :8012 + /state).
 Pure modules are unit-tested (`test/unit/test_identity_*.py`).
 
-## Relationship to `src/services/reid/` (the legacy folder)
+## Relationship to `src/services/identity/` (the legacy folder)
 
 `reid/` holds TWO different things — do not delete it wholesale:
 

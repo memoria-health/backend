@@ -38,8 +38,8 @@ from src.schemas.face_embedding import (
     FaceEmbeddingStatus,
     FaceEnrollmentSummary,
 )
-from src.services.reid import enrollment_processor
-from src.services.reid import storage as reid_storage
+from src.services.identity import enrollment_processor
+from src.services.identity import storage as reid_storage
 
 log = logging.getLogger(__name__)
 

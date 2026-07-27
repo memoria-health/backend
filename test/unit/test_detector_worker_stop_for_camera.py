@@ -68,7 +68,7 @@ def _make_worker() -> DetectorWorker:
         reid_trace_enabled=False,
     )
     # ReIDInference is constructed lazily inside DetectorWorker.__init__
-    # via the import in `from src.services.reid.inference import ...`,
+    # via the import in `from src.services.identity.inference import ...`,
     # but it doesn't do I/O at construction — only on first call. So
     # passing the real settings (with the sentinel URL) is fine.
     return DetectorWorker(settings=settings, sessionmaker=None)  # type: ignore[arg-type]

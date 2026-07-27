@@ -60,7 +60,7 @@ from uuid import UUID
 
 import numpy as np
 
-from src.services.reid import trace
+from src.services.identity import trace
 
 if TYPE_CHECKING:
     from src.settings import Settings

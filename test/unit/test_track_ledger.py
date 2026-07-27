@@ -15,15 +15,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.services.reid.observations import (
+from src.services.identity.observations import (
     LABEL_OTHER,
     LABEL_PATIENT,
     LABEL_UNKNOWN,
     TrackObservation,
 )
 from src.services.detection.patient_presence import TIER_FACE
-from src.services.reid.result import IdentityResult
-from src.services.reid.track_ledger import TrackLedger
+from src.services.identity.result import IdentityResult
+from src.services.identity.track_ledger import TrackLedger
 
 CAM = uuid.UUID("00000000-0000-0000-0000-000000000001")
 OTHER_CAM = uuid.UUID("00000000-0000-0000-0000-0000000000ff")
