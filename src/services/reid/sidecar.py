@@ -50,6 +50,14 @@ STATE_CACHE_S = 1.0
 # identity service must decay to fail-open, not freeze a stale lock.
 STATE_TIMEOUT_S = 2.0
 
+# Payload sanity caps (Phase 0 checkpoint review finding #2, mirroring
+# sam_client's S5 discipline): a corrupt/hostile identity service must
+# not be able to allocate unbounded backend memory before fail-open
+# kicks in. Real homes have a handful of cameras and single-digit
+# simultaneous tracks; these bounds are generous.
+_MAX_CAMERAS = 32
+_MAX_TRACKS = 64
+
 
 class SidecarReID:
     """`label_clip`-compatible provider backed by the identity service.
@@ -127,6 +135,9 @@ class SidecarReID:
         """Match the backend's full camera UUID to the service's
         short key ("9271358c" == str(uuid)[:8]) or an exact key."""
         cams = state.get("cameras") or {}
+        if len(cams) > _MAX_CAMERAS:
+            log.warning("sidecar.cameras_truncated %d", len(cams))
+            cams = dict(list(cams.items())[:_MAX_CAMERAS])
         cid = str(camera_id)
         if cid in cams:
             return cams[cid]
@@ -173,7 +184,11 @@ class SidecarReID:
 
         tracks: list[TrackObservation] = []
         patient_bbox: "tuple[float, float, float, float] | None" = None
-        for tid_s, tv in (entry.get("tracks") or {}).items():
+        raw_tracks = entry.get("tracks") or {}
+        if len(raw_tracks) > _MAX_TRACKS:
+            log.warning("sidecar.tracks_truncated %d", len(raw_tracks))
+            raw_tracks = dict(list(raw_tracks.items())[:_MAX_TRACKS])
+        for tid_s, tv in raw_tracks.items():
             try:
                 tid = int(tid_s)
             except (TypeError, ValueError):

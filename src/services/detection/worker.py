@@ -227,6 +227,16 @@ class DetectorWorker:
             *(room.stop() for room in rooms),
             return_exceptions=True,
         )
+        # Close the identity provider's HTTP pool (sidecar holds a
+        # long-lived httpx client; legacy ReIDInference has no aclose —
+        # guarded). Same close-what-you-open discipline as _lk_api
+        # below (Phase 0 checkpoint review finding #1).
+        _aclose = getattr(self._reid, "aclose", None)
+        if callable(_aclose):
+            try:
+                await _aclose()
+            except Exception:
+                log.exception("detector_worker.stop reid.aclose failed")
         # Close the shared LiveKit REST client AFTER every reconciler
         # has stopped using it. Best-effort; an aclose failure
         # mid-shutdown is logged but does not block the lifespan.

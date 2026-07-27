@@ -121,3 +121,13 @@ def test_label_clip_never_raises_on_garbage_state():
     except Exception as e:  # noqa: BLE001
         pytest.fail(f"label_clip raised: {e!r}")
     assert r.reid_ran in (True, False)
+
+
+def test_outsized_payload_is_capped_not_allocated():
+    from src.services.reid import sidecar as sc_mod
+
+    tracks = {str(i): {"bbox": [1, 2, 3, 4]} for i in range(500)}
+    sc = _sidecar(_state(tracks=tracks))
+    r = _label(sc)
+    assert r.reid_ran is True
+    assert len(r.tracks) <= sc_mod._MAX_TRACKS
