@@ -153,35 +153,37 @@ _DISTANCE_CLASS = re.compile(
     r"at|scratch(es|ing)?|finger|hand[- ]?motion|utensil|cigarette|"
     r"remote)\b", re.I,
 )
-# "for 10 minutes", "more than 5 min", "at least an hour"
-_DURATION = re.compile(
-    r"\b(?:for|than|least|over)\s+(?:about\s+)?(\d+|an?)\s*"
-    r"(hour|hr|minute|min)s?\b", re.I,
-)
+def _entry_confidence_for(
+    shape: str, bucket: str, degradation: str, category: str,
+) -> dict | None:
+    """The entry M-of-N — an INTERNAL confidence gate, NOT a user duration.
 
-# Entry preset menu (locked: dials come from a small menu, shown in
-# plain words on the review screen — never free-form). Snapped to the
-# nearest by the stated duration.
-_ENTRY_PRESETS: tuple[tuple[int, int], ...] = (
-    (3, 300),    # "a few minutes" — ≥3 qualifying ticks in 5 min
-    (5, 900),    # "10-15 minutes"
-    (8, 1800),   # "half an hour or more"
-)
+    How many corroborating detections we require before believing a
+    SUSTAINED state, scaled to how HARD the activity is to see reliably
+    (Aryaman 2026-07-26). A caregiver never dials this; it exists to cut
+    the false positives that distance + lighting cause on hard-to-detect
+    things. Easy-to-see states fire on the first confident detection;
+    small/fine-detail or rapid-motion states require corroboration.
+    Emergencies must not wait, so safety stakes cap corroboration lower
+    than routine.
 
+    Only `state` accumulates entry evidence — instant events fire on-sight
+    and absence fires on its schedule; cross-tick corroboration for those
+    would be the within-clip confirm (k-of-N), not entry M-of-N.
 
-def _entry_preset_for(user_text: str, shape: str) -> dict | None:
-    """States whose CLAIM includes a duration get a windowed entry
-    preset; everything else is on-sight (locked decision: entry speed
-    is independent of anti-spam, which the episode gap owns)."""
+    Windows satisfy `t_seconds >= m * scheduler_tick` (~60 s) so M is
+    physically reachable. TODO(soak): the exact (m, t) per tier are
+    placeholders to calibrate against golden soak data before prod.
+    """
     if shape != "state":
         return None
-    m = _DURATION.search(user_text)
-    if not m:
-        return None
-    qty = 1 if m.group(1).lower() in ("a", "an") else int(m.group(1))
-    seconds = qty * (3600 if m.group(2).lower().startswith(("hour", "hr")) else 60)
-    best = min(_ENTRY_PRESETS, key=lambda p: abs(p[1] - seconds))
-    return {"entry": {"m": best[0], "t_seconds": best[1]}}
+    if degradation == "distance_class":
+        m, t = (2, 180) if category == "safety" else (3, 300)
+    elif bucket in ("rapid", "fine_motion"):
+        m, t = (2, 180)
+    else:
+        return None  # easy to see → fire on the first confident detection
+    return {"entry": {"m": m, "t_seconds": t}}
 
 
 def classify_custom_dims(
@@ -212,7 +214,10 @@ def classify_custom_dims(
         else "every_eligible_tick"
     )
 
-    eventing = _entry_preset_for(user_text, shape)
+    degradation = "distance_class" if _DISTANCE_CLASS.search(hay) else "none"
+    # M-of-N is derived from detection difficulty (bucket + degradation +
+    # stakes), never from a user-stated duration.
+    eventing = _entry_confidence_for(shape, bucket, degradation, category)
 
     return {
         "evidence_branch": branch,
@@ -221,7 +226,5 @@ def classify_custom_dims(
         "duty_cycle": duty,
         "needs_audio": bool(_AUDIO_EVIDENCE.search(hay)),
         "eventing": eventing,
-        "degradation_warning": (
-            "distance_class" if _DISTANCE_CLASS.search(hay) else "none"
-        ),
+        "degradation_warning": degradation,
     }
