@@ -381,6 +381,8 @@ class CameraLoop:
         # faces at NATIVE pixels (ring frames are downscaled for memory).
         self.latest_native: Optional[tuple[float, np.ndarray]] = None
         self.latest_jpeg: Optional[bytes] = None
+        self._raw_hud_at = 0.0       # last raw-heartbeat publish
+        self._annotated_at = 0.0     # last batch-annotated publish
         self.hud = "waiting…"
         self.pod_ms = 0.0
         self.queue_ms = 0.0
@@ -400,7 +402,27 @@ class CameraLoop:
     # bounded, and the STREAM_CAPACITY=2 SDK queue caps what feeds it.
     RING_MAX = 300
 
+    # Raw-HUD heartbeat: the annotated HUD frame is only produced when
+    # a batch runs, and empty rooms deliberately run zero batches — so
+    # after a service restart the dashboard feeds stayed BLANK until
+    # someone entered a room (live 2026-07-27, pre-deploy scare). The
+    # intake path publishes a cheap raw frame every second instead;
+    # batch-annotated frames overwrite it whenever the pipeline runs.
+    RAW_HUD_EVERY_S = 1.0
+
     def push_frame(self, ts: float, bgr: np.ndarray) -> None:
+        if (ts - self._raw_hud_at >= self.RAW_HUD_EVERY_S
+                and ts - self._annotated_at > 5.0):
+            self._raw_hud_at = ts
+            try:
+                import cv2 as _cv2
+                ok, jpg = _cv2.imencode(
+                    ".jpg", bgr, [_cv2.IMWRITE_JPEG_QUALITY, 70],
+                )
+                if ok:
+                    self.latest_jpeg = jpg.tobytes()
+            except Exception:  # noqa: BLE001 — HUD must never hurt intake
+                pass
         self._next_idx += 1
         self.ring.append((self._next_idx, ts, bgr))
         if len(self.ring) > self.RING_MAX:
@@ -639,6 +661,7 @@ class CameraLoop:
         _idx, newest_ts, frame = newest
         self.lag_s = time.time() - newest_ts
         self.latest_jpeg = self._overlay(frame, self.home.seat, self._body_cos)
+        self._annotated_at = time.time()
 
     # ── OUT-OF-BAND IDENTITY (2026-07-24 decoupling) ─────────────────
     # Face (pod /faces, no SAM, ~25ms/crop) + body (local OSNet) + seat

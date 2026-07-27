@@ -65,15 +65,13 @@ class Settings(BaseSettings):
     # match the 4fps frame source + openai_frames_fps (lower than the old 5 to
     # cut frames-per-call cost).
     gemini_model: str = Field(default="gemini-3.6-flash")
-    # Model-level fallback: on ANY primary failure the provider retries
-    # once on this cheaper model (Aryaman 2026-07-27 — availability
-    # over quality when the primary is down). Empty disables.
-    gemini_fallback_model: str = Field(default="gemini-3.1-flash-lite")
-    # Second Gemini tier: tried on the SAME native-video path when the primary
-    # gemini_model errors/overloads, BEFORE dropping to another provider. Prod
-    # primary = gemini-3.1-flash-lite; this steps up to full flash. Env:
+    # Second Gemini tier: tried by the ROUTING chain on the same
+    # native-video path when the primary gemini_model fails, before
+    # dropping to another provider. Aryaman 2026-07-27: primary is the
+    # benchmark winner (3.6-flash), fallback the cheap proven lite —
+    # outages degrade quality, never availability. Env:
     # NEMARA_GEMINI_FALLBACK_MODEL.
-    gemini_fallback_model: str = Field(default="gemini-3.5-flash")
+    gemini_fallback_model: str = Field(default="gemini-3.1-flash-lite")
     gemini_video_fps: str = Field(default="4")
     # Per-frame token budget Gemini spends on each image/video frame — the real
     # "how much detail does the VLM see" dial (independent of the pixels we

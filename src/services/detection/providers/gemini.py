@@ -8,7 +8,6 @@ fields (`speech_heard` + `speech_transcript`) to the prompt + schema
 — these aren't part of the OpenAI fallback (no audio there).
 """
 
-import logging
 from collections.abc import Sequence
 
 from google import genai
@@ -130,41 +129,21 @@ async def gemini_provider(
     if media_res is not None:
         config_kwargs["media_resolution"] = media_res
 
-    # Model ladder (Aryaman 2026-07-27): primary is the benchmark
-    # winner (gemini-3.6-flash: ~2x medication recall, ~half the
-    # cross-fires vs lite); on ANY failure — transport, empty
-    # response, schema parse — retry once on the cheaper fallback so
-    # a primary-model outage degrades quality, never availability.
-    primary = model or settings.gemini_model
-    fallback = getattr(settings, "gemini_fallback_model", "")
-    ladder = [primary] + (
-        [fallback] if fallback and fallback != primary else []
+    # NOTE: model fallback lives in the ROUTING chain (vlm_routing's
+    # gemini -> gemini_fallback tier), not here — a provider-internal
+    # ladder stacked on the chain double-retries (found 2026-07-27
+    # when the merge surfaced both implementations).
+    response = await client.aio.models.generate_content(
+        model=model or settings.gemini_model,
+        contents=[genai_types.Content(role="user", parts=parts)],
+        config=genai_types.GenerateContentConfig(**config_kwargs),
     )
-    response = None
-    res = None
-    for i, mdl in enumerate(ladder):
-        try:
-            response = await client.aio.models.generate_content(
-                model=mdl,
-                contents=[genai_types.Content(role="user", parts=parts)],
-                config=genai_types.GenerateContentConfig(**config_kwargs),
-            )
-            raw = (response.text or "").strip()
-            if not raw:
-                raise RuntimeError("gemini returned empty response")
-            res = parse_and_validate(
-                raw, provider="gemini", required=required,
-                properties=properties,
-            )
-            break
-        except Exception as exc:  # noqa: BLE001 — ladder, then re-raise
-            if i + 1 < len(ladder):
-                logging.getLogger(__name__).warning(
-                    "gemini.model_failed model=%s err=%s — falling back "
-                    "to %s", mdl, type(exc).__name__, ladder[i + 1],
-                )
-                continue
-            raise
+    raw = (response.text or "").strip()
+    if not raw:
+        raise RuntimeError("gemini returned empty response")
+    res = parse_and_validate(
+        raw, provider="gemini", required=required, properties=properties,
+    )
     meta = getattr(response, "usage_metadata", None)
     if meta is not None:
         import dataclasses
