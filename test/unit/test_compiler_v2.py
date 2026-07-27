@@ -73,7 +73,8 @@ def test_reserved_keys_and_prefixes_reject_loudly() -> None:
 
 def _dims(name, text, shape="point_in_time", category="safety"):
     return classify_custom_dims(
-        name=name, user_text=text, shape=shape, category=category,
+        name=name, user_text=text, is_sustained=(shape == "state"),
+        category=category,
     )
 
 
@@ -110,16 +111,6 @@ def test_anyone_subject_and_audio_and_distance_markers() -> None:
     d2 = _dims("Fidgeting", "picking at her fingers and fidgeting",
                shape="state", category="routine")
     assert d2["degradation_warning"] == "distance_class"
-
-
-def test_duration_claim_maps_to_entry_preset_menu() -> None:
-    d = _dims("TV too long", "watching tv for more than 15 minutes",
-              shape="state", category="routine")
-    assert d["eventing"] == {"entry": {"m": 5, "t_seconds": 900}}
-    # Point shapes never get entry windows, whatever the words say.
-    d2 = _dims("Door", "door open for 15 minutes", shape="point_in_time",
-               category="safety")
-    assert d2["eventing"] is None
 
 
 def test_env_wins_over_anyone_with_genuinely_matching_text() -> None:

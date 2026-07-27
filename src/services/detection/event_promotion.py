@@ -332,7 +332,7 @@ async def maybe_promote_analysis(
         # Scheduled ("absence") detectors land their `<id>_detected` in analyses
         # for the scheduler to read, but must NOT fire reactively here — they
         # fire only via the ScheduledDetectorRunner at their deadline, on ABSENCE.
-        if det.shape == "scheduled":
+        if det.alert_trigger == "schedule":
             continue
 
         detected_field, conf_field, base = _promotion_spec_for(det)
@@ -358,8 +358,8 @@ async def maybe_promote_analysis(
         # episode. If the activity was already detected within this detector's
         # hysteresis gap on a prior tick, it's ongoing — suppress, so a whole
         # session ("watching TV") collapses to one event instead of one per
-        # tick. point_in_time detectors are unaffected (momentary events).
-        if det.shape == "state":
+        # tick. Instant (non-sustained) detectors are unaffected.
+        if det.is_sustained:
             cfg = parse_eventing(det.eventing) if v2_decisions else None
             if cfg is not None and cfg.entry_m > 1:
                 # v2 (P4) M>1: the count-crossing edge REPLACES the

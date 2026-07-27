@@ -164,7 +164,7 @@ def resolve_due(
         # outside its window; inside it, the entry is marked `windowed`
         # so the packer gives it a distinct call.
         windowed = False
-        if local_now is not None and d.shape != "scheduled":
+        if local_now is not None and d.alert_trigger != "schedule":
             eligible, windowed = is_active(entry.when_scope, local_now)
             if not eligible:
                 skipped.append((ident, "outside_when_scope"))

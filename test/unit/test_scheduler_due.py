@@ -42,7 +42,7 @@ def _entry(
     subject: str = "patient",
     bucket: str = "scene",
     duty: str = "every_eligible_tick",
-    shape: str = "point_in_time",
+    alert_trigger: str = "leading",
     when_scope: str | None = None,
     category: str = "safety",
     severity: int = 50,
@@ -58,7 +58,7 @@ def _entry(
         dims=EffectiveDims(
             requires_motion=(branch == "person_motion"),
             subject_scope=subject, bucket=bucket,
-            duty_cycle=duty, needs_audio=False, severity=severity, shape=shape,
+            duty_cycle=duty, needs_audio=False, severity=severity, alert_trigger=alert_trigger,
             dims_source="row",
         ),
         when_scope=when_scope,
@@ -151,7 +151,7 @@ def test_scheduled_shape_stays_due_only_scheduled_only_duty_skips() -> None:
     shape detector must keep riding calls or absence events fire
     falsely (T3/T4 review F3)."""
     entries = [
-        _entry("meal_check", shape="scheduled"),
+        _entry("meal_check", alert_trigger="schedule"),
         _entry("night_check", duty="scheduled_only"),
     ]
     ds = resolve_due(
@@ -393,7 +393,7 @@ def test_scheduled_shape_exempt_from_window_gate() -> None:
     # Absence rows keep their all-day per-tick collection regardless of
     # any when_scope text — their schedule_config governs timing.
     out = _resolve_at(
-        [_entry("stretching", shape="scheduled", when_scope="6 PM ±1H")], 3,
+        [_entry("stretching", alert_trigger="schedule", when_scope="6 PM ±1H")], 3,
     )
     assert [d.spec.identifier for d in out.due] == ["stretching"]
     assert out.due[0].windowed is False

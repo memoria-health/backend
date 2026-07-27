@@ -511,7 +511,11 @@ async def infer_detector(
         episode_gap_seconds=inferred.episode_gap_seconds,
         plan=_compose_plan(
             name=body.name or "", prompt=body.prompt,
-            shape=str(inferred.shape), category=str(inferred.category),
+            alert_trigger=inferred.alert_trigger,
+            is_sustained=inferred.is_sustained,
+            category=str(inferred.category),
+            duration_seconds=inferred.duration_seconds,
+            schedule=inferred.schedule,
         ),
     )
 
@@ -547,29 +551,42 @@ def _fmt_time(hhmm: str) -> str:
         return hhmm
 
 
-def _fires_phrase(shape: str, dims: dict, schedule: dict | None) -> str:
+def _fires_phrase(
+    alert_trigger: str, is_sustained: bool, dims: dict,
+    schedule: dict | None, duration_seconds: int | None = None,
+) -> str:
     """The one-line plain-English firing behavior — the single place this
-    copy is derived, shared by the create-review plan and the type-change
-    preview so they can never disagree. Caregiver language only."""
-    entry = (dims.get("eventing") or {}).get("entry") or {}
-    m = int(entry.get("m", 1) or 1)
-    t = int(entry.get("t_seconds", 0) or 0)
-    if shape == "scheduled":
+    copy is derived, so the create-review plan and any preview can never
+    disagree. Caregiver language only, keyed on the alert trigger."""
+    if alert_trigger == "schedule":
         deadline = None
         if schedule:
             deadline = schedule.get("deadline") or schedule.get("window_end")
         if deadline:
             return f"Only if it doesn't happen by {_fmt_time(deadline)}"
         return "Only if it doesn't happen during the scheduled window"
+    if alert_trigger == "trailing":
+        return "When the activity finishes"
+    if alert_trigger == "duration":
+        if duration_seconds and duration_seconds >= 60:
+            return f"Only if it goes on longer than {duration_seconds // 60} minutes"
+        return "Only if it goes on too long"
+    # leading: M-of-N corroboration reads as a short wait; a sustained
+    # activity is one alert per session; an instant event fires on-sight.
+    entry = (dims.get("eventing") or {}).get("entry") or {}
+    m = int(entry.get("m", 1) or 1)
+    t = int(entry.get("t_seconds", 0) or 0)
     if m > 1 and t > 0:
         return f"After it's noticed {m} times within {max(1, t // 60)} minutes"
-    if shape == "state":
+    if is_sustained:
         return "One alert for the whole activity, not repeats"
     return "Right away, the moment it's noticed"
 
 
 def _compose_plan(
-    *, name: str, prompt: str, shape: str, category: str,
+    *, name: str, prompt: str, alert_trigger: str, is_sustained: bool,
+    category: str, duration_seconds: int | None = None,
+    schedule: dict | None = None,
 ):
     """Plain-English preview of the compiled behavior (customs
     visibility, Aryaman 2026-07-18). Pure classification — the same
@@ -580,7 +597,8 @@ def _compose_plan(
 
     try:
         dims = compiler_v2.classify_custom_dims(
-            name=name, user_text=prompt, shape=shape, category=category,
+            name=name, user_text=prompt, is_sustained=is_sustained,
+            category=category,
         )
         # Caregiver-facing "who" — warm, name-free (the infer endpoint has
         # no patient scope). "Your patient only" read clinically; "the
@@ -596,7 +614,9 @@ def _compose_plan(
         # Caregiver language only (Aryaman 2026-07-18): no internal
         # vocabulary — a non-technical reader must understand every line
         # without explanation. Shared with the type-change preview.
-        fires = _fires_phrase(shape, dims, None)
+        fires = _fires_phrase(
+            alert_trigger, is_sustained, dims, schedule, duration_seconds,
+        )
         checks = (
             "Every few minutes"
             if dims["duty_cycle"] == "thinned"
@@ -728,7 +748,7 @@ async def create_detector(
             description=body.description,
             user_text=body.custom_prompt,
             absence=_is_absence(body.alert_trigger.value, body.schedule_config),
-            shape=det.shape,
+            is_sustained=det.is_sustained,
             category=det.category,
             settings=settings,
         )
@@ -744,7 +764,7 @@ async def _compile_and_update_detector(
     description: str,
     user_text: str,
     absence: bool,
-    shape: str,
+    is_sustained: bool,
     category: str,
     settings: Settings,
     identifier: str | None = None,
@@ -778,7 +798,8 @@ async def _compile_and_update_detector(
         # scheduler treats this custom exactly like a built-in.
         compiler_v2.validate_schema_fields(compiled.schema_json)
         dims = compiler_v2.classify_custom_dims(
-            name=name, user_text=user_text, shape=shape, category=category,
+            name=name, user_text=user_text, is_sustained=is_sustained,
+            category=category,
         )
     except compiler_v2.DetectorRejected as e:
         log.error(
@@ -880,7 +901,7 @@ async def patch_detector(
                 description=det.description or "Custom detector",
                 user_text=det.custom_prompt,
                 absence=_is_absence(det.alert_trigger, det.schedule_config),
-                shape=det.shape,
+                is_sustained=det.is_sustained,
                 category=det.category,
                 settings=settings,
                 identifier=det.identifier,
@@ -963,7 +984,7 @@ async def refine_detector(
             description=det.description or "Custom detector",
             user_text=det.custom_prompt,
             absence=_is_absence(det.alert_trigger, det.schedule_config),
-            shape=det.shape,
+            is_sustained=det.is_sustained,
             category=det.category,
             settings=settings,
             identifier=det.identifier,

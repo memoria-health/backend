@@ -95,7 +95,7 @@ class ScheduledDetectorRunner:
             stmt = (
                 select(Detector)
                 .where(
-                    Detector.shape == "scheduled",
+                    Detector.alert_trigger == "schedule",
                     Detector.is_on.is_(True),
                     Detector.identifier.is_not(None),
                 )

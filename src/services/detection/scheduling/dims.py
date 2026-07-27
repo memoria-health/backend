@@ -48,7 +48,7 @@ class EffectiveDims:
     duty_cycle: str         # every_eligible_tick | thinned | scheduled_only
     needs_audio: bool
     severity: int
-    shape: str              # detector row shape (state/point_in_time/scheduled)
+    alert_trigger: str      # leading | trailing | duration | schedule
     dims_source: str        # row | catalog | legacy_default
     # k-of-N confirmation (P4, Aryaman: N extra calls on the SAME
     # clip, ≥k must agree). Parsed from the row's eventing JSONB;
@@ -89,9 +89,13 @@ def _normalize_duty(duty: str) -> str:
     return "thinned" if duty == "sampled" else duty
 
 
-def _fire_rule(shape: str | None, entry_m: int) -> str:
-    """The unified firing semantics (see EffectiveDims.fire_rule)."""
-    if shape == "scheduled":
+def _fire_rule(alert_trigger: str | None, entry_m: int) -> str:
+    """The unified firing semantics (see EffectiveDims.fire_rule).
+
+    schedule → window; everything else accumulates (M>1) or fires on-sight.
+    Phase E adds dedicated 'trailing' / 'duration' rules; until then those
+    triggers ride the leading path (no existing detector uses them)."""
+    if alert_trigger == "schedule":
         return "window"
     return "accumulate" if entry_m > 1 else "instant"
 
@@ -103,7 +107,7 @@ def resolve_dims(row: "Detector") -> EffectiveDims:
     ev = parse_eventing(getattr(row, "eventing", None))
     confirm = dict(
         confirm_k=ev.confirm_k, confirm_n=ev.confirm_n,
-        fire_rule=_fire_rule(row.shape, ev.entry_m),
+        fire_rule=_fire_rule(row.alert_trigger, ev.entry_m),
         entry_m=ev.entry_m, entry_t_seconds=ev.entry_t_seconds,
     )
     catalog_dims = catalog_v2.dims_for(row.identifier or "")
@@ -123,7 +127,7 @@ def resolve_dims(row: "Detector") -> EffectiveDims:
             duty_cycle=_normalize_duty(row.duty_cycle),
             needs_audio=bool(row.needs_audio),
             severity=severity,
-            shape=row.shape,
+            alert_trigger=row.alert_trigger,
             dims_source="row",
             **confirm,
         )
@@ -142,10 +146,10 @@ def resolve_dims(row: "Detector") -> EffectiveDims:
                 row.severity if row.severity is not None
                 else catalog_dims.severity
             ),
-            shape=row.shape,
+            alert_trigger=row.alert_trigger,
             dims_source="catalog",
             **confirm,
         )
     return EffectiveDims(
-        shape=row.shape, dims_source="legacy_default", **confirm, **_LEGACY_DEFAULT,
+        alert_trigger=row.alert_trigger, dims_source="legacy_default", **confirm, **_LEGACY_DEFAULT,
     )

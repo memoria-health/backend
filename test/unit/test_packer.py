@@ -34,7 +34,7 @@ def _due(
             requires_motion=True, subject_scope="anyone",
             bucket=bucket, duty_cycle="every_eligible_tick",
             needs_audio=needs_audio, severity=severity,
-            shape="point_in_time", dims_source="row",
+            alert_trigger="leading", dims_source="row",
         ),
         target_track_ids=targets,
         windowed=windowed,

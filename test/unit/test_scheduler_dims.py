@@ -19,7 +19,7 @@ from src.services.detection.scheduling.dims import resolve_dims
 
 def _row(**over) -> SimpleNamespace:
     base = dict(
-        identifier="fall", shape="point_in_time",
+        identifier="fall", alert_trigger="leading",
         evidence_branch=None, subject_scope=None, bucket=None,
         duty_cycle=None, needs_audio=False, severity=None,
     )
@@ -72,11 +72,11 @@ def test_unbackfilled_builtin_resolves_from_catalog() -> None:
 
 
 def test_pre_p5_custom_gets_legacy_default_like_today() -> None:
-    d = resolve_dims(_row(identifier="custom_a1b2", shape="state"))
+    d = resolve_dims(_row(identifier="custom_a1b2", alert_trigger="leading"))
     assert d.dims_source == "legacy_default"
     # Behaves exactly like today's monolithic call: wide, always due,
     # no subject suppression, motion floor applies.
     assert (d.requires_motion, d.subject_scope, d.bucket, d.duty_cycle) == (
         True, "anyone", "scene", "every_eligible_tick",
     )
-    assert d.shape == "state"
+    assert d.alert_trigger == "leading"

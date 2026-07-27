@@ -154,7 +154,7 @@ _DISTANCE_CLASS = re.compile(
     r"remote)\b", re.I,
 )
 def _entry_confidence_for(
-    shape: str, bucket: str, degradation: str, category: str,
+    is_sustained: bool, bucket: str, degradation: str, category: str,
 ) -> dict | None:
     """The entry M-of-N — an INTERNAL confidence gate, NOT a user duration.
 
@@ -167,15 +167,15 @@ def _entry_confidence_for(
     Emergencies must not wait, so safety stakes cap corroboration lower
     than routine.
 
-    Only `state` accumulates entry evidence — instant events fire on-sight
-    and absence fires on its schedule; cross-tick corroboration for those
-    would be the within-clip confirm (k-of-N), not entry M-of-N.
+    Only SUSTAINED detectors accumulate entry evidence — instant events fire
+    on-sight and absence fires on its schedule; cross-tick corroboration for
+    those would be the within-clip confirm (k-of-N), not entry M-of-N.
 
     Windows satisfy `t_seconds >= m * scheduler_tick` (~60 s) so M is
     physically reachable. TODO(soak): the exact (m, t) per tier are
     placeholders to calibrate against golden soak data before prod.
     """
-    if shape != "state":
+    if not is_sustained:
         return None
     if degradation == "distance_class":
         m, t = (2, 180) if category == "safety" else (3, 300)
@@ -187,7 +187,7 @@ def _entry_confidence_for(
 
 
 def classify_custom_dims(
-    *, name: str, user_text: str, shape: str, category: str,
+    *, name: str, user_text: str, is_sustained: bool, category: str,
 ) -> dict:
     """Row values for a compiled custom detector. Every rule biased so
     a miss lands on today's behavior (wide call, patient scope, every
@@ -210,14 +210,14 @@ def classify_custom_dims(
 
     duty = (
         "thinned"
-        if shape == "state" and category == "routine"
+        if is_sustained and category == "routine"
         else "every_eligible_tick"
     )
 
     degradation = "distance_class" if _DISTANCE_CLASS.search(hay) else "none"
     # M-of-N is derived from detection difficulty (bucket + degradation +
     # stakes), never from a user-stated duration.
-    eventing = _entry_confidence_for(shape, bucket, degradation, category)
+    eventing = _entry_confidence_for(is_sustained, bucket, degradation, category)
 
     return {
         "evidence_branch": branch,
