@@ -75,12 +75,16 @@ _SAM3_STRIDE = max(1, int(os.environ.get("NEMARA_SAM3_STRIDE", "1")))
 # the sole existence authority; a sticky-mask phantom dies at the next
 # ground (≤reground_every ticks) when the grounder finds nobody there.
 
-# Grounder selection (2026-07-24): "sam3" = concept-prompted masks (the
-# original); "yolo" = YOLO26 person BOXES seed EdgeTAM directly (box
-# prompt → EdgeTAM makes the mask). YOLO grounds in ~40ms vs SAM3's
-# ~10s — the fresh-look monopoly behind the 30-50s new-person latency.
-# SAM3 stays fully intact for switch-back and still runs the screens
-# concept pass regardless. YOLO-ground failures fall back to SAM3.
+# Grounder selection: "sam3" = concept-prompted masks (the original);
+# "yoloseg" (2026-07-25, active) = YOLO26-seg person MASKS seed EdgeTAM
+# via the exact same mask-IoU remap + add_new_mask path as SAM3 — same
+# matching currency, ~140ms vs SAM3's ~10s fresh look; "yolo"
+# (2026-07-24, retired) = person BOXES seed EdgeTAM — failed live
+# because rectangles are the wrong matching currency for adjacent
+# people (40-60% box overlap where silhouettes share ~5%), kept for
+# reference. SAM3 stays fully intact for switch-back and still runs
+# the screens concept pass regardless. Grounder failures (detector
+# dead, det-only weights) fall back to SAM3 per-tick.
 _GROUNDER = os.environ.get("NEMARA_GROUNDER", "sam3").strip().lower()
 
 
@@ -240,8 +244,7 @@ class CameraSession:
 
         h, w = frames[0].shape[:2]
         tw, th, _scale = _track_dims(w, h)
-        seeded: "dict[int, np.ndarray]" = {}
-        used_ids: set[int] = set()
+        ms: "list[np.ndarray]" = []
         for (_tid, _bbox, mask, _prob) in got:
             m = np.asarray(mask) > 0.5
             # SAM3 mask -> TRACK res so it matches last_masks + what EdgeTAM
@@ -251,7 +254,21 @@ class CameraSession:
                     m.astype(np.uint8), (tw, th),
                     interpolation=cv2.INTER_NEAREST,
                 ).astype(bool)
-            # Re-map to an existing persistent id by IoU (stable ids).
+            ms.append(m)
+        return self._remap_masks(ms)
+
+    def _remap_masks(
+        self, masks: "list[np.ndarray]",
+    ) -> "dict[int, np.ndarray]":
+        """Map fresh track-res grounding masks onto persistent ids by
+        mask-IoU vs the carried masks — best overlap ≥ _REMAP_IOU keeps
+        the id, otherwise a new id. Shared by every mask-currency
+        grounder (SAM3 concept, YOLO-seg): the matching contract lives
+        HERE, not per-grounder, so grounder choice never changes
+        matching behavior."""
+        seeded: "dict[int, np.ndarray]" = {}
+        used_ids: "set[int]" = set()
+        for m in masks:
             best_id, best_iou = None, _REMAP_IOU
             for pid, pm in self.last_masks.items():
                 if pid in used_ids:
@@ -266,7 +283,38 @@ class CameraSession:
             seeded[best_id] = m
         return seeded
 
-    # ── YOLO grounding (NEMARA_GROUNDER=yolo, 2026-07-24) ─────────
+    # ── YOLO-seg grounding (NEMARA_GROUNDER=yoloseg, 2026-07-25) ──
+    def _ground_yoloseg(self, frames):
+        """Person MASKS from the YOLO26 seg head seed EdgeTAM (~140ms
+        vs SAM3's ~10s fresh look). Same currency as SAM3 grounding —
+        masks — so the IoU remap and the add_new_mask seeding path are
+        identical; only the mask source changes. (The 07-24 box trial
+        failed on currency, not detection: adjacent people's rectangles
+        overlap 40-60% where silhouettes share ~5%.) Returns
+        {id: mask_trackres} or None (detector dead / det-only weights
+        → caller falls back to SAM3). An empty dict is authoritative:
+        YOLO saw nobody."""
+        import cv2
+
+        from sam_service import person_trigger
+
+        masks = person_trigger.person_masks(frames[0])
+        if masks is None:
+            return None
+        h, w = frames[0].shape[:2]
+        tw, th, _scale = _track_dims(w, h)
+        ms = []
+        for m in masks:
+            if m.shape != (th, tw):
+                m = cv2.resize(
+                    m.astype(np.uint8), (tw, th),
+                    interpolation=cv2.INTER_NEAREST,
+                ).astype(bool)
+            if m.any():
+                ms.append(m)
+        return self._remap_masks(ms)
+
+    # ── YOLO box grounding (NEMARA_GROUNDER=yolo, 2026-07-24) ─────
     def _ground_yolo(self, frames):
         """Person boxes from YOLO26 seed EdgeTAM directly (~40ms vs
         SAM3's ~10s fresh look). Returns {id: ("box", xyxy_trackres)}
@@ -443,7 +491,16 @@ class CameraSession:
         if reground:
             seed = None
             mode = "ground"
-            if _GROUNDER == "yolo":
+            if _GROUNDER == "yoloseg":
+                seed = self._ground_yoloseg(frames)
+                if seed is None:
+                    log.warning(
+                        "continuous.yoloseg_ground_failed cam=%s tick=%d "
+                        "— SAM3 fallback", self.camera_id, self.tick,
+                    )
+                else:
+                    mode = "ground_ys"
+            elif _GROUNDER == "yolo":
                 seed = self._ground_yolo(frames)
                 if seed is None:
                     log.warning(

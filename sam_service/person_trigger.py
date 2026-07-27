@@ -35,6 +35,20 @@ _model = None
 _dead = False
 
 
+def _load():
+    """Lazy one-time model load, shared by boxes and masks."""
+    global _model
+    if _model is None:
+        from ultralytics import YOLO
+
+        _model = YOLO(_WEIGHTS)
+        log.info(
+            "trigger.loaded weights=%s task=%s imgsz=%d conf=%.2f",
+            _WEIGHTS, getattr(_model, "task", "?"), _IMGSZ, _CONF,
+        )
+    return _model
+
+
 def person_boxes(bgr) -> "Optional[list]":
     """Person boxes [(x1,y1,x2,y2,conf), ...] on one BGR frame, or
     None if the detector is unavailable (callers treat None as 'no
@@ -42,19 +56,11 @@ def person_boxes(bgr) -> "Optional[list]":
     YOLO-grounding (NEMARA_GROUNDER=yolo) as the box source that seeds
     EdgeTAM — SAM3's fresh-look monopoly was the 30-50s new-person
     latency."""
-    global _model, _dead
+    global _dead
     if _dead:
         return None
     try:
-        if _model is None:
-            from ultralytics import YOLO
-
-            _model = YOLO(_WEIGHTS)
-            log.info(
-                "trigger.loaded weights=%s imgsz=%d conf=%.2f",
-                _WEIGHTS, _IMGSZ, _CONF,
-            )
-        res = _model.predict(
+        res = _load().predict(
             bgr, imgsz=_IMGSZ, conf=_CONF, classes=[0],
             verbose=False, device=0,
         )
@@ -63,6 +69,35 @@ def person_boxes(bgr) -> "Optional[list]":
             x1, y1, x2, y2 = (float(v) for v in b.xyxy[0])
             out.append((x1, y1, x2, y2, float(b.conf[0])))
         return out
+    except Exception:  # noqa: BLE001 — fail-open by design
+        _dead = True
+        log.exception("trigger.dead — person trigger disabled (fail-open)")
+        return None
+
+
+def person_masks(bgr) -> "Optional[list]":
+    """Person masks (FULL-res bool arrays via retina head) from seg
+    weights, or None when there is no signal — detector dead, or the
+    loaded weights are det-only (no seg head). None means 'fall back
+    to SAM3'; an EMPTY LIST means 'zero people' and is authoritative.
+    Mask source for NEMARA_GROUNDER=yoloseg (2026-07-25): masks are
+    the matching currency that survives adjacency; the 07-24 box
+    trial failed on currency, not detection."""
+    global _dead
+    if _dead:
+        return None
+    try:
+        model = _load()
+        if getattr(model, "task", "") != "segment":
+            return None
+        res = model.predict(
+            bgr, imgsz=_IMGSZ, conf=_CONF, classes=[0],
+            verbose=False, device=0, retina_masks=True,
+        )
+        m = res[0].masks
+        if m is None:  # zero detections, NOT a missing seg head
+            return []
+        return [(mm > 0.5) for mm in m.data.cpu().numpy()]
     except Exception:  # noqa: BLE001 — fail-open by design
         _dead = True
         log.exception("trigger.dead — person trigger disabled (fail-open)")

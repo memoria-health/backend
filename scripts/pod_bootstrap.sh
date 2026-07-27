@@ -75,6 +75,9 @@ fi
 # YOLO26x (reground trigger)
 [ -f /workspace/nemara/models/yolo26x.pt ] || \
   (cd /workspace/nemara/models && python3 -c "from ultralytics import YOLO; YOLO('yolo26x.pt')")
+# Seg variant: trigger counts AND yoloseg grounding masks (2026-07-25)
+[ -f /workspace/nemara/models/yolo26x-seg.pt ] || \
+  (cd /workspace/nemara/models && python3 -c "from ultralytics import YOLO; YOLO('yolo26x-seg.pt')")
 ls -la /workspace/nemara/models/
 
 echo "== smoke imports (the deploy will fail loudly if these do) =="
