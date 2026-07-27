@@ -63,6 +63,9 @@ def _make_worker() -> DetectorWorker:
         livekit_api_key="key",
         livekit_api_secret="secret",
         livekit_motion_state_ttl_seconds=15,
+        identity_state_url="http://idsvc:1",
+        identity_state_token="",
+        reid_trace_enabled=False,
     )
     # ReIDInference is constructed lazily inside DetectorWorker.__init__
     # via the import in `from src.services.reid.inference import ...`,

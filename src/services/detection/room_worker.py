@@ -46,7 +46,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
     from src.services.detection.motion_cache import MotionCache
-    from src.services.reid.inference import ReIDInference
+    from src.services.reid.sidecar import SidecarReID
     from src.settings import Settings
 
 log = logging.getLogger(__name__)
@@ -150,7 +150,7 @@ class RoomWorker:
         settings: "Settings",
         sessionmaker: "async_sessionmaker",
         motion_cache: "MotionCache",
-        reid: "ReIDInference",
+        reid: "SidecarReID",
         lk_api: "object | None" = None,
         on_idle_timeout: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:

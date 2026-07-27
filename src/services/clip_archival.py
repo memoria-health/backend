@@ -46,7 +46,6 @@ from uuid import UUID
 from src.db.event import Event
 from src.db.patient import Patient
 from src.services import storage
-from src.services.clip_annotate import annotate_clip_for_display
 from src.services.detection.mp4_remux import Mp4RemuxError, frames_to_mp4
 
 if TYPE_CHECKING:
@@ -182,19 +181,11 @@ async def _archive_one(
 
     combined_mp4 = await concat_mp4s(pre_event_mp4, post_event_mp4)
 
-    # Single encode keeps timestamps monotonic so iOS AVPlayer accepts
-    # the file. The reset-at-boundary hint tells the annotator to
-    # rebuild its BoT-SORT tracker at the 15s cut so the post half
-    # re-identifies the patient independently — otherwise the
-    # patient's motion across the boundary breaks BoT-SORT's
-    # IoU/Kalman matching and the post half never re-locks.
-    annotated_mp4 = await annotate_clip_for_display(
-        combined_mp4,
-        patient_id=patient_id,
-        sessionmaker=sessionmaker,
-        settings=settings,
-        reset_at_seconds=float(settings.clip_post_event_wait_seconds),
-    )
+    # Raw clip, no burned-in annotation — matches production main
+    # (2026-07-27): the brain-drawn patient box died with the legacy
+    # reid pipeline. Patient-box overlays, if they return, will come
+    # from the identity service's bbox stream, not a per-clip re-run.
+    annotated_mp4 = combined_mp4
 
     # Privacy re-check at the upload boundary. The caller already skips
     # spawning this task when privacy is on at promotion time, but privacy

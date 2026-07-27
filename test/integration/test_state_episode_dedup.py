@@ -21,7 +21,7 @@ from src.db.detector import Detector
 from src.db.event import Event
 from src.db.patient import Patient
 from src.services.detection.event_promotion import maybe_promote_analysis
-from test.integration.test_reid_safety_invariant import _setup_patient_with_camera
+from test.integration.identity_helpers import _setup_patient_with_camera
 
 _IDENT = "watching_tv"
 _GAP = 600  # 10 min

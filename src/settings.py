@@ -201,17 +201,9 @@ class Settings(BaseSettings):
     # calls — including the always-on scene call — so identity continuity
     # can be validated for ~$0. Default off; set NEMARA_REID_SOAK_ONLY=true.
     reid_soak_only: bool = Field(default=False)
-    # Identity provider (2026-07-26, implementation A): "legacy" = the
-    # in-process BodyReID brain (ReIDInference.label_clip over the tick
-    # mp4); "sidecar" = synthesize the per-tick IdentityResult from the
-    # standalone identity service's /state (the continuous seat/fusion
-    # stack) — no mp4 reid processing in the backend at all. Fail-open:
-    # an unreachable sidecar yields IdentityResult.empty() (reid_ran=
-    # False), which bypasses identity-based suppression exactly like a
-    # legacy pipeline crash. Flip back to "legacy" is a restart, not a
-    # code change.
-    identity_provider: str = Field(default="legacy")
-    # Base URL of the identity service (tools/run_identity.py).
+    # Base URL of the identity service (the GPU-host sidecar that
+    # synthesizes per-tick IdentityResults from /state — the ONLY
+    # identity provider since the legacy brain's deletion 2026-07-26).
     identity_state_url: str = Field(default="http://host.docker.internal:8012")
     # Bearer token for /state (gpu/identity/contract.py). Empty = no
     # auth (local dev, host-only traffic); production sets

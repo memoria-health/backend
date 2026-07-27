@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.db.detector import Detector
 from src.services.detection.analyses_store import add_analysis
 from src.services.detection.event_promotion import maybe_promote_analysis
-from test.integration.test_reid_safety_invariant import _setup_patient_with_camera
+from test.integration.identity_helpers import _setup_patient_with_camera
 
 _V2 = SimpleNamespace(detection_v2_decision_enabled=True)
 

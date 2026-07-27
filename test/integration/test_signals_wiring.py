@@ -30,12 +30,12 @@ from src.db.camera import Camera
 from src.db.session import get_sessionmaker
 from src.services.detection.camera_ingest import CameraIngest, _RecorderDecision
 from src.services.detection.motion_cache import MotionCache
-from src.services.reid.body_pipeline import TrackObservation
+from src.services.reid.observations import TrackObservation
 from src.services.reid.result import IdentityResult
 from src.settings import get_settings
 from test.fakes.fake_vlm import FakeVLM
 from test.integration.test_identity_suppression_gate import _FixedReID
-from test.integration.test_reid_safety_invariant import _setup_patient_with_camera
+from test.integration.identity_helpers import _setup_patient_with_camera
 
 W, H = 160, 120
 

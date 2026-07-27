@@ -15,7 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.services.reid.body_pipeline import (
+from src.services.reid.observations import (
     LABEL_OTHER,
     LABEL_PATIENT,
     LABEL_UNKNOWN,

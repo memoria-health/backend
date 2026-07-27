@@ -25,7 +25,7 @@ from src.services.detection.event_promotion import (
     _promotion_spec_for,
     maybe_promote_analysis,
 )
-from test.integration.test_reid_safety_invariant import _setup_patient_with_camera
+from test.integration.identity_helpers import _setup_patient_with_camera
 
 
 async def _two_firing_detectors(

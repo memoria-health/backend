@@ -37,8 +37,7 @@ from sqlalchemy import select, text
 
 from src.db.camera import Camera
 from src.db.session import get_engine
-from src.services.reid.cross_clip_body_gallery import CrossClipBodyGallery
-from src.services.reid.inference import ReIDInference
+from src.services.reid.sidecar import SidecarReID
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncConnection, async_sessionmaker
@@ -112,38 +111,20 @@ class DetectorWorker:
         self._motion_cache = MotionCache(
             ttl_seconds=settings.livekit_motion_state_ttl_seconds,
         )
-        # Cross-clip body gallery: in-memory, per-patient OSNet
-        # embedding cache that lets a face-identified person be
-        # body-identified in subsequent clips when their face is
-        # hidden. Constructed here as a backend-wide singleton so
-        # every RoomWorker's per-tick Re-ID pipeline shares one cache.
-        # Lost on backend restart (rebuilds itself).
-        self._body_gallery = CrossClipBodyGallery(settings=settings)
-        # Single identity provider shared across every RoomWorker.
-        # "sidecar" (implementation A, 2026-07-26): per-tick identity is
-        # synthesized from the standalone identity service's /state —
-        # no in-process video reid at all. "legacy": the BodyReID brain
-        # (InsightFace is lazy-singleton'd at module level; sharing the
-        # instance also shares the gallery cache and avoids duplicate
-        # DB reads when multiple cameras tick concurrently).
-        if getattr(settings, "identity_provider", "legacy") == "sidecar":
-            from src.services.reid.sidecar import SidecarReID
-
-            self._reid = SidecarReID(
-                sessionmaker=sessionmaker,
-                settings=settings,
-                body_gallery=self._body_gallery,
-            )
-            log.info(
-                "identity provider: sidecar url=%s",
-                settings.identity_state_url,
-            )
-        else:
-            self._reid = ReIDInference(
-                sessionmaker=sessionmaker,
-                settings=settings,
-                body_gallery=self._body_gallery,
-            )
+        # Identity provider: the sidecar, period (2026-07-26 — the
+        # legacy in-process BodyReID brain was deleted once the sidecar
+        # proved out live). Per-tick identity is synthesized from the
+        # GPU-host identity service's /state; the backend does zero
+        # video identity processing. Fail-open on an unreachable
+        # service is the sidecar's contract.
+        self._reid = SidecarReID(
+            sessionmaker=sessionmaker,
+            settings=settings,
+        )
+        log.info(
+            "identity provider: sidecar url=%s",
+            settings.identity_state_url,
+        )
         self._rooms: dict[str, RoomWorker] = {}
         self._lock = asyncio.Lock()
         self._started = False
@@ -227,16 +208,12 @@ class DetectorWorker:
             *(room.stop() for room in rooms),
             return_exceptions=True,
         )
-        # Close the identity provider's HTTP pool (sidecar holds a
-        # long-lived httpx client; legacy ReIDInference has no aclose —
-        # guarded). Same close-what-you-open discipline as _lk_api
-        # below (Phase 0 checkpoint review finding #1).
-        _aclose = getattr(self._reid, "aclose", None)
-        if callable(_aclose):
-            try:
-                await _aclose()
-            except Exception:
-                log.exception("detector_worker.stop reid.aclose failed")
+        # Close the sidecar's HTTP pool — same close-what-you-open
+        # discipline as _lk_api below (Phase 0 review finding #1).
+        try:
+            await self._reid.aclose()
+        except Exception:
+            log.exception("detector_worker.stop reid.aclose failed")
         # Close the shared LiveKit REST client AFTER every reconciler
         # has stopped using it. Best-effort; an aclose failure
         # mid-shutdown is logged but does not block the lifespan.

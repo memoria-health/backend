@@ -19,7 +19,7 @@ from src.services.detection.scheduling.scheduler import (
     resolve_due,
 )
 from src.services.detection.signals.tick_signals import TickSignals, TrackMotion
-from src.services.reid.body_pipeline import TrackObservation
+from src.services.reid.observations import TrackObservation
 from src.services.reid.result import IdentityResult
 
 

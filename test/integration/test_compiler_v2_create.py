@@ -15,7 +15,7 @@ from src.db.detector import Detector
 from src.services.detector_compiler import CompiledDetector
 from src.settings import get_settings
 from test.conftest import mint_test_jwt
-from test.integration.test_reid_safety_invariant import _setup_patient_with_camera
+from test.integration.identity_helpers import _setup_patient_with_camera
 
 
 def _headers(auth_user) -> dict:
