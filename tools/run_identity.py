@@ -452,6 +452,28 @@ def main() -> None:
                          "face/identity work, full-res frames. Use with the "
                          "pod at NEMARA_EDGE_TRACK_W=640. One-lever baseline.")
     ap.add_argument("--port", type=int, default=8012)
+    ap.add_argument("--track-width", type=int, default=None,
+                    help="ship TRACKING batch frames at this width "
+                         "(applied AFTER --preset, so '--preset "
+                         "yesterday --track-width 640' = yesterday with "
+                         "downsampled identity shipping as the ONLY "
+                         "change). Face probes always ship full-res on "
+                         "their own path — identity quality unaffected. "
+                         "Measured 2026-07-26: cuts wire/encode ~9x but "
+                         "GPU only ~10% (EdgeTAM encodes at fixed "
+                         "internal res) — frame COUNT is the GPU lever.")
+    ap.add_argument("--queue-cap", type=int, default=None,
+                    help="SDK frame queue bound (applied AFTER --preset; "
+                         "the preset's 0=unbounded is OOM-prone on long "
+                         "runs — 2 is the production default)")
+    ap.add_argument("--batch-fps", type=float, default=None,
+                    help="in-batch frame rate (applied AFTER --preset). "
+                         "GPU cost is ~200ms x frames regardless of "
+                         "resolution, so this is THE duty-cycle lever: "
+                         "3fps ≈ 60%% of the footage-second cost of the "
+                         "preset's 12fps(→~5 effective). Trade-off is "
+                         "carry stride (330ms gaps at 3fps) — watch "
+                         "fast-walk tracking.")
     ap.add_argument("--faces", action="store_true",
                     help="ladder step 3a: keep the parity tracking knobs "
                          "but re-enable out-of-band identity probes "
@@ -483,6 +505,24 @@ def main() -> None:
         print(f"[preset] YESTERDAY replica: 40f/12fps, "
               f"faces={'ON' if args.faces else 'off'}, native res, "
               f"unbounded queue, 15fps intake", flush=True)
+
+    if args.track_width:
+        from src.services.identity import loop as loop_mod
+        loop_mod.TRACK_SEND_W = args.track_width
+        print(f"[override] tracking batches ship at {args.track_width}px "
+              f"wide (downsample-for-identity experiment, 2026-07-26)",
+              flush=True)
+    if args.batch_fps:
+        from src.services.identity import loop as loop_mod
+        loop_mod.TARGET_FPS = args.batch_fps
+        print(f"[override] in-batch frame rate {args.batch_fps}fps "
+              f"(cadence/duty experiment, 2026-07-26)", flush=True)
+    if args.queue_cap is not None:
+        STREAM_CAPACITY = args.queue_cap
+        print(f"[override] SDK frame queue capacity {args.queue_cap} "
+              f"(preset's unbounded queue OOM-killed the service after "
+              f"~10h on 2026-07-26; the replication test it served is "
+              f"long validated)", flush=True)
 
     threading.Thread(
         target=lambda: uvicorn.run(
