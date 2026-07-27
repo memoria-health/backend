@@ -64,7 +64,11 @@ class Settings(BaseSettings):
     # Video sampling rate sent to Gemini. "" = Gemini auto (~1fps); we pin 4 to
     # match the 4fps frame source + openai_frames_fps (lower than the old 5 to
     # cut frames-per-call cost).
-    gemini_model: str = Field(default="gemini-3.5-flash")
+    gemini_model: str = Field(default="gemini-3.6-flash")
+    # Model-level fallback: on ANY primary failure the provider retries
+    # once on this cheaper model (Aryaman 2026-07-27 — availability
+    # over quality when the primary is down). Empty disables.
+    gemini_fallback_model: str = Field(default="gemini-3.1-flash-lite")
     # Second Gemini tier: tried on the SAME native-video path when the primary
     # gemini_model errors/overloads, BEFORE dropping to another provider. Prod
     # primary = gemini-3.1-flash-lite; this steps up to full flash. Env:

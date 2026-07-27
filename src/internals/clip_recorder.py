@@ -128,6 +128,17 @@ async def _capture(
         if participant.identity != camera_identity:
             return
         if track.kind == rtc.TrackKind.KIND_VIDEO:
+            # Pin the TOP simulcast layer (Sunny's benchmark finding,
+            # 2026-07-27): without a request LiveKit defaults this
+            # subscriber to VIDEO_QUALITY_LOW = 320x180 — recorded
+            # clips were 180p while the source published 720p+. Same
+            # pattern as room_worker's set_video_quality. Best-effort.
+            try:
+                publication.set_video_quality(
+                    rtc.VideoQuality.VIDEO_QUALITY_HIGH,
+                )
+            except Exception:  # noqa: BLE001 — stay on SFU default
+                log.warning("clip_recorder.quality_pin_failed")
             _spawn_video(track)
         elif track.kind == rtc.TrackKind.KIND_AUDIO:
             _spawn_audio(track)
