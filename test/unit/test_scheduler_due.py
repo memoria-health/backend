@@ -20,7 +20,7 @@ from src.services.detection.scheduling.scheduler import (
 )
 from src.services.detection.signals.tick_signals import TickSignals, TrackMotion
 from src.services.reid.body_pipeline import TrackObservation
-from src.services.reid.inference import IdentityResult
+from src.services.reid.result import IdentityResult
 
 
 def _settings(**over) -> SimpleNamespace:

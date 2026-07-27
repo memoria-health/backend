@@ -29,7 +29,7 @@ from src.db.session import get_sessionmaker
 from src.services.detection import catalog
 from src.services.detection.camera_ingest import CameraIngest, _RecorderDecision
 from src.services.detection.motion_cache import MotionCache
-from src.services.reid.inference import IdentityResult
+from src.services.reid.result import IdentityResult
 from src.settings import get_settings
 from test.fakes.fake_vlm import FakeRapidProvider, FakeVLM
 from test.integration.test_reid_safety_invariant import _setup_patient_with_camera

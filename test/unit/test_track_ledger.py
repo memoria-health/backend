@@ -22,7 +22,7 @@ from src.services.reid.body_pipeline import (
     TrackObservation,
 )
 from src.services.detection.patient_presence import TIER_FACE
-from src.services.reid.inference import IdentityResult
+from src.services.reid.result import IdentityResult
 from src.services.reid.track_ledger import TrackLedger
 
 CAM = uuid.UUID("00000000-0000-0000-0000-000000000001")

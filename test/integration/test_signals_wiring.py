@@ -31,7 +31,7 @@ from src.db.session import get_sessionmaker
 from src.services.detection.camera_ingest import CameraIngest, _RecorderDecision
 from src.services.detection.motion_cache import MotionCache
 from src.services.reid.body_pipeline import TrackObservation
-from src.services.reid.inference import IdentityResult
+from src.services.reid.result import IdentityResult
 from src.settings import get_settings
 from test.fakes.fake_vlm import FakeVLM
 from test.integration.test_identity_suppression_gate import _FixedReID

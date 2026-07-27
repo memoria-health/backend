@@ -22,7 +22,7 @@ from src.services.reid.body_pipeline import (
     PipelineConfig,
     TrackObservation,
 )
-from src.services.reid.inference import IdentityResult
+from src.services.reid.result import IdentityResult
 
 _FRAME = np.zeros((120, 160, 3), dtype=np.uint8)
 
