@@ -13,7 +13,7 @@ holds:
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.db.base import Base
@@ -146,6 +146,29 @@ class Camera(Base):
     ingest_token_hash: Mapped[str | None] = mapped_column(String(64), default=None)
     ingest_token_created_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None,
+    )
+
+    # ── Room-derived privacy (2026-07-27) ────────────────────────────
+    # Privacy is per-camera, derived from the ROOM the camera watches
+    # (docs/plans/2026-07-27-room-privacy-and-clip-censoring.md). On
+    # first frames, `services/room_classifier.py` runs one clean-frame
+    # VLM call: 'bathroom' | 'bedroom' | 'other' (DB CHECK constraint).
+    # `room_classified_at` NULL = not yet classified — the ingest worker
+    # classifies lazily on the next connect; treated as Full until then.
+    # Cleared on room rename / re-pair so the classifier re-runs.
+    room_class: Mapped[str | None] = mapped_column(String(16), default=None)
+    room_class_confidence: Mapped[float | None] = mapped_column(Float, default=None)
+    room_classified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None,
+    )
+    # DENORMALIZED from room_class for hot-path reads (desired-state
+    # poll, gateway roster, clip archival, recorder gate). Written ONLY
+    # by the room classifier and the internal reclassify endpoint —
+    # NEVER via the public camera PATCH. While true: live video+audio to
+    # caregivers is severed per-camera at the SFU and data collection
+    # never records this camera; detection + text insights keep flowing.
+    privacy_enabled: Mapped[bool] = mapped_column(
+        Boolean, server_default=text("false"), default=False,
     )
 
     # ── Memoria Sensor app-present heartbeat (iPhone only) ──────────

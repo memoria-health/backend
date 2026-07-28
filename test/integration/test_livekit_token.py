@@ -11,11 +11,12 @@ the LiveKit grants without re-implementing the HS256 verify.
 
 from __future__ import annotations
 
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import jwt as pyjwt
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import text
 
 from src.settings import Settings, get_settings
 from test.conftest import mint_test_jwt
@@ -292,25 +293,35 @@ async def test_caregiver_broadcaster_token(
     assert decoded["video"].get("canPublishData") is True
 
 
-# ─── Privacy mode severs the caregiver's media grants ────────────
-
-
-async def _set_privacy(client: AsyncClient, headers: dict[str, str], pid: str) -> None:
-    r = await client.patch(
-        f"/v1/patients/{pid}", headers=headers, json={"privacy_mode_enabled": True},
-    )
-    assert r.status_code == 200, r.text
+# ─── Per-camera privacy: token mint is NOT the enforcement point ──
+# (2026-07-27) The old patient-level privacy gate that zeroed
+# subscribe/publish on caregiver tokens is retired. Privacy is
+# per-camera (cameras.privacy_enabled): enforcement is publisher-side
+# track subscription permissions + the per-camera server sever
+# (test/unit/test_livekit_privacy.py). Room-level grants cannot express
+# "this track but not that one", so the caregiver token stays
+# permissive even while one of the patient's cameras is private.
 
 
 @pytest.mark.asyncio
-async def test_viewer_token_severed_under_privacy(
-    livekit_app, client: AsyncClient, auth_user,
+async def test_viewer_token_stays_subscribable_with_a_private_camera(
+    livekit_app, client: AsyncClient, auth_user, session,
 ) -> None:
-    """Privacy on → a viewer token may JOIN (for insights/UI) but is
-    granted neither subscribe (no live in) nor publish (no Talk out).
-    Baked into the JWT so it survives reconnects."""
+    """A private camera must NOT strip the caregiver's room-level
+    subscribe — the other (non-private) cameras' tiles still need live
+    video. Per-track severing happens outside the token."""
     headers, pid = await _setup_patient(client, auth_user)
-    await _set_privacy(client, headers, pid)
+    # Give the patient a private camera directly in the DB.
+    await session.execute(
+        text(
+            "INSERT INTO cameras (id, patient_id, display_id, room, icon_name, "
+            "online, created_at, room_class, room_classified_at, privacy_enabled) "
+            "VALUES (:id, :pid, 1, 'Bathroom', 'tv', true, now(), 'bathroom', "
+            "now(), true)"
+        ),
+        {"id": str(uuid4()), "pid": pid},
+    )
+    await session.commit()
 
     r = await client.post(
         "/v1/livekit/token",
@@ -319,29 +330,8 @@ async def test_viewer_token_severed_under_privacy(
     )
     assert r.status_code == 200, r.text
     v = _decode_lk(r.json()["token"])["video"]
-    assert v["roomJoin"] is True  # still in the room for insights
-    assert v.get("canSubscribe", False) is False  # no live video/audio in
-    assert v.get("canPublish", False) is False  # no Talk audio out
-    assert v.get("canPublishData", False) is False
-
-
-@pytest.mark.asyncio
-async def test_broadcaster_token_severed_under_privacy(
-    livekit_app, client: AsyncClient, auth_user,
-) -> None:
-    """Privacy on → even a broadcaster (Talk) token is fully severed."""
-    headers, pid = await _setup_patient(client, auth_user)
-    await _set_privacy(client, headers, pid)
-
-    r = await client.post(
-        "/v1/livekit/token",
-        headers=headers,
-        json={"room": f"patient_{pid}", "identity": "bc-1", "role": "broadcaster"},
-    )
-    assert r.status_code == 200, r.text
-    v = _decode_lk(r.json()["token"])["video"]
     assert v["roomJoin"] is True
-    assert v.get("canSubscribe", False) is False
+    assert v["canSubscribe"] is True  # room-level subscribe survives
     assert v.get("canPublish", False) is False
 
 

@@ -67,6 +67,7 @@ async def update_partial(
     disabled: bool | None = None,
     ai_paused: bool | None = None,
     desired_state: str | None = None,
+    room: str | None = None,
 ) -> Camera | None:
     """Partial-update a caregiver-owned camera. Returns the refreshed
     row, or None if the camera doesn't exist for this caregiver.
@@ -111,6 +112,19 @@ async def update_partial(
         cam.ai_paused = ai_paused
     if desired_state is not None:
         cam.desired_state = desired_state
+    if room is not None and room != cam.room:
+        # Room rename → re-classify (room-privacy escape hatch ⚑3): the
+        # caregiver saying "this is actually the Living Room" is the ONE
+        # user signal that the room verdict may be wrong. Clearing
+        # room_classified_at re-arms the classifier on the next frames;
+        # room_class + privacy_enabled are KEPT until the new verdict
+        # lands (fail-closed — a bathroom stays private through the
+        # rename window rather than briefly unlocking). NOTE: the
+        # privacy fields themselves are NOT writable here — this is a
+        # side effect of the cosmetic rename, never a direct set.
+        cam.room = room
+        cam.room_class_confidence = None
+        cam.room_classified_at = None
 
     if resuming:
         cam.state = "open"

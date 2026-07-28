@@ -68,10 +68,10 @@ class Settings(BaseSettings):
     # Second Gemini tier: tried by the ROUTING chain on the same
     # native-video path when the primary gemini_model fails, before
     # dropping to another provider. Aryaman 2026-07-27: primary is the
-    # benchmark winner (3.6-flash), fallback the cheap proven lite —
+    # benchmark winner (3.6-flash), fallback the newest lite tier —
     # outages degrade quality, never availability. Env:
     # NEMARA_GEMINI_FALLBACK_MODEL.
-    gemini_fallback_model: str = Field(default="gemini-3.1-flash-lite")
+    gemini_fallback_model: str = Field(default="gemini-3.5-flash-lite")
     gemini_video_fps: str = Field(default="4")
     # Per-frame token budget Gemini spends on each image/video frame — the real
     # "how much detail does the VLM see" dial (independent of the pixels we
@@ -146,6 +146,61 @@ class Settings(BaseSettings):
     # LiveKit Cloud signs webhook deliveries with the same API
     # key/secret; the receiver verifies via livekit-api's TokenVerifier.
     livekit_webhook_api_key: str = Field(default="")  # falls back to livekit_api_key
+
+    # ── Room-derived privacy (2026-07-27) ────────────────────────
+    # Master switch for the automatic room classifier: when a camera
+    # with `room_classified_at IS NULL` starts delivering frames, one
+    # clean-frame VLM call classifies its room (bathroom/bedroom →
+    # privacy_enabled=true, locked). Default ON everywhere; turn OFF
+    # (NEMARA_AUTO_PRIVACY_MODE=false) only in internal/dev
+    # environments so we can test with live feeds. Never user-visible —
+    # this is an env setting, not a product toggle. See
+    # docs/plans/2026-07-27-room-privacy-and-clip-censoring.md and
+    # services/room_classifier.py.
+    auto_privacy_mode: bool = Field(default=True)
+    # Shared secret guarding the support-only /internal/* routes (e.g.
+    # POST /internal/cameras/{id}/reclassify). Callers present it in the
+    # X-Internal-Key header. Fails CLOSED outside env=local/test when
+    # empty — an unset key in prod means every /internal call is
+    # rejected, never open. Env: NEMARA_INTERNAL_SERVICE_KEY.
+    internal_service_key: str = Field(default="")
+
+    # ── Sensitivity screening + clip censoring (2026-07-27) ──────
+    # Master switch for the per-clip sensitivity screen: EVERY event
+    # clip from EVERY camera is screened before upload, and sensitive
+    # clips are censored (person-mask blur + audio stripped) — company
+    # baseline, no per-account setting. Default ON everywhere; turn OFF
+    # (NEMARA_SENSITIVITY_SCREENING_ENABLED=false) only in internal/dev
+    # environments, mirroring auto_privacy_mode. Never user-visible.
+    # See docs/plans/2026-07-27-room-privacy-and-clip-censoring.md and
+    # services/detection/sensitivity.py.
+    # NOTE: honored ONLY when env is local/test — in any other env a
+    # false value is IGNORED (screening stays on, loud warning logged),
+    # mirroring how internal_service_key fails closed by env. See
+    # clip_archival._screening_active.
+    sensitivity_screening_enabled: bool = Field(default=True)
+    # Confidence floor for a "not sensitive" clearance. A well-formed
+    # sensitive=false verdict BELOW this self-reported confidence is
+    # treated as sensitive (censored): doubt → censor, in code, not
+    # just in the prompt. sensitive=true verdicts censor at ANY
+    # confidence. Env: NEMARA_SENSITIVITY_CONFIDENCE_FLOOR.
+    sensitivity_confidence_floor: float = Field(ge=0.0, le=1.0, default=0.6)
+    # PINNED model for the sensitivity classifier. Deliberately NOT the
+    # per-account vlm_provider routing — a safety-critical classifier
+    # must behave identically for every account, and QA/eval is run
+    # against exactly one model. Same Gemini flash family as the
+    # detection default. Env: NEMARA_SENSITIVITY_MODEL.
+    sensitivity_model: str = Field(default="gemini-3.6-flash")
+    # Hard wall-clock cap on the tier-1 (person-mask) censor, which runs
+    # in an ISOLATED child process (censor.py `__main__`). 2026-07-28: a
+    # tier-1 YOLO inference hit a native torch/OpenMP deadlock and froze
+    # the ENTIRE backend process — event loop included — in the local
+    # Docker VM; `asyncio.to_thread` cannot contain a native hang, so
+    # tier 1 now runs out-of-process and is `kill()`ed at this deadline,
+    # falling back to the pure-ffmpeg full-frame tier in-process. A
+    # normal censor pass is seconds; 180s only trips on a wedged child.
+    # Env: NEMARA_CENSOR_TIMEOUT_SECONDS.
+    censor_timeout_seconds: float = Field(gt=0, le=900, default=180.0)
 
     # ── Detector subscriber-bot (Phase 2) ───────────────────────
     # The bot lives inside the FastAPI process as an asyncio task tree
@@ -675,6 +730,26 @@ class Settings(BaseSettings):
     # THIS so post.mp4 is contiguous with pre.mp4 regardless of how short
     # the analysis window gets. Test overrides bump it to ~0.1 to skip waiting.
     clip_post_event_wait_seconds: float = Field(gt=0, le=120, default=15.0)
+    # Frame rate of the incident clip (2026-07-27). Decoupled from the
+    # 4fps LLM cadence so caregivers get watchable playback: the clip
+    # is a SINGLE encode (pre+post frames + one contiguous PCM audio
+    # track in one ffmpeg pass — no concat seam; audio restored
+    # 2026-07-28, censored clips still strip it). Cost of raising
+    # this: the frame buffer must RETAIN this rate (see
+    # frame_buffer_target_fps), so steady-state memory scales
+    # linearly, and the censor's per-frame YOLO pass scales with it.
+    clip_fps: int = Field(ge=1, le=15, default=8)
+
+    @property
+    def frame_buffer_target_fps(self) -> int:
+        """Native retention rate for the per-camera FrameBuffer.
+
+        DERIVED (like frame_buffer_retention_seconds) so the buffer can
+        never retain less than its fastest consumer needs: the LLM tick
+        decimates to `livekit_worker_target_fps` via at_fps either way,
+        but the incident clip snapshots at `clip_fps`.
+        """
+        return max(self.livekit_worker_target_fps, self.clip_fps)
 
     @property
     def frame_buffer_retention_seconds(self) -> float:

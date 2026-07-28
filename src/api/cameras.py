@@ -24,6 +24,7 @@ log = logging.getLogger(__name__)
 
 from src.api import cameras_ingest as pi_ingest_module
 from src.api.deps import CameraAuth, CaregiverAuth, SessionDep, SettingsDep
+from src.services import room_classifier
 from src.services.ingest.pi.auth import mint_ingest_token
 from src.db.camera import Camera
 from src.repos import (
@@ -79,6 +80,10 @@ def _to_response(c: Camera) -> CameraResponse:
         created_at=c.created_at,
         paired=paired,
         app_present=c.app_present,
+        room_class=c.room_class,  # type: ignore[arg-type]
+        room_class_confidence=c.room_class_confidence,
+        room_classified_at=c.room_classified_at,
+        privacy_enabled=c.privacy_enabled,
     )
 
 
@@ -240,14 +245,12 @@ async def create_pairing_code(
     )
     session.add(cam)
     await session.flush()  # Ensure the camera row is visible to the assignment query below.
-    # Auto-assign only the PRESET detectors (Falls, Wandering, etc.) to
-    # the new camera — caregivers expect those to "just work" on every
-    # camera. Custom detectors stay opt-in: a caregiver who built a
-    # `stove_on` detector for the kitchen doesn't expect it to start
-    # running on the bedroom camera the moment a bedroom phone is paired.
-    await camera_detector_repo.assign_preset_detectors_of_patient_to_camera(
-        session, camera_id, patient_id,
-    )
+    # Reconcile detector links from each detector's where_rooms: presets
+    # attach per their scope (all-rooms presets "just work" everywhere),
+    # room-scoped detectors attach only to matching rooms, and null-scoped
+    # custom detectors stay opt-in per camera — the reconciler never
+    # touches those (see sync_links_for_patient's docstring).
+    await camera_detector_repo.sync_links_for_patient(session, patient_id)
     await session.commit()
 
     return CreatePairingCodeResponse(
@@ -388,12 +391,10 @@ async def provision_pi_camera(
     )
     session.add(cam)
     await session.flush()
-    # Auto-assign preset detectors, same convention as the iPhone path
-    # so a freshly-provisioned Pi camera is detector-equivalent to an
-    # iPhone camera in the same room.
-    await camera_detector_repo.assign_preset_detectors_of_patient_to_camera(
-        session, camera_id, patient_id,
-    )
+    # Reconcile detector links from where_rooms, same convention as the
+    # iPhone path so a freshly-provisioned Pi camera is
+    # detector-equivalent to an iPhone camera in the same room.
+    await camera_detector_repo.sync_links_for_patient(session, patient_id)
     # Mark the discovery claimed (if we got here via discovery mode)
     # so it disappears from the next /discovered listing, AND stash
     # the plaintext ingest token on the discovery row so the Pi can
@@ -478,9 +479,9 @@ async def provision_gateway_camera(
     )
     session.add(cam)
     await session.flush()
-    await camera_detector_repo.assign_preset_detectors_of_patient_to_camera(
-        session, camera_id, patient_id,
-    )
+    # Reconcile detector links from where_rooms — same as the other
+    # camera-create paths, and also repairs any pre-existing drift.
+    await camera_detector_repo.sync_links_for_patient(session, patient_id)
     await session.commit()
     return {
         "camera_id": str(camera_id),
@@ -514,11 +515,21 @@ async def delete_camera(
     # /discovered immediately on the next caregiver-app refresh.
     # No-op when the camera was never a Pi (no matching discovery row).
     await pi_discovery_repo.unclaim_for_camera(session, camera_id=camera_id)
+    # Capture patient_id BEFORE the row goes away — needed for the link
+    # reconcile below.
+    cam = await camera_repo.find_by_id(session, camera_id, caregiver_id=auth.id)
     deleted = await camera_repo.delete_by_id(session, camera_id, caregiver_id=auth.id)
     if not deleted:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="camera_not_found",
+        )
+    # The FK cascade already dropped this camera's cameras_detectors rows;
+    # this reconcile is the drift-repair safety net for the patient's
+    # remaining cameras (cheap, same transaction).
+    if cam is not None:
+        await camera_detector_repo.sync_links_for_patient(
+            session, cam.patient_id,
         )
     await session.commit()
     # Best-effort in-process worker shutdown. If the camera was actively
@@ -664,6 +675,15 @@ def _reset_camera_to_unpaired(cam: Camera) -> None:
     cam.no_people_count = 0
     cam.battery_percent = None
     cam.app_present = True  # reset heartbeat flag; moot while unpaired
+    # Re-pair → re-classify (room-privacy plan, escape hatch ⚑3): the
+    # phone may be re-mounted in a different room, so the old verdict is
+    # void. Clearing room_classified_at makes the classifier re-run on
+    # the next frames; room_class + privacy_enabled are KEPT until the
+    # new verdict lands (fail-closed — a bathroom stays private through
+    # the re-pair window rather than briefly unlocking).
+    cam.room_class_confidence = None
+    cam.room_classified_at = None
+    room_classifier.reset_attempts(cam.id)
 
 
 async def _stop_worker_best_effort(request: Request, camera_id: UUID) -> None:
@@ -782,6 +802,10 @@ async def get_my_desired_state(
         desired_state=auth.desired_state,  # type: ignore[arg-type]
         polled_at=datetime.now(timezone.utc),
         room=auth.room,
+        # Room-derived privacy: the publisher restricts its tracks'
+        # subscription permissions when this flips true (picked up
+        # within ~1s via this poll).
+        privacy_enabled=auth.privacy_enabled,
     )
 
 
@@ -870,6 +894,7 @@ async def update_my_desired_state(
         desired_state=body.desired_state,
         polled_at=datetime.now(timezone.utc),
         room=auth.room,
+        privacy_enabled=auth.privacy_enabled,
     )
 
 
@@ -911,7 +936,23 @@ async def set_camera_detectors(
     Validates ownership + that every detector belongs to the camera's
     patient. Takes effect on the next tick — the registry reads the
     join table per call, no in-process cache to invalidate.
+
+    Reconciliation with where_rooms (2026-07-28): links are DERIVED
+    from each detector's where_rooms by sync_links_for_patient, so a
+    picker edit must write back through where_rooms or the next sync
+    would revert it. After the replace, every detector whose
+    membership changed here gets where_rooms rewritten from its
+    resulting link set (NULL when it spans every camera). Null-scoped
+    CUSTOM detectors are exempt — their links are opt-in-authoritative
+    and sync never touches them. Consequence of the room-derived
+    model: two cameras sharing one room name cannot diverge for a
+    room-scoped detector; the closing sync aligns them.
     """
+    prior = set(
+        await camera_detector_repo.list_detector_ids_for_camera(
+            session, camera_id, caregiver_id=auth.id,
+        )
+    )
     try:
         final = await camera_detector_repo.replace_assignments_for_camera(
             session,
@@ -930,6 +971,18 @@ async def set_camera_detectors(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="invalid_detector_ids",
         ) from e
+    changed = prior.symmetric_difference(final)
+    if changed:
+        cam = await camera_repo.find_by_id(
+            session, camera_id, caregiver_id=auth.id,
+        )
+        if cam is not None:
+            await camera_detector_repo.rewrite_where_rooms_from_links(
+                session, cam.patient_id, detector_ids=changed,
+            )
+            await camera_detector_repo.sync_links_for_patient(
+                session, cam.patient_id,
+            )
     await session.commit()
     return CameraDetectorsResponse(detector_ids=list(final))
 
@@ -946,7 +999,7 @@ async def update_camera(
 ) -> CameraResponse:
     """Partial-update a caregiver-owned camera.
 
-    Three mutable fields, all user-facing toggles:
+    Four mutable fields, all user-facing:
       - `disabled`: pauses LLM ticks AND hides the tile from the live
         grid. LiveKit stays connected. Instant on/off.
       - `ai_paused`: pauses LLM ticks only; tile + video stay visible.
@@ -956,7 +1009,40 @@ async def update_camera(
         the LiveKit room entirely. Phone polls
         /v1/cameras/me/desired-state every 1s; reconnect latency
         ~1-2s. Full battery + privacy savings.
+      - `room`: cosmetic rename. Side effect: clears the camera's room
+        classification so the room classifier re-runs (privacy stays as
+        it was until the new verdict lands — fail-closed).
+
+    The privacy fields (room_class / privacy_enabled / …) are NEVER
+    settable here — `extra="forbid"` on the body model 422s them.
     """
+    renamed = body.room is not None
+    if renamed:
+        # Same case-insensitive per-patient uniqueness rule the pairing
+        # flow enforces at creation — two cameras named "Kitchen" would
+        # break the room-name-keyed flows (orphan sweep, detector
+        # where_rooms). Excludes self so a case-only rename is allowed.
+        cam_for_dup = await camera_repo.find_by_id(
+            session, camera_id, caregiver_id=auth.id,
+        )
+        if cam_for_dup is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="camera_not_found",
+            )
+        requested = body.room.strip()
+        dup_stmt = (
+            select(Camera.id)
+            .where(Camera.patient_id == cam_for_dup.patient_id)
+            .where(func.lower(Camera.room) == requested.lower())
+            .where(Camera.id != camera_id)
+            .limit(1)
+        )
+        if (await session.execute(dup_stmt)).scalar_one_or_none() is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="camera_room_duplicate",
+            )
     cam = await camera_repo.update_partial(
         session,
         camera_id,
@@ -964,13 +1050,25 @@ async def update_camera(
         disabled=body.disabled,
         ai_paused=body.ai_paused,
         desired_state=body.desired_state,
+        room=body.room,
     )
     if cam is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="camera_not_found",
         )
+    if renamed:
+        # A room rename changes which detectors' where_rooms this camera
+        # falls under — re-derive the cameras_detectors links in the same
+        # transaction (gains AND losses).
+        await camera_detector_repo.sync_links_for_patient(
+            session, cam.patient_id,
+        )
     await session.commit()
+    if renamed:
+        # Restart the classifier's in-process attempt ledger so the
+        # re-run begins at attempt 1 (the repo cleared the DB timestamp).
+        room_classifier.reset_attempts(camera_id)
     # If the caregiver just disconnected a Pi camera, cancel the in-flight
     # HTTP push so the Pi sees EOF, reconnects, hits the desired_state
     # gate in /v1/cameras/me/frames, and switches into paused mode within

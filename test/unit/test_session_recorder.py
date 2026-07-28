@@ -70,6 +70,7 @@ def _ctx() -> RecorderCtx:
     return RecorderCtx(
         caregiver_id=uuid4(),
         patient_id=uuid4(),
+        camera_id=uuid4(),
         room="Bedroom",
         gate="person",
         confidence=0.7,

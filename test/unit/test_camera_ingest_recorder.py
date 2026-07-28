@@ -34,6 +34,8 @@ def _settings() -> SimpleNamespace:
     return SimpleNamespace(
         livekit_worker_window_seconds=11,
         livekit_worker_target_fps=4,
+        frame_buffer_target_fps=4,
+        clip_fps=4,
         clip_post_event_wait_seconds=15.0,
         frame_buffer_retention_seconds=17.0,
         rapid_fps=8,
@@ -59,6 +61,7 @@ async def test_drive_recorder_forwards_the_decision() -> None:
     ctx = RecorderCtx(
         caregiver_id=uuid4(),
         patient_id=ing.patient_id,
+        camera_id=ing.camera_id,
         room="Bedroom",
         gate="poi",
         confidence=0.8,
@@ -82,7 +85,8 @@ async def test_drive_recorder_forwards_the_decision() -> None:
 async def test_drive_recorder_is_noop_without_a_recorder() -> None:
     ing = _ingest(None)
     ctx = RecorderCtx(
-        caregiver_id=uuid4(), patient_id=uuid4(), room="x", gate="person", confidence=None
+        caregiver_id=uuid4(), patient_id=uuid4(), camera_id=uuid4(), room="x",
+        gate="person", confidence=None,
     )
     await ing._drive_recorder(_RecorderDecision(collect=True, ctx=ctx))  # no raise
 

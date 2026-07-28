@@ -6,10 +6,10 @@ load-bearing check — same pattern as the other repos.
 """
 
 from collections.abc import Sequence
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import delete, insert, select
+from sqlalchemy import delete, insert, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.camera import Camera
@@ -81,7 +81,7 @@ async def replace_assignments_for_camera(
         delete(CameraDetector).where(CameraDetector.camera_id == camera_id)
     )
     if requested:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         await session.execute(
             insert(CameraDetector),
             [{"camera_id": camera_id, "detector_id": d, "created_at": now}
@@ -90,47 +90,6 @@ async def replace_assignments_for_camera(
     await session.flush()
     return requested
 
-
-async def assign_detector_to_cameras(
-    session: AsyncSession,
-    detector_id: UUID,
-    patient_id: UUID,
-    *,
-    room: str | None = None,
-) -> int:
-    """Assign `detector_id` to cameras of `patient_id`, optionally
-    filtered by room name.
-
-    - `room=None` → every camera under the patient (used when the
-      detector's where_rooms is empty / every room).
-    - `room="Kitchen"` → every camera whose `room` column matches
-      exactly. Multiple cameras can share a room name (e.g. two
-      angles in the kitchen) — they all get assigned.
-
-    Idempotent: ON CONFLICT DO NOTHING so re-running the same
-    assignment is safe. Returns number of rows inserted.
-
-    This exists so the detector form's "Where" dropdown does the
-    obvious thing — pick a room, the detector starts running on that
-    camera(s) without the caregiver having to navigate to
-    /cameras/[id] afterwards.
-    """
-    stmt = select(Camera.id).where(Camera.patient_id == patient_id)
-    if room is not None:
-        stmt = stmt.where(Camera.room == room)
-    cam_ids = (await session.execute(stmt)).scalars().all()
-    if not cam_ids:
-        return 0
-    now = datetime.now(timezone.utc)
-    from sqlalchemy.dialects.postgresql import insert as pg_insert
-    insert_stmt = pg_insert(CameraDetector).values(
-        [{"camera_id": c, "detector_id": detector_id, "created_at": now}
-         for c in cam_ids]
-    ).on_conflict_do_nothing(
-        index_elements=["camera_id", "detector_id"],
-    )
-    result = await session.execute(insert_stmt)
-    return result.rowcount or 0
 
 
 def rooms_mean_all(rooms: Sequence[str] | None) -> bool:
@@ -170,7 +129,7 @@ async def set_detector_rooms(
         delete(CameraDetector).where(CameraDetector.detector_id == detector_id)
     )
     if cam_ids:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         await session.execute(
             insert(CameraDetector),
             [{"camera_id": c, "detector_id": detector_id, "created_at": now}
@@ -180,41 +139,180 @@ async def set_detector_rooms(
     return len(cam_ids)
 
 
-async def assign_preset_detectors_of_patient_to_camera(
-    session: AsyncSession, camera_id: UUID, patient_id: UUID,
+async def rewrite_where_rooms_from_links(
+    session: AsyncSession,
+    patient_id: UUID,
+    *,
+    detector_ids: set[UUID] | None = None,
 ) -> int:
-    """Assign every PRESET detector under `patient_id` to `camera_id`.
+    """Write each detector's `where_rooms` back FROM its current links.
 
-    Used when a new camera is paired. Preset detectors (Falls,
-    Wandering, etc.) are auto-seeded on patient create and the
-    caregiver expects them to "just work" everywhere — so a freshly
-    paired camera inherits them automatically.
+    Inverse of `sync_links_for_patient`, for the one flow where the
+    links are edited directly: the per-camera detector picker
+    (PUT /cameras/{id}/detectors). Links are derived state, so a picker
+    edit must be folded back into `where_rooms` or the next sync would
+    revert it.
 
-    Custom detectors are intentionally excluded — they're opt-in per
-    camera. A caregiver who created a 'stove_on' detector for the
-    kitchen camera doesn't expect it to start running on the bedroom
-    camera the moment the bedroom phone is paired. They opt the new
-    camera in explicitly from the /cameras/[id] page.
+    Per detector (restricted to `detector_ids` when given):
+      - custom + where_rooms IS NULL → skipped; opt-in links stay
+        authoritative and sync never touches them.
+      - otherwise: linked to every camera of the patient → where_rooms
+        = NULL (all rooms); else the sorted distinct `room` values of
+        the linked cameras. Preset linked to nothing → [] (runs
+        nowhere, visible as such — NOT NULL, which would mean
+        everywhere).
 
-    Returns number of rows inserted.
+    Returns the number of detectors whose `where_rooms` changed.
     """
-    det_ids = (
+    detectors = (
         await session.execute(
-            select(Detector.id).where(
-                Detector.patient_id == patient_id,
-                Detector.source == "preset",
-            )
+            select(Detector).where(Detector.patient_id == patient_id)
         )
     ).scalars().all()
-    if not det_ids:
-        return 0
-    now = datetime.now(timezone.utc)
-    from sqlalchemy.dialects.postgresql import insert as pg_insert
-    stmt = pg_insert(CameraDetector).values(
-        [{"camera_id": camera_id, "detector_id": d, "created_at": now}
-         for d in det_ids]
-    ).on_conflict_do_nothing(
-        index_elements=["camera_id", "detector_id"],
-    )
-    result = await session.execute(stmt)
-    return result.rowcount or 0
+    cameras = (
+        await session.execute(
+            select(Camera.id, Camera.room).where(Camera.patient_id == patient_id)
+        )
+    ).all()
+    room_by_cam = {c.id: c.room for c in cameras}
+    all_cam_ids = set(room_by_cam)
+
+    links = (
+        await session.execute(
+            select(CameraDetector.detector_id, CameraDetector.camera_id).where(
+                CameraDetector.camera_id.in_(all_cam_ids)
+                if all_cam_ids
+                else CameraDetector.camera_id.is_(None)
+            )
+        )
+    ).all()
+    cams_by_det: dict[UUID, set[UUID]] = {}
+    for det_id, cam_id in links:
+        cams_by_det.setdefault(det_id, set()).add(cam_id)
+
+    changed = 0
+    now = datetime.now(UTC)
+    for det in detectors:
+        if detector_ids is not None and det.id not in detector_ids:
+            continue
+        if det.source != "preset" and det.where_rooms is None:
+            continue  # opt-in custom — links are authoritative, hands off
+        linked = cams_by_det.get(det.id, set())
+        if all_cam_ids and linked == all_cam_ids:
+            new_rooms = None
+        else:
+            new_rooms = sorted({room_by_cam[c] for c in linked})
+        if new_rooms != det.where_rooms and not (
+            new_rooms is None and rooms_mean_all(det.where_rooms)
+        ):
+            det.where_rooms = new_rooms
+            det.updated_at = now
+            changed += 1
+    return changed
+
+
+async def sync_links_for_patient(
+    session: AsyncSession, patient_id: UUID,
+) -> tuple[int, int]:
+    """Reconcile `cameras_detectors` with each detector's `where_rooms`.
+
+    The links are DERIVED state — `where_rooms` is the source of truth
+    for where a detector runs — but they used to be maintained by
+    scattered imperative calls on individual create/update paths, and
+    drifted whenever a path was missed (gateway-created cameras, room
+    renames, …). Field bug: an all-rooms preset with ZERO links, so its
+    is_on toggle did nothing while the app showed it armed. This is the
+    single idempotent repair pass, called from every camera/detector
+    lifecycle mutation in the same transaction.
+
+    Desired camera set per detector:
+      - preset  + where_rooms meaning ALL (NULL / empty / "ALL ROOMS"
+        sentinel, see `rooms_mean_all`) → every camera of the patient.
+      - custom  + where_rooms IS NULL → SKIPPED ENTIRELY. Customs are
+        opt-in per camera by design — a caregiver who made a 'stove_on'
+        detector for the kitchen camera doesn't expect it on a freshly
+        paired bedroom camera. A null-scoped custom's current links are
+        the caregiver's authoritative opt-in set, never auto-grown or
+        auto-pruned here.
+      - any detector with explicit where_rooms (preset or custom) →
+        cameras whose `room` matches an entry, exact string compare —
+        the same semantics `set_detector_rooms` uses (the clients build the rooms picker
+        from the cameras' own `room` values, so they match verbatim).
+
+    Missing links are inserted (ON CONFLICT DO NOTHING); stale links are
+    deleted. Existing in-scope rows are never rewritten, so per-camera
+    `door_config` on kept links survives. Returns (inserted, deleted).
+    """
+    detectors = (
+        await session.execute(
+            select(Detector.id, Detector.source, Detector.where_rooms).where(
+                Detector.patient_id == patient_id,
+            )
+        )
+    ).all()
+    cameras = (
+        await session.execute(
+            select(Camera.id, Camera.room).where(Camera.patient_id == patient_id)
+        )
+    ).all()
+
+    all_cam_ids = {c.id for c in cameras}
+    desired: set[tuple[UUID, UUID]] = set()
+    managed_det_ids: list[UUID] = []
+    for det in detectors:
+        if det.source != "preset" and det.where_rooms is None:
+            continue  # opt-in custom — links are authoritative, hands off
+        managed_det_ids.append(det.id)
+        if rooms_mean_all(det.where_rooms):
+            cam_ids = all_cam_ids
+        else:
+            wanted = set(det.where_rooms)
+            cam_ids = {c.id for c in cameras if c.room in wanted}
+        desired.update((cid, det.id) for cid in cam_ids)
+
+    if not managed_det_ids:
+        return (0, 0)
+
+    current = {
+        (r.camera_id, r.detector_id)
+        for r in (
+            await session.execute(
+                select(CameraDetector.camera_id, CameraDetector.detector_id).where(
+                    CameraDetector.detector_id.in_(managed_det_ids)
+                )
+            )
+        ).all()
+    }
+
+    stale = current - desired
+    missing = desired - current
+
+    deleted = 0
+    if stale:
+        result = await session.execute(
+            delete(CameraDetector).where(
+                tuple_(CameraDetector.camera_id, CameraDetector.detector_id).in_(
+                    list(stale)
+                )
+            )
+        )
+        deleted = result.rowcount or 0
+
+    inserted = 0
+    if missing:
+        now = datetime.now(UTC)
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+        result = await session.execute(
+            pg_insert(CameraDetector)
+            .values(
+                [{"camera_id": c, "detector_id": d, "created_at": now}
+                 for c, d in missing]
+            )
+            .on_conflict_do_nothing(index_elements=["camera_id", "detector_id"])
+        )
+        inserted = result.rowcount or 0
+
+    await session.flush()
+    return (inserted, deleted)
+
+

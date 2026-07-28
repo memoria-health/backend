@@ -12,7 +12,7 @@ here, so they can never drift out of sync:
 
 Entries are `source="preset"` when instantiated, so they inherit every existing
 preset behaviour (auto-attach to newly-paired cameras via
-`camera_detector_repo.assign_preset_detectors_of_patient_to_camera`, "Possible …"
+`camera_detector_repo.sync_links_for_patient`, "Possible …"
 event titles) with no new branching.
 
 The 6 original presets (fall / agitation / wandering / medication / climbing /
@@ -915,14 +915,14 @@ CATALOG: tuple[CatalogEntry, ...] = (
         description="Main door opening — front entry only.",
         category="safety", cohort="adult",
         recommended=False, seeded=True, prompt_fragment=_WANDERING_PROMPT_FRAGMENT,
-        promotion_threshold=0.70, where_scope="HALLWAY",
+        promotion_threshold=0.70,
     ),
     CatalogEntry(
         key="medication", name="Medication adherence", icon_name="pills",
         description="Confirms the morning and evening pill routine at the kitchen counter.",
         category="routine", cohort="adult",
         recommended=False, seeded=True, prompt_fragment=_MEDICATION_PROMPT_FRAGMENT,
-        promotion_threshold=0.70, where_scope="KITCHEN", when_scope="8 AM, 8 PM ±1H",
+        promotion_threshold=0.70, when_scope="8 AM, 8 PM ±1H",
         detected_field="medication_taken",
     ),
     CatalogEntry(

@@ -23,7 +23,10 @@ import pytest_asyncio
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sqlalchemy import update
+
 from src.db.analysis import Analysis
+from src.db.camera import Camera
 from src.settings import Settings, get_settings
 from test.conftest import mint_test_jwt
 
@@ -296,6 +299,68 @@ async def test_start_returns_403_for_unowned_patient(
     )
     assert r.status_code == 403
     assert data_send_mock.sent == []
+
+
+@pytest.mark.asyncio
+async def test_start_returns_403_when_target_camera_is_private(
+    livekit_configured_app, client: AsyncClient, auth_user,
+    session: AsyncSession, data_send_mock,
+) -> None:
+    """A camera with `privacy_enabled=true` (bathroom/bedroom room
+    class) can never become the active talk target — 403, no packet
+    sent to ANY camera. iOS hides the call button for private tiles,
+    but a stale client could still POST an old camera_id, so the
+    server enforces it too.
+    """
+    headers, pid = await _provision_caregiver_and_patient(client, auth_user)
+    cam_a, _ = await _pair_camera(client, headers, pid, "Bathroom")
+    await _pair_camera(client, headers, pid, "Kitchen")
+
+    # privacy_enabled is written only by the room classifier — flip it
+    # directly in the DB, as the classifier would.
+    await session.execute(
+        update(Camera).where(Camera.id == cam_a).values(privacy_enabled=True)
+    )
+    await session.commit()
+
+    r = await client.post(
+        f"/v1/patients/{pid}/talk/start",
+        headers=headers, json={"camera_id": str(cam_a)},
+    )
+    assert r.status_code == 403
+    assert r.json()["detail"] == "talk_not_available_for_private_room_camera"
+    assert data_send_mock.sent == []
+
+
+@pytest.mark.asyncio
+async def test_start_to_non_private_camera_still_works_with_private_sibling(
+    livekit_configured_app, client: AsyncClient, auth_user,
+    session: AsyncSession, data_send_mock,
+) -> None:
+    """Happy path is unchanged when the TARGET is non-private: the call
+    opens on the target and the private sibling still receives the
+    `is_active=false` mute (muting private cameras is always safe —
+    only activation is gated).
+    """
+    headers, pid = await _provision_caregiver_and_patient(client, auth_user)
+    cam_a, identity_a = await _pair_camera(client, headers, pid, "Kitchen")
+    cam_b, identity_b = await _pair_camera(client, headers, pid, "Bathroom")
+
+    await session.execute(
+        update(Camera).where(Camera.id == cam_b).values(privacy_enabled=True)
+    )
+    await session.commit()
+
+    r = await client.post(
+        f"/v1/patients/{pid}/talk/start",
+        headers=headers, json={"camera_id": str(cam_a)},
+    )
+    assert r.status_code == 204, r.text
+
+    assert len(data_send_mock.sent) == 2
+    by_identity = {p.destination_identities[0]: p for p in data_send_mock.sent}
+    assert by_identity[identity_a].payload == {"type": "set_talk_active", "is_active": True}
+    assert by_identity[identity_b].payload == {"type": "set_talk_active", "is_active": False}
 
 
 @pytest.mark.asyncio

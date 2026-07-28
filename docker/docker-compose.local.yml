@@ -20,6 +20,11 @@ services:
     # All config + secrets come straight from the local .env.
     env_file: ../.env
     environment:
+      # torch/OpenMP deadlock guard (2026-07-28): a censor YOLO pass
+      # froze the whole process in this Docker VM; single-threaded BLAS/OMP
+      # avoids the known libomp hang class at modest inference cost.
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
       # gpu/ holds the GPU-host deployables; the backend shares exactly
       # ONE module with that side (gpu/identity/contract.py — the
       # versioned+authed /state seam). Mounted read-only below.

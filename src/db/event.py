@@ -7,7 +7,7 @@ reads + PATCHes them in v0.
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, text
+from sqlalchemy import ARRAY, Boolean, DateTime, ForeignKey, String, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.db.base import Base
@@ -43,10 +43,29 @@ class Event(Base):
     # Bucket-relative key in `incident-clips`; NULL until clip archival
     # completes (post-event window captured + ffmpeg concat uploaded).
     clip_storage_key: Mapped[str | None] = mapped_column(String, default=None)
-    # True when this event's clip was intentionally NOT archived because
-    # the patient was in privacy mode (the suppression already happens;
-    # this just records WHY, so the apps can show "No clip — Privacy mode"
-    # instead of an endless "Generating clip…" for `has_clip=false`.
+    # True when this event's clip was intentionally DROPPED, so the apps
+    # can show a "no clip" placeholder instead of an endless "Generating
+    # clip…" for `has_clip=false`. Since the censor pipeline (2026-07-27)
+    # the only writer is clip_archival's fail-closed terminal: the clip
+    # needed censoring and censoring failed, so it was discarded rather
+    # than uploaded raw. (Historical rows: legacy privacy-mode
+    # suppression.)
     clip_suppressed: Mapped[bool] = mapped_column(
         Boolean, server_default=text("false"), default=False,
+    )
+    # True when the archived clip was CENSORED (person-mask blur + audio
+    # stripped) because the sensitivity screen flagged a dignity-
+    # sensitive moment — or because the screen failed and the clip was
+    # blurred full-frame, fail-closed. Written by clip_archival at
+    # upload time — see docs/plans/2026-07-27-room-privacy-and-clip-
+    # censoring.md.
+    clip_censored: Mapped[bool] = mapped_column(
+        Boolean, server_default=text("false"), default=False,
+    )
+    # Which sensitivity categories the screen flagged (e.g.
+    # ['bathing_showering', 'nudity_or_undress']). NULL for
+    # non-sensitive clips and for clips censored without a trusted
+    # verdict (screen failure → full-frame blur).
+    sensitivity_categories: Mapped[list[str] | None] = mapped_column(
+        ARRAY(String), default=None,
     )

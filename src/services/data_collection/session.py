@@ -48,6 +48,12 @@ class RecorderCtx:
 
     caregiver_id: UUID
     patient_id: UUID
+    # Which camera the session records — carried through to the manager's
+    # upload-boundary privacy re-check (per-camera privacy_enabled,
+    # 2026-07-27). The manager keys sessions by camera_id already; this
+    # puts the id on the finalized payload so the fire-and-forget upload
+    # task can re-check without reaching back into the session dict.
+    camera_id: UUID
     room: str
     gate: str  # "poi" (person-of-interest matched) | "person" (presence only)
     confidence: float | None

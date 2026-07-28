@@ -55,9 +55,22 @@ class EventResponse(BaseModel):
     review_notes: Notes | None
     reviewed_at: datetime | None
     clip_storage_key: str | None
-    # True when the clip was suppressed by privacy mode (vs still
-    # processing). Drives the "No clip — Privacy mode" placeholder.
+    # True when the clip was genuinely dropped (vs still processing):
+    # since the censor pipeline (2026-07-27) that means the fail-closed
+    # terminal — the clip needed censoring and censoring failed, so it
+    # was discarded rather than uploaded raw. (Historical rows: legacy
+    # privacy-mode suppression.) Drives the "no clip" placeholder.
     clip_suppressed: bool
+    # True when the archived clip was CENSORED (person-mask blur + audio
+    # stripped) after the sensitivity screen flagged a dignity-sensitive
+    # moment. Drives the "Sensitive moment — censored for dignity"
+    # treatment in event detail. Written by clip_archival at upload time
+    # (services/detection/sensitivity.py + censor.py, 2026-07-27).
+    clip_censored: bool = False
+    # Which sensitivity categories the screen flagged (enum strings, e.g.
+    # "bathing_showering"). Null for non-sensitive clips and for clips
+    # censored without a trusted verdict (screen failure → full-frame).
+    sensitivity_categories: list[str] | None = None
     created_at: datetime
 
 

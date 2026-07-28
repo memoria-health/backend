@@ -19,9 +19,11 @@ first subscribed.
 
 from __future__ import annotations
 
+import array
 import asyncio
 import json
 import logging
+import math
 import secrets
 import tempfile
 import time
@@ -238,21 +240,22 @@ class RoomWorker:
         self._recorder = RecorderManager(
             settings=settings,
             temp_dir=recorder_temp_dir,
-            privacy_check=self._patient_privacy_check,
+            privacy_check=self._camera_privacy_check,
             region_lookup=self._patient_region,
         )
 
-    async def _patient_privacy_check(self, patient_id) -> bool:
-        """Upload-boundary guard for the recorder: re-read the patient's
-        privacy flag at the moment a clip is about to leave the box, so a
-        privacy flip during the finalize→upload window still drops it."""
+    async def _camera_privacy_check(self, camera_id) -> bool:
+        """Upload-boundary guard for the recorder: re-read the CAMERA's
+        room-derived privacy flag at the moment a clip is about to leave
+        the box, so a privacy flip (classifier finalizing, support
+        override) during the finalize→upload window still drops it."""
         async with self._sessionmaker() as session:
-            p = await session.get(Patient, patient_id)
-        if p is None:
+            cam = await session.get(Camera, camera_id)
+        if cam is None:
             # Row vanished mid-session — fail CLOSED: never upload a clip
             # we can't positively confirm is allowed to leave the box.
             return True
-        return p.privacy_mode_enabled
+        return cam.privacy_enabled
 
     async def _patient_region(self, patient_id) -> str:
         """Data-residency lookup for the recorder: resolve the patient's
@@ -932,9 +935,31 @@ class RoomWorker:
         with and the cheapest to encode into the clip MP4.
         """
 
+        # DIAGNOSTIC (2026-07-28, silent-clip hunt): periodic level meter
+        # on the RAW inbound LiveKit PCM, before the buffer. Field clips
+        # carried an all-zero audio track (-91 dB) while live listen had
+        # real signal — this log point tells us whether zeros arrive from
+        # LiveKit or appear later in buffer/encode. peak_db ≈ -inf/-90s
+        # sustained during daytime noise = zeros enter HERE.
+        meter = {"peak": 0, "chunks": 0, "last_log": time.monotonic()}
+
         def _push_audio(event: object) -> None:
             pcm = bytes(event.frame.data)  # type: ignore[attr-defined]
             ingest.audio_buffer.push(data=pcm, captured_at=time.monotonic())
+            samples = array.array("h")
+            samples.frombytes(pcm[: len(pcm) - (len(pcm) % 2)])
+            if samples:
+                meter["peak"] = max(meter["peak"], max(abs(s) for s in samples))
+            meter["chunks"] += 1
+            now = time.monotonic()
+            if now - meter["last_log"] >= 30.0:
+                peak = meter["peak"]
+                peak_db = 20 * math.log10(peak / 32768.0) if peak else float("-inf")
+                log.info(
+                    "audio_inbound_levels camera=%s chunks=%d peak_db=%.1f",
+                    ingest.camera_id, meter["chunks"], peak_db,
+                )
+                meter.update(peak=0, chunks=0, last_log=now)
             # Fork to the data-collection recorder (sync, non-blocking;
             # no-op unless this camera has an active session).
             self._recorder.feed_audio(ingest.camera_id, pcm)

@@ -40,6 +40,8 @@ logger = logging.getLogger(__name__)
 # Type aliases for the injectable collaborators.
 _Muxer = Callable[..., Awaitable[Path]]
 _Uploader = Callable[..., Awaitable[str]]
+# Called with the CAMERA id (per-camera room-derived privacy, 2026-07-27
+# — the retired patient-level check took a patient id).
 _PrivacyCheck = Callable[[UUID], Awaitable[bool]]
 _RegionLookup = Callable[[UUID], Awaitable[str]]
 
@@ -48,7 +50,7 @@ def _default_encoder_factory(path: Path) -> StreamingMp4Writer:
     return StreamingMp4Writer(path)
 
 
-async def _never_private(_patient_id: UUID) -> bool:
+async def _never_private(_camera_id: UUID) -> bool:
     """Default privacy check — used when no DB-backed check is injected
     (e.g. unit tests). Always permits the upload."""
     return False
@@ -167,8 +169,9 @@ class RecorderManager:
         """Force-ABORT a camera's in-flight session, discarding temp files
         WITHOUT muxing or uploading.
 
-        This is the privacy path: when ``privacy_mode_enabled`` turns on
-        mid-session, the per-tick drive calls this instead of the normal
+        This is the privacy path: when the camera's ``privacy_enabled``
+        turns on mid-session (room classifier finalizing, support
+        override), the per-tick drive calls this instead of the normal
         gate-off route so the already-captured footage never reaches B2.
         No-op if the camera has no active session.
         """
@@ -249,6 +252,7 @@ class RecorderManager:
                 metadata,
                 fs.video_path,
                 fs.audio_path,
+                camera_id=fs.ctx.camera_id,
                 patient_id=fs.ctx.patient_id,
             )
         )
@@ -263,26 +267,30 @@ class RecorderManager:
         video_path: Path,
         audio_path: Path | None,
         *,
+        camera_id: UUID,
         patient_id: UUID,
     ) -> None:
         try:
-            # Defense-in-depth: privacy can flip on AFTER a session
-            # finalized but BEFORE its bytes leave the box. Re-check at the
-            # upload boundary and drop the clip if so — nothing private
-            # ever reaches B2 even on that race. Fail-safe: if the check
-            # itself errors, do NOT upload.
+            # Defense-in-depth: the CAMERA's privacy can flip on (room
+            # classifier finalizing bathroom/bedroom, support override)
+            # AFTER a session finalized but BEFORE its bytes leave the
+            # box. Re-check per-camera at the upload boundary and drop
+            # the clip if so — nothing private ever reaches B2 even on
+            # that race. Fail-safe: if the check itself errors, do NOT
+            # upload.
             try:
-                if await self._privacy_check(patient_id):
+                if await self._privacy_check(camera_id):
                     logger.info(
-                        "data_collection: privacy on at upload; discarding clip %s",
+                        "data_collection: camera privacy on at upload; "
+                        "discarding clip %s",
                         key,
                     )
                     return
             except Exception:
                 logger.exception(
-                    "data_collection: privacy check failed for %s; "
+                    "data_collection: privacy check failed for camera %s; "
                     "discarding clip %s (fail-safe)",
-                    patient_id,
+                    camera_id,
                     key,
                 )
                 return

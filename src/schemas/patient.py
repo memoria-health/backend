@@ -88,9 +88,10 @@ class PatientResponse(BaseModel):
     # which the web + iOS apps use to show the first-open consent banner.
     data_collection_enabled: bool
     data_collection_decided_at: datetime | None
-    # Privacy mode (dignity override). When true: no clips stored, live
-    # video+audio severed at the SFU, event clips stripped from insights.
-    # Overrides (suspends) data_collection_enabled without changing it.
+    # DEPRECATED (2026-07-27): superseded by per-camera
+    # cameras.privacy_enabled (room-derived privacy). Read-only echo of
+    # the historical column — no longer PATCH-able or enforced; kept on
+    # the wire until both clients ship without the toggle.
     privacy_mode_enabled: bool
 
 
@@ -166,8 +167,7 @@ class UpdatePatientRequest(BaseModel):
     # `data_collection_decided_at` server-side. `decided_at` itself is
     # NOT writable here (server-managed) — `extra="forbid"` rejects it.
     data_collection_enabled: bool | None = None
-    # Privacy mode (dignity override). Sending this (true OR false)
-    # flips the per-patient kill switch. It SUSPENDS data collection
-    # without mutating `data_collection_enabled`, so no consent stamp is
-    # touched here. Server-side enforcement does the rest.
-    privacy_mode_enabled: bool | None = None
+    # NOTE (2026-07-27): `privacy_mode_enabled` is deliberately ABSENT.
+    # Privacy is per-camera now (cameras.privacy_enabled, derived from
+    # the room class and never user-settable); a client that still sends
+    # the old patient-level flag is rejected 422 by `extra="forbid"`.

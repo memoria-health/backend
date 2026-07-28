@@ -82,6 +82,7 @@ from src.services.identity.result import IdentityResult
 from src.services.identity.identity_client import IdentityClient
 from src.services.data_collection.gate import should_collect
 from src.services.data_collection.session import RecorderCtx
+from src.services import room_classifier
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -134,10 +135,11 @@ class _RecorderDecision:
     ctx: "RecorderCtx | None" = None
     lead_frames: list | None = None
     lead_audio: bytes | None = None
-    # Privacy mode for this patient (read off the patient row once it
-    # loads). When True the drive ABORTS any in-flight session instead of
-    # taking the linger→finalize→upload route, so pre-privacy footage is
-    # dropped on the device rather than uploaded.
+    # Room-derived privacy for THIS camera (cameras.privacy_enabled, read
+    # off the camera row once it loads — per-camera model, 2026-07-27).
+    # When True the drive ABORTS any in-flight session instead of taking
+    # the linger→finalize→upload route, so pre-privacy footage is dropped
+    # on the device rather than uploaded.
     privacy: bool = False
 
 
@@ -252,7 +254,9 @@ class CameraIngest:
         # retarget never changes what they see.
         self.frame_buffer = FrameBuffer(
             window_seconds=retention_seconds,
-            target_fps=settings.livekit_worker_target_fps,
+            # max(LLM cadence, clip_fps) — the incident clip snapshots
+            # at clip_fps; the LLM tick decimates back via at_fps.
+            target_fps=settings.frame_buffer_target_fps,
         )
         # Fed by RoomWorker._consume_video for every SDK-delivered frame
         # (accepted or not); each tick stamps its snapshot on the row so
@@ -822,14 +826,37 @@ class CameraIngest:
             decision.ctx = RecorderCtx(
                 caregiver_id=patient.caregiver_id,
                 patient_id=self.patient_id,
+                camera_id=self.camera_id,
                 room=cam.room,
                 gate="person",
                 confidence=None,
             )
-            # Privacy is known the moment the patient row loads — set it
+            # Privacy is known the moment the camera row loads — set it
             # now so EVERY tick path (including early returns) aborts an
             # open session rather than letting it linger toward upload.
-            decision.privacy = patient.privacy_mode_enabled
+            # Per-camera (cameras.privacy_enabled) since 2026-07-27.
+            decision.privacy = cam.privacy_enabled
+
+            # Room classifier trigger (room-derived privacy, 2026-07-27):
+            # a camera that has frames flowing but no room verdict yet is
+            # classified lazily. `kick` is cheap synchronous bookkeeping
+            # (attempt spacing, motion-settled check) and spawns the VLM
+            # call fire-and-forget — the tick's hot path never waits on
+            # it. Keyed on room_classified_at IS NULL, so it goes silent
+            # the moment a verdict (or support override) lands.
+            if (
+                self._settings.auto_privacy_mode
+                and cam.room_classified_at is None
+            ):
+                room_classifier.kick(
+                    camera_id=self.camera_id,
+                    livekit_room=cam.livekit_room,
+                    livekit_identity=cam.livekit_identity,
+                    in_motion=motion_in_clip,
+                    frame_buffer=self.frame_buffer,
+                    sessionmaker=self._sessionmaker,
+                    settings=self._settings,
+                )
 
             log.info(
                 "%s START detectors=%s motion=%s prior_state=%s "
@@ -1030,6 +1057,48 @@ class CameraIngest:
                 else self.audio_buffer.snapshot_last_seconds(
                     self._settings.livekit_worker_window_seconds,
                 )
+            )
+            # DIAGNOSTIC (2026-07-28, silent-clip hunt): level of the PCM
+            # actually read back out of the buffer for the VLM window —
+            # pairs with room_worker's audio_inbound_levels to bracket
+            # the AudioBuffer. Inbound healthy + this flat = buffer bug.
+            if pcm:
+                import array as _array
+
+                _s = _array.array("h")
+                _s.frombytes(pcm[: len(pcm) - (len(pcm) % 2)])
+                _peak = max(abs(x) for x in _s) if _s else 0
+                log.info(
+                    "%s audio_window_levels bytes=%d peak_db=%s",
+                    self._log_tag, len(pcm),
+                    f"{20 * __import__('math').log10(_peak / 32768.0):.1f}"
+                    if _peak else "-inf",
+                )
+            # Clip pre-roll refs, snapshotted NOW and anchored to the
+            # analysis window's end. Promotion-time snapshotting would
+            # shift the window late by the LLM's think time and lose
+            # the oldest frames to eviction — a fall clip that starts
+            # with the person already down. Refs are shared with the
+            # buffer (no copy); held only for this tick.
+            clip_pre_frames = (
+                self.frame_buffer.snapshot_last_seconds(
+                    self._settings.livekit_worker_window_seconds,
+                    now=window[-1].captured_at,
+                    at_fps=self._settings.clip_fps,
+                )
+                if window
+                else []
+            )
+            # Matching pre-roll AUDIO, same anchor (2026-07-28: audio is
+            # back in clips — single-pass mux, one contiguous PCM track;
+            # the old "cheap" muxing was the concat seam, now gone).
+            clip_pre_pcm = (
+                self.audio_buffer.snapshot_last_seconds(
+                    self._settings.livekit_worker_window_seconds,
+                    now=window[-1].captured_at,
+                )
+                if window
+                else b""
             )
             try:
                 mp4_bytes = await frames_to_mp4(
@@ -1452,7 +1521,10 @@ class CameraIngest:
                 # RAPID retention (Ledger row 5): hold native `rapid_fps`
                 # only while the loadout carries a RAPID-bucket detector.
                 # Idempotent; other consumers decimate via at_fps anyway.
-                target_fps = self._settings.livekit_worker_target_fps
+                # Floor at frame_buffer_target_fps so dropping the last
+                # RAPID detector never retargets below what the incident
+                # clip (clip_fps) needs retained.
+                target_fps = self._settings.frame_buffer_target_fps
                 self.frame_buffer.retarget(
                     max(self._settings.rapid_fps, target_fps)
                     if any(e.dims.bucket == "rapid" for e in entries)
@@ -1732,7 +1804,7 @@ class CameraIngest:
             # above as the session lead-in. Never alters detection; the
             # actual recording happens in the RoomWorker-owned recorder.
             collect = should_collect(
-                privacy_mode_enabled=patient.privacy_mode_enabled,
+                camera_privacy_enabled=cam.privacy_enabled,
                 data_collection_enabled=patient.data_collection_enabled,
                 motion_in_clip=motion_in_clip,
                 gate_people_present=gate_people_present,
@@ -1742,6 +1814,7 @@ class CameraIngest:
                 decision.ctx = RecorderCtx(
                     caregiver_id=patient.caregiver_id,
                     patient_id=self.patient_id,
+                    camera_id=self.camera_id,
                     room=cam.room,
                     gate="poi" if identity.patient_in_clip else "person",
                     confidence=identity.confidence,
@@ -1856,28 +1929,42 @@ class CameraIngest:
                 # to the LLM think time between pre's end and post's
                 # start.
                 #
-                # PRIVACY: the text event + push/email above still fire
-                # (the insight reaches the caregiver), but under privacy
-                # mode we DON'T archive or surface the video evidence —
-                # skip spawning the post-roll/upload work entirely.
-                # `archive_event` also re-checks privacy before upload to
-                # cover a flip during the post-roll window.
-                if not patient.privacy_mode_enabled:
-                    pre_end_captured_at = window[-1].captured_at
-                    for fired_event in promotion.fired:
-                        asyncio.create_task(
-                            clip_archival.archive_event(
-                                event_id=fired_event.id,
-                                patient_id=self.patient_id,
-                                pre_event_mp4=mp4_bytes,
-                                pre_end_captured_at=pre_end_captured_at,
-                                frame_buffer=self.frame_buffer,
-                                audio_buffer=self.audio_buffer,
-                                sessionmaker=self._sessionmaker,
-                                settings=self._settings,
-                            ),
-                            name=f"clip-archive-{fired_event.id}",
-                        )
+                # PRIVACY: private cameras get clips too (2026-07-27
+                # censor pipeline) — `archive_event` runs the
+                # sensitivity screen on EVERY clip before upload and
+                # censors (person-mask blur + audio strip) or drops it
+                # fail-closed, so there is no promotion-time skip.
+                # docs/plans/2026-07-27-room-privacy-and-clip-censoring.md.
+                # Clip pre-roll: re-snapshot the analysis window at
+                # clip_fps (2026-07-27). The LLM's `window`/`mp4_bytes`
+                # stay at the 4fps analysis cadence; the clip gets the
+                # buffer's native rate, video-only, encoded in ONE
+                # ffmpeg pass with the post-roll (no concat seam, no
+                # muxed PCM). Frame refs are cheap — the arrays are
+                # shared with the buffer and pinned only until the
+                # archive task encodes (~post-roll wait).
+                pre_frames = clip_pre_frames
+                pre_end_captured_at = (
+                    pre_frames[-1].captured_at
+                    if pre_frames
+                    else window[-1].captured_at
+                )
+                for fired_event in promotion.fired:
+                    asyncio.create_task(
+                        clip_archival.archive_event(
+                            event_id=fired_event.id,
+                            patient_id=self.patient_id,
+                            camera_id=self.camera_id,
+                            pre_frames=pre_frames,
+                            pre_pcm=clip_pre_pcm,
+                            pre_end_captured_at=pre_end_captured_at,
+                            frame_buffer=self.frame_buffer,
+                            audio_buffer=self.audio_buffer,
+                            sessionmaker=self._sessionmaker,
+                            settings=self._settings,
+                        ),
+                        name=f"clip-archive-{fired_event.id}",
+                    )
 
             log.info(
                 "%s DONE provider=%s people=%s(%s) src=%s motion=%s "

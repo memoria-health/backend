@@ -19,6 +19,7 @@ with 204 but not acted on — Phase 4 may grow the dispatcher.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Annotated
 
@@ -28,11 +29,16 @@ from starlette.requests import ClientDisconnect
 
 from src.api.deps import SettingsDep
 from src.db.session import get_sessionmaker
+from src.services import livekit_privacy
 from src.services.detection import camera_presence
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1", tags=["livekit"])
+
+# Fire-and-forget privacy re-sever tasks, held so the loop can't GC them
+# (same pattern as room_classifier's attempt tasks).
+_privacy_tasks: set[asyncio.Task] = set()
 
 
 @router.post("/livekit/webhooks", status_code=status.HTTP_204_NO_CONTENT)
@@ -106,6 +112,30 @@ async def receive_livekit_webhook(
             await worker.signal_reconcile(room_name)
         log.info(
             "livekit_webhook participant_joined room=%s identity=%s -> joined",
+            room_name, participant_identity,
+        )
+    elif event.event == "participant_joined" and participant_identity.startswith(
+        "caregiver_"
+    ):
+        # Per-camera privacy self-heal (2026-07-27): the sever in
+        # `livekit_privacy` fires only when privacy FLIPS, so a
+        # caregiver who joins LATER could subscribe to a private
+        # camera until publisher-side track permissions (camera-app /
+        # gateway deploy trains) are live. Re-sever every already-
+        # private camera in the room on EVERY caregiver join —
+        # fire-and-forget + best-effort (the helper swallows all
+        # errors), so the webhook ack is never blocked.
+        task = asyncio.create_task(
+            livekit_privacy.enforce_privacy_for_room(
+                settings, get_sessionmaker(), room=room_name,
+            ),
+            name=f"privacy-resever-{room_name}",
+        )
+        _privacy_tasks.add(task)
+        task.add_done_callback(_privacy_tasks.discard)
+        log.info(
+            "livekit_webhook participant_joined room=%s identity=%s "
+            "-> privacy re-sever",
             room_name, participant_identity,
         )
     elif event.event == "participant_left" and participant_identity.startswith("cam_"):

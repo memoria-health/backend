@@ -13,6 +13,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 Room = Annotated[str, Field(min_length=1, max_length=80)]
 IconName = Annotated[str, Field(min_length=1, max_length=80)]
 
+# Mirrors the DB CHECK constraint on cameras.room_class (room-derived
+# privacy, 2026-07-27). Pydantic Literal fails loud on schema drift.
+RoomClass = Literal["bathroom", "bedroom", "other"]
+
 # Mirrors the DB CHECK constraint on cameras.desired_state. Pydantic
 # Literal raises ValidationError if the DB ever returns something
 # outside this set, fail-loud on schema drift between DB + code.
@@ -100,6 +104,18 @@ class CameraResponse(BaseModel):
     # any not-yet-updated construction site degrade gracefully to
     # "present" and never falsely show "app closed".
     app_present: bool = True
+    # ── Room-derived privacy (2026-07-27) ────────────────────────────
+    # VLM room verdict + when it was finalized. All three are null until
+    # the classifier runs (lazily, on next connect); clients key the
+    # one-time "sensitive room → privacy is on by default" card off a
+    # fresh room_classified_at. NEVER settable via PATCH.
+    room_class: RoomClass | None = None
+    room_class_confidence: float | None = None
+    room_classified_at: datetime | None = None
+    # Denormalized privacy verdict: true for bathroom/bedroom (and the
+    # classifier's fail-closed fallback). Locked — no user toggle;
+    # written only by the classifier / internal reclassify endpoint.
+    privacy_enabled: bool = False
 
     @model_validator(mode="after")
     def _validate_source_pi_url_consistency(self) -> "CameraResponse":
@@ -129,6 +145,17 @@ class UpdateCameraRequest(BaseModel):
     # /v1/cameras/me/desired-state every 1s and reconciles by leaving
     # or rejoining the LiveKit room.
     desired_state: DesiredState | None = None
+    # Cosmetic display/room name. Renaming CLEARS the camera's room
+    # classification (room_classified_at + confidence) so the room
+    # classifier re-runs — the misclassification escape hatch of the
+    # room-privacy plan ⚑3 (a rename signals "this is not the room you
+    # think it is").
+    room: Room | None = None
+    # NOTE: the privacy fields (room_class / room_class_confidence /
+    # room_classified_at / privacy_enabled) are deliberately ABSENT —
+    # they are NEVER settable via the public PATCH (extra="forbid"
+    # rejects them 422). Only the room classifier and the internal
+    # reclassify endpoint write them.
 
 
 class DesiredStateResponse(BaseModel):
@@ -149,6 +176,13 @@ class DesiredStateResponse(BaseModel):
     # its human name (and pick up renames live) instead of only the
     # opaque cam_<hex> identity.
     room: str
+    # Room-derived privacy verdict (2026-07-27). The publisher reads
+    # this on its 1s poll and, when true, restricts its tracks'
+    # subscription permissions to detector_worker_* identities (and
+    # ignores inbound talk) — the SFU-enforced side of per-camera
+    # privacy. Defaults False so an older backend response shape keeps
+    # a not-yet-updated sensor publishing normally.
+    privacy_enabled: bool = False
 
 
 class UpdateMyDesiredStateRequest(BaseModel):

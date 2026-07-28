@@ -392,14 +392,20 @@ async def gateway_roster(
         {"c": caregiver_id, "gw": gateway_id},
     )
     rows = (await session.execute(
-        text("SELECT id, livekit_identity, livekit_room, desired_state "
+        text("SELECT id, livekit_identity, livekit_room, desired_state, "
+             "privacy_enabled "
              f"FROM public.cameras {_cam_where} ORDER BY created_at"),
         {"c": caregiver_id, "gw": gateway_id},
     )).all()
     await session.commit()
+    # `privacy_enabled` (room-derived, 2026-07-27): when true the gateway
+    # restricts this camera's track subscription permissions to
+    # detector_worker_* identities (publisher-side sever) — same contract
+    # as the wall phone's desired-state poll.
     return {"tunnel_port": tunnel_port, "cameras": [
         {"camera_id": str(r[0]), "livekit_identity": r[1],
-         "livekit_room": r[2], "desired_state": r[3]}
+         "livekit_room": r[2], "desired_state": r[3],
+         "privacy_enabled": bool(r[4])}
         for r in rows
     ]}
 
@@ -444,7 +450,8 @@ async def gateway_wait(
 
     async def snapshot():
         rows = (await session.execute(
-            text("SELECT id, livekit_identity, livekit_room, desired_state "
+            text("SELECT id, livekit_identity, livekit_room, desired_state, "
+                 "privacy_enabled "
                  "FROM public.cameras WHERE patient_id IN "
                  "(SELECT id FROM public.patients WHERE caregiver_id = :c) "
                  "AND source_type = 'gateway' "
@@ -454,8 +461,17 @@ async def gateway_wait(
         )).all()
         await session.commit()   # release the connection between checks
         cams = [{"camera_id": str(r[0]), "livekit_identity": r[1],
-                 "livekit_room": r[2], "desired_state": r[3]} for r in rows]
-        fp = "|".join(f"{c['livekit_identity']}:{c['desired_state']}" for c in cams)
+                 "livekit_room": r[2], "desired_state": r[3],
+                 "privacy_enabled": bool(r[4])} for r in rows]
+        # privacy_enabled rides in the fingerprint so a classifier /
+        # reclassify privacy flip wakes the long-poll immediately — the
+        # gateway must restrict track permissions within ~0.4s, not wait
+        # for the 3s roster fallback.
+        fp = "|".join(
+            f"{c['livekit_identity']}:{c['desired_state']}"
+            f":{int(c['privacy_enabled'])}"
+            for c in cams
+        )
         return cams, fp
 
     elapsed = 0.0
@@ -585,9 +601,9 @@ async def gateway_provision_camera(
         )
         session.add(cam)
         await session.flush()
-        await camera_detector_repo.assign_preset_detectors_of_patient_to_camera(
-            session, camera_id, patient_id,
-        )
+        # Reconcile detector links from where_rooms (this bulk gateway
+        # path is exactly where preset links used to drift).
+        await camera_detector_repo.sync_links_for_patient(session, patient_id)
         cameras.append({
             "patient_id": str(patient_id),
             "camera_id": str(camera_id),

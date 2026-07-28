@@ -105,6 +105,7 @@ async def test_presence_session_produces_one_uploaded_av_clip(tmp_path) -> None:
     ctx = RecorderCtx(
         caregiver_id=uuid4(),
         patient_id=uuid4(),
+        camera_id=cam,
         room="Living Room",
         gate="poi",
         confidence=0.91,

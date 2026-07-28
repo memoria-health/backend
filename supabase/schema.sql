@@ -212,11 +212,11 @@ create table public.patients (
   -- now" stamp it so the banner never re-nags.
   data_collection_enabled    boolean not null default false,
   data_collection_decided_at timestamptz,
-  -- Privacy mode (dignity override). While ON it overrides data
-  -- collection (no clips stored), severs live video+audio to caregivers
-  -- at the SFU, and strips event clips from insights — detection + text
-  -- insights keep flowing. A live switch (no decided_at): it SUSPENDS
-  -- data_collection_enabled without mutating it. Enforced server-side.
+  -- DEPRECATED 2026-07-27: superseded by per-camera
+  -- cameras.privacy_enabled (room-derived privacy — see
+  -- docs/plans/2026-07-27-room-privacy-and-clip-censoring.md). No longer
+  -- PATCH-able or enforced; kept for historical rows until a follow-up
+  -- drop delta after both clients ship without the toggle.
   privacy_mode_enabled       boolean not null default false,
   -- Bucket-relative key in `patient-photos` (e.g. "{patient_id}.jpg").
   -- NULL until the caregiver uploads an avatar; the roster + header
@@ -243,6 +243,11 @@ create table public.patients (
 );
 
 create index patients_caregiver_id_idx on public.patients(caregiver_id);
+
+comment on column public.patients.privacy_mode_enabled is
+  'DEPRECATED 2026-07-27: superseded by per-camera cameras.privacy_enabled '
+  '(room-derived privacy). No longer PATCH-able or enforced; column kept for '
+  'historical rows until a follow-up drop delta after clients ship.';
 
 -- Same data-residency guard as caregivers.region: block any region change
 -- arriving on the RLS/PostgREST client path (JWT claims / authenticated|
@@ -431,6 +436,24 @@ create table public.cameras (
   -- both claim one camera. NULL for iphone/pi and not-yet-assigned rows.
   last_heartbeat_at       timestamptz,
   gateway_id              uuid references public.gateways(id) on delete set null,
+  -- ── Room-derived privacy (2026-07-27) ────────────────────────────
+  -- Privacy is per-camera, derived from the ROOM the camera watches
+  -- (docs/plans/2026-07-27-room-privacy-and-clip-censoring.md). On first
+  -- frames, one clean-frame VLM call classifies the room; bathroom /
+  -- bedroom lock the camera Private. `room_classified_at` NULL = not yet
+  -- classified (classified lazily on next connect; treated as Full until
+  -- then). Cleared on room rename / re-pair so the classifier re-runs.
+  room_class              text
+    check (room_class in ('bathroom', 'bedroom', 'other')),
+  room_class_confidence   real,
+  room_classified_at      timestamptz,
+  -- DENORMALIZED from room_class for hot-path reads (desired-state poll,
+  -- gateway roster, clip archival, recorder gate). Written ONLY by the
+  -- room classifier and the internal reclassify endpoint — never via the
+  -- public camera PATCH. While true: live video+audio to caregivers is
+  -- severed per-camera at the SFU and data collection never records this
+  -- camera; detection + text insights keep flowing.
+  privacy_enabled         boolean not null default false,
   constraint cameras_pi_stream_url_length
     check (pi_stream_url is null or length(pi_stream_url) <= 2048),
   constraint cameras_pi_audio_url_length
@@ -740,10 +763,23 @@ create table public.events (
   -- Read at iOS-fetch time by `GET /v1/events/{id}/clip-url`, which
   -- mints a short-lived Supabase Storage signed URL.
   clip_storage_key text,
-  -- True when the clip was intentionally not archived because the patient
-  -- was in privacy mode. Lets the apps render "No clip — Privacy mode"
-  -- instead of an endless "Generating clip…" for has_clip=false events.
+  -- True when the clip was intentionally dropped. Lets the apps render a
+  -- "No clip" placeholder instead of an endless "Generating clip…" for
+  -- has_clip=false events. Since 2026-07-27 private cameras DO get
+  -- (censored) clips — this is stamped only when the censor pipeline
+  -- fails and the clip is discarded rather than uploaded raw
+  -- (clip_archival's fail-closed drop), plus legacy rows from the old
+  -- patient-level privacy-mode suppression.
   clip_suppressed boolean not null default false,
+  -- True when the archived clip was CENSORED (person-mask blur + audio
+  -- stripped) because the sensitivity screen flagged a dignity-sensitive
+  -- moment. Columns land with the room-privacy state layer; the censor
+  -- pipeline that writes them ships separately (plan Phase 2).
+  clip_censored boolean not null default false,
+  -- Which sensitivity categories the screen flagged (e.g.
+  -- '{bathing_showering,nudity_or_undress}'). NULL until the sensitivity
+  -- pipeline ships / for non-sensitive clips.
+  sensitivity_categories text[],
   created_at    timestamptz not null default now()
 );
 

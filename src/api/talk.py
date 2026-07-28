@@ -51,6 +51,10 @@ _CAMERA_NOT_OWNED = HTTPException(
     status_code=status.HTTP_403_FORBIDDEN,
     detail="camera_not_owned_by_patient",
 )
+_CAMERA_PRIVATE = HTTPException(
+    status_code=status.HTTP_403_FORBIDDEN,
+    detail="talk_not_available_for_private_room_camera",
+)
 _UNCONFIGURED = HTTPException(
     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
     detail="livekit_not_configured",
@@ -98,13 +102,29 @@ async def start_talk(
     )
     _ensure_livekit_configured(settings)
 
-    target_ids = {c.id for c in cameras}
-    if body.camera_id not in target_ids:
+    # Fail closed: the target must be one of the patient's own camera
+    # rows. `next(..., None)` doubles as the ownership check — a
+    # camera_id outside the roster resolves to None and is rejected.
+    target = next((c for c in cameras if c.id == body.camera_id), None)
+    if target is None:
         log.info(
             "talk.start reject reason=camera_not_owned caregiver=%s patient=%s camera=%s",
             auth.id, patient_id, body.camera_id,
         )
         raise _CAMERA_NOT_OWNED
+
+    # Room-derived privacy (2026-07-27): a private (bathroom/bedroom)
+    # camera must never become the active talk target — that would put
+    # its wall phone on-air. iOS hides the call button for private
+    # tiles, but a stale client could still POST an old camera_id, so
+    # enforcement lives server-side too. Muting (`is_active=false`)
+    # private siblings below stays allowed — only activation is gated.
+    if target.privacy_enabled:
+        log.info(
+            "talk.start reject reason=camera_private caregiver=%s patient=%s camera=%s",
+            auth.id, patient_id, body.camera_id,
+        )
+        raise _CAMERA_PRIVATE
 
     room = f"patient_{patient_id}"
     for cam in cameras:

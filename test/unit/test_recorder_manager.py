@@ -119,6 +119,7 @@ def _ctx(room="Living Room", gate="poi", conf=0.9) -> RecorderCtx:
     return RecorderCtx(
         caregiver_id=uuid4(),
         patient_id=uuid4(),
+        camera_id=uuid4(),
         room=room,
         gate=gate,
         confidence=conf,
@@ -360,7 +361,7 @@ async def test_privacy_check_at_upload_boundary_drops_clip(tmp_path) -> None:
     clock = _Clock()
     uploader = _FakeUploader()
 
-    async def _privacy_on(_patient_id) -> bool:
+    async def _privacy_on(_camera_id) -> bool:
         return True
 
     mgr = RecorderManager(

@@ -99,6 +99,8 @@ def _ingest() -> CameraIngest:
         settings=SimpleNamespace(
             frame_buffer_retention_seconds=20.0,
             livekit_worker_target_fps=4,
+            frame_buffer_target_fps=4,
+            clip_fps=4,
         ),
         reid=None,
     )

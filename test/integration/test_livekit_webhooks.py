@@ -243,13 +243,21 @@ async def test_non_patient_room_is_no_op(
 
 @pytest.mark.asyncio
 async def test_caregiver_identity_in_patient_room_is_no_op(
-    client: AsyncClient, installed_worker, fake_receiver,
+    client: AsyncClient, installed_worker, fake_receiver, monkeypatch,
 ) -> None:
     """A caregiver entering Talk mode shows up in the room too. The
     webhook receives a `participant_joined` event for the
     `caregiver_<...>` identity — must NOT cause the worker to
-    (re)join the room, which it's already in.
+    (re)join the room, which it's already in. (It DOES trigger the
+    per-camera privacy re-sever — see the test below.)
     """
+    async def _resever(settings, sessionmaker, *, room: str) -> None:
+        return None  # not under test here — just keep it off the DB
+
+    monkeypatch.setattr(
+        "src.api.livekit_webhooks.livekit_privacy.enforce_privacy_for_room",
+        _resever,
+    )
     body = _payload(
         "participant_joined",
         room_name="patient_5b1c0312-44a0-4f9d-9a3a-2d4f44a1f0bb",
@@ -262,6 +270,76 @@ async def test_caregiver_identity_in_patient_room_is_no_op(
     )
     assert r.status_code == 204
     assert installed_worker.joined == []
+
+
+@pytest.mark.asyncio
+async def test_caregiver_join_triggers_privacy_resever(
+    client: AsyncClient, installed_worker, fake_receiver, monkeypatch,
+) -> None:
+    """Deploy-order self-heal (2026-07-27): a caregiver joining AFTER a
+    camera went private must have the per-camera sever re-applied — the
+    flip-time sever can't cover them, and publisher-side permissions
+    ship on other deploy trains. The webhook fires the room re-sever
+    (fire-and-forget) on every caregiver_* join.
+    """
+    import asyncio
+
+    calls: list[str] = []
+
+    async def _resever(settings, sessionmaker, *, room: str) -> None:
+        calls.append(room)
+
+    monkeypatch.setattr(
+        "src.api.livekit_webhooks.livekit_privacy.enforce_privacy_for_room",
+        _resever,
+    )
+    body = _payload(
+        "participant_joined",
+        room_name="patient_5b1c0312-44a0-4f9d-9a3a-2d4f44a1f0bb",
+        identity="caregiver_a4f1c2d8-5c7e-4dab-9c2f-72e1f3b0aa01",
+    )
+    r = await client.post(
+        "/v1/livekit/webhooks",
+        content=body,
+        headers={"Authorization": "Bearer fake.jwt", "Content-Type": "application/json"},
+    )
+    assert r.status_code == 204
+    await asyncio.sleep(0.01)  # let the fire-and-forget task run
+    assert calls == ["patient_5b1c0312-44a0-4f9d-9a3a-2d4f44a1f0bb"]
+    # The worker is untouched — this is a privacy path, not a join path.
+    assert installed_worker.joined == []
+
+
+@pytest.mark.asyncio
+async def test_camera_join_does_not_trigger_privacy_resever(
+    client: AsyncClient, installed_worker, fake_receiver, monkeypatch,
+) -> None:
+    """cam_* joins take the worker path only — the re-sever is scoped
+    to caregiver identities."""
+    import asyncio
+
+    calls: list[str] = []
+
+    async def _resever(settings, sessionmaker, *, room: str) -> None:
+        calls.append(room)
+
+    monkeypatch.setattr(
+        "src.api.livekit_webhooks.livekit_privacy.enforce_privacy_for_room",
+        _resever,
+    )
+    body = _payload(
+        "participant_joined",
+        room_name="patient_5b1c0312-44a0-4f9d-9a3a-2d4f44a1f0bb",
+        identity="cam_ce110001",
+    )
+    r = await client.post(
+        "/v1/livekit/webhooks",
+        content=body,
+        headers={"Authorization": "Bearer fake.jwt", "Content-Type": "application/json"},
+    )
+    assert r.status_code == 204
+    await asyncio.sleep(0.01)
+    assert calls == []
 
 
 @pytest.mark.asyncio

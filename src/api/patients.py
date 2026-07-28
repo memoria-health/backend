@@ -30,7 +30,6 @@ from src.schemas.patient import (
 )
 from src.services import email, onboarding, storage
 from src.services import region as region_routing
-from src.services.livekit_privacy import enforce_privacy_for_room
 
 router = APIRouter(prefix="/v1/patients", tags=["patient"])
 
@@ -140,7 +139,6 @@ async def patch_patient(
     auth: CaregiverAuth,
     body: UpdatePatientRequest,
     session: SessionDep,
-    settings: SettingsDep,
 ) -> PatientResponse:
     """Partial update.
 
@@ -203,14 +201,11 @@ async def patch_patient(
 
     await session.commit()
 
-    # Privacy turned ON → instantly sever any caregiver ALREADY connected
-    # to this patient's LiveKit room. The committed flag already gates new
-    # token mints (api/livekit.py); this closes the window for live
-    # sessions still holding a pre-privacy token. Best-effort: the helper
-    # swallows LiveKit errors so the toggle always succeeds, and the bot +
-    # camera participants are left untouched so insights keep flowing.
-    if fields.get("privacy_mode_enabled") is True:
-        await enforce_privacy_for_room(settings, patient_id)
+    # NOTE (2026-07-27): the patient-level privacy_mode_enabled toggle is
+    # retired — privacy is per-camera now (cameras.privacy_enabled, owned
+    # by the room classifier + internal reclassify endpoint). The field is
+    # gone from UpdatePatientRequest, so a client that still sends it gets
+    # a 422 via extra="forbid" — same rejection as any unknown field.
 
     return _to_response(p)
 

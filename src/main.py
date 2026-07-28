@@ -7,6 +7,7 @@ new aggregate appends one `include_router` line.
 
 import logging
 import os
+import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -79,6 +80,7 @@ from src.api.events import router as events_router
 from src.api.face_embeddings import router as face_embeddings_router
 from src.api.feedback import router as feedback_router
 from src.api.health import router as health_router
+from src.api.internal.cameras import router as internal_cameras_router
 from src.api.livekit import router as livekit_router
 from src.api.livekit_webhooks import router as livekit_webhooks_router
 from src.api.pairing import router as pairing_router
@@ -99,7 +101,7 @@ from src.db import patient as _patient  # noqa: F401
 from src.db import patient_face_embedding as _patient_face_embedding  # noqa: F401
 from src.db import pi_discovery as _pi_discovery  # noqa: F401
 from src.db.session import get_engine, get_sessionmaker
-from src.services import email, push
+from src.services import clip_archival, email, push
 from src.services.detection.presence_cache import PresenceCache
 from src.services.detection.presence_sweeper import PresenceSweeper
 from src.services.detection.worker import DetectorWorker
@@ -107,11 +109,42 @@ from src.services.scheduling.scheduler import ScheduledDetectorRunner
 from src.settings import get_settings
 
 
+def _warm_censor_model() -> None:
+    """Preload YOLO seg weights for the clip censor (daemon thread)."""
+    try:
+        from src.services.detection import censor
+
+        censor._get_seg_model()
+        logging.getLogger(__name__).info("censor model warmed")
+    except Exception:  # noqa: BLE001 — warmup is best-effort
+        logging.getLogger(__name__).warning(
+            "censor model warmup failed; will retry lazily on first "
+            "censored clip", exc_info=True,
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Touch the engine so the lazy `lru_cache` factory binds at startup
     # instead of on the first request — surfaces bad NEMARA_DB_URL early.
     engine = get_engine()
+    # Sweep clip tempfiles stranded by a hard-killed (SIGKILL/OOM)
+    # previous process — raw clip bytes must never outlive a crash.
+    # See clip_archival.sweep_scratch_dir; runs before any clip work.
+    clip_archival.sweep_scratch_dir()
+    # Warm the censor's YOLO seg model off the startup path: the first
+    # load pays weights download + torch init (measured minutes on a
+    # cold host vs ~9s steady-state per censored clip). Daemon thread —
+    # never blocks startup, failure just re-raises lazily on first use.
+    # Still valuable now that tier-1 censoring runs in a child process
+    # (censor._censor_person_mask_subprocess): ultralytics resolves the
+    # bare "yolo11n-seg.pt" name against the process cwd, the warmup
+    # downloads it there (repo root locally, WORKDIR /app in the
+    # container), and the child inherits that cwd — so every censor
+    # subprocess finds the weights cached instead of re-downloading.
+    threading.Thread(
+        target=_warm_censor_model, name="censor-model-warmup", daemon=True
+    ).start()
     # Phase 2: in-process detector subscriber-bot. Webhook-driven; the
     # `/v1/livekit/webhooks` route reads `app.state.detector_worker`
     # to dispatch participant_joined/left events. Worker idles at
@@ -195,6 +228,11 @@ def create_app() -> FastAPI:
     app.include_router(support_router)
     # Product Feedback (persisted + best-effort Resend) from Settings.
     app.include_router(feedback_router)
+    # Support-only /internal routes (room-privacy reclassify escape
+    # hatch). Guarded by the X-Internal-Key shared secret; fails closed
+    # outside local/test when NEMARA_INTERNAL_SERVICE_KEY is unset, so
+    # mounting unconditionally is safe.
+    app.include_router(internal_cameras_router)
 
     # Experimental, non-production routes under src/internals/. Gated by
     # NEMARA_ENABLE_INTERNALS (default off). The import lives inside the
