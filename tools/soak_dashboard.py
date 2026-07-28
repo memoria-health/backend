@@ -98,6 +98,7 @@ _CAM_NAMES: dict[str, str] | None = None
 # row-level fallback fields legacy rows carry.
 _HOURLY_SQL = text("""
 select to_char(date_trunc('hour', a.created_at + :tzoff), 'MM-DD HH24:00') as h,
+       coalesce(a.detector_fields->>'vlm_model', '')     as m,
        count(*) filter (where a.provider != 'skipped')  as analyzed,
        coalesce(sum(c.calls_sent), 0)                    as calls,
        -- Row totals (vlm_*_tokens) already CONTAIN the per-call ledger
@@ -121,7 +122,7 @@ left join lateral (
         coalesce(a.detector_fields->'sched_calls', '[]'::jsonb)) e
 ) c on true
 where a.created_at >= :since
-group by 1 order by 1
+group by 1, 2 order by 1
 """)
 
 
@@ -133,17 +134,25 @@ async def _hourly(s) -> list:
     rows = (await s.execute(
         _HOURLY_SQL, {"since": _SINCE, "tzoff": _TZ_OFF},
     )).all()
-    # Cost priced server-side from _PRICE so the JS chart can never
-    # drift from the calibrated rates again (it used to hardcode the
-    # stale 2.5-generation prices and understate bars ~5x).
-    pin, pout = _PRICE["lite"]
-    out = [
-        {"h": r.h, "an": r.analyzed, "calls": int(r.calls),
-         "tin": int(r.tin), "tout": int(r.tout),
-         "cost": round(int(r.tin) * pin + int(r.tout) * pout, 4),
-         "g": r.g, "d": r.d, "o": r.o}
-        for r in rows
-    ]
+    # Cost priced server-side, per RECORDED MODEL (rows are grouped by
+    # hour + vlm_model; unattributed legacy rows price as lite). Keeps
+    # the chart bill-accurate now that the primary is a flash-class
+    # model — the old single-lite pricing would understate bars ~5x.
+    by_hour: dict[str, dict] = {}
+    for r in rows:
+        pin, pout = _MODEL_PRICE.get(r.m, _PRICE["lite"])
+        b = by_hour.setdefault(r.h, {
+            "h": r.h, "an": 0, "calls": 0, "tin": 0, "tout": 0,
+            "cost": 0.0, "g": 0, "d": 0, "o": 0,
+        })
+        b["an"] += r.analyzed
+        b["calls"] += int(r.calls)
+        b["tin"] += int(r.tin)
+        b["tout"] += int(r.tout)
+        b["cost"] = round(
+            b["cost"] + int(r.tin) * pin + int(r.tout) * pout, 4)
+        b["g"] += r.g; b["d"] += r.d; b["o"] += r.o
+    out = list(by_hour.values())
     _HOURLY_CACHE = (now, out)
     return out
 
@@ -673,21 +682,6 @@ _PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <div class="card"><h2>Tick log — newest first</h2>
 <p class="mut" style="font-size:11.5px;margin:0 0 8px">How to read a line: every detector in the loadout is asked on every analyzed tick, grouped into the calls shown — <span class="mono">key·Ndet</span> = one Gemini call carrying N detectors. Silence = every detector answered no; <span class="mono">⚑ name</span> = that detector answered YES. <span class="mono">⛔closed</span> = that call was pre-gated and never sent ($0) — today only the convulsion bucket has a pre-gate (<span class="mono">rapid-gate-motion</span> is its motion evidence), which is why gate chatter looks convulsion-specific. Absence/scheduled detectors don't ride calls; they evaluate from coverage at their deadline. <span class="mono">ingest-fps=A→kept B</span> = LiveKit delivered A fps to the backend (stream health; want ≥8) → buffer kept B for analysis (capped at the 4fps target by design; ~3.4 is normal, NOT a problem); <span class="mono">worst-frame-gap</span> = longest frame silence in the window. <span class="mono">track-motion</span> = largest per-track motion fraction this tick; <span class="mono">env-motion</span> = scene motion outside any track.</p>
 <div class="logwin" id="log"></div></div>
-<div class="card"><h2>Compiler acceptance — ran Jul 14 (pure-rules half; pinned by 22 unit goldens)</h2>
-<div class="tblwrap"><table>
-<tr><th>Ask</th><th>Routed to</th><th>Extras</th></tr>
-<tr><td>watching tv &gt;15 min</td><td>still-person · zoom · sampled</td><td>entry 5×-in-15min</td></tr>
-<tr><td>stove left on</td><td>room · snapshot</td><td>on sight</td></tr>
-<tr><td>dad leaves through the front door</td><td>PERSON, not door</td><td>exit-verb routing ✓</td></tr>
-<tr><td>visitor knocks / stranger enters</td><td>anyone</td><td>✓</td></tr>
-<tr><td>calls out for help</td><td>patient</td><td>audio: yes ✓</td></tr>
-<tr><td>picking at fingers &gt;10 min</td><td>person · wide view</td><td>distance warning · entry 3×-in-5min</td></tr>
-<tr><td>door left open 15 min</td><td>room · snapshot</td><td></td></tr>
-<tr><td>sleeping over an hour</td><td>still-person · sampled</td><td>entry 8×-in-30min</td></tr>
-<tr><td>pacing at night</td><td>person · every tick (safety)</td><td>✓</td></tr>
-</table></div>
-<p class="mut" style="font-size:12px;margin:8px 0 0">Refusals: eye-twitch / shivering / wearing-a-ring rejected with plain-language reasons · "violent shaking, <i>not just</i> shivering" and the medical bracelet correctly accepted (false-reject class: zero) · reserved field names refused loudly. Notes: "10 minutes" sits between presets and snaps to the sooner one (alerts earlier); fingertip fidgeting rides the wide view with a warning — conservative until soak data justifies the zoom reroute.</p>
-</div>
 <script>
 const $=id=>document.getElementById(id);
 function esc(s){return String(s??"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]))}
