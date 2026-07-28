@@ -49,7 +49,8 @@ DIMS: dict[str, DetectorDims] = {
     "agitation":   DetectorDims(True, "patient", "scene", 60,
                                 needs_audio=True, evidence_unit="sample",
                                 duty_cycle="thinned"),
-    "seizure":     DetectorDims(True, "patient", "rapid", 96),
+    # "seizure" removed 2026-07-28 with its catalog entry (VLM samples
+    # below tremor frequency; rapid lane stays for warned customs).
     "wandering":   DetectorDims(True, "patient", "scene", 55),
     "medication":  DetectorDims(True, "patient", "person", 20),
     "climbing":    DetectorDims(True, "patient", "scene", 66,

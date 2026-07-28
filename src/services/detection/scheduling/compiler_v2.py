@@ -214,7 +214,15 @@ def classify_custom_dims(
         else "every_eligible_tick"
     )
 
-    degradation = "distance_class" if _DISTANCE_CLASS.search(hay) else "none"
+    # rapid_frequency outranks distance_class: high-frequency motion
+    # (tremor-band, 3-6 Hz) sits below VLM video sampling — a temporal
+    # ceiling the benchmark measured directly (Convulsion was removed
+    # from the catalog over it). Any custom ask that compiles into the
+    # rapid/fine_motion lanes must surface a high-FP/FN warning.
+    if bucket in ("rapid", "fine_motion"):
+        degradation = "rapid_frequency"
+    else:
+        degradation = "distance_class" if _DISTANCE_CLASS.search(hay) else "none"
     # M-of-N is derived from detection difficulty (bucket + degradation +
     # stakes), never from a user-stated duration.
     eventing = _entry_confidence_for(is_sustained, bucket, degradation, category)

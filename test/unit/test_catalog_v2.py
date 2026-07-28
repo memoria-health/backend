@@ -25,8 +25,9 @@ def test_severity_lockstep_with_catalog_map() -> None:
 
 def test_load_bearing_dims_pinned() -> None:
     d = catalog_v2.DIMS
-    assert d["seizure"].bucket == "rapid"                       # the P0 recipe
-    assert d["seizure"].requires_motion is True
+    # Convulsion removed from the catalog 2026-07-28 (VLM samples below
+    # tremor frequency — benchmark-measured; rapid lane stays for customs).
+    assert "seizure" not in d
     assert d["stove_left_on"].requires_motion is False  # no person needed
     assert d["stove_left_on"].bucket == "scene"  # snapshot retired 2026-07-18
     assert d["agitation"].needs_audio is True                   # tone matters

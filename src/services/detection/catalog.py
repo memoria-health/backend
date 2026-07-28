@@ -266,54 +266,6 @@ _MEDICATION_PROMPT_FRAGMENT = (
     "no separate hand-to-mouth placing gesture', 'no person visible')."
 )
 
-_SEIZURE_PROMPT_FRAGMENT = (
-    "seizure_detected: boolean. TRUE when the person shows SEIZURE activity. The "
-    "MOST IMPORTANT pattern to catch is SMALL, FAST, VIBRATION-LIKE trembling of "
-    "the ARMS or HANDS — rapid, buzzing, quivering, repetitive shaking that stays "
-    "in a SMALL, LOCALIZED spot and does NOT sweep across the frame. This fine, "
-    "high-frequency arm/hand shaking (myoclonic / clonic jerking) is the KEY "
-    "signal, and it is easy to miss without the motion highlight. Large, violent "
-    "whole-body convulsing (stiff body, collapsed on the floor or bed, "
-    "uncontrolled jerking of arms and legs) ALSO counts. In every case the "
-    "movement is INVOLUNTARY and the person is NOT moving purposefully or "
-    "responding.\n"
-    "\n"
-    "RED MOTION HIGHLIGHT — WATCH THE ARMS, THIS IS THE KEY SIGNAL: a red tint "
-    "marks where motion is. RED CONCENTRATED ON THE ARMS OR HANDS that keeps "
-    "flickering / staying RED in a SMALL localized area across many frames — "
-    "WITHOUT the arm travelling anywhere — IS the fine rapid vibration of a "
-    "seizure. Even a small, tight red patch that stays buzzing on a hand or "
-    "forearm is a STRONG seizure sign — lean toward TRUE. A large red region held "
-    "in place (whole-body convulsion) also counts. Red that TRAVELS across the "
-    "frame, or one big smooth red sweep (reaching, a single arm swing), is "
-    "ordinary movement, NOT a seizure.\n"
-    "\n"
-    "TELL IT APART FROM EXERCISE: deliberate rhythmic activity — jumping jacks, "
-    "working out, dancing, clapping, big arm waves — is ALSO rhythmic and lights "
-    "up red, but it is LARGE, SLOWER, SWEEPING, COORDINATED, and the person is "
-    "upright and IN CONTROL. A seizure is the opposite: FAST + SMALL + jittery "
-    "(or violently uncontrolled), INVOLUNTARY, uncoordinated, usually collapsed / "
-    "slumped, the person not in control. Fast small localized jitter = seizure; "
-    "large slow coordinated sweeps = exercise → FALSE.\n"
-    "\n"
-    "Set FALSE if any of:\n"
-    "  - the movement is deliberate / coordinated / exercise-like (jumping jacks, "
-    "working out, dancing, clapping, a purposeful wave), a big single sweep, or it "
-    "travels across the frame (walking, reaching, gesturing);\n"
-    "  - the person is calmly still, sleeping, or moving normally;\n"
-    "  - the motion is brief or one-off, not sustained rapid repetitive shaking;\n"
-    "  - no person is visible, or it is too far / unclear to judge.\n"
-    "\n"
-    "seizure_confidence: number 0-1. 0 = no seizure. 0.3-0.6 = some rapid "
-    "repetitive shaking but brief, faint, or partly obscured. 0.7+ = clear "
-    "sustained fine or violent shaking held in place (arms/hands buzzing red "
-    "across many frames under the motion highlight).\n"
-    "seizure_reasoning: one short sentence — e.g. 'right hand and forearm stayed "
-    "lit red and vibrated rapidly in a small spot across the clip — fine seizure "
-    "jerking', 'both arms convulsed violently while the person lay stiff on the "
-    "couch', 'big coordinated arm swings, looked like exercise — not a seizure', "
-    "'no person visible'."
-)
 
 _CLIMBING_PROMPT_FRAGMENT = (
     "climbing_detected: boolean. TRUE if a child is climbing onto something "
@@ -903,13 +855,14 @@ CATALOG: tuple[CatalogEntry, ...] = (
         recommended=False, seeded=True, prompt_fragment=_AGITATION_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
-    CatalogEntry(
-        key="seizure", name="Convulsion", icon_name="bolt.heart",
-        description="Convulsive shaking — rhythmic, repetitive limb or whole-body jerking.",
-        category="safety", cohort="both",
-        recommended=False, seeded=False, prompt_fragment=_SEIZURE_PROMPT_FRAGMENT,
-        promotion_threshold=0.65,
-    ),
+    # Convulsion REMOVED from the catalog (Aryaman 2026-07-28): the
+    # benchmark showed VLM video sampling sits below tremor frequency
+    # (3-6 Hz) — a temporal-sampling ceiling, not resolution — so the
+    # detector's FP/FN rate is unacceptable as a built-in. The rapid
+    # LANE stays for custom detectors, which now carry a
+    # "rapid_frequency" degradation warning at compile (compiler_v2).
+    # Successor: computed-motion FFT multi-criterion detector,
+    # post-pilot (docs/plans/2026-07-28-pilot-master-worklist.md).
     CatalogEntry(
         key="wandering", name="Wandering", icon_name="door.left.hand.open",
         description="Main door opening — front entry only.",
