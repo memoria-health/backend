@@ -113,13 +113,21 @@ def state(request: Request) -> JSONResponse:
     })
 
 
-def _mjpeg(cam_id: str):
+async def _mjpeg(cam_id: str):
+    # ASYNC on purpose (2026-07-27): the sync version ran in FastAPI's
+    # ~40-thread pool, one thread pinned per open stream — and when a
+    # camera had no frame yet it never yielded, so a disconnected
+    # client was never detected and the thread leaked forever. Browser
+    # tabs re-opening streams across service restarts exhausted the
+    # pool, wedging every sync endpoint (/, /state) while the async
+    # loop ran fine. Async generators cost no threads and Starlette
+    # cancels them on client disconnect even before the first yield.
     while True:
         sp = _HOME.cameras.get(cam_id) if _HOME else None
         jpg = sp.latest_jpeg if sp else None
         if jpg:
             yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n")
-        time.sleep(1 / 15)
+        await asyncio.sleep(1 / 15)
 
 
 _TIMELINE: "deque" = None  # (ts, {cam: 'patient'|'people'|'empty'})
@@ -312,6 +320,34 @@ async def _run_livekit(
     room = rtc.Room()
 
     reader_tasks: dict[str, asyncio.Task] = {}
+    loop_tasks: dict[str, asyncio.Task] = {}
+
+    def _remove_camera(cam_id: str, why: str) -> None:
+        """Tear a camera loop down when its publisher leaves. Without
+        this, a deleted camera haunts home.cameras (and the dashboard +
+        /state) until the next process restart (2026-07-28: ghost
+        3d60d66b). Seat safety is free: removal drops the camera's
+        tracks from the live set, so a seat it held dies via the normal
+        seat.py not-in-live path."""
+        cams = dict(home.cameras)
+        cam_loop = cams.pop(cam_id, None)
+        if cam_loop is None:
+            return
+        # Swap-not-mutate, same as the create path.
+        home.cameras = cams
+        for tasks in (reader_tasks, loop_tasks):
+            t = tasks.pop(cam_id, None)
+            if t is not None and not t.done():
+                t.cancel()
+        log.info("identity.camera_removed cam=%s (%s)", cam_id, why)
+
+    @room.on("participant_disconnected")
+    def _on_participant_gone(participant):  # noqa: ANN001
+        ident = participant.identity
+        if ident.startswith("cam_"):
+            _remove_camera(
+                ident.removeprefix("cam_"), "participant_disconnected",
+            )
 
     @room.on("disconnected")
     def _on_disconnected(*_a):  # noqa: ANN001
@@ -343,7 +379,7 @@ async def _run_livekit(
             cams = dict(home.cameras)
             cams[cam_id] = cam_loop
             home.cameras = cams
-            asyncio.ensure_future(cam_loop.run())
+            loop_tasks[cam_id] = asyncio.ensure_future(cam_loop.run())
             log.info("identity.camera_started cam=%s", cam_id)
         # ONE reader per camera: a re-subscribe replaces the old reader
         # instead of racing it (double intake = double convert cost +
@@ -440,24 +476,33 @@ async def _amain(args: argparse.Namespace) -> None:
     except Exception:                        # noqa: BLE001 — names are
         log.exception("identity.cam_names_failed")  # cosmetic; ids ok
     async def _pod_progress_watchdog(home_ref):
-        """Frames arriving but ZERO successful pod round-trips for
-        POD_WEDGE_S ⇒ the HTTP path is wedged (poisoned pool after a
-        tunnel death, dead pod, ...) — exit; the supervisor restart
-        rebuilds the client. Complements the disconnect exit: this
-        catches the failures that DON'T fire an event."""
+        """Link-health watchdog. `last_pod_ok` is stamped by every
+        successful pod round-trip — real batches when the room is
+        active, the heartbeat below when it is idle — so staleness has
+        exactly ONE meaning: the pod path (tunnel, connection pool,
+        pod process) is broken. Exit; the supervisor restart rebuilds
+        the client. The heartbeat rides the SAME SamServiceClient the
+        batches use on purpose: a poisoned pool (the 2026-07-27
+        incident) must fail the heartbeat too, or it goes undetected.
+        v1 gated on "frames fresh + no pod success", which conflated
+        idle (motion-gated rooms send no batches) with wedged — quiet
+        rooms crash-looped every ~2.5 min, wiping the body pool."""
         POD_WEDGE_S = 120.0
+        HEARTBEAT_S = 30.0
         while True:
-            await asyncio.sleep(15.0)
+            await asyncio.sleep(HEARTBEAT_S)
+            try:
+                await home_ref.sam.health()
+                home_ref.last_pod_ok = time.time()
+            except Exception as e:               # noqa: BLE001
+                log.warning("identity.pod_heartbeat_failed: %s", e)
             now = time.time()
-            frames_fresh = any(
-                getattr(lp, "_raw_hud_at", 0) > now - 30
-                for lp in home_ref.cameras.values()
-            )
             last_ok = getattr(home_ref, "last_pod_ok", None)
-            if frames_fresh and last_ok is not None and now - last_ok > POD_WEDGE_S:
+            if last_ok is not None and now - last_ok > POD_WEDGE_S:
                 log.error(
-                    "identity.pod_wedged — frames flowing but no pod "
-                    "success for %.0fs; exiting for supervisor restart",
+                    "identity.pod_wedged — no successful pod contact "
+                    "(batch or heartbeat) for %.0fs; exiting for "
+                    "supervisor restart",
                     now - last_ok,
                 )
                 os._exit(4)

@@ -25,6 +25,7 @@ echo "$(date -u +%FT%TZ) identity supervisor: start room=$ROOM port=$PORT" >> "$
 while true; do
   uv run --directory "$REPO" python gpu/identity/service.py \
     --room "$ROOM" --port "$PORT" >> "$LOG" 2>&1
-  echo "$(date -u +%FT%TZ) identity supervisor: service exited rc=$? — restart in 3s" >> "$LOG"
+  rc=$?  # capture BEFORE the echo — $(date) inside it resets $? to 0
+  echo "$(date -u +%FT%TZ) identity supervisor: service exited rc=$rc — restart in 3s" >> "$LOG"
   sleep 3
 done
