@@ -58,18 +58,23 @@
       |---|---|---|---|
       | Falls | scene (4fps clean) | patient | lie on the floor |
       | Calling for help | scene + audio | patient | shout "help" |
-      | Watching TV | scene — RECLASSIFIED 2026-07-28 (was person/zoom; TV-watching needs scene context — the crop excludes the evidence). Duration semantics via its N-in-M entry rule | patient | turn TV on ≥15 min; a glance must NOT fire |
+      | Watching TV | scene — RECLASSIFIED 2026-07-28 (was person/zoom; TV-watching needs scene context — the crop excludes the evidence). Duration semantics via its N-in-M entry rule, set to ~5 MIN for the soak (Aryaman: don't waste time) | patient | watch TV ~5 min; a glance must NOT fire |
       | Medication adherence | person (4fps crop) | patient | pill-bottle mime |
       | Setup test | scene | anyone | uncle/aunt walks through (doubles as discrimination test) |
       | Wandering | scene + door_config | patient | exit through front door |
       | Missed evening medication | scheduled/absence (NO calls — evaluates from coverage at deadline) | patient | set window tonight, do NOTHING → must fire absence |
       | (new) "Drinking water" | person | patient | drink from a BOTTLE; exercises create→compile→NL-refine e2e |
 
-      Convulsion EXCLUDED — deletion candidate (benchmark: VLM samples
-      below tremor frequency; silhouettes non-deterministic; successor =
-      computed-motion FFT post-pilot). Rapid bucket therefore untenanted
-      → flash-tier recipes go quiet (cost savings). fine_motion + face
-      buckets also have no tenants. Left OFF: Meals (not on-demand),
+      Convulsion REMOVED OUTRIGHT 2026-07-28 (not just soak-excluded):
+      catalog entry + dims deleted, preset rows deleted via
+      apply_convulsion_removal_delta.sql (run on prod at deploy), and
+      the compiler now stamps degradation_warning="rapid_frequency" on
+      any CUSTOM ask routed to rapid/fine_motion (high FP/FN at VLM
+      sampling rates — benchmark-measured temporal ceiling). Client
+      warning copy for rapid_frequency: TODO web + iOS. Result: exactly
+      TWO active built-in buckets — scene and person. Rapid lane
+      infrastructure retained for warned customs; FFT successor
+      post-pilot. Left OFF: Meals (not on-demand),
       Agitation/Choking (optional mimes), General Emergency (redundant
       w/ Falls), Stove (no kitchen camera).
       COMPILER LESSON (from the Watching-TV miss): context-dependent
@@ -154,17 +159,43 @@
        + deep-health smoke; sr_server (24GB squatter) kill w/ Sunny.
 11.[ ] One-way "Make private" per camera (PATCH accepts true only).
 
-## Phase 4 — activity + sleep detectors (design session next; build after merge)
+## Phase 4 — activity + sleep (Whoop-level rigor, Aryaman 2026-07-28: "not
+## a heuristic — as reliable and robust as possible")
 
-- Sleep: presence-derived, NOT clip-derived (bedroom is private).
-  Substrate exists free: seat-in-bedroom + motion-below-threshold + track
-  rustle-cycle rate (restlessness). Sleep onset / night wandering / restless
-  score with zero VLM cost + zero private-room clips. Resolves the parked
-  "sleep-occupancy decision": identity telemetry IS the sleep signal.
-- Activity: daytime ADL rollups — room transitions/hr (seat movement),
-  active-vs-sedentary time (track motion), low-rate VLM activity labeling in
-  non-private rooms only. The "Whoop for the home" scorecard.
+- Sleep — behavioral sleep measurement (honest boundary: in-bed quiescence,
+  not physiological staging; no HR/HRV sensor exists):
+  * 30s EPOCHS classified over fused signals: seat presence (identity),
+    motion-energy series (frame-diff, already computed for the latch),
+    track micro-motion (rustle cycles — clean post phantom-fix), scene
+    luminance (lights-out is a strong bedtime prior; IR-mode step handled).
+  * State model with SMOOTHING (HMM-style transition costs, hysteresis) —
+    states: out-of-room / in-bed-active / quiescent / disturbed. No single
+    thresholds: per-home percentile-calibrated bands learned from the
+    patient's own nights (Whoop's baseline principle).
+  * Nightly record: bedtime, sleep onset, disturbance intervals (+intensity),
+    out-of-bed events (night wandering — the clinical headline), wake time,
+    CONFIDENCE + data-quality flags ("camera offline 02:10-02:50 — night
+    partially observed"). Coverage gaps degrade confidence, never fabricate.
+  * Edge cases in scope: partner in bed (disturbances attributed only via
+    track association / solo), bedroom TV glow (luminance flicker filter),
+    pets (small-track filter), bathroom trips (seat-exit + return = one
+    out-of-bed event with duration).
+  * VALIDATION, not vibes: run vs Aryaman's own wearable + self-report
+    nightly during soak/dev weeks; ship gate = bedtime/wake within ±15 min
+    and out-of-bed recall ~100% on the validation nights.
+- Activity — same rigor: epoch classification (stationary / moving / active)
+  from track displacement distributions (angle-robust), room transitions,
+  occupied-time normalization; daily score vs the patient's own 14-day
+  baseline (trend, not absolute); confidence + coverage flags; posture
+  split deferred (ceiling-angle bbox geometry unreliable — revisit with
+  sampled VLM labeling in non-private rooms if pilots want it).
 - Pilot mode: RECORD-ONLY (no notifications) → week-2 family report artifact.
+
+## EXIT REVIEW (mandatory, before pilot go-live)
+
+- [ ] Walk the "Parked" list AND "Known residual risks" line by line with
+      Aryaman — each gets an explicit "accepted for pilots" or "do now".
+      Nothing ships as silently-parked.
 
 ## Open decisions (Aryaman)
 
