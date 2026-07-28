@@ -328,6 +328,7 @@ async def run_scheduled_calls(
             "key": plan.plan_key,
             "detectors": idents,
             "provider": used_provider,
+            "model": result.model,
             "input_tokens": int(usage.get("input", 0)),
             "output_tokens": int(usage.get("output", 0)),
             **({"degraded_artifact": True} if degraded_this_call else {}),

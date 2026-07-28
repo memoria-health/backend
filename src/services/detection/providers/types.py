@@ -31,6 +31,11 @@ class ProviderResult:
     # Per-call token spend {"input": n, "output": n} when the provider
     # reports it — the cost ledger's raw data (detection v2). None = unknown.
     usage: dict[str, int] | None = None
+    # The MODEL that actually served this call (2026-07-28). Routing
+    # tiers and recipe keys no longer imply the model — pricing is only
+    # accurate when the served model rides with the tokens. None = a
+    # provider path that predates this field.
+    model: str | None = None
 
 
 class Provider(Protocol):

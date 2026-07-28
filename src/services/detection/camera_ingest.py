@@ -1725,6 +1725,11 @@ class CameraIngest:
             if result.usage:
                 result.detector_fields["vlm_input_tokens"] = result.usage.get("input", 0)
                 result.detector_fields["vlm_output_tokens"] = result.usage.get("output", 0)
+            if result.model:
+                # Served-model attribution (2026-07-28): pricing is only
+                # accurate when the model rides with the tokens — recipe
+                # tiers and routing choice no longer imply it.
+                result.detector_fields["vlm_model"] = result.model
 
             # Gateway-threshold tuning stats (see motion.py #1/#4):
             # observation only, queryable per row. Supersedes the

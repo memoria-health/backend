@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 import src.services.detection.vlm_routing as vlm_routing
+from src.services.detection.providers.types import ProviderResult
 
 
 def _identity() -> SimpleNamespace:
@@ -34,7 +35,11 @@ def _patch_all(monkeypatch, calls, *, gemini_ok_on=None) -> None:
     async def fake_gemini(*, model=None, **_kw):
         calls.append(("gemini", model))
         if gemini_ok_on is not None and model == gemini_ok_on:
-            return "GEMINI_RESULT"
+            # A real ProviderResult: run_vlm stamps the served model onto
+            # it via dataclasses.replace, which rejects loose stubs.
+            return ProviderResult(
+                description="GEMINI_RESULT", detector_fields={},
+            )
         raise RuntimeError("gemini boom")
 
     def _make(name):
@@ -75,5 +80,6 @@ async def test_flash_tier_success_reported_as_gemini(monkeypatch) -> None:
         log_tag="t", settings=_settings(),
     )
     assert used == "gemini"          # existing constraint value, not a new one
-    assert result == "GEMINI_RESULT"
+    assert result.description == "GEMINI_RESULT"
+    assert result.model == "flash"   # served-model attribution rides the result
     assert calls == [("gemini", "flash-lite"), ("gemini", "flash")]  # stops at flash

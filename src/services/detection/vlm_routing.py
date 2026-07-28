@@ -13,6 +13,7 @@ Two jobs:
 import logging
 import time
 from collections.abc import Sequence
+from dataclasses import replace as _dc_replace
 from uuid import UUID
 
 from sqlalchemy import select
@@ -116,7 +117,7 @@ async def run_vlm(
                     patient_in_clip=identity.patient_in_clip,
                     model=gmodel,
                 )
-                return "gemini", result
+                return "gemini", _dc_replace(result, model=gmodel)
             fn = {
                 "openai": openai_provider,
                 "openrouter": openrouter_provider,
@@ -138,7 +139,12 @@ async def run_vlm(
                 ),
                 sample_fps=identity.sample_fps if reuse else None,
             )
-            return prov, result
+            served_model = {
+                "openai": settings.openai_model,
+                "openrouter": settings.openrouter_model,
+                "dashscope": settings.dashscope_model,
+            }[prov]
+            return prov, _dc_replace(result, model=served_model)
         except Exception as e:  # noqa: BLE001
             errors[prov] = str(e)
             log.warning("%s vlm provider %s failed: %s", log_tag, prov, e)

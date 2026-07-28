@@ -38,16 +38,29 @@ from src.settings import get_settings
 # tokens outside the ledger (legacy rows, confirm votes) price as lite
 # — a slight floor, never an overstatement... except flash confirms,
 # noted in the report.
-# CALIBRATED TO THE ACTUAL BILL (2026-07-19 audit): the 2026-07-18 soak
-# day recorded 32.59M in / 0.78M out across 3,360 calls and AI Studio
-# billed ~$14 — the old table priced the "lite" tier at Gemini
-# 2.5-flash-lite rates ($0.10/$0.40) while the configured model is
-# gemini-3.1-flash-lite, whose effective rates the bill implies are
-# ~$0.30/M in, ~$2.50/M out ($11.7 of the $14; the remainder is
-# thinking tokens the ledger didn't record until today's provider
-# fix). Both tiers now use the bill-implied rates; re-verify against
-# AI Studio at the next top-up.
-_PRICE = {"lite": (0.30 / 1e6, 2.50 / 1e6), "flash": (0.30 / 1e6, 2.50 / 1e6)}
+# LIST PRICES, verified 2026-07-28 against the published Gemini API
+# pricing (and the 3.5-flash-lite list rate exactly matches the
+# 2026-07-19 bill-calibrated effective rate of the old lite tier, which
+# validates the calibration method):
+#   gemini-3.6-flash       $1.50/M in   $7.50/M out   <- "flash" tier
+#   gemini-3.5-flash-lite  $0.30/M in   $2.50/M out   <- "lite" tier
+# NOTE the 5x/3x flash-vs-lite gap: with 3.6-flash as PRIMARY the same
+# call volume that billed ~$14/day on lite projects to ~$55+/day.
+# provider usage["output"] already includes thinking tokens (billed at
+# the output rate), so output-token pricing here is bill-accurate.
+# Re-verify against AI Studio at the next top-up.
+_PRICE = {"lite": (0.30 / 1e6, 2.50 / 1e6), "flash": (1.50 / 1e6, 7.50 / 1e6)}
+# Per-MODEL prices — preferred when the ledger entry carries "model"
+# (recorded from 2026-07-28 on). The recipe-tier keys above are the
+# LEGACY fallback only: recipe tier no longer implies the model (every
+# routed call runs settings.gemini_model regardless of tier), so
+# tier-priced legacy rows understate whenever the primary is a flash-
+# class model.
+_MODEL_PRICE = {
+    "gemini-3.6-flash":      (1.50 / 1e6, 7.50 / 1e6),
+    "gemini-3.5-flash-lite": (0.30 / 1e6, 2.50 / 1e6),
+    "gemini-3.1-flash-lite": (0.30 / 1e6, 2.50 / 1e6),
+}
 
 app = FastAPI()
 _SINCE: datetime = datetime.now(timezone.utc)
@@ -208,19 +221,25 @@ async def data() -> JSONResponse:
         tot_in += row_in
         tot_out += row_out
         led_in = led_out = 0
+        row_model = f.get("vlm_model")
         for c2 in (f.get("sched_calls") or ()):
             ci = int(c2.get("input_tokens", 0))
             co = int(c2.get("output_tokens", 0))
             tier = "flash" if ":flash:" in str(c2.get("key", "")) else "lite"
-            pin, pout = _PRICE[tier]
+            # Served-model pricing when recorded (2026-07-28+); recipe
+            # tier only as the legacy fallback.
+            mp = _MODEL_PRICE.get(str(c2.get("model") or row_model or ""))
+            pin, pout = mp if mp else _PRICE[tier]
             cost += ci * pin + co * pout
             led_in += ci
             led_out += co
             if tier == "flash":
                 flash_tok += ci + co
-        # Tokens outside the per-call ledger (legacy rows, confirm
-        # votes): price as lite.
-        pin, pout = _PRICE["lite"]
+        # Tokens outside the per-call ledger (confirm votes, legacy
+        # rows): confirm votes run the PRIMARY model, so price by the
+        # row's recorded model when present; lite only for true legacy.
+        mp = _MODEL_PRICE.get(str(row_model or ""))
+        pin, pout = mp if mp else _PRICE["lite"]
         cost += max(0, row_in - led_in) * pin + max(0, row_out - led_out) * pout
 
         tracks = f.get("sig_tracks") or []
