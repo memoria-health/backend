@@ -1,0 +1,153 @@
+# Pilot master worklist — consolidated across all sessions (2026-07-28)
+
+> Canonical order-of-operations for getting every repo to main and the system
+> to pilot families. Consolidates three workstreams: identity productionization
+> + resilience (this session), room-privacy + clip censoring (Jul 27–28 session,
+> canonical plan: `2026-07-27-room-privacy-and-clip-censoring.md`), and the
+> prod login-hang incident (Jul 28 session). Update THIS file as items land;
+> per-session trackers do not belong in the repo.
+
+## Ground truth (verified 2026-07-28, do not re-derive)
+
+- All repos share the feature wave: backend + caregiver on
+  `feat/gateway-camera-ownership`, web on `feat/web-customs-visibility`,
+  camera-app on `fix/camera-local-signing`, gateway already merged to main.
+- Backend tip `7f62727` (identity resilience fixes) on top of `7963d9b`
+  (privacy/censoring). 906 unit tests green at `7963d9b`.
+- Gateway box runs origin/main `0c1878b` (identity-service allow-list) —
+  verified on-box. The Jul-28 handoff's "box runs 17a9db7" was stale.
+  `0c1878b` is a PRODUCTION fix, not a backdoor: identity-service is AI
+  processing, same SFU trust class as detector workers; caregivers stay
+  blocked in private rooms. Caveat: LiveKit API secret can mint any identity
+  → key rotation is the real lock on the private-room door.
+- Detection is LIVE locally (`NEMARA_REID_SOAK_ONLY=false`).
+- Bedroom is room-classified private (0.99); identity tracks it via the
+  allow-list. Counsel language must state: "AI processes private rooms;
+  humans never see raw video."
+- Prod incident root cause CLOSED: partner's prototype dashboard polled prod
+  DB directly and exhausted pooler slots; fixed on his side (his repo, his
+  responsibility). Remaining backend-side items are in Phase 3.
+- SAM3 phantom churn root cause: SAM3 grounding runs on NATIVE input frames;
+  gateway's Jul-27 1080p deploy moved SAM3 from a proven ≤1280-wide input to
+  1920, where it intermittently splits a recumbent/seated person into two
+  instances (YOLO trigger dets=1 the whole time). Births/deaths 8-13/hr in
+  occupied rooms + a forced-reground loop (~2.4s SAM3 every ~15s) burning GPU.
+
+## Phase 0 — pre-soak fixes (blocks soak data quality)
+
+- [ ] SAM3 grounding-input resolution pin (pod): downscale frames fed to SAM3
+      grounding to 1280-wide (the proven operating point); existing
+      mask→track-res resize path unchanged. NOT the consensus-merge idea
+      (withdrawn — wrong layer; YOLO is a trigger, not an arbiter).
+      Fold in: `_iou` shape-mismatch rescale one-liner (latent landmine).
+      Deploy = rsync + pod restart. Success = phantom births ~0 in occupied
+      still rooms; forced-reground loop gone; discrimination test still
+      tracks 2 real people as 2.
+- [ ] Prod hygiene: delete Supabase auth user
+      `claude-diag-probe-20260728@example.com`; confirm no local env/profile
+      references the prod pooler (policy now has an incident behind it).
+- [x] Backend branch closed out (`7f62727` pushed).
+
+## Phase 1 — full-system soak (24–48h; THE ship-gate before any merge)
+
+- [ ] Detector matrix: every built-in preset type fires correctly across both
+      rooms; NL-refined custom detector; subject-scope (patient-elsewhere →
+      anyone-only); global crowd rule; cost vs bill-calibrated expectations.
+- [ ] Privacy chain live: staged sensitive event → screen → censor → censored
+      clip w/ audio in caregiver app; quiet fall → clean clip. Outputs seed
+      the sensitivity eval corpus.
+- [ ] Data-collection exclusion field test (never exercised): research consent
+      on, motion both cameras, B2 receives ONLY non-private clips.
+- [ ] Identity discrimination test (needs 2nd person): tracked but NOT seated;
+      also validates the resolution pin doesn't merge two real people.
+- [ ] Wifi drill mid-soak: router off 3 min, hands off, all green ≤60s.
+      Known weak link: ssh tunnel keeper (unsupervised; colocation deletes it
+      in prod). Full-router drill = standing pre-deploy ritual per home.
+- [ ] Soak-end counters: identity restarts (~0 expected), gateway watchdog
+      fires, backend swallowed-error volume, phantom merge count.
+
+## Phase 2 — review → merge wave (after soak passes; merge order = deploy order)
+
+1. [ ] Backend full-diff adjudicated review (3 feature streams interact —
+       review them together), then telemetry-gate discussion (below), then PR.
+       DB deltas collected in apply order: camera-privacy, dashscope-provider,
+       detector-links normalize. Deltas run BEFORE backend deploy.
+2. [ ] Telemetry gate (pre-PR, Aryaman-mandated). Agenda from real incidents:
+       silent failures (stale client, dead tunnel, zombie gateway, wedged
+       dashboard, login hang with no log line); process-alive ≠ service-healthy
+       (identity truth = /state within 2s); /ready measures the wrong thing for
+       connection exhaustion. Minimum set for a 2-person team (proposal):
+       Logfire/Sentry capture on swallowed exceptions + one synthetic login
+       canary incl. real Realtime join w/ timeout + one home-offline operator
+       alert + identity restart counter. Decide, then build ONLY that.
+3. [ ] camera-app PR (publisher; revert temp signing/local-IP fallbacks first).
+4. [ ] caregiver PR (revert temp fallbacks; fold iOS 1080p change into same
+       TestFlight build; `xcodegen generate` after merges).
+5. [ ] web PR (validate with `pnpm build && pnpm start`, dev-mode hydration
+       known-broken).
+6. [ ] Deploy checklist execution (privacy plan doc's list is load-bearing):
+       explicit NEMARA_ENV + INTERNAL_SERVICE_KEY, OMP/MKL single-thread env,
+       bake yolo11n-seg.pt into image, Railway env ADD
+       (IDENTITY_STATE_URL/TOKEN) + SCRUB deleted keys (extra=forbid boot
+       crash), legacy `privacy_mode_enabled` family check, deploy order
+       DB → backend → publishers → clients.
+
+## Phase 3 — pilot-blocking builds (post-merge)
+
+1. [ ] iOS login resilience: bootstrap() must not block sign-in on Realtime
+       subscribe (timeout + fire-and-forget behind existing 1s REST poll);
+       same for cold-launch restore. The incident's actual product bug.
+2. [ ] New cameras PRIVATE-BY-DEFAULT until classified (closes live-observed
+       15-min bedroom-stream gap; pairing copy already written).
+3. [ ] Backend pool right-size (10+10 → ~5+5 single replica) + role-level
+       idle timeouts (config-only).
+4. [ ] Key rotation (LiveKit/APNs/Gemini/OpenAI/OpenRouter/Resend) — BLOCKS
+       all prod env work; .env.bak still in git history on main.
+5. [ ] /state bearer token BOTH sides + unify env name
+       (backend `NEMARA_IDENTITY_STATE_TOKEN` vs service
+       `NEMARA_IDENTITY_TOKEN` — currently mismatched, silent no-auth trap).
+6. [ ] Research/B2 recording censoring (recordings currently RAW) — gates
+       consent PDF → gates attestation → gates research-consent pilots.
+7. [ ] Consent attestation on DataCollection sheet + BIPA biometrics clause.
+8. [ ] Sensitivity eval corpus + measured FALSE-NEGATIVE rate (ship number).
+9. [ ] Censor soak on Railway substrate (local numbers are Docker-VM numbers).
+10.[ ] Identity colocation on GPU host (kills tunnel failure class; verify
+       RunPod HTTP port exposure as part of the task) + reserved GPU + autopay
+       + deep-health smoke; sr_server (24GB squatter) kill w/ Sunny.
+11.[ ] One-way "Make private" per camera (PATCH accepts true only).
+
+## Phase 4 — activity + sleep detectors (design session next; build after merge)
+
+- Sleep: presence-derived, NOT clip-derived (bedroom is private).
+  Substrate exists free: seat-in-bedroom + motion-below-threshold + track
+  rustle-cycle rate (restlessness). Sleep onset / night wandering / restless
+  score with zero VLM cost + zero private-room clips. Resolves the parked
+  "sleep-occupancy decision": identity telemetry IS the sleep signal.
+- Activity: daytime ADL rollups — room transitions/hr (seat movement),
+  active-vs-sedentary time (track motion), low-rate VLM activity labeling in
+  non-private rooms only. The "Whoop for the home" scorecard.
+- Pilot mode: RECORD-ONLY (no notifications) → week-2 family report artifact.
+
+## Open decisions (Aryaman)
+
+- [ ] intimate_situation: the one silent carve-out to "censored clips keep
+      audio"? (flagged by privacy session)
+- [ ] Pilot families: research consent from day 1 (pulls items 6-9 forward)
+      or observation-first?
+
+## Parked (explicitly NOT for pilots)
+
+Counsel questions (Zinia + US: bathroom statutes, BIPA, household notice,
+"encrypted in transit/at rest" wording — runs in parallel, not code);
+patients.privacy_mode column drop + client legacy-wiring delta (after clients
+ship); detector hygiene (zero-link cleanup, room chips, duplicate prevention);
+web room-rename UI; Docker Desktop launchd keepalive (dev-only); legacy
+env-named settings scrub (move with container env); stale docstring sweep;
+yoloseg containment-dedup retrial; seizure-FFT + gait ST-GCN (post-pilot).
+
+## Known residual risks (accepted, from privacy plan doc)
+
+Raw clip bytes survivable in scratch only on SIGKILL mid-censor (boot sweep +
+ephemeral FS); Tapo classification lacks motion-settled frame gate (fails
+closed); two cameras sharing a room name can't diverge for scoped detectors;
+legacy silent-clip mystery never root-caused (probes guard the live chain).
