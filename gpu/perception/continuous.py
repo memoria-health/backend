@@ -86,6 +86,16 @@ _SAM3_STRIDE = max(1, int(os.environ.get("NEMARA_SAM3_STRIDE", "1")))
 # ids live.) Grounder failures fall back to SAM3 per-tick.
 _GROUNDER = os.environ.get("NEMARA_GROUNDER", "sam3").strip().lower()
 
+# Width cap on the frames FED TO SAM3 grounding (2026-07-28). SAM3's
+# instance decisions are input-scale-sensitive: the proven soak weeks ran
+# ≤1280-wide input; the Jul-27 1080p gateway deploy silently moved it to
+# 1920, where a recumbent/seated person intermittently splits into two
+# instances (phantom births 8-13/hr in occupied rooms, YOLO trigger
+# dets=1 throughout, plus a forced-reground loop arguing about it).
+# Masks are resized to track-res downstream either way — only SAM3's view
+# changes. 0 = native (the misbehaving regime); env knob is for live A/B.
+_SAM3_GROUND_W = int(os.environ.get("NEMARA_SAM3_GROUND_W", "1280"))
+
 
 def _track_dims(w: int, h: int) -> tuple[int, int, float]:
     """(track_w, track_h, scale) for a full-res frame. scale = track/orig."""
@@ -114,7 +124,14 @@ def _get_edge():
 
 def _iou(a: np.ndarray, b: np.ndarray) -> float:
     if a.shape != b.shape:
-        return 0.0
+        # Cross-resolution comparison (input res changed mid-session):
+        # rescale instead of declaring zero overlap — a silent 0.0 makes
+        # every carried track unmatchable and full-rebirths the room.
+        import cv2
+        b = cv2.resize(
+            b.astype(np.uint8), (a.shape[1], a.shape[0]),
+            interpolation=cv2.INTER_NEAREST,
+        ).astype(bool)
     inter = np.logical_and(a, b).sum()
     union = np.logical_or(a, b).sum()
     return float(inter) / float(union) if union else 0.0
@@ -192,6 +209,15 @@ class CameraSession:
         from perception import sam_track
 
         ctx = list(frames[: min(6, len(frames))])
+        if _SAM3_GROUND_W > 0 and ctx and ctx[0].shape[1] > _SAM3_GROUND_W:
+            s = _SAM3_GROUND_W / float(ctx[0].shape[1])
+            ctx = [
+                cv2.resize(
+                    f, (_SAM3_GROUND_W, max(1, round(f.shape[0] * s))),
+                    interpolation=cv2.INTER_AREA,
+                )
+                for f in ctx
+            ]
         got: list = []
         with torch.inference_mode(), torch.autocast(
             "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available(),
