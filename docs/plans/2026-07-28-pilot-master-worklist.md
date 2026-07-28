@@ -50,9 +50,40 @@
 
 ## Phase 1 — full-system soak (24–48h; THE ship-gate before any merge)
 
-- [ ] Detector matrix: every built-in preset type fires correctly across both
-      rooms; NL-refined custom detector; subject-scope (patient-elsewhere →
-      anyone-only); global crowd rule; cost vs bill-calibrated expectations.
+- [ ] Detector matrix — the soak ON-set (9), chosen to cover every active
+      bucket, every subject scope, audio, schedule, door, preset+custom+
+      fresh-create, and a deliberate negative case:
+
+      | Detector | Bucket (recipe) | Scope | On-demand test |
+      |---|---|---|---|
+      | Falls | scene (4fps clean, lite-tier) | patient | lie on the floor |
+      | Calling for help | scene + audio | patient | shout "help" |
+      | Convulsion | rapid (8fps OVERLAY, flash-tier, motion pre-gate) | patient | tremor mime; also verifies rapid gate stays $0 when quiet |
+      | Watching TV | person (4fps crop, lite-tier) | patient | turn TV on |
+      | Medication adherence | person | patient | pill-bottle mime |
+      | Setup test | scene | anyone | uncle/aunt walks through (doubles as discrimination test) |
+      | Wandering | scene + door_config | patient | exit through front door |
+      | Missed evening medication | scheduled (NO calls — evaluates from coverage at deadline) | patient | set window tonight, do NOTHING → must fire absence |
+      | (new) custom "drinking water from a glass" | person | patient | drink water; exercises create→compile→NL-refine e2e |
+
+      Buckets NOT covered (no detector uses them yet): fine_motion, face.
+      Left OFF: Meals (not on-demand), Agitation/Choking (optional mimes),
+      General Emergency (redundant w/ Falls), Stove (no kitchen camera).
+- [ ] Explicit tests beyond daily living (each with expected outcome):
+      1. Falls positive → event + clip in caregiver app ≤90s.
+      2. Calling-for-help positive → audio ridden, transcript non-empty.
+      3. Convulsion mime → rapid lane fires; quiet hours → rapid gate
+         chatter shows ⛔closed, $0.
+      4. Missed-medication NEGATIVE → absence fires at deadline with zero
+         VLM calls attributed to it.
+      5. Discrimination: visitor in frame → tracked, NOT seated, Setup-test
+         (anyone) fires, patient-scoped detectors do NOT.
+      6. Patient-elsewhere: Aryaman seated in bedroom → LR runs anyone-only
+         (skip reason identity_not_patient on patient-scoped LR calls).
+      7. Towel test (censor chain) → clip_censored + dignity overlay.
+      8. Wandering door exit → fires with door_config semantics.
+      9. Cost audit at hour 6 and hour 24: dashboard $ vs recorded
+         tokens×list-price by model; flag >10% drift.
 - [ ] Privacy chain live: staged sensitive event → screen → censor → censored
       clip w/ audio in caregiver app; quiet fall → clean clip. Outputs seed
       the sensitivity eval corpus.
