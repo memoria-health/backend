@@ -56,24 +56,31 @@
 
       | Detector | Bucket (recipe) | Scope | On-demand test |
       |---|---|---|---|
-      | Falls | scene (4fps clean, lite-tier) | patient | lie on the floor |
+      | Falls | scene (4fps clean) | patient | lie on the floor |
       | Calling for help | scene + audio | patient | shout "help" |
-      | Convulsion | rapid (8fps OVERLAY, flash-tier, motion pre-gate) | patient | tremor mime; also verifies rapid gate stays $0 when quiet |
-      | Watching TV | person (4fps crop, lite-tier) | patient | turn TV on |
-      | Medication adherence | person | patient | pill-bottle mime |
+      | Watching TV | scene — RECLASSIFIED 2026-07-28 (was person/zoom; TV-watching needs scene context — the crop excludes the evidence). Duration semantics via its N-in-M entry rule | patient | turn TV on ≥15 min; a glance must NOT fire |
+      | Medication adherence | person (4fps crop) | patient | pill-bottle mime |
       | Setup test | scene | anyone | uncle/aunt walks through (doubles as discrimination test) |
       | Wandering | scene + door_config | patient | exit through front door |
-      | Missed evening medication | scheduled (NO calls — evaluates from coverage at deadline) | patient | set window tonight, do NOTHING → must fire absence |
-      | (new) custom "drinking water from a glass" | person | patient | drink water; exercises create→compile→NL-refine e2e |
+      | Missed evening medication | scheduled/absence (NO calls — evaluates from coverage at deadline) | patient | set window tonight, do NOTHING → must fire absence |
+      | (new) "Drinking water" | person | patient | drink from a BOTTLE; exercises create→compile→NL-refine e2e |
 
-      Buckets NOT covered (no detector uses them yet): fine_motion, face.
-      Left OFF: Meals (not on-demand), Agitation/Choking (optional mimes),
-      General Emergency (redundant w/ Falls), Stove (no kitchen camera).
+      Convulsion EXCLUDED — deletion candidate (benchmark: VLM samples
+      below tremor frequency; silhouettes non-deterministic; successor =
+      computed-motion FFT post-pilot). Rapid bucket therefore untenanted
+      → flash-tier recipes go quiet (cost savings). fine_motion + face
+      buckets also have no tenants. Left OFF: Meals (not on-demand),
+      Agitation/Choking (optional mimes), General Emergency (redundant
+      w/ Falls), Stove (no kitchen camera).
+      COMPILER LESSON (from the Watching-TV miss): context-dependent
+      activities (watching TV, cooking, eating) must route to scene even
+      when the subject is a person; person crops are for body-evidence
+      tasks only. Fold into compiler prompt/goldens at branch wrap.
 - [ ] Explicit tests beyond daily living (each with expected outcome):
       1. Falls positive → event + clip in caregiver app ≤90s.
       2. Calling-for-help positive → audio ridden, transcript non-empty.
-      3. Convulsion mime → rapid lane fires; quiet hours → rapid gate
-         chatter shows ⛔closed, $0.
+      3. Watching TV duration: 15+ min viewing fires; a 1-min glance
+         does NOT (entry-rule negative).
       4. Missed-medication NEGATIVE → absence fires at deadline with zero
          VLM calls attributed to it.
       5. Discrimination: visitor in frame → tracked, NOT seated, Setup-test
