@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import subprocess
 import sys
 import tempfile
@@ -403,7 +404,9 @@ async def _censor_person_mask_subprocess(in_path: str, out_path: str) -> None:
 
 
 async def _censor_full_frame(in_path: str, out_path: str) -> None:
-    """Tier 2: pure-ffmpeg full-frame blur + `-an`. Deliberately no
+    """Tier 2: pure-ffmpeg full-frame blur, source audio kept
+    (2026-07-28: censored clips carry audio — product call; the visual
+    is censored, the cry for help must stay audible). Deliberately no
     OpenCV/ultralytics in this path so a broken CV stack can never take
     the last-resort censor down with it."""
     try:
@@ -413,7 +416,7 @@ async def _censor_full_frame(in_path: str, out_path: str) -> None:
             "-y",
             "-i", in_path,
             "-vf", _FFMPEG_BLUR_FILTER,
-            "-an",
+            "-map", "0:v", "-map", "0:a?", "-c:a", "copy",
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
@@ -432,11 +435,54 @@ async def _censor_full_frame(in_path: str, out_path: str) -> None:
         )
 
 
+async def _mux_source_audio(source_path: str, video_path: str) -> None:
+    """Copy the SOURCE clip's audio track onto a censored video-only
+    file, in place (2026-07-28: censored clips carry audio — the visual
+    is censored, the cry for help must stay audible). Best-effort: a
+    source with no audio track muxes cleanly to a silent clip via the
+    optional `0:a?` map, and any mux failure leaves the silent censored
+    video as-is (a censored clip without audio beats no clip)."""
+    import tempfile as _tempfile
+
+    tmp = _tempfile.mktemp(
+        suffix=".mp4", dir=os.path.dirname(video_path) or None,
+    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", video_path, "-i", source_path,
+            "-map", "0:v", "-map", "1:a?",
+            "-c", "copy", "-movflags", "+faststart",
+            tmp,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        rc = await proc.wait()
+        if rc == 0 and os.path.getsize(tmp) > 0:
+            os.replace(tmp, video_path)
+        else:
+            log.warning(
+                "censor.audio_mux_failed rc=%s — shipping censored video "
+                "without audio", rc,
+            )
+    except Exception:
+        log.warning(
+            "censor.audio_mux_failed — shipping censored video without "
+            "audio", exc_info=True,
+        )
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
 async def censor_clip(
     in_path: str, out_path: str, *, full_frame: bool = False,
 ) -> None:
     """Censor the clip at `in_path` into `out_path` (video pixelated/
-    blurred, audio stripped).
+    blurred; the SOURCE audio track is carried over — 2026-07-28
+    product call: visuals are censored, sound stays).
 
     ``full_frame=True`` skips tier 1 entirely — used when the caller has
     no per-clip verdict to trust (sensitivity screen failed), so the
@@ -451,6 +497,7 @@ async def censor_clip(
     if not full_frame:
         try:
             await _censor_person_mask_subprocess(in_path, out_path)
+            await _mux_source_audio(in_path, out_path)
             return
         except TimeoutError as exc:
             log.warning(

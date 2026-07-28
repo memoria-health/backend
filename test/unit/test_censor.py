@@ -8,8 +8,9 @@ download in CI.
 
 Contracts under test:
 
-  - AUDIO IS STRIPPED: a fixture clip WITH an audio track comes out of
-    both censor tiers with zero audio streams (ffprobe-verified).
+  - AUDIO IS KEPT (2026-07-28 product call): a fixture clip WITH an
+    audio track comes out of both censor tiers with its audio stream
+    intact (ffprobe-verified) — visuals censored, sound stays.
   - No-person frames of a sensitive clip are pixelated FULL-FRAME
     (`_censor_frame` with mask=None), and masked frames keep pixels
     outside the dilated mask untouched.
@@ -99,7 +100,7 @@ async def _write_fixture(tmp_path) -> str:
     in_path = str(tmp_path / "in.mp4")
     with open(in_path, "wb") as f:
         f.write(mp4)
-    # Sanity: the fixture really does carry audio, or the strip
+    # Sanity: the fixture really does carry audio, or the audio-kept
     # assertions below are vacuous.
     assert _codec_types(in_path) == {"video", "audio"}
     return in_path
@@ -108,11 +109,11 @@ async def _write_fixture(tmp_path) -> str:
 # ── full-frame tier (tier 2) ─────────────────────────────────────────
 
 
-async def test_full_frame_censor_strips_audio(tmp_path) -> None:
+async def test_full_frame_censor_keeps_audio(tmp_path) -> None:
     in_path = await _write_fixture(tmp_path)
     out_path = str(tmp_path / "out.mp4")
     await censor_clip(in_path, out_path, full_frame=True)
-    assert _codec_types(out_path) == {"video"}  # video kept, NO audio
+    assert _codec_types(out_path) == {"video", "audio"}
 
 
 async def test_full_frame_censor_raises_on_undecodable_input(tmp_path) -> None:
@@ -132,7 +133,7 @@ def _run_person_mask_inprocess(monkeypatch) -> None:
     subprocess) so the seg-seam monkeypatches apply. The subprocess
     mechanics themselves are covered by the subprocess-seam tests
     below; these tests pin the PIPELINE contract (frame treatment +
-    audio strip)."""
+    audio kept)."""
 
     async def _inprocess(in_path: str, out_path: str) -> None:
         await aio.to_thread(censor._censor_person_mask_sync, in_path, out_path)
@@ -140,21 +141,21 @@ def _run_person_mask_inprocess(monkeypatch) -> None:
     monkeypatch.setattr(censor, "_censor_person_mask_subprocess", _inprocess)
 
 
-async def test_person_mask_tier_no_person_pixelates_and_strips_audio(
+async def test_person_mask_tier_no_person_pixelates_and_keeps_audio(
     tmp_path, monkeypatch,
 ) -> None:
     """Sensitive clip, seg finds nobody in any frame → every frame is
-    censored full-frame (never left raw) and the audio is gone."""
+    censored full-frame (never left raw); source audio muxed back."""
     _run_person_mask_inprocess(monkeypatch)
     monkeypatch.setattr(censor, "_get_seg_model", lambda: object())
     monkeypatch.setattr(censor, "_person_mask", lambda model, frame: None)
     in_path = await _write_fixture(tmp_path)
     out_path = str(tmp_path / "out.mp4")
     await censor_clip(in_path, out_path)
-    assert _codec_types(out_path) == {"video"}
+    assert _codec_types(out_path) == {"video", "audio"}
 
 
-async def test_person_mask_tier_with_mask_strips_audio(
+async def test_person_mask_tier_with_mask_keeps_audio(
     tmp_path, monkeypatch,
 ) -> None:
     def _mask(model, frame):
@@ -169,7 +170,7 @@ async def test_person_mask_tier_with_mask_strips_audio(
     in_path = await _write_fixture(tmp_path)
     out_path = str(tmp_path / "out.mp4")
     await censor_clip(in_path, out_path)
-    assert _codec_types(out_path) == {"video"}
+    assert _codec_types(out_path) == {"video", "audio"}
 
 
 async def test_person_mask_streaming_preserves_frame_count(
@@ -204,7 +205,7 @@ async def test_seg_stack_failure_falls_back_to_full_frame(
     in_path = await _write_fixture(tmp_path)
     out_path = str(tmp_path / "out.mp4")
     await censor_clip(in_path, out_path)  # must not raise
-    assert _codec_types(out_path) == {"video"}
+    assert _codec_types(out_path) == {"video", "audio"}
 
 
 # ── tier-1 subprocess isolation (2026-07-28 hardening) ───────────────
@@ -239,7 +240,7 @@ async def test_subprocess_success_end_to_end(tmp_path, monkeypatch) -> None:
         ],
     )
     await censor_clip(in_path, out_path)
-    assert _codec_types(out_path) == {"video"}
+    assert _codec_types(out_path) == {"video", "audio"}
 
 
 async def test_subprocess_timeout_kills_child_and_falls_back(
@@ -271,7 +272,7 @@ async def test_subprocess_timeout_kills_child_and_falls_back(
     pid = int(open(pid_file).read())
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
-    assert _codec_types(out_path) == {"video"}
+    assert _codec_types(out_path) == {"video", "audio"}
 
 
 async def test_subprocess_nonzero_exit_falls_back(tmp_path, monkeypatch) -> None:
@@ -281,7 +282,7 @@ async def test_subprocess_nonzero_exit_falls_back(tmp_path, monkeypatch) -> None
     out_path = str(tmp_path / "out.mp4")
     _fake_cmd(monkeypatch, "-c", "import sys; sys.exit(3)")
     await censor_clip(in_path, out_path)  # must not raise
-    assert _codec_types(out_path) == {"video"}
+    assert _codec_types(out_path) == {"video", "audio"}
 
 
 async def test_subprocess_failure_and_tier2_failure_raises(
