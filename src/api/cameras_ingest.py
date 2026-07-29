@@ -393,7 +393,9 @@ async def gateway_roster(
     )
     rows = (await session.execute(
         text("SELECT id, livekit_identity, livekit_room, desired_state, "
-             "privacy_enabled "
+             "privacy_enabled, "
+             "(SELECT audio_capture_enabled FROM public.patients p "
+             " WHERE p.id = patient_id) AS audio_capture_enabled "
              f"FROM public.cameras {_cam_where} ORDER BY created_at"),
         {"c": caregiver_id, "gw": gateway_id},
     )).all()
@@ -402,10 +404,14 @@ async def gateway_roster(
     # restricts this camera's track subscription permissions to
     # detector_worker_* identities (publisher-side sever) — same contract
     # as the wall phone's desired-state poll.
+    # `audio_capture_enabled` (patient-level, 2026-07-28): when false the
+    # gateway never publishes the audio track — the facilities audio kill,
+    # severed at the source so nothing downstream can leak it.
     return {"tunnel_port": tunnel_port, "cameras": [
         {"camera_id": str(r[0]), "livekit_identity": r[1],
          "livekit_room": r[2], "desired_state": r[3],
-         "privacy_enabled": bool(r[4])}
+         "privacy_enabled": bool(r[4]),
+         "audio_capture_enabled": bool(r[5]) if r[5] is not None else True}
         for r in rows
     ]}
 
@@ -451,7 +457,9 @@ async def gateway_wait(
     async def snapshot():
         rows = (await session.execute(
             text("SELECT id, livekit_identity, livekit_room, desired_state, "
-                 "privacy_enabled "
+                 "privacy_enabled, "
+                 "(SELECT audio_capture_enabled FROM public.patients p "
+                 " WHERE p.id = patient_id) AS audio_capture_enabled "
                  "FROM public.cameras WHERE patient_id IN "
                  "(SELECT id FROM public.patients WHERE caregiver_id = :c) "
                  "AND source_type = 'gateway' "
@@ -462,14 +470,18 @@ async def gateway_wait(
         await session.commit()   # release the connection between checks
         cams = [{"camera_id": str(r[0]), "livekit_identity": r[1],
                  "livekit_room": r[2], "desired_state": r[3],
-                 "privacy_enabled": bool(r[4])} for r in rows]
-        # privacy_enabled rides in the fingerprint so a classifier /
-        # reclassify privacy flip wakes the long-poll immediately — the
-        # gateway must restrict track permissions within ~0.4s, not wait
-        # for the 3s roster fallback.
+                 "privacy_enabled": bool(r[4]),
+                 "audio_capture_enabled":
+                     bool(r[5]) if r[5] is not None else True}
+                for r in rows]
+        # privacy_enabled + audio_capture_enabled ride in the fingerprint
+        # so a classifier / reclassify / audio-kill flip wakes the
+        # long-poll immediately — the gateway must react within ~0.4s,
+        # not wait for the 3s roster fallback.
         fp = "|".join(
             f"{c['livekit_identity']}:{c['desired_state']}"
             f":{int(c['privacy_enabled'])}"
+            f":{int(c['audio_capture_enabled'])}"
             for c in cams
         )
         return cams, fp

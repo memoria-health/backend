@@ -32,9 +32,11 @@ _TICKS_SQL = text("""
 select a.captured_at, substr(a.camera_id::text, 1, 8) as cam,
        c.patient_id::text as patient_id,
        a.people_present, a.motion_in_clip,
-       a.detector_fields->>'sleep_detected'   as sd,
-       a.detector_fields->>'sleep_activity'   as sa,
-       a.detector_fields->>'sleep_confidence' as sc
+       a.detector_fields->>'sleep_detected'      as sd,
+       a.detector_fields->>'sleep_activity'      as sa,
+       a.detector_fields->>'sleep_confidence'    as sc,
+       a.detector_fields->>'activity_state'      as ast,
+       a.detector_fields->>'activity_confidence' as ac
 from analyses a join cameras c on c.id = a.camera_id
 where a.captured_at >= :t0 and a.captured_at < :t1
   and a.provider != 'skipped'
@@ -54,15 +56,15 @@ on conflict (patient_id, night_date) do update set
 """)
 
 _ACTIVITY_UPSERT = text("""
-insert into activity_days (patient_id, day_date, per_camera, occupied_ticks,
-    moving_ticks, active_fraction, room_transitions, coverage_ticks)
-values (cast(:pid as uuid), :dd, cast(:pc as jsonb), :oc, :mv, :af, :rt, :cv)
+insert into activity_days (patient_id, day_date, state_minutes,
+    active_fraction, room_transitions, labeled_minutes, label_ticks)
+values (cast(:pid as uuid), :dd, cast(:sm as jsonb), :af, :rt, :lm, :lt)
 on conflict (patient_id, day_date) do update set
-    per_camera = excluded.per_camera, occupied_ticks = excluded.occupied_ticks,
-    moving_ticks = excluded.moving_ticks,
+    state_minutes = excluded.state_minutes,
     active_fraction = excluded.active_fraction,
     room_transitions = excluded.room_transitions,
-    coverage_ticks = excluded.coverage_ticks, computed_at = now()
+    labeled_minutes = excluded.labeled_minutes,
+    label_ticks = excluded.label_ticks, computed_at = now()
 """)
 
 
@@ -74,7 +76,7 @@ def _utc_naive(d: date, hour: int) -> datetime:
 
 async def _run(night_date: date) -> None:
     from src.services.detection.activity_summary import (
-        ActivityTick, summarize_day,
+        StateTick, summarize_day,
     )
     from src.services.detection.sleep_summary import SleepTick, summarize_night
 
@@ -111,27 +113,29 @@ async def _run(night_date: date) -> None:
         # ── activity: the night_date's daytime (00:00 -> 24:00 local) ─
         d0 = _utc_naive(night_date, 0)
         d1 = _utc_naive(night_date + timedelta(days=1), 0)
+        day_end = min(d1, datetime.now(timezone.utc).replace(tzinfo=None))
         rows = (await s.execute(_TICKS_SQL, {"t0": d0, "t1": d1})).all()
         act: dict[str, list] = {}
         for r in rows:
-            act.setdefault(r.patient_id, []).append(ActivityTick(
+            if r.ast is None:
+                continue                 # activity detector off that tick
+            act.setdefault(r.patient_id, []).append(StateTick(
                 at=r.captured_at, camera=r.cam,
-                people_present=bool(r.people_present),
-                motion=bool(r.motion_in_clip),
+                state=r.ast, confidence=float(r.ac or 0.0),
             ))
         for pid, ticks in act.items():
-            day = summarize_day(ticks)
+            day = summarize_day(ticks, window_end=day_end)
             await s.execute(_ACTIVITY_UPSERT, {
                 "pid": pid, "dd": night_date,
-                "pc": json.dumps(day["per_camera"]),
-                "oc": day["occupied_ticks"], "mv": day["moving_ticks"],
+                "sm": json.dumps(day["state_minutes"]),
                 "af": day["active_fraction"],
-                "rt": day["room_transitions"], "cv": day["coverage_ticks"],
+                "rt": day["room_transitions"],
+                "lm": day["labeled_minutes"], "lt": day["label_ticks"],
             })
             print(f"activity {pid[:8]} {night_date}: "
+                  f"states={day['state_minutes']} "
                   f"active={day['active_fraction']} "
-                  f"transitions={day['room_transitions']} "
-                  f"coverage={day['coverage_ticks']}")
+                  f"labeled={day['labeled_minutes']}m")
         await s.commit()
 
 

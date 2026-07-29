@@ -62,6 +62,29 @@ _SLEEP_PROMPT_FRAGMENT = (
     "sleep_reasoning: 1 short sentence describing what you saw."
 )
 
+# Activity (2026-07-28, Aryaman): "actual physical activity and
+# movement" — engagement, not raw pixel motion. Seated EXERCISE is
+# active; seated fidgeting is sitting. Same transition-labeling economy
+# as sleep: labels ride motion ticks, silence persists the last state
+# (a posture change is physically a motion event), and the daily
+# summarizer time-weights the timeline. record_only — never an event.
+_ACTIVITY_PROMPT_FRAGMENT = (
+    "activity_detected: boolean. TRUE if the person is PHYSICALLY ACTIVE "
+    "— walking, exercising (including seated exercises like lifting "
+    "weights or stretching), doing chores, or otherwise physically "
+    "engaged in a task. FALSE if they are lying down, sitting passively "
+    "(reading, watching TV, using a phone — small hand movements do NOT "
+    "count as activity), or standing still.\n"
+    "activity_state: string, exactly one of: 'lying', 'sitting' "
+    "(seated and NOT physically exercising, regardless of small hand/arm "
+    "movements), 'standing' (upright but not going anywhere), 'active' "
+    "(walking, exercising in ANY posture including seated weights or "
+    "floor exercises, chores, physically engaged tasks). Pick the state "
+    "that best describes MOST of the clip.\n"
+    "activity_confidence: number 0-1.\n"
+    "activity_reasoning: 1 short sentence describing the activity level."
+)
+
 _FALL_PROMPT_FRAGMENT = (
     "fall_detected: boolean. TRUE if a person falls to the ground in the "
     "clip — they collapse, slip, trip, stumble, sag, or drop and end up down "
@@ -810,7 +833,10 @@ class CatalogEntry:
     # Alerting spine (2026-07-26): which moment fires + internal temporal
     # nature. Most built-ins are leading; agitation is sustained; stove is a
     # duration ("on & unattended > duration_seconds").
-    alert_trigger: str = "leading"   # leading | trailing | duration | schedule
+    # record_only (2026-07-28): the detector's fields are recorded on every
+    # tick for summarizers (sleep/activity) but NEVER promote an event or
+    # notify anyone — skipped by reactive promotion AND the scheduled runner.
+    alert_trigger: str = "leading"   # leading | trailing | duration | schedule | record_only
     is_sustained: bool = False
     duration_seconds: int | None = None
     # Most detectors use `<key>_detected`. Medication is the exception
@@ -835,6 +861,11 @@ class CatalogEntry:
     # flips the (single, per-patient) detector row's `is_on=false` the instant
     # it promotes an event, so it can't fire again on this or any other camera.
     fire_once: bool = False
+    # Extra per-tick response fields BEYOND the standard detected/confidence/
+    # reasoning triple (2026-07-28, sleep/activity): merged into schema_json so
+    # they reach the LLM RESPONSE SCHEMA — a field named only in the prompt is
+    # never returned by structured output. {"field": {"type": "string"}, ...}
+    extra_schema: "dict[str, dict[str, str]] | None" = None
 
     @property
     def detected_key(self) -> str:
@@ -856,6 +887,7 @@ class CatalogEntry:
             self.detected_key:   {"type": "boolean"},
             self.confidence_key: {"type": "number"},
             self.reasoning_key:  {"type": "string"},
+            **(self.extra_schema or {}),
         }
 
 
@@ -904,6 +936,19 @@ CATALOG: tuple[CatalogEntry, ...] = (
         category="routine", cohort="both",
         recommended=False, seeded=False, prompt_fragment=_SLEEP_PROMPT_FRAGMENT,
         promotion_threshold=0.60,
+        alert_trigger="record_only",
+        extra_schema={"sleep_activity": {"type": "string"}},
+    ),
+    CatalogEntry(
+        key="activity", name="Activity", icon_name="figure.walk",
+        description="Tracks how much of the day is spent lying, sitting, "
+                    "standing, or physically active.",
+        category="routine", cohort="both",
+        recommended=False, seeded=False,
+        prompt_fragment=_ACTIVITY_PROMPT_FRAGMENT,
+        promotion_threshold=0.60,
+        alert_trigger="record_only",
+        extra_schema={"activity_state": {"type": "string"}},
     ),
     CatalogEntry(
         key="medication", name="Medication adherence", icon_name="pills",
@@ -1079,7 +1124,7 @@ def _validate_catalog() -> None:
             raise ValueError(f"[catalog] {e.key}: bad cohort {e.cohort!r}")
         if e.category not in ("safety", "routine"):
             raise ValueError(f"[catalog] {e.key}: bad category {e.category!r}")
-        if e.alert_trigger not in ("leading", "trailing", "duration", "absence"):
+        if e.alert_trigger not in ("leading", "trailing", "duration", "absence", "record_only"):
             raise ValueError(f"[catalog] {e.key}: bad alert_trigger {e.alert_trigger!r}")
         if e.alert_trigger == "duration" and not e.duration_seconds:
             raise ValueError(f"[catalog] {e.key}: duration trigger needs duration_seconds")
@@ -1204,6 +1249,7 @@ _SEVERITY: dict[str, int] = {
     "meal_eaten": 22,
     "medication": 20,
     "sleep": 15,     # overnight labeling — below every safety + medication
+    "activity": 14,  # daytime state labeling — record_only, lowest priority
 }
 
 

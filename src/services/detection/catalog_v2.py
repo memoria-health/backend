@@ -60,6 +60,11 @@ DIMS: dict[str, DetectorDims] = {
     # dropping any label corrupts the whole night. The economy comes
     # from tick silence, never from skipping labels.
     "sleep":       DetectorDims(True, "patient", "scene", 15),
+    # Activity: PERSON bucket (body-evidence + binds to the patient's
+    # identified track — visitors never pollute the score); rides the
+    # person call that fires on motion ticks. Same silence-persists
+    # economy as sleep. record_only.
+    "activity":    DetectorDims(True, "patient", "person", 14),
     "medication":  DetectorDims(True, "patient", "person", 20),
     "climbing":    DetectorDims(True, "patient", "scene", 66,
                                 evidence_unit="sample"),

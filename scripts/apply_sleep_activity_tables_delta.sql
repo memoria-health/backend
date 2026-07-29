@@ -17,6 +17,14 @@ CREATE TABLE IF NOT EXISTS public.sleep_nights (
     UNIQUE (patient_id, night_date)
 );
 
+-- v2 (same day): activity moved from motion-tick counts to time-weighted
+-- VLM state minutes (lying/sitting/standing/active). Legacy count columns
+-- retained with defaults; new columns below.
+ALTER TABLE IF EXISTS public.activity_days
+    ADD COLUMN IF NOT EXISTS state_minutes   jsonb NOT NULL DEFAULT '{}'::jsonb,
+    ADD COLUMN IF NOT EXISTS labeled_minutes real,
+    ADD COLUMN IF NOT EXISTS label_ticks     integer NOT NULL DEFAULT 0;
+
 CREATE TABLE IF NOT EXISTS public.activity_days (
     id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     patient_id    uuid NOT NULL REFERENCES public.patients(id) ON DELETE CASCADE,
@@ -27,6 +35,9 @@ CREATE TABLE IF NOT EXISTS public.activity_days (
     active_fraction   real,
     room_transitions  integer NOT NULL DEFAULT 0,
     coverage_ticks    integer NOT NULL DEFAULT 0,
+    state_minutes     jsonb NOT NULL DEFAULT '{}'::jsonb,
+    labeled_minutes   real,
+    label_ticks       integer NOT NULL DEFAULT 0,
     computed_at   timestamptz NOT NULL DEFAULT now(),
     UNIQUE (patient_id, day_date)
 );

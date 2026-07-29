@@ -30,7 +30,6 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 ONSET_QUIET = timedelta(minutes=15)
-OUT_RETURN_MAX = timedelta(minutes=60)
 WAKE_CONFIRM = timedelta(minutes=30)
 MIN_CONFIDENCE = 0.6
 
@@ -98,11 +97,14 @@ def summarize_night(
             i += 1
             continue
         if t.activity == "leaving_bed" or (not t.in_bed):
-            # Return-scan: a later in-bed tick within OUT_RETURN_MAX
-            # makes this an out-of-bed event, not the wake.
+            # Return-scan (reopen fix, Aryaman 2026-07-28): ANY later
+            # in-bed tick makes this an out-of-bed event — including a
+            # 3am wander that lasts hours, clinically the headline
+            # event. Wake is ONLY a leave with no return before the
+            # window ends. (v1 capped returns at 60min and truncated
+            # wander nights with a false wake.)
             ret = next(
-                (j for j in range(i + 1, len(ts))
-                 if ts[j].in_bed and ts[j].at - t.at <= OUT_RETURN_MAX),
+                (j for j in range(i + 1, len(ts)) if ts[j].in_bed),
                 None,
             )
             if ret is not None:

@@ -2,7 +2,7 @@
 
 from datetime import datetime, timedelta
 
-from src.services.detection.activity_summary import ActivityTick, summarize_day
+from src.services.detection.activity_summary import StateTick, summarize_day
 from src.services.detection.sleep_summary import SleepTick, summarize_night
 
 _N = datetime(2026, 7, 28, 22, 0)          # 10pm, naive-UTC like the DB
@@ -66,18 +66,41 @@ def test_wake_needs_confirmation_gap() -> None:
     assert "incomplete_night" in out["flags"]
 
 
-def test_activity_day_rollup() -> None:
-    base = datetime(2026, 7, 28, 9, 0)
+def test_night_wander_over_an_hour_is_out_of_bed_not_wake() -> None:
+    # The reopen fix: 90 minutes out at 3am must NOT truncate the night.
     ticks = [
-        ActivityTick(base + timedelta(minutes=i * 10), cam, present, motion)
-        for i, (cam, present, motion) in enumerate([
-            ("LR", True, True), ("LR", True, False), ("BR", True, True),
-            ("LR", True, True), ("LR", False, False),
-        ])
+        _t(0, True, "settling"),
+        _t(300, False, "leaving_bed"),     # 03:00 wander
+        _t(390, True, "settling"),         # 04:30 back to bed
+        _t(600, False, "leaving_bed"),     # 08:00 real wake
     ]
-    out = summarize_day(ticks)
-    assert out["occupied_ticks"] == 4
-    assert out["moving_ticks"] == 3
-    assert out["active_fraction"] == 0.75
-    assert out["room_transitions"] == 2      # LR→BR→LR
-    assert out["coverage_ticks"] == 5
+    out = summarize_night(ticks, window_end=_N + timedelta(hours=14))
+    assert len(out["out_of_bed_events"]) == 1
+    assert out["out_of_bed_events"][0]["duration_minutes"] == 90
+    assert out["wake_time"] == _t(600, False).at
+    # onset 22:00 → wake 06:00 = 600 min, minus 90 away
+    assert out["duration_minutes"] == 510
+    assert out["flags"] == []
+
+
+def test_activity_state_timeline_time_weighted() -> None:
+    base = datetime(2026, 7, 28, 9, 0)
+
+    def s(mins, cam, state, conf=0.9):
+        return StateTick(base + timedelta(minutes=mins), cam, state, conf)
+
+    ticks = [
+        s(0, "LR", "sitting"),       # 9:00 sits (fidgeting labels sitting)
+        s(60, "LR", "active"),       # 10:00 seated weights — ACTIVE
+        s(90, "BR", "lying"),        # 10:30 lies down in bedroom
+        s(95, "BR", "junk", 0.9),    # unknown state ignored
+        s(120, "LR", "sitting", 0.2),  # low confidence ignored
+    ]
+    out = summarize_day(ticks, window_end=base + timedelta(minutes=150))
+    assert out["state_minutes"] == {
+        "lying": 60.0, "sitting": 60.0, "standing": 0.0, "active": 30.0,
+    }
+    assert out["active_fraction"] == 0.2       # 30 / 150 labeled
+    assert out["room_transitions"] == 1        # LR→BR
+    assert out["labeled_minutes"] == 150.0
+    assert out["label_ticks"] == 3

@@ -347,7 +347,9 @@ async def maybe_promote_analysis(
         # runner to read, but must NOT fire reactively here: schedule fires on
         # ABSENCE at its deadline; trailing fires on the FALLING edge when the
         # activity ends. Both are handled by the ScheduledDetectorRunner.
-        if det.alert_trigger in ("absence", "trailing"):
+        if det.alert_trigger in ("absence", "trailing", "record_only"):
+            # record_only (sleep/activity): fields feed the summarizers,
+            # never an event — and the scheduled runner ignores it too.
             continue
 
         detected_field, conf_field, base = _promotion_spec_for(det)
