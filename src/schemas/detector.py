@@ -94,9 +94,6 @@ class DetectorResponse(BaseModel):
     # user-meaningful "has it gone on too long" bar. Distinct from
     # episode_gap_seconds (hysteresis) and from the internal M-of-N.
     duration_seconds: int | None = None
-    # Legacy display scalar — DERIVED on serialize from where_rooms (no longer
-    # stored). "ALL ROOMS" for every-room, else the joined room names.
-    where_scope: Scope = "ALL ROOMS"
     # Rooms the detector is scoped to (the canonical stored rep). None → every
     # room (back-compat with rows created before multi-room existed).
     where_rooms: Rooms | None = None

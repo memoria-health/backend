@@ -60,7 +60,7 @@ async def test_list_detectors_returns_four_presets_after_patient_create(
     assert falls["category"] == "safety"
     assert falls["source"] == "preset"
     assert falls["alert_trigger"] == "leading"
-    assert falls["where_scope"] == "ALL ROOMS"
+    assert falls.get("where_scope") is None   # vestige deleted 2026-07-28
     assert falls["when_scope"] == "ALWAYS"
     assert falls["sensitivity"] == "standard"
     assert falls["is_on"] is True
@@ -96,7 +96,7 @@ async def test_create_custom_detector_full_field_assertion(
     assert d["category"] == "safety"
     assert d["source"] == "custom"                          # server-forced
     assert d["alert_trigger"] == "leading"
-    assert d["where_scope"] == "KITCHEN"
+    assert d["where_rooms"] == ["KITCHEN"]
     assert d["when_scope"] == "11 PM – 6 AM"
     assert d["sensitivity"] == "standard"                   # default
     assert d["is_on"] is True

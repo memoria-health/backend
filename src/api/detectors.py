@@ -269,17 +269,7 @@ def _to_response(d: Detector) -> DetectorResponse:
     resp = DetectorResponse.model_validate(d, from_attributes=True)
     return resp.model_copy(update={
         "accuracy_caveat": _accuracy_caveat(d.identifier, d.bucket),
-        # where_scope is no longer stored — derived from the canonical rooms.
-        "where_scope": _scalar_where_scope(d.where_rooms),
     })
-
-
-def _scalar_where_scope(rooms: list[str] | None) -> str:
-    """The legacy `where_scope` display scalar, DERIVED from the room set:
-    "ALL ROOMS" for every-room, else the joined room names bounded to 80."""
-    if camera_detector_repo.rooms_mean_all(rooms):
-        return "ALL ROOMS"
-    return ", ".join(rooms)[:80]
 
 
 @router.get(
@@ -1017,7 +1007,6 @@ async def refine_detector(
             "duration_seconds": new_duration,
             "when_scope": when_scope,
             "where_rooms": where_rooms,
-            "where_scope": _scalar_where_scope(where_rooms),
         })
 
     old_rooms = det.where_rooms
