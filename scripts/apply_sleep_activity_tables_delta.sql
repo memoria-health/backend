@@ -2,6 +2,15 @@
 -- tools/run_daily_summaries.py from the pure summarizers
 -- (sleep_summary.py / activity_summary.py). RECORD-ONLY for pilots — no
 -- notifications read these yet. Idempotent.
+-- record_only alert trigger (sleep/activity): the detectors' fields feed
+-- the summary tables below, never event promotion. The CHECK must admit
+-- the new value or the rows can't insert.
+ALTER TABLE public.detectors DROP CONSTRAINT IF EXISTS detectors_alert_trigger_check;
+ALTER TABLE public.detectors ADD CONSTRAINT detectors_alert_trigger_check
+    CHECK (alert_trigger = ANY (ARRAY[
+        'leading'::text, 'trailing'::text, 'duration'::text,
+        'absence'::text, 'record_only'::text]));
+
 CREATE TABLE IF NOT EXISTS public.sleep_nights (
     id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     patient_id    uuid NOT NULL REFERENCES public.patients(id) ON DELETE CASCADE,
