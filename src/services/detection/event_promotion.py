@@ -352,6 +352,21 @@ async def maybe_promote_analysis(
             # never an event — and the scheduled runner ignores it too.
             continue
 
+        # Criticality split (Aryaman 2026-07-28, from the soak's first
+        # false fire — Watching TV attributed to a visiting aunt):
+        # NON-CRITICAL patient detectors (category=routine) FAIL-QUIET —
+        # they fire only when identity POSITIVELY confirms the patient in
+        # the clip, so a visitor's routine never lands on the patient's
+        # record. SAFETY detectors keep FAIL-LOUD semantics (fire unless
+        # the patient is confirmed elsewhere — the upstream skip): a fall
+        # must never be missed because a face wasn't visible.
+        if (det.subject_scope == "patient"
+                and det.category == "routine"
+                and not _is_truthy_bool(
+                    detector_fields.get("identity_patient_in_clip"))):
+            skipped.append(f"{ident}(patient_unconfirmed)")
+            continue
+
         detected_field, conf_field, base = _promotion_spec_for(det)
         if not _is_truthy_bool(detector_fields.get(detected_field)):
             continue
