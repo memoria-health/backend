@@ -633,25 +633,62 @@ _PAGE = """<!doctype html><html><head><meta charset="utf-8">
   <span class="chip" id="since"></span>
   <span class="chip num" id="pace"></span>
 </header>
-<div class="card"><h2>Cameras</h2><div class="cams" id="cams"></div></div>
-<div class="card"><h2>Test plan — in order; each step earns trust for the next</h2>
+<div class="card"><h2>SOAK TEST PLAN — 2026-07-28 wave (identity + privacy + detectors + sleep/activity)</h2>
+<p class="mut" style="font-size:12px;margin:0 0 8px">Every test is doable at a moment's notice. Narrate takes in chat ("fall, now") so Claude timestamps ground truth. Model: <span class="mono">gemini-3.5-flash-lite</span> everywhere; every call records model+tokens, so the 3.6-flash bill is arithmetic.</p>
+
+<h3 style="margin:10px 0 4px">A · Active detectors (10)</h3>
 <div class="tblwrap"><table>
-<tr><th>#</th><th>Do</th><th>Expect</th></tr>
-<tr><td>1</td><td>Un-pause both cams, say "go"</td><td>ticks flip to analyzed · exactly one scene call · no events</td></tr>
-<tr><td>2</td><td>Walk into view</td><td>tracks=1 on the tick line · evidence photo with an UNKNOWN box</td></tr>
-<tr><td>3</td><td>Enroll, then face the camera</td><td>box flips to PATIENT *face — identity chain proven</td></tr>
-<tr><td>4</td><td>One fall (lie down abruptly)</td><td>ONE fall event on the phone — full pipeline works</td></tr>
-<tr><td>5</td><td>Stay lying a while</td><td>no second fall event — anti-spam holds</td></tr>
-<tr><td>6</td><td>Shake hard ~20 s · later, jumping jacks</td><td>shake → convulsion fires (overlay call + gate in log) · jacks → NOTHING</td></tr>
-<tr><td>7</td><td>Pill-take gesture</td><td>medication fires · its zoomed call visible in the log</td></tr>
-<tr><td>8</td><td>Glance at TV 2 min · later, watch 20 min straight</td><td>glance: nothing · full watch: ONE alert around minute 15</td></tr>
-<tr><td>9</td><td>Drink water on camera before 5:45 pm · skip stretching</td><td>Water check silent · ~6:50 pm stretching absence alert with coverage %</td></tr>
-<tr><td>10</td><td>Passive: TV on in empty room ~40 min · fan in closed bedroom</td><td>ZERO events — this is the false-alarm + cost dataset</td></tr>
-<tr><td>11</td><td>Burner on, walk away 10 min</td><td>stove alert</td></tr>
-<tr><td>12</td><td>Privacy on 15 min (ideally mid-recording)</td><td>ticks continue · no clips · in-flight recording dies un-uploaded</td></tr>
+<tr><th>Detector</th><th>Bucket</th><th>Scope</th><th>Alerting</th></tr>
+<tr><td>Falls</td><td>scene</td><td>patient</td><td>event + clip + notify</td></tr>
+<tr><td>Calling for help</td><td>scene + audio</td><td>patient</td><td>event + clip + notify</td></tr>
+<tr><td>Watching TV <span class="mut">(reclassified to scene; ~5-min entry)</span></td><td>scene</td><td>patient</td><td>event after sustained viewing</td></tr>
+<tr><td>Medication adherence</td><td>person crop</td><td>patient</td><td>event + notify</td></tr>
+<tr><td>Setup test</td><td>scene</td><td><b>anyone</b></td><td>event, fire-once</td></tr>
+<tr><td>Wandering</td><td>scene + door</td><td>patient</td><td>event + notify</td></tr>
+<tr><td>Missed evening medication</td><td>scheduled/absence — ZERO calls</td><td>patient</td><td>absence event at deadline</td></tr>
+<tr><td>Drinking water <span class="mut">(create via web UI — tests the create→compile flow itself)</span></td><td>person crop</td><td>patient</td><td>event</td></tr>
+<tr><td>Sleep</td><td>scene</td><td>patient</td><td><b>record_only</b> — nightly row, NEVER an event</td></tr>
+<tr><td>Activity</td><td>person crop</td><td>patient</td><td><b>record_only</b> — daily row, NEVER an event</td></tr>
 </table></div>
-<p class="mut" style="font-size:12px;margin:8px 0 0">Steps 1–4 are the "system is alive" gate. Narrate takes in chat ("fall, now") — Claude timestamps <span class="mono">soak_truth.csv</span>; evening scoring: <span class="mono">soak_report.py --hours 4 --truth soak_truth.csv</span></p>
+<p class="mut" style="font-size:12px;margin:4px 0 8px">Off by design: Meals (not on-demand) · Agitation/Choking (optional mimes) · General Emergency (redundant w/ Falls) · Stove (no kitchen cam) · Convulsion (DELETED — VLM below tremor Nyquist).</p>
+
+<h3 style="margin:10px 0 4px">B · Moment's-notice detector tests</h3>
+<div class="tblwrap"><table>
+<tr><th>#</th><th>Do (≤2 min each)</th><th>Expect</th><th>Verify where</th></tr>
+<tr><td>1</td><td>Lie on the floor abruptly</td><td>ONE fall event ≤90s, clean clip</td><td>phone + Events feed</td></tr>
+<tr><td>2</td><td>Stay lying 3 more min</td><td>NO second fall event (anti-spam)</td><td>Events feed</td></tr>
+<tr><td>3</td><td>Shout "help, help me" while still</td><td>calling-for-help fires, transcript non-empty (audio path)</td><td>event body + tick log</td></tr>
+<tr><td>4</td><td>Pill-bottle mime to mouth</td><td>medication fires; person-crop call visible in tick log</td><td>tick log <span class="mono">person:</span> call</td></tr>
+<tr><td>5</td><td>Glance at TV 1 min, walk away</td><td>NOTHING (entry-rule negative)</td><td>Events feed stays quiet</td></tr>
+<tr><td>6</td><td>Watch TV ~5+ min</td><td>ONE watching-tv event around min 5</td><td>Events feed</td></tr>
+<tr><td>7</td><td>Create "Drinking water (from a bottle)" in web UI, then drink from a bottle</td><td>compile succeeds (no warning) → detector fires on the drink</td><td>web create flow + Events</td></tr>
+<tr><td>8</td><td>Exit through the front door fully</td><td>wandering fires (door semantics)</td><td>Events feed</td></tr>
+<tr><td>9</td><td>Tonight: do NOTHING at med window</td><td>missed-medication absence event at deadline, zero VLM calls attributed</td><td>Events + tick log (no calls)</td></tr>
+</table></div>
+
+<h3 style="margin:10px 0 4px">C · Sleep + Activity (record-only — check tables, never the feed)</h3>
+<div class="tblwrap"><table>
+<tr><th>Do</th><th>Expect</th></tr>
+<tr><td>Sleep normally tonight</td><td>morning <span class="mono">run_daily_summaries.py</span> → sleep_nights row: bedtime/onset/wake within ±15 min of your recollection; disturbances ≈ remembered wake-ups; NO event, NO notification</td></tr>
+<tr><td>Daytime: 10 min lying on the couch, 10 min seated at desk (fidget freely!), 5 min seated arm exercises, walk between rooms</td><td>activity_days state_minutes: fidgeting counts as SITTING, seated exercise as ACTIVE, transitions counted; NO event</td></tr>
+<tr><td>Lie in bed awake on your phone 10 min before sleeping</td><td>ticks labeled NOT-asleep (propped/phone excluded by the strict definition) — bedtime starts only when you actually settle</td></tr>
+</table></div>
+
+<h3 style="margin:10px 0 4px">D · System drills (once each during the soak)</h3>
+<div class="tblwrap"><table>
+<tr><th>Drill</th><th>Do</th><th>Pass condition</th></tr>
+<tr><td>WIFI (the big one)</td><td>router off 3 min, hands OFF</td><td>gateway + backend + identity + GPU link all green ≤60s after restore, zero human action; watch the ssh tunnel (known weak link)</td></tr>
+<tr><td>Audio kill</td><td>flip Audio OFF in settings (web or iOS), speak near a camera 1 min, flip back</td><td>gateway log "video ONLY, audio killed" within seconds; no transcript for that window; audio returns on flip-back</td></tr>
+<tr><td>Censor chain</td><td>towel test in a private room</td><td>clip_censored=true, dignity overlay in app, audio preserved, never autoplays</td></tr>
+<tr><td>Discrimination</td><td>uncle/aunt walks through alone, then both of you in frame</td><td>they are TRACKED but never seated as patient; Setup-test (anyone) fires; patient-scoped detectors do NOT fire on them; two real people = two tracks (no merge)</td></tr>
+<tr><td>Patient-elsewhere</td><td>you in bedroom (seat confirmed), visitor in LR</td><td>LR runs anyone-only; patient-scoped LR ticks skip with <span class="mono">identity_not_patient</span></td></tr>
+<tr><td>Data-collection exclusion</td><td>research consent ON, motion in both rooms</td><td>B2 receives clips ONLY from the non-private camera</td></tr>
+</table></div>
+
+<h3 style="margin:10px 0 4px">E · Standing negatives + daily rituals</h3>
+<p class="mut" style="font-size:12px;margin:0">NEGATIVES (should stay silent): empty rooms all day = $0 · you sitting still = $0 calls · TV playing in an empty room · fan/curtain motion. RITUALS: hour-6 + hour-24 cost audit (this page's $ vs tokens×list-price, flag >10% drift) · every morning <span class="mono">uv run python tools/run_daily_summaries.py</span> then compare vs recollection · watch phantom births stay ~0 (bedroom occupied) · identity restarts should be 0.</p>
 </div>
+<div class="card"><h2>Cameras</h2><div class="cams" id="cams"></div></div>
 <!-- Legacy "Identity — per camera" card removed (Aryaman 2026-07-24):
      its data source was the stopped batch pipeline. The lane timeline
      lives on, fed by the NEW identity service, above the live views.
