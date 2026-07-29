@@ -160,15 +160,21 @@
        must never enter the patient's behavioral record), web + iOS
        category color/label maps. Trace the FULL enum fanout (DDL,
        schema, both client enums — the record_only lesson).
-0b.[ ] MULTI-WINDOW when_scope (found 2026-07-28, soak): the Medication
-       adherence preset ships when_scope="8 AM, 8 PM +-1H" but
-       parse_schedule SILENTLY TRUNCATES to the first window (7-9 AM
-       runtime eligibility only — the evening dose is unwatched), and
-       the client editor can't parse it at all (displays "All day").
-       Three surfaces, three stories. Fix = real multi-window support
-       (parser + ScheduleWindow + is_active + dims + editor display) OR
-       forbid multi-window strings at the catalog/compiler boundary and
-       ship two rows. Soak workaround: row set when_scope=ALWAYS.
+0b.[x] MULTI-WINDOW when_scope — FIXED same night (2026-07-28).
+       CORRECTED facts: per-tick ELIGIBILITY (is_active) always
+       honored both windows — leading detectors like Medication
+       adherence were never truncated (earlier claim wrong). The real
+       truncation was parse_schedule (the ABSENCE runner's lens, first
+       window only) + the web editor displaying "All day" for scopes it
+       couldn't parse. Fixed: parse_schedules() returns every window;
+       the absence runner evaluates each at its own deadline (stateless
+       per-window single-fire via event occurred_at == deadline;
+       last_scheduled_eval_date = whole-day completion only); web
+       editor fail-honest 'other' state shows the scope verbatim.
+       Medication row restored to "8 AM, 8 PM +-1H" (the truth).
+0c.[x] ALERT-MEANING NAMING — compiler outputs suggested_name (absence
+       = miss-phrased, else the activity); web create flow applies it.
+       [ ] iOS create flow applies suggested_name (rides next build).
        ALERT-TRIGGER SEMANTICS (documented from the med incident): a
        detector always watches for a POSITIVE activity; alert_trigger
        is the alerting polarity on top — leading fires on sight,
