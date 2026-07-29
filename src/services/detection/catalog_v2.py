@@ -52,6 +52,11 @@ DIMS: dict[str, DetectorDims] = {
     # "seizure" removed 2026-07-28 with its catalog entry (VLM samples
     # below tremor frequency; rapid lane stays for warned customs).
     "wandering":   DetectorDims(True, "patient", "scene", 55),
+    # Sleep: requires_motion=True is the COST DESIGN, not an oversight —
+    # burst ticks label the moments, tick silence between them is the
+    # asleep signal (sleep_summary.py). A still sleeper costs $0.
+    "sleep":       DetectorDims(True, "patient", "scene", 15,
+                                duty_cycle="thinned"),
     "medication":  DetectorDims(True, "patient", "person", 20),
     "climbing":    DetectorDims(True, "patient", "scene", 66,
                                 evidence_unit="sample"),

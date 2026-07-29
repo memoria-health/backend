@@ -35,6 +35,30 @@ from datetime import date, datetime, timezone
 # `onboarding.py` so seeding output is byte-identical. Do not reword
 # them here without intending to change every patient's detector.
 
+# Sleep (2026-07-28, Aryaman's design): the DETECTOR only labels burst
+# ticks — ticks are motion-gated, so a still sleeper generates none and
+# the tick SILENCE between labeled moments is the sleep signal. The
+# nightly state machine (sleep_summary.py) derives bedtime / onset /
+# disturbances / out-of-bed / wake from these labels + the gaps. Cost:
+# rides the shared scene call on ticks that fire anyway (~1-2% prompt
+# growth); a quiet night is $0. Pin to the lite tier when per-detector
+# difficulty routing lands — this is an EASY visual task.
+_SLEEP_PROMPT_FRAGMENT = (
+    "sleep_detected: boolean. TRUE if a person is lying in a bed (on or "
+    "under the covers, reclined in a sleeping position). FALSE if no one "
+    "is in the bed, they are only sitting on the edge, or they are "
+    "standing / away from the bed.\n"
+    "sleep_activity: string, exactly one of: 'settling' (getting into "
+    "bed, arranging covers, lying down), 'stirring' (movement while "
+    "staying lying down — rolling over, shifting), 'sitting_up' (rising "
+    "to a sitting position in bed), 'leaving_bed' (getting out of bed "
+    "or already out and moving away), 'none' (no bed-related activity "
+    "visible). Pick the LAST state visible in the clip.\n"
+    "sleep_confidence: number 0-1. 0.7+ = the in-bed/out-of-bed state is "
+    "clearly visible.\n"
+    "sleep_reasoning: 1 short sentence describing what you saw."
+)
+
 _FALL_PROMPT_FRAGMENT = (
     "fall_detected: boolean. TRUE if a person falls to the ground in the "
     "clip — they collapse, slip, trip, stumble, sag, or drop and end up down "
@@ -871,6 +895,14 @@ CATALOG: tuple[CatalogEntry, ...] = (
         promotion_threshold=0.70,
     ),
     CatalogEntry(
+        key="sleep", name="Sleep", icon_name="bed.double",
+        description="Tracks bedtime, sleep duration, disturbances, and "
+                    "out-of-bed events overnight.",
+        category="routine", cohort="both",
+        recommended=False, seeded=False, prompt_fragment=_SLEEP_PROMPT_FRAGMENT,
+        promotion_threshold=0.60,
+    ),
+    CatalogEntry(
         key="medication", name="Medication adherence", icon_name="pills",
         description="Confirms the morning and evening pill routine at the kitchen counter.",
         category="routine", cohort="adult",
@@ -1145,7 +1177,7 @@ _SEVERITY: dict[str, int] = {
     "choking": 100,
     "fire_smoke": 98,
     "child_cord_entanglement": 97,
-    "seizure": 96,
+    # "seizure" removed 2026-07-28 with its catalog entry.
     "fall": 95,
     "child_head_impact": 93,
     "calling_for_help": 88,
@@ -1168,6 +1200,7 @@ _SEVERITY: dict[str, int] = {
     "child_device_usage": 25,
     "meal_eaten": 22,
     "medication": 20,
+    "sleep": 15,     # overnight labeling — below every safety + medication
 }
 
 
