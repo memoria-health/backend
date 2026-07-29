@@ -75,6 +75,9 @@ class PatientResponse(BaseModel):
     status_line: str
     last_event_at: datetime | None
     cameras_paused: bool
+    # Facilities audio kill: False = no audio track is ever published for
+    # this patient's cameras (severed at the source). Family homes: True.
+    audio_capture_enabled: bool
     photo_storage_key: str | None
     created_at: datetime
     updated_at: datetime
@@ -158,6 +161,10 @@ class UpdatePatientRequest(BaseModel):
     relation: Relation | None = None
     home_address: Address | None = None
     cameras_paused: bool | None = None
+    # Facilities audio kill toggle. Flip propagates to the gateway within
+    # ~0.4s via the roster long-poll fingerprint; publishers republish
+    # without (or with) the audio track.
+    audio_capture_enabled: bool | None = None
     # Per-patient email alert settings. Omitting leaves unchanged;
     # sending `email_alert_recipients` replaces the whole list.
     email_alerts_enabled: bool | None = None
