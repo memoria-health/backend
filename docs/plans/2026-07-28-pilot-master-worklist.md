@@ -253,12 +253,15 @@ event of any kind for sleep/activity. The events feed remains purely
 alert-worthy moments; sleep/activity insight surfaces later through a
 dedicated reader of the summary tables (sleep card / weekly family
 report), never through the events pipeline.
-NIGHT WRAP-UP RULE (v1.5, build during soak): the night closes at
-whichever comes FIRST — the noon window end, or DAY-BEGUN: sustained
-patient activity in another room (Activity labels ≥15 min outside the
-bedroom after a bed-exit). Fixes the morning-nap conflation: a post-
-day-begun return to bed becomes a NAP (separate, or logged in
-activity), not an extension of the night.
+NIGHT WRAP-UP (Aryaman final 2026-07-28: keep it simple — SHELVED:
+episode scorer, main-sleep selection, day-begun heuristic). What ships
+is v1+reopen exactly as built: wake = a seen not-asleep moment with no
+asleep sighting for 30 min (WAKE_CONFIRM) — so a re-sleep within 30 min
+counts as part of the night (Aryaman's rule, already the code). Known
+quirk accepted pending real-night data: a LATE return (hours later,
+still before noon) also merges — night SPAN stretches but
+duration_minutes correctly excludes awake time. Revisit only from soak
+data.
 
 ## EXIT REVIEW (mandatory, before pilot go-live)
 
