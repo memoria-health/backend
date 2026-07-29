@@ -955,7 +955,12 @@ CATALOG: tuple[CatalogEntry, ...] = (
         description="Confirms the morning and evening pill routine at the kitchen counter.",
         category="routine", cohort="adult",
         recommended=False, seeded=True, prompt_fragment=_MEDICATION_PROMPT_FRAGMENT,
-        promotion_threshold=0.70, when_scope="8 AM, 8 PM ±1H",
+        # ALL DAY (Aryaman 2026-07-28): presets never ship hardcoded
+        # schedules — a time window is a CAREGIVER choice made through
+        # the editor's picker (one representation, consistent on every
+        # surface). The old "8 AM, 8 PM ±1H" was an authored guess in a
+        # format no editor could edit.
+        promotion_threshold=0.70,
         detected_field="medication_taken",
     ),
     CatalogEntry(
