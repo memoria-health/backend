@@ -154,8 +154,27 @@ class ScheduledDetectorRunner:
             we = _parse_hhmm(cfg.get("window_end"))
             dl = _parse_hhmm(cfg.get("deadline"))
             days = cfg.get("days_of_week") or []
+            # Graceful defaults (2026-07-28, "Missed evening medication"
+            # incident): the create path emits deadline-only configs, and
+            # the old all-or-nothing check silently skipped them FOREVER
+            # (one WARNING, no event, caregiver believes it's armed).
+            # Deadline-only now means "seen at any point today before the
+            # deadline": window_end defaults to the deadline, window_start
+            # to midnight. Only a truly unusable config (no deadline at
+            # all) still bails — and loudly.
+            if dl is None and we is not None:
+                dl = we
+            if we is None and dl is not None:
+                we = dl
+            if ws is None and we is not None:
+                ws = time(0, 0)
             if cadence not in ("daily", "weekly") or ws is None or we is None or dl is None:
-                log.warning("scheduled_runner.incomplete_config detector=%s", det.id)
+                log.error(
+                    "scheduled_runner.unusable_config detector=%s cfg=%s — "
+                    "this ABSENCE detector will NEVER evaluate; fix its "
+                    "schedule_config",
+                    det.id, cfg,
+                )
                 return
             if ws >= we:
                 # v1 doesn't support windows crossing midnight.
