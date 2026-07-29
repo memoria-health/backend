@@ -151,3 +151,20 @@ def is_active(text: str | None, local_now: datetime) -> tuple[bool, bool]:
         elif now >= start or now <= end:  # window crosses midnight
             return True, True
     return False, True
+
+
+def parse_schedules(text: str | None) -> tuple[ScheduleWindow, ...]:
+    """ALL evaluable windows for the absence runner — multi-window
+    support (Aryaman 2026-07-28): "8 AM, 8 PM ±1H" is TWO daily
+    windows, each with its own deadline. parse_schedule's first-window
+    view silently dropped every window after the first. Inverted /
+    midnight-crossing windows are still rejected per v1 parity; day
+    tokens apply to every window in the scope."""
+    windows = parse_windows(text)
+    if not windows:
+        return ()
+    days = parse_days(text)
+    return tuple(
+        ScheduleWindow(start_min=s, end_min=e, days=days)
+        for s, e in windows if s < e
+    )

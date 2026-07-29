@@ -439,6 +439,10 @@ class InferredConfig:
     episode_gap_seconds: int | None = field(default=None)
     # Set only when alert_trigger == "duration": the "too long" threshold.
     duration_seconds: int | None = field(default=None)
+    # Alert-meaning name nudge (2026-07-28): absence names must be
+    # miss-phrased or the "Possible <name>" title inverts. None when the
+    # model returned nothing usable.
+    suggested_name: str | None = field(default=None)
     # General active window (ANY trigger): "HH:MM-HH:MM" 24h or "ALWAYS".
     # None when the model gave nothing usable (caller keeps the current value).
     when_scope: str | None = field(default=None)
@@ -495,6 +499,14 @@ def _infer_meta_prompt(*, name: str | None, prompt: str) -> str:
         '     - "routine" = everyday, non-emergency behaviour where a false '
         'alarm is merely annoying noise: watching TV, using a phone or tablet, '
         'a visitor arriving, eating a snack, reading, sitting on the couch.\n'
+        '  "suggested_name": a short display name stating what the ALERT '
+        "MEANS. Event titles read 'Possible <name>', so for "
+        'alert_trigger="absence" the name MUST be phrased as the MISS '
+        '("Missed evening medication", "Skipped breakfast") — NEVER the '
+        'positive activity ("Evening medication" would title as "Possible '
+        'Evening medication", the inverse of the alert). For other triggers, '
+        "name the activity itself. Return the caregiver's own name when it "
+        'already reads correctly; improve it only when it would mislead.\n'
         f'  "icon_name": one of {_ALLOWED_ICONS}\n'
         '  "sensitivity": "low" | "standard" | "high" (default "standard"). '
         'Lower it for low-stakes routine behaviours (e.g. watching TV -> '
@@ -604,6 +616,11 @@ def _coerce_inferred(raw: dict) -> InferredConfig:
         where_hint = wh.strip()
 
     return InferredConfig(
+        suggested_name=(
+            str(raw.get("suggested_name")).strip()[:60]
+            if isinstance(raw.get("suggested_name"), str)
+            and raw.get("suggested_name").strip() else None
+        ),
         alert_trigger=alert_trigger,
         is_sustained=is_sustained,
         category=category, icon_name=icon,

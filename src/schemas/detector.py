@@ -212,6 +212,10 @@ class InferDetectorResponse(BaseModel):
     category: DetectorCategory
     icon_name: IconName
     sensitivity: DetectorSensitivity
+    # Alert-meaning name nudge: absence detectors must be miss-phrased
+    # ("Missed evening medication") or the "Possible <name>" title
+    # inverts. Clients prefill the name field with this.
+    suggested_name: str | None = None
     schedule_config: ScheduleConfig | None = None
     # Set when is_sustained: the inferred rising-edge episode gap (seconds).
     # The review screen may show/adjust it; null otherwise.

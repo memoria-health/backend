@@ -436,16 +436,17 @@ async def add_detectors_from_library(
             **catalog_v2.row_kwargs(e.key),
         )
         await detector_repo.insert(session, det)
-        room = None if e.where_scope == "ALL ROOMS" else e.where_scope
-        assigned = await camera_detector_repo.assign_detector_to_cameras(
-            session, det.id, patient_id, room=room,
-        )
         log.info(
-            "[detectors] from-library add key=%s detector=%s patient=%s assigned_cameras=%d",
-            e.key, det.id, patient_id, assigned,
+            "[detectors] from-library add key=%s detector=%s patient=%s",
+            e.key, det.id, patient_id,
         )
         created.append(det)
 
+    if created:
+        # Belt-and-braces reconcile: the per-detector assign above covers
+        # the new rows; this repairs any pre-existing link drift for the
+        # patient in the same transaction.
+        await camera_detector_repo.sync_links_for_patient(session, patient_id)
     await session.commit()
     log.info(
         "[detectors] from-library patient=%s created=%d skipped_already_present=%s",
@@ -487,6 +488,7 @@ async def infer_detector(
             detail="detector_inference_unavailable",
         ) from e
     return InferDetectorResponse(
+        suggested_name=inferred.suggested_name,
         alert_trigger=inferred.alert_trigger,  # type: ignore[arg-type]
         is_sustained=inferred.is_sustained,
         duration_seconds=inferred.duration_seconds,
@@ -699,14 +701,15 @@ async def create_detector(
     )
     await detector_repo.insert(session, det)
 
-    # Auto-assign to the cameras in the selected rooms. Saves the caregiver
-    # from opening /cameras/[id] after creating each detector — they already
-    # told us which room(s) they want it on. Rooms with no camera yet insert
-    # nothing (the intent is preserved on `where_rooms` and reapplied when a
-    # camera is paired into that room).
-    await camera_detector_repo.set_detector_rooms(
-        session, det.id, patient_id, resolved_rooms,
-    )
+    # Links derive from where_rooms via the reconciler — except a custom
+    # with NO room scope, which the reconciler deliberately skips (opt-in
+    # semantics): initialize it to every camera once, here; the caregiver
+    # prunes from /cameras/[id] afterwards.
+    if camera_detector_repo.rooms_mean_all(resolved_rooms):
+        await camera_detector_repo.set_detector_rooms(
+            session, det.id, patient_id, resolved_rooms,
+        )
+    await camera_detector_repo.sync_links_for_patient(session, patient_id)
     await session.commit()
 
     # Kick off the compile. asyncio.create_task lets the request return
@@ -839,9 +842,25 @@ async def patch_detector(
     # only — presets (esp. wandering) carry per-camera door_config on their
     # CameraDetector rows that a blanket replace would wipe, and rooms
     # editing is a custom-detector affordance in the UI anyway.
-    if rescope_rooms and det.source == "custom":
+    if (
+        rescope_rooms
+        and det.source == "custom"
+        and camera_detector_repo.rooms_mean_all(fields["where_rooms"])
+    ):
+        # Custom rescoped to ALL ROOMS: re-initialize the opt-in set (the
+        # reconciler skips null-scoped customs by design).
         await camera_detector_repo.set_detector_rooms(
             session, det.id, det.patient_id, fields["where_rooms"],
+        )
+    if rescope_rooms:
+        # Re-derive links from the new where_rooms for ALL sources. For
+        # presets this is the door_config-safe path set_detector_rooms
+        # can't provide: the reconciler only inserts missing / deletes
+        # stale links, never rewrites kept rows, so per-camera wandering
+        # door_config survives a rescope. NOT run on plain is_on toggles
+        # (rescope_rooms is False there) — the hot path stays link-free.
+        await camera_detector_repo.sync_links_for_patient(
+            session, det.patient_id,
         )
     await session.commit()
     # Recompile-on-edit (bug fix 2026-07-18): an edited custom_prompt
@@ -1015,10 +1034,17 @@ async def refine_detector(
             "where_rooms": where_rooms,
         },
     )
-    # Re-assign cameras when the NL refine re-scoped the rooms.
+    # Re-assign cameras when the NL refine re-scoped the rooms, then
+    # reconcile so links always derive from where_rooms.
     if where_rooms != old_rooms:
-        await camera_detector_repo.set_detector_rooms(
-            session, det.id, det.patient_id, where_rooms,
+        if det.source == "custom" and camera_detector_repo.rooms_mean_all(
+            where_rooms
+        ):
+            await camera_detector_repo.set_detector_rooms(
+                session, det.id, det.patient_id, where_rooms,
+            )
+        await camera_detector_repo.sync_links_for_patient(
+            session, det.patient_id,
         )
     await session.commit()
     asyncio.create_task(

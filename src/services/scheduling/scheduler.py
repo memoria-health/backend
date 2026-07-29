@@ -130,45 +130,39 @@ class ScheduledDetectorRunner:
             return ZoneInfo(_FALLBACK_TZ)
 
     async def _evaluate_one(self, session: AsyncSession, det: Detector) -> None:
-        # schedule_config dissolution (Aryaman 2026-07-18): when_scope
-        # is THE windows mechanism. The runner reads it first —
-        # "MON,WED 8:00 AM - 9:00 AM" ⇒ window 8-9, weekly on those
-        # days; no day tokens ⇒ daily; deadline ≡ window end (the
-        # window(hit|miss) fire rule evaluates at close). Legacy rows
-        # whose when_scope is ALWAYS-flavored fall back to their old
-        # schedule_config until the app migration backfills them.
-        from src.services.detection.scheduling.when_scope import parse_schedule
+        # schedule_config dissolution (2026-07-18) + MULTI-WINDOW support
+        # (Aryaman 2026-07-28): when_scope is THE truth, and every window
+        # in it gets its own deadline evaluation — "8 AM, 8 PM +-1H" is
+        # two daily checks. (parse_schedule's old first-window view
+        # silently dropped the evening one.) Per-window single-fire is
+        # stateless: an absence event's occurred_at IS its window's
+        # deadline, so an existing event at that exact instant means
+        # this window already fired today. last_scheduled_eval_date now
+        # marks WHOLE-DAY completion (all deadlines processed) only.
+        from src.services.detection.scheduling.when_scope import (
+            ScheduleWindow, parse_schedules,
+        )
 
-        sw = parse_schedule(det.when_scope)
-        days: list[int] | None
-        if sw is not None:
-            ws = time(int(sw.start_min // 60), int(sw.start_min % 60))
-            we = time(int(sw.end_min // 60), int(sw.end_min % 60))
-            dl = we
-            days = list(sw.days) if sw.days is not None else None
-            cadence = "weekly" if days else "daily"
-        else:
+        sws = list(parse_schedules(det.when_scope))
+        if not sws:
             cfg = det.schedule_config or {}
             cadence = cfg.get("cadence")
-            ws = _parse_hhmm(cfg.get("window_start"))
-            we = _parse_hhmm(cfg.get("window_end"))
-            dl = _parse_hhmm(cfg.get("deadline"))
-            days = cfg.get("days_of_week") or []
+            ws_t = _parse_hhmm(cfg.get("window_start"))
+            we_t = _parse_hhmm(cfg.get("window_end"))
+            dl_t = _parse_hhmm(cfg.get("deadline"))
+            days_cfg = cfg.get("days_of_week") or []
             # Graceful defaults (2026-07-28, "Missed evening medication"
-            # incident): the create path emits deadline-only configs, and
-            # the old all-or-nothing check silently skipped them FOREVER
-            # (one WARNING, no event, caregiver believes it's armed).
-            # Deadline-only now means "seen at any point today before the
-            # deadline": window_end defaults to the deadline, window_start
-            # to midnight. Only a truly unusable config (no deadline at
-            # all) still bails — and loudly.
-            if dl is None and we is not None:
-                dl = we
-            if we is None and dl is not None:
-                we = dl
-            if ws is None and we is not None:
-                ws = time(0, 0)
-            if cadence not in ("daily", "weekly") or ws is None or we is None or dl is None:
+            # incident): deadline-only configs mean "seen at any point
+            # today before the deadline" — window_end defaults to the
+            # deadline, window_start to midnight. Only a truly unusable
+            # config (no deadline at all) bails, and loudly.
+            if dl_t is None and we_t is not None:
+                dl_t = we_t
+            if we_t is None and dl_t is not None:
+                we_t = dl_t
+            if ws_t is None and we_t is not None:
+                ws_t = time(0, 0)
+            if cadence not in ("daily", "weekly") or ws_t is None or we_t is None:
                 log.error(
                     "scheduled_runner.unusable_config detector=%s cfg=%s — "
                     "this ABSENCE detector will NEVER evaluate; fix its "
@@ -176,10 +170,14 @@ class ScheduledDetectorRunner:
                     det.id, cfg,
                 )
                 return
-            if ws >= we:
-                # v1 doesn't support windows crossing midnight.
+            if ws_t >= we_t:
                 log.warning("scheduled_runner.inverted_window detector=%s", det.id)
                 return
+            sws = [ScheduleWindow(
+                start_min=ws_t.hour * 60.0 + ws_t.minute,
+                end_min=we_t.hour * 60.0 + we_t.minute,
+                days=tuple(days_cfg) if days_cfg else None,
+            )]
 
         patient = await session.get(Patient, det.patient_id)
         if patient is None:
@@ -188,102 +186,115 @@ class ScheduledDetectorRunner:
         now_local = datetime.now(tz)
         today = now_local.date()
 
-        # Weekly: only on configured weekdays (0=Mon..6=Sun).
-        if cadence == "weekly":
-            if now_local.weekday() not in (days or []):
-                return
-
-        # Deadline not yet reached today → wait.
-        deadline_local = datetime.combine(today, dl, tzinfo=tz)
-        if now_local < deadline_local:
-            return
-
-        # Single-fire: already evaluated today.
+        # Whole day already processed.
         if det.last_scheduled_eval_date == today:
             return
 
-        # Window → UTC for the analyses query (captured_at is UTC).
-        start_utc = datetime.combine(today, ws, tzinfo=tz).astimezone(timezone.utc)
-        end_utc = datetime.combine(today, we, tzinfo=tz).astimezone(timezone.utc)
-        detected_key = f"{det.identifier}_detected"
+        def _t(minutes: float) -> time:
+            return time(int(minutes) // 60, int(minutes) % 60)
 
-        if getattr(self._settings, "detection_v2_decision_enabled", False):
-            # v2 (P4, parallel-systems rule): same semantics, but the
-            # counting goes through the ONE shared primitive the state
-            # entry also uses (scheduling/decision.py) — a single
-            # implementation to soak. threshold=None = legacy's
-            # no-confidence-gate behavior exactly. Cleanup Ledger row 2
-            # retires this runner entirely once proven.
-            from src.services.detection.scheduling.decision import (
-                qualifying_tick_count,
-            )
-            seen = (
-                await qualifying_tick_count(
-                    session,
-                    patient_id=patient.id,
-                    detected_field=detected_key,
-                    conf_field=f"{det.identifier}_confidence",
-                    threshold=None,
-                    since=start_utc,
-                    before=end_utc,
-                )
-            ) > 0
-        else:
-            seen_stmt = (
-                select(Analysis.id)
-                .where(
-                    Analysis.patient_id == patient.id,
-                    Analysis.captured_at >= start_utc,
-                    Analysis.captured_at < end_utc,
-                    Analysis.detector_fields[detected_key].astext == "true",
-                )
-                .limit(1)
-            )
-            seen = (await session.execute(seen_stmt)).scalar_one_or_none() is not None
-
-        # Mark evaluated regardless of outcome (single-fire for the day).
-        det.last_scheduled_eval_date = today
-
-        if seen:
-            await session.commit()
-            log.info("scheduled_runner.seen detector=%s date=%s — no alert", det.id, today)
+        due_today = [
+            w for w in sws
+            if w.days is None or now_local.weekday() in w.days
+        ]
+        if not due_today:
             return
 
-        # Absent. But "not detected" is only meaningful if we were actually
-        # watching. With no sensor connected — or AI paused / the camera
-        # disconnected for the whole window — there are zero analyzing ticks
-        # and uptime is 0%. Firing then is a false alarm: you can't say a thing
-        # "didn't happen" when you weren't looking at all. Suppress that case.
-        # Partial coverage still fires (with the low-coverage caveat in the
-        # narrative) — we only drop the genuinely-blind case.
-        pct = await self._uptime_pct(session, patient.id, start_utc, end_utc)
-        if pct == 0:
+        for w in due_today:
+            ws, we = _t(w.start_min), _t(w.end_min)
+            deadline_local = datetime.combine(today, we, tzinfo=tz)
+            if now_local < deadline_local:
+                continue
+            deadline_utc = deadline_local.astimezone(timezone.utc)
+
+            # Per-window single-fire, stateless: occurred_at == deadline.
+            already = (await session.execute(
+                select(Event.id).where(
+                    Event.detector_id == det.id,
+                    Event.occurred_at == deadline_utc,
+                ).limit(1)
+            )).scalar_one_or_none()
+            if already is not None:
+                continue
+
+            start_utc = datetime.combine(today, ws, tzinfo=tz).astimezone(timezone.utc)
+            end_utc = deadline_utc
+            detected_key = f"{det.identifier}_detected"
+
+            if getattr(self._settings, "detection_v2_decision_enabled", False):
+                from src.services.detection.scheduling.decision import (
+                    qualifying_tick_count,
+                )
+                seen = (
+                    await qualifying_tick_count(
+                        session,
+                        patient_id=patient.id,
+                        detected_field=detected_key,
+                        conf_field=f"{det.identifier}_confidence",
+                        threshold=None,
+                        since=start_utc,
+                        before=end_utc,
+                    )
+                ) > 0
+            else:
+                seen_stmt = (
+                    select(Analysis.id)
+                    .where(
+                        Analysis.patient_id == patient.id,
+                        Analysis.captured_at >= start_utc,
+                        Analysis.captured_at < end_utc,
+                        Analysis.detector_fields[detected_key].astext == "true",
+                    )
+                    .limit(1)
+                )
+                seen = (await session.execute(seen_stmt)).scalar_one_or_none() is not None
+
+            if seen:
+                # debug, not info: seen windows re-check every tick until
+                # the day's final deadline stamps completion.
+                log.debug(
+                    "scheduled_runner.seen detector=%s window_end=%s — no alert",
+                    det.id, we,
+                )
+                continue
+
+            pct = await self._uptime_pct(session, patient.id, start_utc, end_utc)
+            if pct == 0:
+                log.info(
+                    "scheduled_runner.no_monitoring detector=%s window_end=%s — "
+                    "suppressed (0%% coverage)",
+                    det.id, we,
+                )
+                continue
+
+            event = self._build_absence_event(
+                det=det, patient=patient, ws=ws, we=we,
+                deadline_utc=deadline_utc, uptime_pct=pct,
+            )
+            session.add(event)
             await session.commit()
             log.info(
-                "scheduled_runner.no_monitoring detector=%s date=%s — suppressed (0%% coverage)",
-                det.id, today,
+                "scheduled_runner.fired detector=%s date=%s window_end=%s "
+                "event=%s uptime=%d%%",
+                det.id, today, we, event.id, pct,
             )
-            return
+            asyncio.create_task(push.dispatch_event_pushes(
+                sessionmaker=self._sessionmaker, event_ids=[event.id],
+                settings=self._settings,
+            ))
+            asyncio.create_task(email.dispatch_event_emails(
+                sessionmaker=self._sessionmaker, event_ids=[event.id],
+                settings=self._settings,
+            ))
 
-        event = self._build_absence_event(
-            det=det, patient=patient, ws=ws, we=we, deadline_utc=deadline_local.astimezone(timezone.utc),
-            uptime_pct=pct,
+        # Whole-day completion: stamp only after the LAST deadline passed,
+        # so earlier windows can't block later ones.
+        last_deadline = max(
+            datetime.combine(today, _t(w.end_min), tzinfo=tz) for w in due_today
         )
-        session.add(event)
-        await session.commit()
-        log.info(
-            "scheduled_runner.fired detector=%s date=%s event=%s uptime=%d%%",
-            det.id, today, event.id, pct,
-        )
-
-        # Reuse the existing fire-and-forget dispatchers (both work with
-        # camera_id=None — they key off the event's patient).
-        asyncio.create_task(push.dispatch_event_pushes(
-            sessionmaker=self._sessionmaker, event_ids=[event.id], settings=self._settings,
-        ))
-        asyncio.create_task(email.dispatch_event_emails(
-            sessionmaker=self._sessionmaker, event_ids=[event.id], settings=self._settings,
-        ))
+        if now_local >= last_deadline:
+            det.last_scheduled_eval_date = today
+            await session.commit()
 
     async def _evaluate_trailing(self, session: AsyncSession, det: Detector) -> None:
         """Fire once a sustained activity has FINISHED — detected recently,
