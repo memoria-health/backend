@@ -472,6 +472,12 @@ async def run_scheduled_calls(
         "sched_calls": call_ledger,
         "vlm_input_tokens": total_in,
         "vlm_output_tokens": total_out,
+        # Row-level served-model attribution for the SCHEDULER path
+        # (2026-07-28): per-call models live in the ledger above; this
+        # mirrors the scene call's model so hourly rollups and
+        # confirm-vote pricing (which run the same primary) group
+        # correctly without exploding the ledger.
+        "vlm_model": getattr(scene_result, "model", None),
     }
     if confirm_ledger:
         sched_fields["sched_confirm"] = confirm_ledger
