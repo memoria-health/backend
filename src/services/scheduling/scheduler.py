@@ -384,7 +384,12 @@ class ScheduledDetectorRunner:
         self, *, det: Detector, patient: Patient, ws: time, we: time,
         deadline_utc: datetime, uptime_pct: int,
     ) -> Event:
-        title = f"Not detected: {det.name}"
+        # No "Not detected:" prefix (Aryaman 2026-07-28): absence
+        # detectors are naturally NAMED as the miss ("Missed evening
+        # medication"), so a negating prefix stacks a double negative.
+        # The name carries the caregiver's meaning; the clause adds the
+        # factual evidence.
+        title = f"{det.name} — not seen by {we.strftime('%-I:%M %p')}"
         coverage_note = (
             " Coverage was low during this window, so treat this as uncertain."
             if uptime_pct < 60 else ""
