@@ -55,8 +55,11 @@ DIMS: dict[str, DetectorDims] = {
     # Sleep: requires_motion=True is the COST DESIGN, not an oversight —
     # burst ticks label the moments, tick silence between them is the
     # asleep signal (sleep_summary.py). A still sleeper costs $0.
-    "sleep":       DetectorDims(True, "patient", "scene", 15,
-                                duty_cycle="thinned"),
+    # NOT thinned (2026-07-28, Aryaman walkthrough): night bursts are
+    # sparse and each one may BE the wake / out-of-bed transition —
+    # dropping any label corrupts the whole night. The economy comes
+    # from tick silence, never from skipping labels.
+    "sleep":       DetectorDims(True, "patient", "scene", 15),
     "medication":  DetectorDims(True, "patient", "person", 20),
     "climbing":    DetectorDims(True, "patient", "scene", 66,
                                 evidence_unit="sample"),
