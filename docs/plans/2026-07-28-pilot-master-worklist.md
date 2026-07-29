@@ -295,6 +295,15 @@ still before noon) also merges — night SPAN stretches but
 duration_minutes correctly excludes awake time. Revisit only from soak
 data.
 
+0d.[ ] CLIP A/V SYNC (Aryaman observed 2026-07-28): frames_to_mp4
+       encodes frames at a FIXED nominal fps while frames were captured
+       at jittery wall-clock moments, but the PCM track is contiguous
+       real time — so video runs fast/slow vs audio and drift grows
+       through the clip ("-shortest" truncates, never aligns). Fix =
+       true per-frame PTS (concat-demuxer durations from FrameSnapshot
+       timestamps) or per-clip effective fps (n_frames/real_span) as
+       the cheap 90% version. Do post-test-pass (changes clip encode).
+
 ## EXIT REVIEW (mandatory, before pilot go-live)
 
 - [ ] Walk the "Parked" list AND "Known residual risks" line by line with
