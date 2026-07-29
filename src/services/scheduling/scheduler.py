@@ -384,20 +384,25 @@ class ScheduledDetectorRunner:
         self, *, det: Detector, patient: Patient, ws: time, we: time,
         deadline_utc: datetime, uptime_pct: int,
     ) -> Event:
-        # No "Not detected:" prefix (Aryaman 2026-07-28): absence
-        # detectors are naturally NAMED as the miss ("Missed evening
-        # medication"), so a negating prefix stacks a double negative.
-        # The name carries the caregiver's meaning; the clause adds the
-        # factual evidence.
-        title = f"{det.name} — not seen by {we.strftime('%-I:%M %p')}"
+        # "Possible <name>" (Aryaman 2026-07-28) — the SAME title shape
+        # as every other event. Absence detectors are naturally NAMED as
+        # the miss ("Missed evening medication"), so the system must add
+        # NO negation of its own: not "Not detected:", not "not seen by".
+        title = f"Possible {det.name}"
         coverage_note = (
             " Coverage was low during this window, so treat this as uncertain."
             if uptime_pct < 60 else ""
         )
+        # Narrative semantics (Aryaman 2026-07-28): the detector WATCHES
+        # for a routine happening; the event reports that it didn't.
+        # Never embed the detector's (miss-phrased) name in a negated
+        # sentence — "didn't detect 'Missed medication'" reads as the
+        # medication having been taken.
         narrative = (
-            f"Memoria didn't detect \"{det.name}\" between "
-            f"{ws.strftime('%H:%M')} and {we.strftime('%H:%M')} today. "
-            f"Cameras were actively monitoring about {uptime_pct}% of that window."
+            f"Memoria watched for this between {ws.strftime('%-I:%M %p')} "
+            f"and {we.strftime('%-I:%M %p')} today, and the routine it "
+            f"looks for didn't happen by the deadline. Cameras were "
+            f"actively monitoring about {uptime_pct}% of that window."
             f"{coverage_note}"
         )
         return Event(
@@ -412,6 +417,10 @@ class ScheduledDetectorRunner:
             location="Scheduled check",
             occurred_at=deadline_utc,
             has_clip=False,
+            # No camera, no clip, EVER — stamp the suppression contract
+            # so apps show the no-clip placeholder instead of an endless
+            # "Generating clip…" (2026-07-28, the med-absence event).
+            clip_suppressed=True,
             narrative=narrative,
             opened=False,
             reviewed=False,
