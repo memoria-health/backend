@@ -160,6 +160,15 @@
        must never enter the patient's behavioral record), web + iOS
        category color/label maps. Trace the FULL enum fanout (DDL,
        schema, both client enums — the record_only lesson).
+0b.[ ] MULTI-WINDOW when_scope (found 2026-07-28, soak): the Medication
+       adherence preset ships when_scope="8 AM, 8 PM +-1H" but
+       parse_schedule SILENTLY TRUNCATES to the first window (7-9 AM
+       runtime eligibility only — the evening dose is unwatched), and
+       the client editor can't parse it at all (displays "All day").
+       Three surfaces, three stories. Fix = real multi-window support
+       (parser + ScheduleWindow + is_active + dims + editor display) OR
+       forbid multi-window strings at the catalog/compiler boundary and
+       ship two rows. Soak workaround: row set when_scope=ALWAYS.
        ALERT-TRIGGER SEMANTICS (documented from the med incident): a
        detector always watches for a POSITIVE activity; alert_trigger
        is the alerting polarity on top — leading fires on sight,
