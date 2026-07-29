@@ -31,6 +31,8 @@ class AlertTrigger(str, Enum):
     trailing = "trailing"  # when the activity ends (sustained only)
     duration = "duration"  # once it's held >= duration_seconds (sustained only)
     absence = "absence"    # NOT detected within its active window (when_scope)
+    record_only = "record_only"  # never alerts — fields feed the daily
+                                 # summarizers (sleep/activity)
 
 
 class DetectorSensitivity(str, Enum):
