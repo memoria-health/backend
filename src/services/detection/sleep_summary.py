@@ -44,6 +44,12 @@ class SleepTick:
     in_bed: bool                 # sleep_detected
     activity: str                # settling|stirring|sitting_up|leaving_bed|none
     confidence: float            # sleep_confidence
+    # Identity gate (Aryaman 2026-07-28): the night may only START on a
+    # tick where identity POSITIVELY confirmed the patient — a visitor
+    # napping in the bed must never open the patient's night. Once the
+    # night is open, unconfirmed ticks are accepted (a person under
+    # covers can't face-confirm; persistence carries identity).
+    patient_confirmed: bool = True
 
 
 def summarize_night(
@@ -70,7 +76,13 @@ def summarize_night(
     if not in_bed_ticks:
         out["flags"].append("no_bed_entry")
         return out
-    out["bedtime"] = in_bed_ticks[0].at
+    confirmed_entry = [t for t in in_bed_ticks if t.patient_confirmed]
+    if not confirmed_entry:
+        # Someone was in the bed, but identity never confirmed the
+        # patient — do not open a night on a possible visitor.
+        out["flags"].append("no_confirmed_bed_entry")
+        return out
+    out["bedtime"] = confirmed_entry[0].at
 
     def _next_at(i: int) -> datetime:
         """Time of the tick after index i, or the window end."""
@@ -79,7 +91,8 @@ def summarize_night(
     # ── onset: first in-bed tick followed by ONSET_QUIET of silence ──
     onset_i: int | None = None
     for i, t in enumerate(ts):
-        if t.in_bed and _next_at(i) - t.at >= ONSET_QUIET:
+        # Onset must ALSO be identity-confirmed (the night-opening gate).
+        if t.in_bed and t.patient_confirmed and _next_at(i) - t.at >= ONSET_QUIET:
             onset_i = i
             out["sleep_onset"] = t.at
             break

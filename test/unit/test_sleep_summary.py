@@ -104,3 +104,33 @@ def test_activity_state_timeline_time_weighted() -> None:
     assert out["room_transitions"] == 1        # LR→BR
     assert out["labeled_minutes"] == 150.0
     assert out["label_ticks"] == 3
+
+
+def test_unconfirmed_visitor_in_bed_never_opens_the_night() -> None:
+    # Identity gate: in-bed ticks exist but none patient-confirmed —
+    # a visitor napping must not open the patient's night.
+    ticks = [
+        SleepTick(_N + timedelta(minutes=0), True, "settling", 0.9,
+                  patient_confirmed=False),
+        SleepTick(_N + timedelta(minutes=200), False, "leaving_bed", 0.9,
+                  patient_confirmed=False),
+    ]
+    out = summarize_night(ticks, window_end=_N + timedelta(hours=12))
+    assert out["flags"] == ["no_confirmed_bed_entry"]
+    assert out["bedtime"] is None
+
+
+def test_confirmed_entry_then_unconfirmed_night_ticks_accepted() -> None:
+    # Once the night opens on a confirmed tick, under-cover (unconfirmed)
+    # ticks count normally — persistence carries identity.
+    ticks = [
+        SleepTick(_N, True, "settling", 0.9, patient_confirmed=True),
+        SleepTick(_N + timedelta(minutes=180), True, "stirring", 0.9,
+                  patient_confirmed=False),
+        SleepTick(_N + timedelta(minutes=540), False, "leaving_bed", 0.9,
+                  patient_confirmed=False),
+    ]
+    out = summarize_night(ticks, window_end=_N + timedelta(hours=12))
+    assert out["disturbances"] == 1
+    assert out["wake_time"] is not None
+    assert out["flags"] == []

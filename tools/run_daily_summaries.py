@@ -36,7 +36,8 @@ select a.captured_at, substr(a.camera_id::text, 1, 8) as cam,
        a.detector_fields->>'sleep_activity'      as sa,
        a.detector_fields->>'sleep_confidence'    as sc,
        a.detector_fields->>'activity_state'      as ast,
-       a.detector_fields->>'activity_confidence' as ac
+       a.detector_fields->>'activity_confidence' as ac,
+       a.detector_fields->>'identity_patient_in_clip' as pic
 from analyses a join cameras c on c.id = a.camera_id
 where a.captured_at >= :t0 and a.captured_at < :t1
   and a.provider != 'skipped'
@@ -94,6 +95,7 @@ async def _run(night_date: date) -> None:
             by_patient.setdefault(r.patient_id, []).append(SleepTick(
                 at=r.captured_at, in_bed=(r.sd == "true" or r.sd == "True"),
                 activity=(r.sa or "none"), confidence=float(r.sc or 0.0),
+                patient_confirmed=(r.pic == "true"),
             ))
         for pid, ticks in by_patient.items():
             night = summarize_night(ticks, window_end=window_end)
@@ -119,6 +121,12 @@ async def _run(night_date: date) -> None:
         for r in rows:
             if r.ast is None:
                 continue                 # activity detector off that tick
+            if r.pic != "true":
+                # 100%% patient-gated (Aryaman 2026-07-28): a visitor's
+                # movements must NEVER count as the patient's activity.
+                # Trade-off accepted: unconfirmed-but-patient ticks drop
+                # too — labeled_minutes shows the reduced coverage.
+                continue
             act.setdefault(r.patient_id, []).append(StateTick(
                 at=r.captured_at, camera=r.cam,
                 state=r.ast, confidence=float(r.ac or 0.0),
