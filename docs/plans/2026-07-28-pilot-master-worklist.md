@@ -50,6 +50,19 @@
 
 ## Phase 1 — full-system soak (24–48h; THE ship-gate before any merge)
 
+- MODEL PLAN (Aryaman 2026-07-28, supersedes "day 1 all-3.6"): the soak
+  runs 3.5-FLASH-LITE EVERYWHERE (local NEMARA_GEMINI_MODEL override at
+  soak open); escalate to 3.6-flash only if accuracy problems appear.
+  Per-call model+token attribution makes the lite→flash bill translation
+  pure arithmetic. Per-DETECTOR tier segregation is REJECTED (Aryaman):
+  model is per-call, so intra-bucket tiering would mint NEW calls
+  (2→4/tick) — model choice stays whole-deployment, lite-first.
+- SLEEP joins the ON-set (10 detectors incl. Sleep); tonight = sleep
+  validation night 1 vs Aryaman's self-report/wearable. IR-motion
+  evidence already in hand (overnight 07-27/28 bedroom latches at
+  00:15/02:32/03:50 — transitions detectable; fine stirring under
+  covers may under-trip → failure direction = OVERCOUNT undisturbed
+  sleep, validated tonight).
 - [ ] Detector matrix — the soak ON-set (9), chosen to cover every active
       bucket, every subject scope, audio, schedule, door, preset+custom+
       fresh-create, and a deliberate negative case:
@@ -158,6 +171,21 @@
        RunPod HTTP port exposure as part of the task) + reserved GPU + autopay
        + deep-health smoke; sr_server (24GB squatter) kill w/ Sunny.
 11.[ ] One-way "Make private" per camera (PATCH accepts true only).
+12.[ ] FACILITIES AUDIO KILL (Aryaman 2026-07-28): patient-level
+       audio_capture_enabled=false for facility deployments — enforced at
+       the SOURCE (gateway + iOS publishers never publish the audio
+       track, roster-driven like privacy_enabled), needs_audio detectors
+       auto-degrade via existing sched_degraded_audio machinery, clips/
+       transcripts/speech fields silent for free. Counsel: jurisdictions
+       + facility rules + two-party-consent states (add to Zinia/US list).
+13.[ ] Empty-room ENVIRONMENT sampling decision: env detectors (stove)
+       currently never run in empty rooms (presence gate) — "stove left
+       on after leaving the house" is unmonitored. Option: low-cadence
+       snapshot class (~1 frame/10min) only where an env detector is
+       configured. Decide + price before pilots.
+14.[ ] Creation-time cost note for STILL-eligible customs (still-person /
+       environment classes poll during stillness — the expensive class),
+       mirroring the rapid_frequency warning pattern.
 
 ## Phase 4 — activity + sleep — V1 BUILT 2026-07-28 (commit 9ea6a05)
 

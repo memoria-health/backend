@@ -44,10 +44,13 @@ from datetime import date, datetime, timezone
 # growth); a quiet night is $0. Pin to the lite tier when per-detector
 # difficulty routing lands — this is an EASY visual task.
 _SLEEP_PROMPT_FRAGMENT = (
-    "sleep_detected: boolean. TRUE if a person is lying in a bed (on or "
-    "under the covers, reclined in a sleeping position). FALSE if no one "
-    "is in the bed, they are only sitting on the edge, or they are "
-    "standing / away from the bed.\n"
+    "sleep_detected: boolean. TRUE only if a person is lying in a bed IN "
+    "A SLEEPING POSITION with MINIMAL MOVEMENT — settled on or under the "
+    "covers, head down, AND their eyes are closed (when the face is "
+    "visible; if the face is turned away or buried, judge by the settled "
+    "sleeping posture alone). FALSE if no one is in the bed, they are "
+    "sitting up or on the edge, propped up actively using a phone/laptop/"
+    "watching TV, or standing / away from the bed.\n"
     "sleep_activity: string, exactly one of: 'settling' (getting into "
     "bed, arranging covers, lying down), 'stirring' (movement while "
     "staying lying down — rolling over, shifting), 'sitting_up' (rising "
