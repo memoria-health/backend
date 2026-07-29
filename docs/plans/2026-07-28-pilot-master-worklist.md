@@ -150,6 +150,23 @@
 
 ## Phase 3 — pilot-blocking builds (post-merge)
 
+0. [ ] BEHAVIOR category (Aryaman 2026-07-28, MUST-DO post-soak, ~half
+       day): three-way split — safety (health/harm, red), behavior
+       (clinical observations: agitation, confusion, pacing,
+       sundowning — GREEN/informational, data for the care team not
+       alarms), routine (rest). Touchpoints: detector_category enum +
+       delta, catalog reclass (Agitation), compiler rubric, criticality
+       gate (behavior = fail-quiet like routine — a visitor's pacing
+       must never enter the patient's behavioral record), web + iOS
+       category color/label maps. Trace the FULL enum fanout (DDL,
+       schema, both client enums — the record_only lesson).
+       ALERT-TRIGGER SEMANTICS (documented from the med incident): a
+       detector always watches for a POSITIVE activity; alert_trigger
+       is the alerting polarity on top — leading fires on sight,
+       absence fires on deadline-without-sight, record_only never
+       fires. Absence events: title "Possible <name>", watched-for
+       narrative, clip_suppressed=True always (no camera, no clip).
+
 1. [ ] iOS login resilience: bootstrap() must not block sign-in on Realtime
        subscribe (timeout + fire-and-forget behind existing 1s REST poll);
        same for cold-launch restore. The incident's actual product bug.
