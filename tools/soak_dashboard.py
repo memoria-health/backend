@@ -661,7 +661,9 @@ _PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <tr><td>4</td><td>Pill-bottle mime to mouth</td><td>medication fires; person-crop call visible in tick log</td><td>tick log <span class="mono">person:</span> call</td></tr>
 <tr><td>5</td><td>Glance at TV 1 min, walk away</td><td>NOTHING (entry-rule negative)</td><td>Events feed stays quiet</td></tr>
 <tr><td>6</td><td>Watch TV ~5+ min</td><td>ONE watching-tv event around min 5</td><td>Events feed</td></tr>
-<tr><td>7</td><td>Create "Drinking water (from a bottle)" in web UI, then drink from a bottle</td><td>compile succeeds (no warning) → detector fires on the drink</td><td>web create flow + Events</td></tr>
+<tr><td>7</td><td>Create "Drinking water (from a bottle)" in web UI, scoped to LIVING ROOM ONLY</td><td>compile succeeds; compiler's suggested name lands in the name field</td><td>web create flow</td></tr>
+<tr><td>7b</td><td>Drink from a bottle in the BEDROOM</td><td>NOTHING — room scope is structural: the detector isn't even in the bedroom camera's loadout (no call carries it)</td><td>tick log (bedroom calls list detectors)</td></tr>
+<tr><td>7c</td><td>Drink from a bottle in the LIVING ROOM</td><td>detector fires</td><td>Events feed</td></tr>
 <tr><td>8</td><td>Exit through the front door fully</td><td>wandering fires (door semantics)</td><td>Events feed</td></tr>
 <tr><td>9</td><td>Tonight: do NOTHING at med window</td><td>missed-medication absence event at deadline, zero VLM calls attributed</td><td>Events + tick log (no calls)</td></tr>
 </table></div>
@@ -685,6 +687,29 @@ _PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <tr><td>Data-collection exclusion</td><td>research consent ON, motion in both rooms</td><td>B2 receives clips ONLY from the non-private camera</td></tr>
 </table></div>
 
+<script>
+(function(){
+  var card = document.currentScript.closest('.card');
+  var rows = card.querySelectorAll('table tr');
+  rows.forEach(function(tr, i){
+    if (tr.querySelector('th')) {
+      var th = document.createElement('th'); th.textContent = '\u2713';
+      tr.insertBefore(th, tr.firstChild); return;
+    }
+    var label = tr.cells[0] ? tr.cells[0].textContent.slice(0, 50) : String(i);
+    var key = 'soaktest:' + label;
+    var td = document.createElement('td');
+    var cb = document.createElement('input'); cb.type = 'checkbox';
+    cb.checked = localStorage.getItem(key) === '1';
+    function apply(){
+      tr.style.opacity = cb.checked ? 0.35 : 1;
+      tr.style.textDecoration = cb.checked ? 'line-through' : 'none';
+    }
+    cb.onchange = function(){ localStorage.setItem(key, cb.checked ? '1' : '0'); apply(); };
+    apply(); td.appendChild(cb); tr.insertBefore(td, tr.firstChild);
+  });
+})();
+</script>
 <h3 style="margin:10px 0 4px">E · Standing negatives + daily rituals</h3>
 <p class="mut" style="font-size:12px;margin:0">NEGATIVES (should stay silent): empty rooms all day = $0 · you sitting still = $0 calls · TV playing in an empty room · fan/curtain motion. RITUALS: hour-6 + hour-24 cost audit (this page's $ vs tokens×list-price, flag >10% drift) · every morning <span class="mono">uv run python tools/run_daily_summaries.py</span> then compare vs recollection · watch phantom births stay ~0 (bedroom occupied) · identity restarts should be 0.</p>
 </div>
