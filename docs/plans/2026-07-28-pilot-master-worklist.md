@@ -159,8 +159,24 @@
        + deep-health smoke; sr_server (24GB squatter) kill w/ Sunny.
 11.[ ] One-way "Make private" per camera (PATCH accepts true only).
 
-## Phase 4 — activity + sleep (Whoop-level rigor, Aryaman 2026-07-28: "not
-## a heuristic — as reliable and robust as possible")
+## Phase 4 — activity + sleep — V1 BUILT 2026-07-28 (commit 9ea6a05)
+
+SHIPPED (Aryaman's simplified price-aware design superseding the epoch/HMM
+sketch below): "Sleep" catalog detector (scene bucket, patient, severity 15,
+motion-gated ON PURPOSE — burst ticks label moments, tick silence = asleep)
++ pure state machine `sleep_summary.py` (onset = in-bed + 15min quiet;
+disturbances; out-of-bed = leave+return<=60min; wake = leave + 30min
+confirm; incomplete nights FLAG, never fabricate) + `activity_summary.py`
+(zero-VLM: active fraction, transitions, coverage) + `sleep_nights` /
+`activity_days` tables (delta applied locally, RUNS ON PROD AT DEPLOY) +
+`tools/run_daily_summaries.py` runner. Marginal cost ~$0.10-0.15/night
+worst case on lite; ~$0 when other bedroom detectors already tick.
+REMAINING: enable Sleep in the soak ON-set (bedroom); validate vs Aryaman's
+wearable/self-report across soak nights (±15min bedtime/wake, ~100%
+out-of-bed recall = ship gate); pin sleep to lite tier when difficulty
+routing lands; family-report rendering post-pilot.
+
+Original rigor notes (kept for the validation phase):
 
 - Sleep — behavioral sleep measurement (honest boundary: in-bed quiescence,
   not physiological staging; no HR/HRV sensor exists):
