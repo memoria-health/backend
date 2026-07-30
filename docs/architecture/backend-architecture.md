@@ -8,14 +8,18 @@ How the backend is laid out, what conventions to follow when adding to it, and h
 nemara-backend/
 ├── pyproject.toml                # uv + ruff + pytest config; py >=3.12,<3.14 (.python-version pins 3.13)
 ├── Makefile                      # install, dev, test[-unit|-integration], lint, format, db-*, e2e, fresh[-seed], down
-├── Dockerfile                    # CPU torch; YOLO + InsightFace weights pre-cached
-├── yolo11n.pt / yolo11s.pt       # YOLO11 person-detector weights (re-ID; 11s is the default)
+├── docker/                       # Dockerfile (CPU torch; weights pre-cached) + Dockerfile.dev + docker-compose.local.yml
+├── railway.toml                  # Railway deploy config
+├── requirements-gpu.txt          # GPU-host deps (ultralytics SAM3, boxmot/OSNet, insightface, onnxruntime-gpu)
+├── yolo11n.pt / yolo11s.pt       # YOLO11 person-detector weights
 ├── scripts/
 │   ├── local-start.sh            # one-command stack-up (Supabase + buckets + uvicorn :8002 + ngrok)
 │   ├── seed.py                   # programmatic demo seed (calls services, not raw SQL)
 │   ├── seed_demo_camera.py       # App Review demo camera (persistent reusable pairing code)
 │   ├── reseed_*_prompt.py        # refresh a preset detector's prompt in a live DB
 │   ├── apply_*_delta.sql         # idempotent prod schema patches (see Conventions)
+│   ├── backfill_detector_dims.py # backfill detection-v2 dimension columns from catalog_v2
+│   ├── pod.sh / pod_bootstrap.sh / pod_tunnel.sh / gpu_setup.sh   # GPU-pod ops (perception server)
 │   ├── e2e/cli.py                # `uv run e2e <command>` — fire-event, add-patient, flip-detector…
 │   └── pi/                       # Pi device-side: install.sh, captive portal, announce daemon, MJPEG pusher
 ├── supabase/
@@ -24,7 +28,19 @@ nemara-backend/
 │   └── seed.sql                  # empty; Python seeder runs in scripts/seed.py
 ├── tools/
 │   ├── lk_room_audit.py          # LiveKit room snapshot; flags zombie/idle detector workers
-│   └── provision_pi.sh           # SSH into a Pi and run scripts/pi/install.sh
+│   ├── provision_pi.sh           # SSH into a Pi and run scripts/pi/install.sh
+│   ├── download_models.py        # pre-fetch model weights
+│   ├── live_tracker_view.py      # legacy live-tracker debug viewer (superseded by gpu/identity/service.py)
+│   └── soak_dashboard.py / soak_report.py / soak_watch.py   # soak monitoring + analysis
+├── gpu/                          # GPU-host deployables (run on the pod / GPU box, NOT in the backend container)
+│   ├── perception/               # SAM3 + EdgeTAM continuous-tracking server (docs/architecture/continuous-tracking.md)
+│   │   ├── server.py             #   FastAPI: POST /observe (frames → stable tracks) + POST /faces
+│   │   ├── continuous.py         #   persistent per-camera CameraSession — SAM3 grounds, EdgeTAM propagates
+│   │   └── sam_track.py / face_worker.py / person_trigger.py
+│   ├── identity/                 # the consolidated identity pipeline (see gpu/identity/README.md)
+│   │   ├── service.py            #   entry point — live MJPEG overlay :8012 + authenticated /state
+│   │   └── loop.py / seat.py / scoring.py / harvest.py / gallery.py / matching.py / …
+│   └── deploy/identity_supervisor.sh   # restart-on-exit supervisor for the identity service
 ├── src/
 │   ├── main.py                   # app factory; lifespan owns the 3 background runtimes
 │   ├── settings.py               # pydantic-settings, NEMARA_* prefix
@@ -34,6 +50,7 @@ nemara-backend/
 │   │   ├── health.py             #   /health (liveness) + /ready (DB reachability)
 │   │   ├── caregivers.py         #   /v1/me CRUD + DELETE (full account deletion)
 │   │   ├── patients.py           #   /v1/patients… + photo upload/url + test-email
+│   │   ├── patient_members.py    #   patient sharing — owner/member roles, share-by-email
 │   │   ├── detectors.py          #   detector CRUD + /detectors/library + /detectors/infer
 │   │   ├── events.py             #   list/get/review + /v1/events/{id}/clip-url
 │   │   ├── cameras.py            #   cameras CRUD, pairing-code, pi-provision, /v1/cameras/me/* (wall phone)
@@ -42,12 +59,13 @@ nemara-backend/
 │   │   ├── livekit.py            #   /v1/livekit/token (camera api-key OR caregiver JWT)
 │   │   ├── livekit_webhooks.py   #   participant joined/left + room_finished → worker dispatch
 │   │   ├── pi_discovery.py       #   /v1/cameras/pi-announce (unauthenticated) + /discovered
-│   │   ├── face_embeddings.py    #   re-ID selfie enrollment + status/summary
+│   │   ├── face_embeddings.py    #   identity selfie enrollment + status/summary
 │   │   ├── talk.py               #   /active-camera + /talk/{start,end}
 │   │   ├── devices.py            #   /v1/me/devices (APNs token registration)
 │   │   ├── support.py            #   Contact Support → Resend to founders
-│   │   └── feedback.py           #   product feedback: persist row + best-effort email
-│   ├── db/                       # SQLAlchemy ORM models (one per table; 11 tables)
+│   │   ├── feedback.py           #   product feedback: persist row + best-effort email
+│   │   └── internal/             #   internal-route scaffold
+│   ├── db/                       # SQLAlchemy ORM models (one per table; 12 tables)
 │   ├── repos/                    # pure async queries; no business logic
 │   ├── schemas/                  # pydantic v2 request/response models
 │   ├── services/
@@ -58,13 +76,15 @@ nemara-backend/
 │   │   ├── account_deletion.py   # storage + workers + auth-user cascade delete
 │   │   ├── active_camera.py      # freshest people_present camera for Talk carousel
 │   │   ├── storage.py            # Supabase Storage (photos + clips); signed URLs
+│   │   ├── region.py             # region-aware storage routing (US/IN data-residency partition)
 │   │   ├── push.py               # APNs dispatch (HTTP/2, ES256 .p8)
 │   │   ├── email.py              # Resend: event alerts + support + feedback
-│   │   ├── clip_archival.py      # in-process pre+post event clip → annotate → concat → upload
-│   │   ├── clip_annotate.py      # burn green patient bbox onto archived clips (best-effort)
-│   │   ├── scheduling/scheduler.py  # ScheduledDetectorRunner — "absence" detectors
+│   │   ├── clip_archival.py      # in-process pre+post event clip → concat → upload
+│   │   ├── livekit_privacy.py    # live SFU enforcement when a patient flips privacy mode
+│   │   ├── scheduling/scheduler.py  # ScheduledDetectorRunner — absence + trailing detectors
 │   │   ├── detection/            # realtime detector pipeline (see section below)
-│   │   ├── reid/                 # patient re-identification (see section below)
+│   │   ├── identity/             # backend half of the identity seam (see section below; was services/reid)
+│   │   ├── data_collection/      # opt-in per-patient session recorder → Backblaze B2
 │   │   └── ingest/pi/            # Pi MJPEG push → LiveKit relay (see section below)
 │   └── internals/                # experimental routes; gated by NEMARA_ENABLE_INTERNALS (default off)
 │       ├── record_clip.py        #   POST …/record-clip — on-demand server-side clip recording
@@ -84,7 +104,7 @@ nemara-backend/
 - **No trivial tests.** Tests must catch real bugs the type system doesn't already.
 - **Python 3.13 via `.python-version`** (pyproject allows `>=3.12,<3.14`). Python 3.14 silently skips `.pth` files starting with `_`, which breaks hatchling's editable install. Don't bump until upstream fixes this.
 - **`.env` is NOT tracked.** Secrets stay out of git (rotated after the early tracked-`.env` period); share dev secrets out-of-band, prod secrets live in the deploy platform. `scripts/local-start.sh` auto-detects the LAN IP so iOS devices on the same network reach local Supabase.
-- **Heavy ML deps are real.** torch (CPU), ultralytics (YOLO11), boxmot (BoT-SORT + OSNet), insightface + onnxruntime (SCRFD/ArcFace) all ship in the image for re-ID; weights are pre-cached in the Dockerfile.
+- **Heavy ML deps are split by host.** The backend image ships torch (CPU) + insightface/onnxruntime (SCRFD/ArcFace) for face enrollment; the GPU host installs `requirements-gpu.txt` (ultralytics for SAM3, boxmot/OSNet body embeddings, onnxruntime-gpu) for the perception + identity services under `gpu/`.
 
 ## Auth paths
 
@@ -119,9 +139,9 @@ The realtime pipeline lives in `src/services/detection/`, behind an in-process L
    - Camera row gone → raise, reconciler reaps the ingest.
    - `disabled` / `ai_paused` → skip LLM, write a synthetic "skipped" analysis (state machine deliberately not advanced).
    - `state == closed` and no cached motion → skip LLM, advance state with `people_present=false`.
-   - **Re-ID identity gate:** if the patient is enrolled, re-ID ran, no track locked as PATIENT, and there is positive not-the-patient evidence (≥1 face was checked, or every body track locked as OTHER) → skip LLM entirely (saves the provider call when e.g. a helper is in frame).
-   - Otherwise: snapshot buffers → MP4 via `mp4_remux.py` (ffmpeg pipe) → **Gemini first** (`gemini_model`, default `gemini-3.5-flash`, native video + audio), fall back to **OpenAI** (`openai_model`, default `gpt-5.4`, 4fps JPEG frames via `frame_extraction.py`; patient bbox burned in by `frame_annotate.py` when re-ID located them). `_parse.py` validates the JSON and clamps `*_confidence` to `[0, 1]`.
-6. **Presence verdict:** the `people_present` fed to the state machine is `LLM OR re-ID-patient-match` when enrollment exists; LLM-only otherwise. `state_machine.py` flips `cameras.state` open↔closed atomically (single row-locked UPDATE; `close_threshold` consecutive no-people ticks to close).
+   - **Identity gate:** if the patient is enrolled and the identity service's verdict (read via `services/identity/identity_client.py`, the `/state` seam) positively places the patient elsewhere with no track held as PATIENT → skip patient-scoped work (saves the provider call when e.g. a helper is in frame).
+   - Otherwise: snapshot buffers → MP4 via `mp4_remux.py` (ffmpeg pipe) → provider chain per `vlm_routing.py`: the caregiver-account `vlm_provider` picks the primary; the Gemini path runs `gemini_model` (default `gemini-3.6-flash`, native video + audio) with a same-path Gemini model fallback (`gemini_fallback_model`), then DashScope (Alibaba Qwen3-VL, native video), then OpenRouter (frame-sampled Qwen) as the last-resort net. The OpenAI path (`openai_model`, default `gpt-5.4`) uses 4fps JPEG frames via `frame_extraction.py`. `_parse.py` validates the JSON and clamps `*_confidence` to `[0, 1]`.
+6. **Presence verdict:** the `people_present` fed to the state machine is `LLM OR identity-patient-match` when enrollment exists; LLM-only otherwise. `state_machine.py` flips `cameras.state` open↔closed atomically (single row-locked UPDATE; `close_threshold` consecutive no-people ticks to close).
 7. **Event promotion** (`event_promotion.py`): a detector fires when `<id>_detected == true`, `<id>_confidence >= threshold`, and no event for the same `(patient, detector)` exists in the last 30s. Thresholds: base 0.70 for every catalog detector, shifted by the caregiver's per-detector sensitivity (low +0.15, standard +0, high −0.30; clamped to [0.05, 0.95]).
 8. **Side-effects** (fire-and-forget after commit): APNs push to all registered caregiver devices, email alerts (if `patient.email_alerts_enabled`), and clip archival kickoff.
 
@@ -138,23 +158,28 @@ UI mapping: `online` → LIVE; `!online && app_present` → reconnectable "Disco
 
 ## Detection library & custom detectors
 
-- **`detection/catalog.py` is the single source of truth** for every built-in detector: 22 entries (6 seeded presets + 16 library add-ons), each a frozen `CatalogEntry` carrying key, prompt fragment, category (`safety`/`routine`), shape (`point_in_time`/`state`/`scheduled`), cohort (`child`/`adult`/`both`), and promotion threshold. Consumers: onboarding seeding, the `/detectors/library` endpoints, and event promotion's thresholds.
+- **`detection/catalog.py` is the single source of truth** for every built-in detector: 24 entries (seeded presets + library add-ons + the hidden `setup_test`), each a frozen `CatalogEntry` carrying key, prompt fragment, category (`safety`/`routine`), the alerting spine (`alert_trigger` ∈ `leading`/`trailing`/`duration`/`absence` + `is_sustained` + optional `duration_seconds` — this replaced the old `shape` column), cohort (`child`/`adult`/`both`), and promotion threshold. `detection/catalog_v2.py` holds the built-ins' detection-v2 dimensions (`requires_motion`, `subject_scope`, `bucket`, `duty_cycle`, …). Consumers: onboarding seeding, the `/detectors/library` endpoints, and event promotion's thresholds.
 - **Age-based seeding** (`onboarding.py`): minors get Falls + Climbing + Distress; adults get Falls + Agitation + Wandering + Medication.
-- **Custom detectors** (`detector_compiler.py`): `POST /v1/detectors/infer` classifies free text into shape/category/sensitivity/schedule synchronously; `POST /v1/patients/{id}/detectors` returns 201 immediately and compiles in a background task — the LLM (OpenAI `openai_compile_model`, default `gpt-5.4`; Gemini fallback) writes the prompt fragment, while the `custom_<8hex>` identifier and JSON schema are templated server-side. Inclusivity is tuned by stakes: reactive-safety detectors compile inclusive (missed emergency > false alarm); routine and scheduled detectors compile conservative.
+- **Custom detectors** (`detector_compiler.py`): `POST /v1/detectors/infer` classifies free text into `alert_trigger`/`is_sustained`/category/sensitivity/schedule synchronously; `POST /v1/patients/{id}/detectors` returns 201 immediately and compiles in a background task — the LLM (OpenAI `openai_compile_model`, default `gpt-5.4`; Gemini fallback) writes the prompt fragment, while the `custom_<8hex>` identifier and JSON schema are templated server-side. `scheduling/compiler_v2.py` derives the v2 dimension columns, including the internal M-of-N entry-confidence gate by detection difficulty. Room scope is the `where_rooms` JSONB set (the stored `where_scope` scalar was dropped; it's derived on serialize). Inclusivity is tuned by stakes: reactive-safety detectors compile inclusive (missed emergency > false alarm); routine and scheduled detectors compile conservative.
 
-## Scheduled ("absence") detectors
+## Scheduled ("absence") and trailing detectors
 
-`scheduling/scheduler.py` runs `ScheduledDetectorRunner`, independent of the webhook-driven worker. Detectors with `shape='scheduled'` describe a recurring window in `detectors.schedule_config` (JSONB: cadence, days, window, deadline). Each tick (60s), for any detector whose deadline has passed today and isn't yet evaluated (`last_scheduled_eval_date` single-fire guard), it converts the caregiver-timezone window to UTC, queries `analyses` for the watched signal, and — if the signal was **never seen** — fires a patient-level absence event (`camera_id=NULL`, narrative includes the window and camera-uptime %). Reuses the same push + email dispatchers. The reactive path skips `scheduled`-shape detectors entirely; the same prompt fragment runs in every tick either way, the scheduler only inverts and windows the firing.
+`scheduling/scheduler.py` runs `ScheduledDetectorRunner`, independent of the webhook-driven worker. It owns two `alert_trigger` values that fire outside the per-tick path:
 
-## Patient re-identification (re-ID)
+- **`absence`** (rename of the old `shape='scheduled'`): a recurring window in `detectors.schedule_config` (JSONB: cadence, days, window, deadline). Each tick (60s), for any detector whose deadline has passed today and isn't yet evaluated (`last_scheduled_eval_date` single-fire guard), it converts the caregiver-timezone window to UTC, queries `analyses` for the watched signal, and — if the signal was **never seen** — fires a patient-level absence event (`camera_id=NULL`, narrative includes the window and camera-uptime %).
+- **`trailing`**: fires on the FALLING edge of a sustained activity — the runner watches for an episode that has ended and emits one event per episode.
 
-`src/services/reid/` answers "is the person in frame the *patient*, or someone else?" so detections aren't suppressed (or fired) on the wrong person.
+Both reuse the same push + email dispatchers. The reactive path skips `absence`/`trailing` detectors entirely; the same prompt fragment runs in every tick either way, this runner only changes when the firing happens.
 
-- **Enrollment:** caregiver uploads 1–N selfies (`POST /v1/patients/{id}/face-embeddings`, 202 + background processing). `enrollment_processor.py` downloads from Supabase Storage, runs SCRFD face detection + ArcFace embedding (InsightFace), quality-gates on det score, and marks rows `ready`/`failed`. Embeddings (512-dim float32) live in Postgres `patient_face_embeddings`; only selfie photos persist in storage.
-- **Inference per tick** (`inference.py`, bounded by `reid_timeout_seconds`): sample frames at ~5fps → YOLO11 person detection (`body_detector.py`) → BoT-SORT tracking with OSNet body embeddings (`tracker.py`) → periodic face checks per track (`embeddings.py`, quality-adaptive thresholds) → tracks lock as PATIENT / OTHER / UNKNOWN (`body_pipeline.py`). Output `IdentityResult` feeds the tick's identity gate and presence verdict, and shares its decoded frames with the OpenAI fallback path.
-- **Cross-clip body gallery** (`cross_clip_body_gallery.py`): in-memory, clustered OSNet embeddings per patient (TTL hours) so a person identified in clip N is pre-labeled in clip N+1 even when their face is hidden.
-- **Adaptive harvest** (`harvester.py`): high-confidence face matches insert `source='harvested'` embedding rows (FIFO-capped) to close the selfie→wall-cam domain gap.
-- If re-ID can't run (no enrollment, timeout, crash), the pipeline degrades to LLM-only presence — re-ID failure never blocks detection.
+## Patient identity (continuous tracking + identity service)
+
+Identity answers "is the person in frame the *patient*, or someone else?" so detections aren't suppressed (or fired) on the wrong person. Since the 2026-07 consolidation there is **one identity pipeline, and it lives on the GPU host** (`gpu/identity/`, see `gpu/identity/README.md`); the legacy in-process per-tick brain (`inference.py` / `body_pipeline.py` / BoT-SORT tracker in `services/reid/`) was deleted — the sidecar is the only identity provider.
+
+- **Perception substrate** (`gpu/perception/`): a persistent per-camera SAM3 + EdgeTAM continuous-tracking session on the pod produces **stable track ids across ticks** (`POST /observe`) plus a face pass (`POST /faces`). Deep-dive: `docs/architecture/continuous-tracking.md`.
+- **Identity service** (`gpu/identity/service.py`, supervised by `gpu/deploy/identity_supervisor.sh`, port 8012): per-camera continuous batches drive the pod session; a three-rule identity layer sits on top — calibrated scoring (face weighted by pixel size, OSNet body pool as the workhorse), a single home-wide patient **seat**, and liberal body-pool **harvest** only when a face-confirmed track is alone in frame. Serves a live MJPEG overlay and an authenticated `/state` JSON (`identity.contract`).
+- **Backend consumer** (`src/services/identity/`, renamed from `services/reid` 2026-07-27): `identity_client.py` reads `/state` (~ms), `result.py`/`observations.py` hold the verdict shapes, and `track_ledger.py` is the bind-once-hold sticky lock — every stable track is born UNKNOWN, binds PATIENT on a face/pool match, and is then held until the track dies (retire on grace / bounded scene-extension, `reid_scene_extension_max_s`). Two labels only: PATIENT or UNKNOWN.
+- **Enrollment** (stays in the backend): caregiver uploads 1–N selfies (`POST /v1/patients/{id}/face-embeddings`, 202 + background processing). `enrollment_processor.py` downloads from Supabase Storage, runs SCRFD face detection + ArcFace embedding (InsightFace), quality-gates on det score, and marks rows `ready`/`failed`. Embeddings (512-dim float32) live in Postgres `patient_face_embeddings`; the GPU-side gallery reads them back through the DB.
+- If identity can't run (no enrollment, sidecar down, timeout), the pipeline degrades to LLM-only presence — identity failure never blocks detection.
 
 ## Pi camera ingest
 
@@ -176,14 +201,15 @@ The iOS Live tab is a phone-call metaphor: the caregiver swipes a carousel of ca
 - `POST /v1/patients/{id}/talk/end` — `is_active=false` to every paired camera. Idempotent.
 - Packet shape (LiveKit `set_talk_active` topic): `{"type": "set_talk_active", "is_active": bool}`. Cameras gate local audio playback on the latest flag — the SFU never mutes tracks, so routing changes are O(ms).
 
-## Clip archival & annotation
+## Clip archival
 
 Fully in-process — **no LiveKit Egress** (it's documented in `clip_archival.py` as the future alternative if reliability demands it).
 
 1. **Pre-event clip:** the ~11s MP4 the tick already built for the LLM is reused as-is.
 2. **Post-event clip:** sleep `clip_post_event_wait_seconds` (15s), then snapshot the live `FrameBuffer` + `AudioBuffer` anchored at the pre-clip's end timestamp (so the LLM's think-time gap doesn't leak into the clip).
-3. **Annotation:** `clip_annotate.py` re-runs the re-ID body pipeline over the clip and burns a green box around the patient (best-effort — any failure uploads the original clip).
-4. **Concat + upload:** ffmpeg concat → `incident-clips/events/{event_id}.mp4` (Supabase Storage), then `events.clip_storage_key` + `has_clip=true`; Realtime notifies the app, and `GET /v1/events/{id}/clip-url` mints a short-lived signed URL for inline playback.
+3. **Concat + upload:** ffmpeg concat → `incident-clips/events/{event_id}.mp4` (Supabase Storage), then `events.clip_storage_key` + `has_clip=true`; Realtime notifies the app, and `GET /v1/events/{id}/clip-url` mints a short-lived signed URL for inline playback.
+
+(The old `clip_annotate.py` step — burning a green patient bbox onto archived clips — was removed along with the legacy in-process re-ID pipeline.)
 
 If the worker dies during the post-event sleep, the clip is lost (event text survives) — accepted for v0.
 
@@ -204,6 +230,7 @@ If the worker dies during the post-event sleep, the clip is lost (event text sur
 
 ## Sister repos
 
-- [`nemara-camera-app`](../nemara-camera-app) — iPhone wall-phone publisher (NemaraCam)
-- [`nemara-caregiver-app`](../nemara-caregiver-app) — caregiver iOS app
-- [`nemara-web-app`](../nemara-web-app) — caregiver web dashboard
+- [`nemara-camera-app`](../../../nemara-camera-app) — iPhone wall-phone publisher (NemaraCam)
+- [`nemara-caregiver-app`](../../../nemara-caregiver-app) — caregiver iOS app
+- [`nemara-web-app`](../../../nemara-web-app) — caregiver web dashboard
+- [`nemara-gateway`](../../../nemara-gateway) — edge appliance: RTSP cams → LiveKit `cam_*` participants

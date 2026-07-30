@@ -1,9 +1,19 @@
 # Continuous tracking (SAM3 + EdgeTAM) — architecture, failure modes, tuning
 
 This is the perception core that produces stable person tracks for the
-re-identification brain. It replaced the per-clip track-ledger stitching
+identity layer (`gpu/identity/`, consumed by the backend via
+`src/services/identity/`). It replaced the per-clip track-ledger stitching
 (the "ghost deadlock" era) with a **persistent per-camera session** that
-holds identity across ticks. Read this before touching `sam_service/continuous.py`.
+holds identity across ticks. Read this before touching
+`gpu/perception/continuous.py` (served by `gpu/perception/server.py` —
+`POST /observe` + `POST /faces`).
+
+Two runtime toggles added since this doc was first written:
+`NEMARA_TRACKER` (`edgetam` default = SAM3-ground + EdgeTAM-carry as
+described below; `sam3` = SAM3's own tracker over the whole clip, with
+`NEMARA_SAM3_STRIDE` frame striding) and `NEMARA_GROUNDER` (`sam3`
+production default — chosen 2026-07-26 after `yoloseg` fragmented a
+recumbent person into two instances).
 
 ---
 
@@ -43,9 +53,11 @@ observe(frames):
   reground = first tick OR (tick - last_ground) >= reground_every OR last_masks empty
   seed = SAM3 ground (reground)  |  last_masks (carry)
   out  = EdgeTAM propagate(frames, seed)
-  drift-guard(out)        # §2.2
   last_masks = out[last_frame] (cleared to {} if empty)   # §2.1
 ```
+
+(The drift-guard step that used to sit after propagate was removed —
+see §2.2.)
 
 ---
 
@@ -60,75 +72,81 @@ it keeps a mask. Fix: `last_masks` is **cleared to empty** whenever a tick
 produces no tracks — a ground that found nobody, or a carry that lost
 everyone. A ground is authoritative on existence.
 
-### 2.2 Drift smear (the couch phantom) — mask-coherence drift guard
+### 2.2 Drift smear (the couch phantom) — drift guard **[SUPERSEDED — removed 2026-07-24]**
 On **carry** ticks, a lost/departing target makes EdgeTAM **smear** the
 mask onto the nearest high-contrast background (the couch). Audited from
 the leave sequence (camera 3c6570af): the smear **balloons 2.2–2.9× the
 last SAM3 ground mask** and turns wide / fragments, while legit tracking
 of a present moving person stays **≤ ~1.6×** and coherent.
 
-So the signal is mask **area + shape vs the ground reference** — *not*
-centroid teleport (measured centroid drift was ~0.12 for stable AND
-drifting tracks alike; teleport cannot tell them apart, and the smear
-balloons *in place*). `_is_drift`:
+A mask-coherence drift guard (`_is_drift`: balloon ≥ 2.5× any shape, or
+1.8–2.5× when wide/fragmented → drop the track + force a re-ground) was
+built on those numbers — and then **PURGED on 2026-07-24**: in live use
+it mistook a person walking TOWARD the camera (whose mask legitimately
+balloons) for a smear and killed live tracks. The `NEMARA_EDGE_DRIFT_*`
+knobs and `tests/test_drift_guard.py` are gone with it.
 
-- `balloon ≥ 2.5×` (any shape) → drift, or
-- `1.8× ≤ balloon < 2.5×` **and** (bbox went wide `w/h ≥ 1.15` **or**
-  fragmented `largest-component/total < 0.55`) → drift.
-
-A flagged track is dropped and a **re-ground is forced** so SAM3
-re-adjudicates existence next tick — a real person is re-acquired cheaply,
-a phantom is cleared. This is why false positives are safe: the worst case
-is one extra ~2 s ground tick.
+The current defense is simpler: **re-grounds are the sole existence
+authority**. A sticky-mask phantom dies at the next SAM3 ground
+(≤ `NEMARA_EDGE_REGROUND` ticks) when the grounder finds nobody there,
+and §2.1's clear-on-empty prevents it from re-seeding. The backend
+scene-extension cap (§2.3) is the backstop for the window in between.
 
 ### 2.3 The 890-second phantom lock — lives in the BACKEND
 The pod drift fed a backend bug: a phantom track keeps `num_tracks > 0` →
 `people_present` → `scene_present`, and the ledger's scene-extension reset
 `last_seen = now` **every tick with no cap**, holding a departed patient
-for ~15 minutes. Fixed in `nemara-v2-soak` (`track_ledger.py`): the
-scene-extension is **bounded** by `reid_scene_extension_max_s` (150 s)
-since the last *real* body sighting. A still patient in bed is re-grounded
-by SAM3 within the window; a phantom is not. §2.2 removes the drift at the
-source; this is the backend backstop.
+for ~15 minutes. Fixed and now on this branch
+(`src/services/identity/track_ledger.py` — since rewritten as the
+bind-once-hold ledger keyed directly by the pod's stable `track_id`,
+labels PATIENT/UNKNOWN only): the scene-extension is **bounded** by
+`reid_scene_extension_max_s` (150 s) since the last *real* body sighting.
+A still patient in bed is re-grounded by SAM3 within the window; a
+phantom is not. Regrounds remove the drift at the source (§2.2); this is
+the backend backstop.
 
-### 2.4 Re-entry blindness — motion calibration (BACKEND)
+### 2.4 Re-entry blindness — motion calibration (BACKEND) **[NOT MERGED — staged in the `nemara-v2-soak` worktree only]**
 Separate from tracking: a returning patient at couch distance (~5–6 m) was
 never even waking the camera. A block's mean-luma delta is an **edge-sweep
 signal that decays ~44/metres**, so the old wake floor of 12 went blind
-past ~3.7 m. Fixed in `nemara-v2-soak` (`motion.py`): floor 12 → 7,
-adaptive gate 4× → 3×, and a **spatial-adjacency wake rule** (≥2
-orthogonally-adjacent tripped blocks) that rejects grain by *shape*, which
-is what makes the lower floor safe. Plus an opt-in **warm-room keepalive**
-(`reid_warm_keepalive_s`, default off) for a patient who returns and
-immediately settles.
+past ~3.7 m. The staged fix (in `nemara-v2-soak`, `motion.py`): floor
+12 → 7, adaptive gate 4× → 3×, a **spatial-adjacency wake rule** (≥2
+orthogonally-adjacent tripped blocks) that rejects grain by *shape*, and
+an opt-in **warm-room keepalive** (`reid_warm_keepalive_s`, default off).
+**On this branch (`feat/gateway-camera-ownership`) none of that has
+landed**: `src/services/detection/motion.py` still has
+`BLOCK_DELTA_TRIP = 12.0`, `BASELINE_MULT = 4.0`, no adjacency rule, and
+there is no `reid_warm_keepalive_s` setting.
 
 ---
 
 ## 3. Tuning knobs
 
-Pod / perception (env, read in `continuous.py`):
+Pod / perception (env, read in `gpu/perception/continuous.py`):
 
 | var | default | meaning |
 |---|---|---|
 | `NEMARA_EDGE_REGROUND` | 5 | ticks between SAM3 re-grounds |
 | `NEMARA_EDGE_TRACK_W` | 640 | EdgeTAM track-resolution width (0 = full-res) |
 | `NEMARA_EDGE_REMAP_IOU` | 0.30 | IoU floor to keep an id across a re-ground |
-| `NEMARA_EDGE_DRIFT_BIG_BALLOON` | 2.5 | drift: balloon that drops a track regardless of shape |
-| `NEMARA_EDGE_DRIFT_BALLOON` | 1.8 | drift: balloon that drops a track *if* wide/fragmented |
-| `NEMARA_EDGE_DRIFT_WIDE_ASPECT` | 1.15 | drift: banded "went wide" bbox w/h |
-| `NEMARA_EDGE_DRIFT_LCC_MIN` | 0.55 | drift: banded fragmentation floor |
+| `NEMARA_EDGE_CKPT` / `_CFG` / `_ROOT` | /workspace/edgetam/… | EdgeTAM checkpoint / config / repo root |
+| `NEMARA_TRACKER` | edgetam | tracker backend: `edgetam` (ground+carry, this doc) or `sam3` (SAM3's own tracker per clip) |
+| `NEMARA_SAM3_STRIDE` | 1 | sam3 mode only: track every Nth clip frame (~halves cost at 2) |
+| `NEMARA_GROUNDER` | sam3 | grounder: `sam3` (production) or `yoloseg` (rejected 2026-07-26 — fragmented a recumbent person) |
 | `NEMARA_EDGE_DEBUG_DIR` | "" | if set, dump per-tick mask overlays (OFF in prod) |
 
-Backend (pydantic `Settings`, env-tunable, in `nemara-v2-soak`):
+(The `NEMARA_EDGE_DRIFT_*` knobs are gone — the drift guard was removed, §2.2.)
+
+Backend (pydantic `Settings`, env-tunable via `NEMARA_*`, `src/settings.py`):
 
 | setting | default | meaning |
 |---|---|---|
-| `reid_binding_retire_after_s` | 45 | base grace before a patient binding retires |
+| `reid_binding_retire_after_s` | 15 | base grace before a patient binding retires (was 45 in the soak-era doc) |
 | `reid_scene_extension_max_s` | 150 | cap on scene-presence extension without a body re-sighting |
-| `reid_warm_keepalive_s` | 0 (off) | keep a recently-occupied room scanning for a quick return |
-| `NEMARA_MOTION_BLOCK_DELTA_TRIP` | 7 | per-block wake floor (luma) |
-| `NEMARA_MOTION_BASELINE_MULT` | 3 | adaptive-baseline multiplier |
-| `NEMARA_MOTION_WAKE_MIN_ADJ_PAIRS` | 1 | adjacent tripped-pairs required to wake |
+
+The §2.4 motion knobs (`reid_warm_keepalive_s`,
+`NEMARA_MOTION_BLOCK_DELTA_TRIP` 7, `BASELINE_MULT` 3, adjacency pairs)
+exist only in the unmerged `nemara-v2-soak` staging — not on this branch.
 
 ---
 
@@ -141,8 +159,9 @@ Backend (pydantic `Settings`, env-tunable, in `nemara-v2-soak`):
   redeploy, and per-tick overlays land there (green mask + id + bbox).
   Pull them and eyeball the person vs a smear. **Turn this OFF for
   production** — it fills disk and slows ticks.
-- **Drift-guard unit tests:** `tests/test_drift_guard.py` (numpy + cv2,
-  runs off-GPU), pinned to the measured 2.2–2.9× smear.
+- **Unit tests:** the drift-guard tests were deleted with the guard
+  (§2.2). The pure identity-layer modules that consume these tracks are
+  tested in `test/unit/test_identity_*.py` (off-GPU).
 
 ---
 
@@ -155,7 +174,9 @@ Backend (pydantic `Settings`, env-tunable, in `nemara-v2-soak`):
   real high-fps walk-out clip before it's worth building.
 - **Stricter / subject-scoped SAM3 grounding** — the couch phantom was
   *not* SAM3's fault (it grounded nobody correctly), so this is lower
-  priority; still useful for general seed quality.
-- **Backend bind-once + hold-with-audit ledger rewrite** — the continuous
-  session now gives stable ids, so the ledger can eventually be simplified
-  to bind-once. Deferred.
+  priority; still useful for general seed quality. (A YOLO26-seg grounder
+  was tried and rejected 2026-07-26 — see `NEMARA_GROUNDER` in §3.)
+- ~~**Backend bind-once ledger rewrite**~~ — **DONE**:
+  `src/services/identity/track_ledger.py` is now the bind-once-hold
+  ledger keyed by the pod's stable `track_id` (PATIENT/UNKNOWN only,
+  no geometric stitcher).

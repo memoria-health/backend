@@ -54,9 +54,24 @@ _HOME: IdentityHome | None = None   # set in main; read by the HTTP layer
 
 app = FastAPI()
 
-# /state auth (contract.py): empty = no auth (local dev). Production
-# sets NEMARA_IDENTITY_TOKEN on both sides of the seam.
-_STATE_TOKEN = os.environ.get("NEMARA_IDENTITY_TOKEN", "")
+# /state auth (contract.py): empty = no auth (local dev).
+#
+# ONE name across the seam: NEMARA_IDENTITY_STATE_TOKEN. The backend
+# has always read it under that name (settings.identity_state_token +
+# the NEMARA_ prefix); this side used to read NEMARA_IDENTITY_TOKEN,
+# so setting either one alone left the OTHER side with an empty token
+# — and an empty token here means auth_ok() waves everything through.
+# Silent no-auth, no error anywhere. The legacy name is still accepted
+# so an already-provisioned box keeps working, and says so loudly.
+_STATE_TOKEN = os.environ.get("NEMARA_IDENTITY_STATE_TOKEN", "")
+if not _STATE_TOKEN:
+    _legacy = os.environ.get("NEMARA_IDENTITY_TOKEN", "")
+    if _legacy:
+        log.warning(
+            "using deprecated NEMARA_IDENTITY_TOKEN; rename it to "
+            "NEMARA_IDENTITY_STATE_TOKEN (the name the backend reads)"
+        )
+        _STATE_TOKEN = _legacy
 
 
 @app.get("/")
@@ -160,9 +175,38 @@ async def _timeline_sampler() -> None:
             log.exception("identity.timeline_sample_failed")
 
 
+@app.get("/probes")
+def probes(request: Request, n: int = 1600) -> JSONResponse:
+    """Every identity probe's full scores (faces raw cos+px, body raw
+    cos, fused candidates), newest-last per camera — the soak
+    dashboard's tick-correlated analysis feed (Aryaman 2026-07-28).
+
+    Authenticated like /state: this payload is per-track similarity to
+    the patient's enrolled FACE AND BODY gallery — biometric-derived
+    data, and more sensitive than /state's seat summary.
+    """
+    from identity.contract import auth_ok
+
+    if not auth_ok(request.headers.get("authorization"), _STATE_TOKEN):
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    if _HOME is None:
+        return JSONResponse({"probes": {}, "names": {}})
+    return JSONResponse({
+        "probes": {
+            cam_id: list(sp.probe_history)[-max(1, min(n, 4000)):]
+            for cam_id, sp in _HOME.cameras.items()
+        },
+        "names": dict(_HOME.cam_names),
+    })
+
+
 @app.get("/timeline")
-def timeline(n: int = 2160) -> JSONResponse:
+def timeline(request: Request, n: int = 2160) -> JSONResponse:
     """Last n samples (default 6h at 10s) for the lane view."""
+    from identity.contract import auth_ok
+
+    if not auth_ok(request.headers.get("authorization"), _STATE_TOKEN):
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
     if _TIMELINE is None:
         return JSONResponse({"samples": []})
     return JSONResponse({
@@ -172,9 +216,13 @@ def timeline(n: int = 2160) -> JSONResponse:
 
 
 @app.get("/events")
-def events(n: int = 200) -> JSONResponse:
+def events(request: Request, n: int = 200) -> JSONResponse:
     """Unsupervised-soak journal tail + confirm-latency stats — the
     soak dashboard's Identity section reads this."""
+    from identity.contract import auth_ok
+
+    if not auth_ok(request.headers.get("authorization"), _STATE_TOKEN):
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
     if _HOME is None or _HOME.journal is None:
         return JSONResponse({"events": [], "confirm_stats": []})
     lats = [round(v, 1) for _a, v in _HOME.confirm_stats]
@@ -193,9 +241,17 @@ def events(n: int = 200) -> JSONResponse:
 
 
 @app.get("/snap/{name}")
-def snap(name: str):
+def snap(name: str, request: Request):
+    """Journal snapshot JPEGs — authenticated, because these are IMAGE
+    data cropped from the camera, same exposure class as /stream. Every
+    endpoint on this service is now behind the token; the split where
+    only some were made the token look like a control it wasn't."""
     from fastapi.responses import Response
 
+    from identity.contract import auth_ok
+
+    if not auth_ok(request.headers.get("authorization"), _STATE_TOKEN):
+        return Response(status_code=401)
     if _HOME is None or _HOME.journal is None or "/" in name or ".." in name:
         return Response(status_code=404)
     p = _HOME.journal.snaps / name
@@ -205,7 +261,20 @@ def snap(name: str):
 
 
 @app.get("/stream/{cam_id}")
-def stream(cam_id: str) -> StreamingResponse:
+def stream(cam_id: str, request: Request):
+    """Annotated live view — DEV/DEBUG ONLY.
+
+    This is raw camera video with tracking boxes and carries NO room
+    privacy gating: it would show a bathroom or bedroom exactly as the
+    camera sees it. Authenticated like /state, and it must never be
+    reachable in production — the prod build has no live-feed path
+    that bypasses the privacy rules, and this endpoint must not become
+    one (Aryaman 2026-07-29).
+    """
+    from identity.contract import auth_ok
+
+    if not auth_ok(request.headers.get("authorization"), _STATE_TOKEN):
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
     return StreamingResponse(
         _mjpeg(cam_id), media_type="multipart/x-mixed-replace; boundary=frame",
     )
@@ -339,6 +408,17 @@ async def _run_livekit(
             t = tasks.pop(cam_id, None)
             if t is not None and not t.done():
                 t.cancel()
+        # The probe loop is owned by the CameraLoop itself (it starts
+        # its own task), so popping the loop task does not stop it: it
+        # kept running every 0.5s forever and held the camera's frame
+        # ring alive with it. The ring holds native-resolution frames,
+        # so each leaked camera costs hundreds of MB that is never
+        # reclaimed — and camera churn (a flapping gateway) leaks one
+        # per reconnect.
+        probe = getattr(cam_loop, "_probe_task", None)
+        if probe is not None and not probe.done():
+            probe.cancel()
+        cam_loop.ring.clear()
         log.info("identity.camera_removed cam=%s (%s)", cam_id, why)
 
     @room.on("participant_disconnected")
@@ -406,8 +486,91 @@ async def _run_livekit(
         "identity.connected participants=%s",
         [p.identity for p in room.remote_participants.values()],
     )
+    # Missed-subscription recovery walk (2026-07-29): auto_subscribe
+    # covers the happy path, but a gateway restart can re-publish
+    # tracks without a track_subscribed callback ever reaching us —
+    # live today at 11:16: participant present, publications listed,
+    # intake frozen (15s+ lag) until a manual service restart. Same
+    # recovery the backend room_worker has ("walking for missed
+    # track_subscribed"): every 10s, any cam_* video publication that
+    # is unsubscribed — or subscribed while that camera's intake has
+    # gone quiet — gets its subscription toggled.
+    walk_every_s = 10.0
+    intake_quiet_s = 15.0
+    # Consecutive passes a camera has looked unhealthy. Re-subscribing
+    # that keeps not working means the room object itself is wrong, so
+    # escalate to the supervisor for a clean rebuild instead of warning
+    # every 10s forever — the same doctrine as the pod watchdog and the
+    # room-disconnect handler above.
+    walk_strikes: dict[str, int] = {}
+    walk_max_strikes = 6
     while True:
-        await asyncio.sleep(3600)
+        await asyncio.sleep(walk_every_s)
+        try:
+            now = time.time()
+            for p in list(room.remote_participants.values()):
+                if not p.identity.startswith("cam_"):
+                    continue
+                cam_id = p.identity.removeprefix("cam_")
+                if only_cam and only_cam not in cam_id:
+                    continue
+                sp = home.cameras.get(cam_id)
+                last_ts = (
+                    sp.ring[-1][1] if sp is not None and sp.ring else 0.0
+                )
+                quiet = now - last_ts > intake_quiet_s
+                healthy = True
+                for pub in p.track_publications.values():
+                    # Per-publication: one failing subscribe must not
+                    # skip the remaining cameras for the whole pass.
+                    try:
+                        if pub.kind != rtc.TrackKind.KIND_VIDEO:
+                            continue
+                        if not pub.subscribed:
+                            healthy = False
+                            log.warning(
+                                "identity.walk_resubscribe cam=%s "
+                                "(publication not subscribed)", cam_id,
+                            )
+                            pub.set_subscribed(True)
+                        elif quiet:
+                            healthy = False
+                            # Re-issue subscribe ONLY — never
+                            # unsubscribe first. Unsubscribing ends the
+                            # video stream WITHOUT waking the reader
+                            # task waiting on its queue, so the reader
+                            # hangs and only a later track_subscribed
+                            # callback can clean it up — the very
+                            # callback this walk exists because it
+                            # can't be trusted. Re-subscribing is
+                            # harmless when already subscribed, and is
+                            # exactly what the backend's room_worker
+                            # does; the toggle version could create the
+                            # outage it was meant to repair.
+                            log.warning(
+                                "identity.walk_resubscribe cam=%s "
+                                "(subscribed but intake quiet %.0fs)",
+                                cam_id, now - last_ts,
+                            )
+                            pub.set_subscribed(True)
+                    except Exception:  # noqa: BLE001
+                        healthy = False
+                        log.exception(
+                            "identity.walk_publication_failed cam=%s", cam_id,
+                        )
+                if healthy:
+                    walk_strikes.pop(cam_id, None)
+                    continue
+                walk_strikes[cam_id] = walk_strikes.get(cam_id, 0) + 1
+                if walk_strikes[cam_id] >= walk_max_strikes:
+                    log.error(
+                        "identity.walk_exhausted cam=%s — %d passes without "
+                        "healthy intake; exiting for supervisor restart",
+                        cam_id, walk_strikes[cam_id],
+                    )
+                    os._exit(5)
+        except Exception:   # noqa: BLE001 — the walk must never kill the service
+            log.exception("identity.walk_failed")
 
 
 # ── Face gallery (persistent DB enrollment) ──────────────────────────
@@ -551,6 +714,18 @@ def main() -> None:
     # the constants (loop.py + the intake constants above). The
     # experiments and their measurements live in git history and
     # docs/plans/2026-07-26-identity-productionization.md.
+
+    # 0.0.0.0 with no token = /state, /probes and the /stream debug feed
+    # are open to anything that can reach the box. On the dev rig that is
+    # the LAN; colocation puts it on a rented GPU host. Say it out loud
+    # at every boot rather than leaving it to be discovered.
+    if not _STATE_TOKEN:
+        log.warning(
+            "NEMARA_IDENTITY_STATE_TOKEN is unset — /state, /probes and "
+            "/stream are UNAUTHENTICATED on 0.0.0.0:%d. Set it here and "
+            "on the backend (same name) before any non-dev network.",
+            args.port,
+        )
 
     threading.Thread(
         target=lambda: uvicorn.run(

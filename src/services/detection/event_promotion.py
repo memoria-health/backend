@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import Float, and_, cast, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.analysis import Analysis
@@ -30,6 +30,7 @@ from src.db.event import Event
 from src.db.patient import Patient
 from src.services.detection.scheduling.decision import (
     cooldown_seconds_for,
+    episode_exit_gap_for,
     parse_eventing,
     windowed_entry_verdict,
 )
@@ -223,53 +224,120 @@ def _select_primary(
     return min(candidates, key=_rank)
 
 
-# Fallback episode gap (seconds) for a `state` detector that has no
-# inferred `episode_gap_seconds` — e.g. the legacy preset Agitation. Safety
-# states tighten the gap (re-alert sooner after a lull); routine states use
-# a longer one. New custom state detectors carry their own LLM-inferred gap.
-_DEFAULT_STATE_GAP_SAFETY = 60
-_DEFAULT_STATE_GAP_ROUTINE = 300
+# ── state episodes: entry on evidence, exit on ABSENCE of evidence ────
+#
+# An episode ENDS when the detector's positive evidence stops for
+# `exit gap` seconds. It does NOT end after a fixed duration, so an
+# episode lasts exactly as long as the behaviour does — a 3-minute nap
+# and a 3-hour one both yield one event, with no per-detector guess
+# about how long the activity "should" take.
+#
+# This replaced `episode_gap_seconds` as a rising-edge hysteresis
+# (2026-07-29). That scheme had two defects, both seen live: it needed
+# an LLM-guessed duration per detector, and it was applied as a sliding
+# COUNT window that drains mid-episode — a Watching-TV session produced
+# 5 events in 25 minutes because the count of ABOVE-THRESHOLD ticks fell
+# below M during ordinary confidence wobble, re-arming entry while the
+# man never moved. See the soak log: "held (1/3)" → fire → "ongoing
+# (4/3)".
+#
+# The gap is derived from CRITICALITY, not from the behaviour, so it
+# stays scale-free: safety states re-alert sooner after a real lull (a
+# caregiver needs nudging again), routine states stay quiet. Its two
+# constants keep the values the old category defaults used, so a detector
+# that never had an inferred gap behaves as it did before.
+#
+# The constants and accessor live in `scheduling.decision`
+# (`episode_exit_gap_for`) so the rising edge here and the falling
+# ("finished") edge in services/scheduling/scheduler cannot drift apart.
+
+# How far back the episode-boundary scan looks. Bounds query cost; an
+# episode running longer than this re-fires once, which is logged.
+_EPISODE_LOOKBACK_SECONDS = 12 * 3600
 
 
-def _episode_gap_for(det: Detector) -> int:
-    """Hysteresis gap (seconds) for a `state` detector: its inferred value,
-    else a category-aware default."""
-    if det.episode_gap_seconds:
-        return det.episode_gap_seconds
-    category = str(getattr(det.category, "value", det.category))
-    return _DEFAULT_STATE_GAP_SAFETY if category == "safety" else _DEFAULT_STATE_GAP_ROUTINE
-
-
-async def _state_episode_ongoing(
+async def _episode_boundary(
     session: AsyncSession,
     *,
     patient_id: UUID,
     detected_field: str,
-    conf_field: str,
-    threshold: float,
-    since: datetime,
-    before: datetime,
-) -> bool:
-    """True if this detector was already PROMOTABLE — detected=true AND
-    confidence >= threshold — on a PRIOR tick within [since, before), i.e. the
-    continuous activity was already firing-eligible, so this tick is NOT a
-    fresh rising edge.
+    now: datetime,
+    exit_gap_seconds: int,
+) -> datetime | None:
+    """Start of the episode in progress at `now`, or None if the detector
+    has no positive evidence in the lookback.
 
-    The confidence gate matters: a prior SUB-threshold blip (detected=true but
-    below the bar, which never fires) must NOT count as "ongoing", or it would
-    swallow the genuine first above-threshold event of an episode. Reads the
-    per-tick `analyses` history; the current tick's row is excluded via the
-    half-open `before` (it has captured_at == occurred_at).
+    The boundary is the oldest positive tick reachable from `now` without
+    crossing a gap of >= `exit_gap_seconds`. Computed with one window
+    function: mark every positive tick whose predecessor is missing or
+    too far back as a run-start, then take the most recent such mark.
+
+    Continuation counts `detected=true` at ANY confidence, deliberately
+    looser than the promotion threshold. The whole failure being fixed
+    was an episode "ending" because confidence wobbled under the bar
+    while the behaviour continued — so a sub-threshold tick is still
+    evidence the activity is ongoing, even though it could never fire.
     """
-    stmt = (
-        select(Analysis.id)
+    lookback_start = now - timedelta(seconds=_EPISODE_LOOKBACK_SECONDS)
+    positives = (
+        select(
+            Analysis.captured_at.label("at"),
+            func.lag(Analysis.captured_at)
+            .over(order_by=Analysis.captured_at)
+            .label("prev"),
+        )
         .where(
             and_(
                 Analysis.patient_id == patient_id,
-                Analysis.captured_at >= since,
-                Analysis.captured_at < before,
+                Analysis.captured_at > lookback_start,
+                Analysis.captured_at <= now,
                 Analysis.detector_fields[detected_field].astext == "true",
-                cast(Analysis.detector_fields[conf_field].astext, Float) >= threshold,
+            )
+        )
+        .subquery()
+    )
+    gap = timedelta(seconds=exit_gap_seconds)
+    stmt = select(func.max(positives.c.at)).where(
+        or_(
+            positives.c.prev.is_(None),
+            positives.c.at - positives.c.prev >= gap,
+        )
+    )
+    boundary = (await session.execute(stmt)).scalar_one_or_none()
+    # An episode older than the lookback gets truncated here, which lets it
+    # re-fire once. Say so rather than letting it look like a fresh episode.
+    if boundary is not None and boundary - lookback_start < timedelta(seconds=30):
+        _log.warning(
+            "[event_promotion] %s episode boundary hit the %dh lookback edge "
+            "(%s) — an episode longer than the lookback will re-fire once",
+            detected_field, _EPISODE_LOOKBACK_SECONDS // 3600,
+            boundary.isoformat(),
+        )
+    return boundary
+
+
+async def _episode_already_fired(
+    session: AsyncSession,
+    *,
+    detector_id: UUID,
+    patient_id: UUID,
+    since: datetime,
+) -> bool:
+    """True if this detector already filed an event at or after `since`
+    (the current episode's start).
+
+    Keyed on the EVENTS table rather than on tick history: "have we
+    already told the caregiver about this episode" is the question the
+    anti-spam rule actually asks, and it stays correct no matter how the
+    tick evidence wobbles in between.
+    """
+    stmt = (
+        select(Event.id)
+        .where(
+            and_(
+                Event.detector_id == detector_id,
+                Event.patient_id == patient_id,
+                Event.occurred_at >= since,
             )
         )
         .limit(1)
@@ -386,25 +454,46 @@ async def maybe_promote_analysis(
         if float(conf) < threshold:
             continue
 
-        # Continuous ("state") detectors fire only on the RISING EDGE of an
-        # episode. If the activity was already detected within this detector's
-        # hysteresis gap on a prior tick, it's ongoing — suppress, so a whole
-        # session ("watching TV") collapses to one event instead of one per
-        # tick. Instant (non-sustained) detectors are unaffected.
+        # Continuous ("state") detectors fire ONCE PER EPISODE. An episode
+        # runs from its first positive tick until positive evidence stops
+        # for the exit gap; one event is filed at entry and everything
+        # after it is "ongoing", however long the behaviour lasts.
+        # Instant (non-sustained) detectors are unaffected.
         if det.is_sustained:
+            exit_gap = episode_exit_gap_for(det)
+            boundary = await _episode_boundary(
+                session,
+                patient_id=patient_id,
+                detected_field=detected_field,
+                now=occurred_at,
+                exit_gap_seconds=exit_gap,
+            )
+            # Already filed an event inside THIS episode ⇒ ongoing. This is
+            # the whole anti-spam rule, and it is bounded by the behaviour
+            # rather than by any timer, which is why it no longer needs a
+            # per-detector duration guess.
+            if boundary is not None and await _episode_already_fired(
+                session, detector_id=det.id, patient_id=patient_id,
+                since=boundary,
+            ):
+                _log.info(
+                    "[event_promotion] %s episode ongoing since %s "
+                    "(exit gap %ds) — no new event",
+                    ident, boundary.isoformat(), exit_gap,
+                )
+                ongoing.append(ident)
+                continue
+
             cfg = parse_eventing(det.eventing) if v2_decisions else None
             # Duration trigger: the entry window IS the duration threshold, so
             # it fires on the crossing (present for ~D) and re-arms after a lull.
             if cfg is not None and det.alert_trigger == "duration" and det.duration_seconds:
                 cfg = _apply_duration_entry(cfg, det.duration_seconds)
             if cfg is not None and cfg.entry_m > 1:
-                # v2 (P4) M>1: the count-crossing edge REPLACES the
-                # activity rising edge — prior qualifying ticks inside
-                # the window are the evidence being accumulated, so the
-                # legacy check would misread them as "ongoing" and an
-                # M=3 state could never fire. Crossing semantics carry
-                # their own anti-spam (a saturated window = ongoing);
-                # a lull that drains the window below M re-arms entry.
+                # M>1: accumulate entry evidence, clamped to this episode.
+                # The clamp matters — an unclamped T wider than the exit gap
+                # would still see the previous episode's ticks and report
+                # "ongoing" for a genuinely new one.
                 verdict, count = await windowed_entry_verdict(
                     session,
                     patient_id=patient_id,
@@ -413,6 +502,7 @@ async def maybe_promote_analysis(
                     threshold=threshold,
                     now=occurred_at,
                     cfg=cfg,
+                    floor=boundary,
                 )
                 if verdict != "fire":
                     _log.info(
@@ -421,21 +511,6 @@ async def maybe_promote_analysis(
                     )
                     ongoing.append(ident)
                     continue
-            elif await _state_episode_ongoing(
-                session,
-                patient_id=patient_id,
-                detected_field=detected_field,
-                conf_field=conf_field,
-                threshold=threshold,
-                since=occurred_at - timedelta(
-                    seconds=_episode_gap_for(det),
-                ),
-                before=occurred_at,
-            ):
-                # M=1 (or flag off): today's on-sight rising edge,
-                # byte-for-byte.
-                ongoing.append(ident)
-                continue
 
         candidates.append(
             _Candidate(

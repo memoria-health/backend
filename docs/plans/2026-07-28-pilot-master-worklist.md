@@ -35,6 +35,21 @@
 
 ## Phase 0 — pre-soak fixes (blocks soak data quality)
 
+- [ ] **PER-CAMERA POD PROCESSES — resume here (2026-07-29).** Proven
+      that the pod's `_perception_lock` (`perception/server.py:80`) is
+      the real serialiser and that the A40 runs two independent pod
+      processes in genuine parallel (1.6-1.8x, pod compute UNCHANGED at
+      ~2s). Full measurements + the three-stacked-bottlenecks model:
+      `docs/architecture/identity-latency.md` ROOT CAUSE section.
+      Build: one pod process per camera on its own port, cameras routed
+      to their own process (`_SESSIONS` is process-global, so EdgeTAM
+      session affinity comes free instead of round-robining). ~11GB of
+      46GB for two model copies. Touches the client (per-camera pod URL)
+      + `identity_supervisor.sh` (N processes) + the tunnel (N ports) —
+      wants its own design pass, do not bolt on. Only AFTER this does
+      the uplink become the binding constraint and frame-size work
+      become worth revisiting. Symptom this closes: 12-16s lag whenever
+      both rooms are occupied.
 - [ ] SAM3 grounding-input resolution pin (pod): downscale frames fed to SAM3
       grounding to 1280-wide (the proven operating point); existing
       mask→track-res resize path unchanged. NOT the consensus-merge idea
@@ -43,6 +58,40 @@
       Deploy = rsync + pod restart. Success = phantom births ~0 in occupied
       still rooms; forced-reground loop gone; discrimination test still
       tracks 2 real people as 2.
+- [x] IDENTITY AUTH — CLOSED 2026-07-29 ~18:30. Token generated, in
+      backend `.env`, exported to the identity supervisor. Verified:
+      every endpoint 401s without it, 200s with it; backend `/ready`
+      reads identity ok (it now sends the bearer, and a 401 reports
+      `unauthorized` instead of the old `< 500` → "ok", which would
+      have made the check meaningless). ALL SIX endpoints are gated
+      now, not just three — `/timeline`, `/events` and `/snap` were
+      open, and `/snap` serves camera-cropped JPEGs, same exposure
+      class as `/stream`.
+      CONSUMERS THAT BROKE AND WERE FIXED (this is the part that made
+      it not a 30-second job): `tools/sentinel.py` (urllib RAISES on
+      401, so identity read as DOWN — it logged `identity: 0` for two
+      cycles before the restart), `tools/soak_dashboard.py`'s four
+      server-side proxies, and the dashboard's `<img>` tags, which
+      cannot carry an Authorization header — `/identity_stream/{cam}`
+      and `/identity_snap/{name}` proxies now front them server-side.
+      RELAUNCH PATTERN (anything talking to identity needs the env
+      var; a process started before the token was set fails closed):
+        export NEMARA_IDENTITY_STATE_TOKEN=$(grep '^NEMARA_IDENTITY_STATE_TOKEN=' .env | cut -d= -f2)
+      Applies to identity_supervisor.sh, soak_dashboard.py, sentinel.py.
+- [ ] ~~**IDENTITY IS UNAUTHENTICATED RIGHT NOW.**~~ (kept for the
+      record — this was the state until 2026-07-29 18:30.)
+      `NEMARA_IDENTITY_STATE_TOKEN` is set NOWHERE — not in `.env`, not
+      on the identity service — and an empty token means `auth_ok()`
+      waves every caller through. The service binds `0.0.0.0:8012`, so
+      on the dev rig `/state` (seat + per-camera identity), `/probes`
+      (per-probe face/body scores) and `/stream` (LIVE ANNOTATED VIDEO,
+      including the bedroom) are open to anything on the LAN. Since
+      2026-07-29 the service says so loudly at every boot; nobody has
+      acted on it yet. Fix = pick a secret, set the SAME
+      `NEMARA_IDENTITY_STATE_TOKEN` in backend `.env` and in the
+      identity service's environment, restart both. Do it before the
+      box leaves this LAN; the same variable is already on the Phase-2
+      Railway env-ADD list.
 - [ ] Prod hygiene: delete Supabase auth user
       `claude-diag-probe-20260728@example.com`; confirm no local env/profile
       references the prod pooler (policy now has an incident behind it).
@@ -182,18 +231,28 @@
        fires. Absence events: title "Possible <name>", watched-for
        narrative, clip_suppressed=True always (no camera, no clip).
 
-1. [ ] iOS login resilience: bootstrap() must not block sign-in on Realtime
-       subscribe (timeout + fire-and-forget behind existing 1s REST poll);
-       same for cold-launch restore. The incident's actual product bug.
-2. [ ] New cameras PRIVATE-BY-DEFAULT until classified (closes live-observed
-       15-min bedroom-stream gap; pairing copy already written).
+1. [x] iOS login resilience — DONE 2026-07-29. `bootstrap()` no longer
+       awaits `openRealtimeChannels()` (detached Task), and each
+       `subscribeWithError()` now has a 10s budget: the 07-28 hang was
+       a call that never RETURNED, so its own catch block never ran.
+       The 1s camera poll + foreground resync already carry state
+       without Realtime. Cold-launch restore rides the same path.
+       Build verified (`xcodebuild` succeeds under Swift 6 strict
+       concurrency).
+2. [~] New cameras PRIVATE-BY-DEFAULT until classified — DROPPED for
+       pilots (Aryaman 2026-07-29). The 15-min bedroom-stream window
+       stays open until the classifier lands a verdict.
 3. [ ] Backend pool right-size (10+10 → ~5+5 single replica) + role-level
        idle timeouts (config-only).
 4. [ ] Key rotation (LiveKit/APNs/Gemini/OpenAI/OpenRouter/Resend) — BLOCKS
        all prod env work; .env.bak still in git history on main.
-5. [ ] /state bearer token BOTH sides + unify env name
-       (backend `NEMARA_IDENTITY_STATE_TOKEN` vs service
-       `NEMARA_IDENTITY_TOKEN` — currently mismatched, silent no-auth trap).
+5. [x] /state token name UNIFIED 2026-07-29 — both sides read
+       `NEMARA_IDENTITY_STATE_TOKEN`; the service still accepts the old
+       `NEMARA_IDENTITY_TOKEN` with a deprecation warning, and now logs
+       loudly at boot when NO token is set (it binds 0.0.0.0, so an
+       empty token means /state, /probes and /stream are open).
+       REMAINING (ops, not code): actually SET the token on both sides
+       — it is unset today, so identity is currently open on the LAN.
 6. [ ] Research/B2 recording censoring (recordings currently RAW) — gates
        consent PDF → gates attestation → gates research-consent pilots.
 7. [ ] Consent attestation on DataCollection sheet + BIPA biometrics clause.
@@ -295,14 +354,200 @@ still before noon) also merges — night SPAN stretches but
 duration_minutes correctly excludes awake time. Revisit only from soak
 data.
 
-0d.[ ] CLIP A/V SYNC (Aryaman observed 2026-07-28): frames_to_mp4
-       encodes frames at a FIXED nominal fps while frames were captured
-       at jittery wall-clock moments, but the PCM track is contiguous
-       real time — so video runs fast/slow vs audio and drift grows
-       through the clip ("-shortest" truncates, never aligns). Fix =
-       true per-frame PTS (concat-demuxer durations from FrameSnapshot
-       timestamps) or per-clip effective fps (n_frames/real_span) as
-       the cheap 90% version. Do post-test-pass (changes clip encode).
+0d.[x] CLIP A/V SYNC — FIXED 2026-07-28 night (frames_to_vfr_mp4 in
+       mp4_remux.py): true per-frame durations via concat demuxer,
+       materialized on a clip_fps grid (`-vf fps=N` + exact `-t` cap —
+       raw `-vsync vfr` writes lying container durations), leading-PCM
+       trim for A/V t=0 alignment, no `-shortest`. Symptoms this
+       killed: 10-12s wandering clips for ~26s windows, the 21:27 fall
+       couch→floor "teleport", audio drift. Soak test B10 verifies on
+       every event clip from ~23:30 on. VLM-path frames_to_mp4 kept
+       (model doesn't watch in real time).
+
+0e.[x] WANDERING DOOR-GATE — 2026-07-28 night: registry.py legacy
+       grandfather branch DELETED; NULL door_config == unset == the
+       sensor does not run wandering (matches the app's "inactive
+       until exit doors set" promise; the generic prompt produced two
+       FP events in 2.5 min on family room-exits). Prompt targeting
+       also hardened: ONLY the designated exit door counts — any other
+       exit from frame (other doorway / off-edge / behind furniture)
+       is explicit FALSE. NOTE: test_rapid_seizure_path.py deleted
+       with Convulsion (Aryaman call) — the rapid-overlay pipeline has
+       NO end-to-end test now; re-add via a synthetic rapid-bucket
+       custom detector if rapid customs ship to users.
+
+## Resilience + telemetry architecture (as-built 2026-07-29 — the
+## seed of the post-soak hardening discussion)
+
+Born from three DISTINCT same-day infrastructure failures, all with
+the same disease — process-alive ≠ data-flowing:
+  1. 05:37–07:25 backend Docker-container egress wedge (new outbound
+     connections to LiveKit timed out; gateway + internet fine;
+     /health said 200 throughout; 108 min blind).
+  2. 11:02 gateway box wifi blip → LiveKit publisher ZOMBIE
+     (participant + publications registered, zero media; systemd saw
+     a running process; backend logged "walking for missed
+     track_subscribed" forever).
+  3. Identity service stranded subscriptions after the gateway
+     restart (its /state answered with frozen data; separately it had
+     silently frozen 04:19→08:07 holding the pod lock after a tunnel
+     death — watchdog blind).
+
+Layer 1 — in-process recovery (each service saves itself first):
+  - backend room_worker: reconnect loop + publication walk (existed).
+  - identity service: NEW missed-subscription walk (10s cadence:
+    unsubscribed publication → subscribe; subscribed-but-intake-quiet
+    15s → toggle). gpu/identity/service.py main loop.
+  - tunnel: gpu/deploy/tunnel_supervisor.sh active /health probe
+    (3 fails → kill+relaunch; ssh stderr captured to
+    /tmp/pod_tunnel.log). NOTE 2026-07-29: the legacy
+    scripts/pod_tunnel.sh loop from Jul 27 was found still running
+    and RACING it over port 8000 — killed; delete the script file.
+  - identity supervisor: gpu/deploy/identity_supervisor.sh (existed).
+
+Layer 2 — data-freshness probes (the truth signals):
+  - GET /health/freshness (backend): per-ONLINE-camera newest-analysis
+    age, 503 when any > 300s. Excludes disabled/ai_paused/offline so
+    intentional disconnects can never read as outages. THE portable
+    prod artifact: point a Railway healthcheck / external pinger at it.
+  - GET /ready (backend): dependency diagnosis layer — db (hard 503),
+    livekit reachability, identity /state, gateway_poll age (stamped
+    by /v1/gateway/wait). Reported-not-gated: status ok|degraded;
+    only db kills readiness. Caveat encoded in the docstring: an HTTP
+    200 from a dependency proves reachability, NOT data flow.
+  - identity /state lag_s per camera; /probes (per-probe face/body/
+    cand scores, 2026-07-29) for the dashboard's tick-correlated view.
+
+Layer 3 — the sentinel (tools/sentinel.py, host-run, stdlib-only,
+dev-rig; journal /tmp/sentinel.jsonl):
+  - Probes every 30s: backend/identity/tunnel/dashboard HTTP, frames
+    age via /health/freshness, identity lag via /state, gateway ping,
+    Docker gvisor in-progress-connection trend.
+  - Actions (shared 600s cooldown + 3/hr cap; forensics captured
+    BEFORE every restart into /tmp/sentinel_forensics/):
+      frames stale + backend 200 + gateway pings
+        + walk-signature in backend logs → GATEWAY restart (ssh)
+        + no walk-signature → BACKEND docker restart
+      identity lag > 300s WHILE frames fresh → IDENTITY restart
+        (high bar: costs the in-memory body pool).
+  - First live fire 2026-07-29 11:08: detected in <5 min, forensics
+    correctly ruled out the egress-wedge theory in one file read.
+  - Deliberate non-goals: never restarts on dead gateway/backend
+    probes alone (wrong-side restarts), never acts on an
+    intentionally-quiet home.
+
+Prod mapping (the post-soak discussion): freshness endpoint +
+external pinger replaces the sentinel's probe layer; caregiver-facing
+home-offline alert MUST key on data freshness (pilot-blocker);
+Railway's own healthcheck must NOT gate on /ready degraded (only
+db-fail); colocation deletes the tunnel class outright.
+
+DECIDED (Aryaman 2026-07-29): identity is stream-scoped, not
+toggle-scoped. "Pause AI" / Hide stop DETECTION only (streams keep
+flowing by design for instant resume) and identity keeps processing —
+it has no user-facing output and is what makes detection correct at
+resume. Parity is required ONLY for actual camera disconnects, and
+there it is structural: disconnect unpublishes → identity reader
+dies + participant_disconnected teardown + stale-intake track clear.
+No code change. Pilot consent language should describe identity
+processing as tied to the camera being CONNECTED, not to AI toggles.
+
+CLOSED 2026-07-29 — gateway publish-freshness watchdog. The box
+cannot see its own zombie (room, publications and connection_state
+all read healthy while zero media leaves), so the SUBSCRIBER tells
+it: `/gateway/roster` now returns `online` per camera (the backend's
+frame-arrival view, independent of AI pause), and
+`RosterManager._check_publish_freshness` exits the process after
+WD_PUBLISH_DARK_S=120s of publishing-into-the-void. Discovered while
+wiring it: the 2026-07-27 `_watchdog` was DEAD (never scheduled,
+and it read a RosterManager attribute off CameraSource) — which is
+exactly why the second zombie survived. Its LiveKit-unhealthy
+judgment now runs for real in the same method. BOTH judgments are
+gated on this box actually decoding frames for that camera, because
+an unplugged camera tears its publishers down and would otherwise
+trip the unhealthy branch every 45s forever, restarting the whole
+box (and every other camera on it) on a fault it cannot fix.
+Tradeoff accepted: a wedged BACKEND that reports every camera
+offline will make the gateway restart every ~2 min. Cheap, and the
+alternative is a blind home.
+
+CLOSED 2026-07-29 — sentinel is KEY-ONLY. `~/.ssh/memoria_ops.pub`
+installed in the box's authorized_keys; the expect/password path is
+DELETED, not made optional (a shared password usable from any machine
+on the LAN is not a control for hardware in someone's home). ssh and
+rsync to the box now work plainly. Host + key path override via
+`NEMARA_GATEWAY_SSH_HOST` / `NEMARA_GATEWAY_SSH_KEY`.
+
+- [ ] ONE COMMAND STILL OWED, on the box (needs Aryaman — the sudoers
+      write was blocked here): install
+      `/etc/sudoers.d/memoria-gateway-watchdog` granting NOPASSWD on
+      `systemctl restart|is-active|status memoria-gateway` ONLY. Exact
+      lines in nemara-gateway/GATEWAY_ACCESS.md §3. Until then the
+      sentinel's gateway restart reports
+      `GATEWAY_RESTART_FAILED: sudo wants a password` and does not
+      hang — and the gateway's OWN watchdog (which needs no ssh at
+      all) is unaffected, so the home is still covered.
+
+### 2026-07-29 adjudicated review — OPEN findings (fix before merge)
+
+Three review agents audited the day's diff. 9 defects fixed same-day
+(see changelog below); these remain OPEN and are merge-blockers unless
+noted:
+
+- **door_config wiped on detector-list edit** (`camera_detector_repo.
+  replace_assignments_for_camera`): the PUT deletes+reinserts
+  cameras_detectors rows without carrying `door_config`, so a
+  caregiver toggling any detector on a camera silently DISABLES
+  wandering there. Fix: preserve door_config (select-then-restore).
+  Also `child_wandering` can never obtain a door_config — the picker
+  hard-codes "wandering" — so it is structurally dark; parameterize
+  or drop it from _WANDERING_IDENTIFIERS.
+- **Sleep summariser uses the RUNNER HOST's timezone**, not
+  `caregivers.timezone`, and captures a fixed offset at import (also
+  wrong across DST). Blocks the India pilot. `camera_ingest.
+  _resolve_caregiver_tz` is the pattern to copy.
+- **Sleep ticks are not camera-scoped** — `_TICKS_SQL` pulls every
+  camera carrying the sleep detector; a second camera's ticks
+  manufacture out-of-bed events. `SleepTick` needs a camera field.
+- **Onset walk-back crosses blind gaps and the identity gate**, so
+  `sleep_onset` can be attributed to a visitor hours early; and
+  `bedtime` is no longer identity-gated and is None whenever onset
+  isn't found (v1 set it first).
+- **PCM alignment is back-computed from byte length** — any audio
+  underrun silently displaces the whole track (measured: 16s offset).
+  Buffers must return the first chunk's captured_at instead.
+- **Sleep-watch session self-extinguishes ~1h after the last in-bed
+  sighting**, so a 3am wake under a blanket isn't covered; and
+  `DIMS["sleep"].requires_motion=True` means raising the post-soak
+  scheduler dials would strip sleep fields from forced looks entirely.
+- [x] FIXED 2026-07-29 (below): `/ready` auth + identity URL,
+  `/state` token name, gateway publish-freshness watchdog, iOS
+  sign-in blocking on Realtime.
+- ACCEPTED, no fix (Aryaman 2026-07-29): censor cost doubling with
+  honest ~26s clips — we take the hit.
+- DROPPED (Aryaman 2026-07-29): new cameras private-by-default until
+  classified.
+- **Sentinel**: `gateway_zombie_signature` keys on a join-time log
+  line, so it does NOT fire in the zombie case it was written for
+  (restarts the backend instead); `pkill -f` can hit the uv wrapper /
+  unrelated processes and does nothing if identity is off-host;
+  restart budget is shared, so identity restarts can starve a real
+  backend wedge. Per-target budgets + a backend-exported signal.
+- **`/ready` holds a DB session across ~6s of outbound HTTP**,
+  is unauthenticated, and `get_settings()` has no lru_cache (re-reads
+  .env per call) — close to the 2026-07-28 pool-exhaustion incident.
+  Also `identity_state_url` defaults to host.docker.internal, so
+  /ready will read "degraded" on Railway forever.
+- **Censor cost doubles** with the now-honest ~26s clips (208 decoded
+  frames vs ~83, single-threaded YOLO, 180s timeout → a timeout
+  downgrades to full-frame blur); `censor.py`'s fps fallback is 4.0
+  but clips are clip_fps=8. Sensitivity screen spend ~2.4x/clip.
+- **Identity `_remove_camera` never cancels `_probe_task`** — a
+  removed camera's probe loop runs forever and pins its native-res
+  ring (GBs). Pre-existing, amplified by camera churn.
+- VFR encode does per-frame JPEG conversion + file writes ON the event
+  loop; move to a thread. `end_at` earlier than the last frame is
+  silently ignored (drift, never truncation — verified).
 
 ## EXIT REVIEW (mandatory, before pilot go-live)
 
@@ -312,10 +557,20 @@ data.
 
 ## Open decisions (Aryaman)
 
-- [ ] intimate_situation: the one silent carve-out to "censored clips keep
-      audio"? (flagged by privacy session)
-- [ ] Pilot families: research consent from day 1 (pulls items 6-9 forward)
-      or observation-first?
+- [x] intimate_situation IS the one silent carve-out — DECIDED + BUILT
+      2026-07-29. `sensitivity.SILENT_CATEGORIES`; `censor_clip` /
+      `_censor_full_frame` take `keep_audio`. Everywhere else audio
+      stays (the cry-for-help rule). A MISSING verdict does NOT
+      silence — that path is the screen-failure fallback and fires on
+      ordinary clips, so silencing it would strip the shout from a fall
+      whose screen timed out. Silence requires a positive finding.
+- [x] Pilot families: OBSERVATION-FIRST — research consent is NOT
+      assumed from day 1 (Aryaman 2026-07-29). Consequences: items 6-9
+      (B2 recording censoring, consent attestation + BIPA, sensitivity
+      eval corpus, censor soak) stay in their current position rather
+      than being pulled forward; the data-collection flag ships OFF and
+      any research-consent home is opt-in per family, later. Do NOT
+      build anything that presumes a consented corpus exists.
 
 ## Parked (explicitly NOT for pilots)
 

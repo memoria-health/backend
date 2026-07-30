@@ -121,6 +121,60 @@ _FEW_SHOT_EXAMPLE_ROUTINE_REACTIVE = (
 )
 
 
+# Hard rules for every compiled detector, each one a fix for a specific
+# false-positive class observed in the 2026-07-29 soak review. Prepended
+# to the meta-prompt so they bind before the caregiver's wording is read.
+#
+# Rules 1-4 come from "Watching TV", compiled from the caregiver text
+# "Tell me when he is watching TV". It fired 5 times in 25 minutes on a
+# man working on a laptop, because the generated block said the screen
+# being lit OR the person being focused on it -- so orientation alone
+# satisfied it -- and its list of competing activities named phone,
+# tablet, reading and eating but not LAPTOP, the most common posture in
+# the room. Rule 5 comes from "Calling for help", whose generated block
+# ended with a worked example containing a famous emergency catchphrase;
+# the model then "transcribed" that catchphrase out of ordinary
+# conversation.
+_HARD_RULES = """\
+Follow these rules without exception. They override anything in the
+caregiver's wording that conflicts with them.
+
+1. REQUIRE THE PHYSICAL EVIDENCE. Identify the observable thing that
+   must be visible (or audible) for this behaviour to be happening at
+   all, and make it a REQUIRED condition. Never join a required
+   observation to an alternative with "or" -- that makes it optional. If
+   the required evidence cannot be seen, the answer is FALSE.
+
+2. A BEHAVIOUR LABEL IS NOT AN OBSERVATION. Body orientation, being in
+   the room where something usually happens, or proximity to an object
+   are never sufficient on their own. Say so explicitly.
+
+3. NAME THE COMPETING ACTIVITIES. List the things a person in a home is
+   most likely to be doing that could be mistaken for this behaviour,
+   and state that each one means FALSE. Always consider a laptop or
+   computer, a phone or tablet, reading, eating, cleaning, and talking
+   to someone.
+
+4. NEVER RELY ON WHAT THE MODEL CANNOT KNOW. Do not refer to a person's
+   habits, routine, usual spot, schedule, or medical history. The model
+   sees only this clip.
+
+5. DO NOT INCLUDE A QUOTABLE EXAMPLE OF THE THING BEING DETECTED. Never
+   write out a specific sentence, phrase, or catchphrase that would count
+   as a positive. The model copies such examples into its output as if it
+   had observed them. Describe the CATEGORY of evidence instead.
+
+6. UNCLEAR IS NOT WEAK EVIDENCE, IT IS NO EVIDENCE. State that an
+   ambiguous, occluded, distant, or unintelligible clip is FALSE, and
+   that this is the common case rather than an edge case.
+
+7. IF THIS DETECTOR DEPENDS ON SOUND, judge only words that can actually
+   be made out, require that the exact words be quoted in the reasoning
+   before TRUE is allowed, and state that audio which may come from a
+   television, radio, speaker, phone, or laptop does not count.
+"""
+
+
 def _meta_prompt(
     *, identifier: str, name: str, description: str, user_text: str,
     absence: bool, category: str,
@@ -169,7 +223,8 @@ def _meta_prompt(
 
     return (
         "You are configuring a computer-vision detector that runs on "
-        "short (~15s) clips from a wall-mounted home security camera.\n\n"
+        "short (~11s) clips from a wall-mounted home security camera.\n\n"
+        f"{_HARD_RULES}\n"
         "The caregiver wants a new detector with this description:\n"
         f"  Name:        {name!r}\n"
         f"  Description: {description!r}\n"

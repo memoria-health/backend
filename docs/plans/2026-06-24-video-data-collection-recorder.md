@@ -1,5 +1,7 @@
 # Video Data-Collection Recorder — Implementation Plan (v1, ACTIVE)
 
+> Status (2026-07-27): implemented — `src/services/data_collection/` (b2, gate, keys, manager, mux, session, streaming_encoder) all live; hooks wired in `src/services/detection/room_worker.py` + `camera_ingest.py`; consent columns on `src/db/patient.py`; companion consent UI also shipped (see 2026-06-24-data-collection-consent-ui.md).
+
 > **STATUS — ACTIVE (chosen path).** We evaluated **LiveKit Egress** and rejected it on cost: audio requires *Track Composite* egress at **$0.02/min ≈ $14k/mo at 50 homes**, vs **~$0** for this in-process recorder (it reuses frames detection already decodes — no extra LiveKit subscription, no double-charge). This is the v1 plan. The egress option stays documented as the at-large-scale fallback.
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.

@@ -1,10 +1,13 @@
 # Track-ledger ghost deadlock — diagnosis + known easy fix
 
 **Status:** KNOWN BUG, fix documented below, **NOT applied**. The architecture
-is pivoting to EdgeTAM-continuous tracking (see memory
-`nemara-edgetam-continuous-pivot`), which dissolves the whole bug class by
-giving the pod stable track ids across ticks. Apply this fix **only** if the
-ledger architecture must be kept as the live path.
+pivoted to EdgeTAM-continuous tracking (pivot COMPLETED 2026-07-24; the live
+path is now the identity service, `gpu/identity/`), which dissolves the whole
+bug class by giving the pod stable track ids across ticks. The legacy ledger
+still exists at `src/services/identity/track_ledger.py` as the A/B-and-fallback
+brain, slated for deletion at P3 (see `gpu/identity/README.md`) — this doc
+stays alive exactly as long as that file does. Apply this fix **only** if the
+ledger architecture must be revived as the live path.
 
 ## Symptom
 
@@ -22,7 +25,9 @@ minutes) but the output shows `lock=None` / `patient_in_clip=False`.
    can't bridge the jump, so a NEW entry (`1020`/`1012`) births instead of
    continuing `1019`.
 3. `1019` loses its live track → bodyless **"ghost"**. But `_retire`
-   (`track_ledger.py` ~:795) extends a PATIENT ghost's `last_seen` every tick
+   (`src/services/identity/track_ledger.py`; line numbers below are from the
+   2026-07-22 file and have since shifted) extends a PATIENT ghost's
+   `last_seen` every tick
    the scene sees *anyone* → the ghost **never retires** (immortalized).
 4. The live re-numbered track (`1020`) matches the patient pool (0.72) and
    tries to bind, but `_bind_patient` keeps the incumbent on an equal-tier tie

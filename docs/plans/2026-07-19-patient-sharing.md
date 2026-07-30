@@ -1,5 +1,7 @@
 # Plan: Patient Sharing (multi-caregiver access) + future per-patient roles
 
+> Status (2026-07-27): partially implemented — backend fully shipped (schema + RLS + backfill in 0973ff1; membership-scoped repos via `src/repos/access.py`, share endpoints `src/api/patient_members.py`, LiveKit token membership gate in f1c0564, both 2026-07-19). Client "Manage access / Share" screens (§5, web + iOS) not built.
+
 Branch: `feat/patient-sharing` (off `origin/main` @ c159356)
 
 ## Goal

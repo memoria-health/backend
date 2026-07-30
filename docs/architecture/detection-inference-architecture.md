@@ -4,6 +4,24 @@
 > generalizes this material into the hierarchical detector model. This file is kept
 > as the **experimental-evidence record** — §4's measured results remain the proof
 > base cited by v2. Do not extend this file; extend v2.
+>
+> **Naming drift vs shipped code (reconciled 2026-07-27)** — this doc's design
+> vocabulary predates the phase C–H2 refactors. Where it says:
+> - `persistence: point / state` and "'Scheduled' is not a shape" → shipped as the
+>   **alerting spine**: `alert_trigger` (`leading`/`trailing`/`duration`/`absence`)
+>   + `is_sustained` on the `detectors` row; the `shape` column/enum was dropped.
+> - `requires_movement` (§7) → shipped as the `requires_motion` boolean column
+>   (the intermediate `evidence_branch` enum was later collapsed into it).
+> - k-of-N / windowed-count M (§6) → the within-clip confirm exists in
+>   `decision.py`; the **entry M-of-N shipped as an INTERNAL confidence gate
+>   derived from detection difficulty** (`compiler_v2.py`), never user-facing.
+> - Multi-person fan-out (§5) → shipped with a **global home-wide crowd
+>   fallback**: above `scheduler_crowd_fallback_tracks` tracks, crop buckets
+>   fall back to full-scene.
+> - Layer-1/Layer-2 tracking-vs-attribution (§5) → shipped as the SAM3+EdgeTAM
+>   continuous perception pod (`gpu/perception/`) + the `gpu/identity/` sidecar,
+>   not the in-process YOLO+BoT-SORT stack described here.
+> The measurements in §4 are unaffected.
 
 > Original status: **design spec** (2026-07-11, re-drafted). The north star is **detection
 > accuracy** across the whole size×speed space — large/small, slow/fast — plus an

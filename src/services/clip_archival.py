@@ -10,8 +10,10 @@ When a detector fires, the caregiver app needs to see *what happened*
          `settings.clip_post_event_wait_seconds` and then snapshots
          the FrameBuffer (the subscriber-bot keeps writing into it
          continuously between ticks).
-  final — pre+post in ONE ffmpeg encode at clip_fps with a single
-         contiguous PCM audio track, uploaded as
+  final — pre+post in ONE wall-clock-faithful encode
+         (`frames_to_vfr_mp4`: each frame keeps its real captured_at
+         timing, so the clip plays the true window duration and audio
+         aligns 1:1) with a single contiguous PCM track, uploaded as
          `events/{event_id}.mp4` in the `incident-clips` Supabase
          Storage bucket. Single-encode is deliberate (2026-07-27): the
          old reuse-LLM-MP4 + concat assembly had a visible seam and
@@ -61,7 +63,7 @@ from src.db.event import Event
 from src.db.patient import Patient
 from src.services import storage
 from src.services.detection import censor, sensitivity
-from src.services.detection.mp4_remux import Mp4RemuxError, frames_to_mp4
+from src.services.detection.mp4_remux import Mp4RemuxError, frames_to_vfr_mp4
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -80,6 +82,9 @@ async def archive_event(
     camera_id: UUID,
     pre_frames: list,
     pre_pcm: bytes,
+    # Measured capture time of the first PCM chunk. None = unknown, in
+    # which case audio is muxed without shift rather than guessed at.
+    pre_pcm_start: float | None = None,
     pre_end_captured_at: float,
     frame_buffer: "FrameBuffer",
     audio_buffer: "AudioBuffer",
@@ -87,10 +92,11 @@ async def archive_event(
     settings: "Settings",
 ) -> None:
     """Capture the post-event window, encode it together with the
-    pre-event frames in ONE ffmpeg pass at `clip_fps` (audio muxed as a
-    single contiguous PCM track — 2026-07-28, audio restored; censored
-    clips still strip it), upload the result, and flip `has_clip=true`
-    on the events row.
+    pre-event frames in ONE wall-clock-faithful ffmpeg pass
+    (`frames_to_vfr_mp4` — 2026-07-28: real per-frame timing, so the
+    clip plays the true window duration and the contiguous PCM track
+    aligns 1:1; censored clips still strip audio), upload the result,
+    and flip `has_clip=true` on the events row.
 
     Errors are caught and logged. The events row stays without a clip
     rather than the whole detector pipeline crashing — caregivers
@@ -98,10 +104,6 @@ async def archive_event(
 
     `pre_frames` is a clip_fps snapshot of the analysis window taken
     at tick time (frame refs shared with the buffer — cheap to hold).
-    Single-encode (2026-07-27) replaced the old reuse-the-LLM-MP4 +
-    concat + muxed-PCM assembly: one encode at clip_fps has no concat
-    seam and no audio, which is deliberate — the muxed audio never
-    aligned cleanly and made clips look cheap.
 
     `pre_end_captured_at` is the `time.monotonic()` timestamp of the
     last frame in the pre-event snapshot. The archive task uses it
@@ -122,6 +124,7 @@ async def archive_event(
             camera_id=camera_id,
             pre_frames=pre_frames,
             pre_pcm=pre_pcm,
+            pre_pcm_start=pre_pcm_start,
             pre_end_captured_at=pre_end_captured_at,
             frame_buffer=frame_buffer,
             audio_buffer=audio_buffer,
@@ -153,6 +156,9 @@ async def _archive_one(
     camera_id: UUID,
     pre_frames: list,
     pre_pcm: bytes,
+    # Measured capture time of the first PCM chunk. None = unknown, in
+    # which case audio is muxed without shift rather than guessed at.
+    pre_pcm_start: float | None = None,
     pre_end_captured_at: float,
     frame_buffer: "FrameBuffer",
     audio_buffer: "AudioBuffer",
@@ -207,29 +213,40 @@ async def _archive_one(
         await _stamp_clip_suppressed(sessionmaker, event_id)
         return
 
-    # Single-encode assembly (2026-07-27): pre frames captured at tick
-    # time + post frames from the buffer, one video-only ffmpeg pass at
-    # clip_fps. No concat (no seam), no muxed PCM (deliberate — audio
-    # never aligned cleanly and made clips look cheap). Guard against
-    # boundary overlap: post's cutoff anchors at pre_end, but a late
-    # retarget can duplicate the boundary frame.
+    # Single-encode assembly: pre frames captured at tick time + post
+    # frames from the buffer, one ffmpeg pass. Guard against boundary
+    # overlap: post's cutoff anchors at pre_end, but a late retarget
+    # can duplicate the boundary frame.
     pre_last = pre_frames[-1].captured_at if pre_frames else float("-inf")
     clip_frames = list(pre_frames) + [
         f for f in post_frames if f.captured_at > pre_last
     ]
-    post_pcm = (
-        audio_buffer.snapshot_last_seconds(wait_seconds, now=target_wall_time)
+    post_pcm, post_pcm_start = (
+        audio_buffer.snapshot_window(wait_seconds, now=target_wall_time)
         if post_available
-        else b""
+        else (b"", None)
     )
     clip_pcm = pre_pcm + post_pcm
+    # Where the combined track actually STARTS: the pre-roll's measured
+    # start when there is pre-roll audio, else the post-roll's. Never
+    # derived from the byte length — a buffer gap would then shift the
+    # whole track against the video.
+    clip_pcm_start = pre_pcm_start if pre_pcm else post_pcm_start
+    # Wall-clock-faithful VFR encode (2026-07-28): each frame keeps its
+    # real captured_at as display timing, so the clip plays the true
+    # window duration and audio aligns 1:1 — no fixed-fps time
+    # compression (the old encode played frame-count/clip_fps seconds:
+    # short, sped-up clips that teleported across still stretches).
+    clip_ends_at = target_wall_time if post_available else pre_end_captured_at
     try:
-        combined_mp4 = await frames_to_mp4(
+        combined_mp4 = await frames_to_vfr_mp4(
             clip_frames,
             fps=settings.clip_fps,
+            end_at=clip_ends_at,
             pcm=clip_pcm if clip_pcm else None,
             pcm_sample_rate=audio_buffer.sample_rate,
             pcm_num_channels=audio_buffer.num_channels,
+            pcm_starts_at=clip_pcm_start,
         )
     except (Mp4RemuxError, ValueError) as exc:
         log.warning("clip_archival.clip_encode_failed event_id=%s err=%s", event_id, exc)
@@ -393,13 +410,27 @@ async def resolve_clip_for_upload(
     # falls back to full-frame internally).
     full_frame = verdict is None
     categories = list(verdict.categories) if verdict is not None else None
+    # The intimate-situation carve-out (Aryaman 2026-07-29): audio stays
+    # on every other censored clip, because the reason we kept it is
+    # that a cry for help must be audible. Here the sound is itself the
+    # exposure, so a blurred picture with the audio intact would defeat
+    # the censor.
+    #
+    # A MISSING verdict does NOT silence. The no-verdict path is the
+    # screen-failure fallback (timeout, low confidence, API error) and
+    # it fires on ordinary clips — a fall whose screen timed out would
+    # lose the shout, which is precisely the case the audio rule exists
+    # to protect. Silence requires a POSITIVE intimacy finding.
+    keep_audio = not (set(categories or ()) & sensitivity.SILENT_CATEGORIES)
     log.info(
         "clip_archival.censoring event_id=%s camera_id=%s full_frame=%s "
-        "categories=%s",
-        event_id, camera_id, full_frame, categories,
+        "categories=%s keep_audio=%s",
+        event_id, camera_id, full_frame, categories, keep_audio,
     )
     try:
-        censored_bytes = await _censor_bytes(mp4, full_frame=full_frame)
+        censored_bytes = await _censor_bytes(
+            mp4, full_frame=full_frame, keep_audio=keep_audio,
+        )
     except Exception:  # noqa: BLE001 — censor failure → drop, never raw
         log.exception(
             "clip_archival.censor_failed event_id=%s camera_id=%s — "
@@ -451,7 +482,9 @@ def sweep_scratch_dir() -> int:
     return removed
 
 
-async def _censor_bytes(mp4: bytes, *, full_frame: bool) -> bytes:
+async def _censor_bytes(
+    mp4: bytes, *, full_frame: bool, keep_audio: bool = True,
+) -> bytes:
     """Round-trip the in-memory clip through `censor.censor_clip` via
     tempfiles. The RAW tempfile (and the censored one) are unlinked in
     the finally — no raw clip bytes persist on disk past this call,
@@ -464,7 +497,9 @@ async def _censor_bytes(mp4: bytes, *, full_frame: bool) -> bytes:
             in_path = f.name
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False, dir=_scratch_dir()) as f:
             out_path = f.name
-        await censor.censor_clip(in_path, out_path, full_frame=full_frame)
+        await censor.censor_clip(
+            in_path, out_path, full_frame=full_frame, keep_audio=keep_audio,
+        )
         with open(out_path, "rb") as f:
             censored_bytes = f.read()
         if not censored_bytes:

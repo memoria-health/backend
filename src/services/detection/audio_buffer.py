@@ -91,11 +91,34 @@ class AudioBuffer:
         plays back). `now` defaults to `time.monotonic()`; tests pin
         it.
         """
+        return self.snapshot_window(seconds, now=now)[0]
+
+    def snapshot_window(
+        self,
+        seconds: float,
+        *,
+        now: float | None = None,
+    ) -> tuple[bytes, float | None]:
+        """Same window as `snapshot_last_seconds`, but ALSO returns the
+        capture time of the first chunk included (None when empty).
+
+        Anything aligning this audio against video must use that
+        timestamp rather than working the start time back from
+        len(pcm) / bytes-per-second. That arithmetic assumes the buffer
+        is gapless AND ends exactly at the caller's anchor; a muted
+        track, an unpublished track, or an SDK stall breaks both, and
+        the mis-inferred offset then displaces the ENTIRE track (16s,
+        measured) while still producing a file that looks structurally
+        normal — so nothing downstream can detect it.
+        """
         if seconds <= 0:
-            return b""
+            return b"", None
         ref = time.monotonic() if now is None else now
         cutoff = ref - seconds
-        return b"".join(c.data for c in self._chunks if c.captured_at >= cutoff)
+        picked = [c for c in self._chunks if c.captured_at >= cutoff]
+        if not picked:
+            return b"", None
+        return b"".join(c.data for c in picked), picked[0].captured_at
 
     def __len__(self) -> int:
         return len(self._chunks)

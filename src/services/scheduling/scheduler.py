@@ -42,17 +42,17 @@ from src.db.detector import Detector
 from src.db.event import Event
 from src.db.patient import Patient
 from src.services import email, push
+from src.services.detection.scheduling.decision import episode_exit_gap_for
 from src.settings import Settings
 
 log = logging.getLogger(__name__)
 
 _FALLBACK_TZ = "America/New_York"
 
-# Trailing trigger (Phase E): default hysteresis gap when a detector has no
-# episode_gap_seconds, and how far back the falling-edge sweep looks for the
-# episode's last sighting (bounded so a long-idle detector doesn't scan all
-# history each tick).
-_DEFAULT_TRAILING_GAP_SECONDS = 300
+# How far back the falling-edge sweep looks for the episode's last
+# sighting (bounded so a long-idle detector doesn't scan all history each
+# tick). The gap itself now comes from `decision.episode_exit_gap_for` so
+# both edges of an episode use one definition.
 _TRAILING_LOOKBACK_SECONDS = 6 * 3600
 
 
@@ -305,7 +305,13 @@ class ScheduledDetectorRunner:
         patient = await session.get(Patient, det.patient_id)
         if patient is None:
             return
-        gap = det.episode_gap_seconds or _DEFAULT_TRAILING_GAP_SECONDS
+        # Same exit gap the rising edge uses, so the two edges agree on
+        # when an episode ended (2026-07-29). Previously read the
+        # per-detector `episode_gap_seconds`, an LLM-guessed activity
+        # duration — with the two edges free to disagree, a session could
+        # report "finished" while the rising edge still considered it
+        # ongoing. Criticality-derived, so nothing is guessed per detector.
+        gap = episode_exit_gap_for(det)
         now_utc = datetime.now(timezone.utc)
         detected_key = f"{det.identifier}_detected"
 

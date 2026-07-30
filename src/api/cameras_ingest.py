@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from collections.abc import AsyncIterator
 
 from datetime import datetime, timezone
@@ -47,6 +48,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import func, select, text
 
+from src.api import health as health_mod
 from src.api.deps import SessionDep, SettingsDep
 from src.db.camera import Camera
 from src.repos import camera_detector_repo
@@ -393,7 +395,7 @@ async def gateway_roster(
     )
     rows = (await session.execute(
         text("SELECT id, livekit_identity, livekit_room, desired_state, "
-             "privacy_enabled, "
+             "privacy_enabled, online, "
              "(SELECT audio_capture_enabled FROM public.patients p "
              " WHERE p.id = patient_id) AS audio_capture_enabled "
              f"FROM public.cameras {_cam_where} ORDER BY created_at"),
@@ -407,11 +409,22 @@ async def gateway_roster(
     # `audio_capture_enabled` (patient-level, 2026-07-28): when false the
     # gateway never publishes the audio track — the facilities audio kill,
     # severed at the source so nothing downstream can leak it.
+    # `online` (2026-07-29): the SUBSCRIBER's view of whether this
+    # camera's frames are actually landing here — stamped by the room
+    # worker on real frame arrival and independent of detector activity
+    # (an ai_paused camera still reads online). The gateway cannot see
+    # this about itself: in the 2026-07-29 wifi-blip zombie its room,
+    # publications and connection_state all said healthy while zero
+    # media left the box. Handing it back closes that blind spot.
+    # Deliberately NOT in /gateway/wait's fingerprint — `online` flaps
+    # on ordinary blips, and fingerprinting it would wake the long poll
+    # constantly for something the 3s roster poll delivers anyway.
     return {"tunnel_port": tunnel_port, "cameras": [
         {"camera_id": str(r[0]), "livekit_identity": r[1],
          "livekit_room": r[2], "desired_state": r[3],
          "privacy_enabled": bool(r[4]),
-         "audio_capture_enabled": bool(r[5]) if r[5] is not None else True}
+         "online": bool(r[5]),
+         "audio_capture_enabled": bool(r[6]) if r[6] is not None else True}
         for r in rows
     ]}
 
@@ -434,6 +447,13 @@ async def gateway_wait(
     drops. (Internal 0.4s DB check; a Postgres LISTEN/NOTIFY upgrade would make
     it truly instant + zero internal polling.)
     """
+    # Dependency-health stamp: /ready reports how long ago the gateway
+    # last long-polled — a box whose service died or whose network
+    # dropped stops polling, and that age is the cheapest backend-side
+    # signal of it. Must stay BELOW the docstring: put above it, the
+    # string stops being the docstring and the contract above vanishes
+    # from /docs and from help().
+    health_mod.last_gateway_poll_mono = time.monotonic()
     if not authorization.lower().startswith("bearer "):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="missing_bearer_token",

@@ -92,6 +92,21 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# Sleep-watch (2026-07-29): while an in-bed sighting is fresher than
+# SESSION_S, a closed camera still buys one full VLM look every
+# INTERVAL_S (~12 flash-lite calls/hour) so a wake can't hide inside
+# the no-motion economy — the first soak night went blind on a wake
+# because waking to a phone moves less than the motion gate needs.
+# How long an in-bed sighting keeps the sleep-watch armed. Sized to a
+# whole night, NOT an hour: once someone is under the covers the
+# forced looks come back "no person visible", so an hour-long session
+# expired around midnight and the 3am wake it exists to catch was
+# never watched for. The session is CLOSED early the moment a look
+# sees the person visibly up and not in bed (see the stamp site), so a
+# daytime nap doesn't leave it armed all evening.
+_SLEEP_WATCH_SESSION_S = 12 * 3600.0
+_SLEEP_WATCH_INTERVAL_S = 300.0
+
 # Bound on how long stop() will wait for in-flight tick bodies to
 # finish before force-cancelling. Re-id-gated ticks (fast path) finish
 # in ~3s; Gemini-running ticks take up to ~28s and we'd rather
@@ -224,6 +239,15 @@ class CameraIngest:
         # across the room's cameras). None when the feature is off /
         # not wired — then every recorder hook is a no-op.
         self._recorder = recorder
+        # Sleep-watch (2026-07-29, Aryaman): while a tick has recently
+        # SEEN the patient in bed, the closed-state economy may not go
+        # fully blind — a still sleeper (or one who wakes without big
+        # movement) closed the camera and hid a real wake inside a
+        # skip window on the first soak night. Self-gating: a camera
+        # whose loadout has no sleep detector never sees
+        # sleep_detected=true, so it never opens a session.
+        self._last_sleep_seen_mono = float("-inf")
+        self._last_full_look_mono = float("-inf")
         # Retained for log identification; the actual reaper for a
         # vanished camera lives in `LiveKitRoomReconciler`.
         self._livekit_identity = livekit_identity
@@ -770,6 +794,10 @@ class CameraIngest:
         # Set iff this tick was woken out of the closed state by the
         # backend motion pass (whole-frame env fraction that fired).
         backend_wake_env: float | None = None
+        # True when this tick only ran because the sleep-watch bought a
+        # look — i.e. the motion check said NO motion. Kept separate so
+        # the row never claims motion that did not happen.
+        sleep_watch_forced = False
         # Pinned (queued-shed) ticks anchor EVERYTHING at their shed
         # moment: the row's captured_at, and tick_mono so any further
         # buffer snapshot (e.g. the RAPID native window) reads the same
@@ -971,6 +999,37 @@ class CameraIngest:
                     # a real wake; with no hint, stay closed exactly as
                     # the pre-consolidation no-hint path did.
                     woke = bool(sad_motion)
+                if not woke:
+                    # Sleep-watch forced look: the patient was seen in
+                    # bed within the last hour and no full look has run
+                    # for 5+ minutes — buy one VLM tick so a wake can't
+                    # hide in the no-motion skip (a person waking to
+                    # their phone moves less than the motion gate needs).
+                    now_mono = time.monotonic()
+                    if (
+                        now_mono - self._last_sleep_seen_mono
+                        < _SLEEP_WATCH_SESSION_S
+                        and now_mono - self._last_full_look_mono
+                        >= _SLEEP_WATCH_INTERVAL_S
+                    ):
+                        woke = True
+                        sleep_watch_forced = True
+                        # Claim the 5-minute budget HERE, at the moment
+                        # we decide to spend it. Several paths below
+                        # return before the end of the tick (no frames
+                        # in the window, encode failure, identity gate),
+                        # and two ticks can be in flight at once — a
+                        # stamp placed at the end would leave this
+                        # condition true and fire a forced look on
+                        # EVERY 10s tick until one tick fully finished.
+                        self._last_full_look_mono = now_mono
+                        log.info(
+                            "%s SLEEP-WATCH forced look — in-bed seen "
+                            "%.0fs ago, last full look %.0fs ago",
+                            self._log_tag,
+                            now_mono - self._last_sleep_seen_mono,
+                            now_mono - self._last_full_look_mono,
+                        )
                 if woke:
                     log.info(
                         "%s closed-state WAKE (sad=%s block_max=%.1f blocks=%d)",
@@ -984,9 +1043,18 @@ class CameraIngest:
                     # visible only in logs. Unit note: since the block-
                     # motion consolidation this carries the max BLOCK
                     # DELTA (luma levels), not the old env fraction.
-                    backend_wake_env = (
-                        wake_check.max_block_delta if wake_check else 0.0
-                    )
+                    if not sleep_watch_forced:
+                        backend_wake_env = (
+                            wake_check.max_block_delta if wake_check else 0.0
+                        )
+                    # A sleep-watch look deliberately runs with NO
+                    # motion, so it must leave backend_wake_env unset:
+                    # that value is what makes the row report
+                    # motion_in_clip=true / motion_src="backend", and
+                    # it also feeds the data-collection gate. Claiming
+                    # motion here would corrupt night-time restlessness
+                    # data AND could start recording someone asleep in
+                    # bed on a camera whose room isn't classified yet.
                 else:
                     state_after = await apply_tick_update(
                         session,
@@ -1092,13 +1160,16 @@ class CameraIngest:
             # Matching pre-roll AUDIO, same anchor (2026-07-28: audio is
             # back in clips — single-pass mux, one contiguous PCM track;
             # the old "cheap" muxing was the concat seam, now gone).
-            clip_pre_pcm = (
-                self.audio_buffer.snapshot_last_seconds(
+            # snapshot_window (not snapshot_last_seconds) so the clip
+            # encoder gets the MEASURED start time of this audio rather
+            # than inferring it from the byte count.
+            clip_pre_pcm, clip_pre_pcm_start = (
+                self.audio_buffer.snapshot_window(
                     self._settings.livekit_worker_window_seconds,
                     now=window[-1].captured_at,
                 )
                 if window
-                else b""
+                else (b"", None)
             )
             try:
                 mp4_bytes = await frames_to_mp4(
@@ -1855,6 +1926,10 @@ class CameraIngest:
                 state_after_state = (
                     cam.state if cam.state in ("open", "closed") else "open"
                 )
+                # No state-machine update ran, so there is no fresh
+                # counter to report; keep the camera's stored value for
+                # the log line rather than leaving it unbound.
+                no_people_count_log = cam.no_people_count
             else:
                 # State machine update. Same session, one commit at
                 # the end.
@@ -1865,6 +1940,25 @@ class CameraIngest:
                     motion_in_clip=motion_in_clip,
                 )
                 state_after_state = state_after.state
+                no_people_count_log = state_after.no_people_count
+            # Sleep-watch: record whether this look saw the patient in
+            # bed. (The "a look happened" stamp is NOT here — it is
+            # claimed at the decision point, because several paths
+            # between there and here return early and a stamp that
+            # only lands on full completion would leave the forced
+            # look firing on every single tick.)
+            _sleep_field = result.detector_fields.get("sleep_detected")
+            if str(_sleep_field).lower() == "true":
+                self._last_sleep_seen_mono = time.monotonic()
+            elif _sleep_field is not None and gate_people_present:
+                # Seen, and NOT in bed — the person is visibly up, so
+                # the wake has been observed and there is nothing left
+                # to watch for. Close the session rather than keep
+                # buying looks for the rest of the window. (An
+                # under-covers sleeper reads people_present=false and
+                # is deliberately excluded here — that must not be
+                # mistaken for getting up.)
+                self._last_sleep_seen_mono = float("-inf")
             await add_analysis(
                 session,
                 camera_id=self.camera_id,
@@ -1894,7 +1988,15 @@ class CameraIngest:
             log.info(
                 "%s ✅ analysis SAVED — provider=%s people_present=%s count=%s state=%s",
                 self._log_tag, used_provider, gate_people_present,
-                gate_people_count, state_after.state,
+                # state_after_state, NOT state_after: on the
+                # state-freeze path (degraded identity, person not
+                # visible, lock held) no state-machine update runs and
+                # state_after is never assigned. Reading it there
+                # raised AFTER the row and events had committed, so the
+                # tick was logged as failed and the clip/recorder tail
+                # never ran — and sleep-watch makes that path the
+                # ordinary night-time case.
+                gate_people_count, state_after_state,
             )
 
             # Fan APNs out after the events row is committed — a
@@ -1962,6 +2064,7 @@ class CameraIngest:
                             camera_id=self.camera_id,
                             pre_frames=pre_frames,
                             pre_pcm=clip_pre_pcm,
+                            pre_pcm_start=clip_pre_pcm_start,
                             pre_end_captured_at=pre_end_captured_at,
                             frame_buffer=self.frame_buffer,
                             audio_buffer=self.audio_buffer,
@@ -1975,6 +2078,6 @@ class CameraIngest:
                 "%s DONE provider=%s people=%s(%s) src=%s motion=%s "
                 "state=%s/%s events_fired=%d dedup=%d",
                 self._log_tag, used_provider, gate_people_present, gate_people_count,
-                present_src, motion_in_clip, state_after.state, state_after.no_people_count,
+                present_src, motion_in_clip, state_after_state, no_people_count_log,
                 len(promotion.fired), len(promotion.skipped_for_dedup),
             )

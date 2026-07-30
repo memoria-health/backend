@@ -11,9 +11,16 @@
 # Usage (dev Mac or GPU host):
 #   NEMARA_IDENTITY_ROOM=patient_<uuid> gpu/deploy/identity_supervisor.sh
 # Optional: NEMARA_IDENTITY_LOG (default /tmp/identity_service.log),
-#           NEMARA_IDENTITY_PORT (default 8012),
-#           NEMARA_IDENTITY_TOKEN (enables /state auth — see
-#           gpu/identity/contract.py).
+#           NEMARA_IDENTITY_PORT (default 8012).
+#
+# NEMARA_IDENTITY_STATE_TOKEN — SET THIS. The service binds 0.0.0.0,
+# and an empty token means the auth check accepts every caller, so
+# /state, /probes and /stream (live annotated video) are open to
+# anything that can reach this host. Use the SAME value the backend has
+# in its .env under the same name; the service warns at boot when it is
+# missing. (The old name NEMARA_IDENTITY_TOKEN is still read, with a
+# deprecation warning — the two-name split was itself a silent no-auth
+# trap, since setting one left the other side wide open.)
 set -u
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"

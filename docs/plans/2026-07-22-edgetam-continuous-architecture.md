@@ -1,5 +1,7 @@
 # EdgeTAM-continuous identity — architecture + build plan
 
+> Status (2026-07-27): implemented. Pod continuous session = `gpu/perception/continuous.py` (sam_service was renamed gpu/perception, 10ed6c5); backend bind-once-hold = `src/services/identity/track_ledger.py`; the rip-out list was executed. Two deviations from this plan's letter: labels were simplified to PATIENT/UNKNOWN only (Aryaman 2026-07-22 — the verified-OTHER audit listed under KEEP was deleted), and identity itself later moved OUT of the backend tick into a separate GPU-host service (2026-07-24 architecture + 2026-07-26 productionization plans) — the pool/harvest machinery in KEEP now lives in `gpu/identity/` (gallery.py, harvest.py), not `cross_clip_body_gallery.py`, which is deleted.
+
 > **North star (the design axiom):** once the patient is found with sufficient
 > confidence, the lock is **sacrosanct** — nothing interferes with it until the
 > patient **actually leaves view**. Every design choice below is judged against
@@ -10,7 +12,7 @@
 The track-ledger ran identity on **discrete ~10s SAM3 clips**. SAM3 renumbers
 the subject across each tick boundary; the geometric stitcher can't always
 bridge it, so the binding strands on a bodyless "ghost" that then deadlocks the
-live track (see `../ghost-deadlock-known-fix.md`). It also ran SAM3 at
+live track (see `../runbooks/ghost-deadlock-known-fix.md`). It also ran SAM3 at
 ~250ms/frame → dropped ticks + cross-camera desync. Both failures come from the
 **same root**: identity re-decided every tick because tracking isn't continuous
 across ticks. Continuous tracking removes the root.

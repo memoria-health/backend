@@ -145,3 +145,17 @@ def test_continuous_pushing_stays_within_window() -> None:
         buf.push(data=_pcm(160), captured_at=100.0 + 0.02 * i)
     # At steady state, exactly 5s / 0.02s = 250 chunks fit in the window.
     assert 245 <= len(buf) <= 255
+
+
+def test_snapshot_window_reports_measured_start_not_inferred() -> None:
+    """The clip encoder aligns audio using this timestamp. Inferring it
+    from len(pcm)/rate assumes a gapless buffer; with a gap the whole
+    track ends up displaced (16s, measured 2026-07-29)."""
+    buf = AudioBuffer(window_seconds=30.0, sample_rate=16000, num_channels=1)
+    # A gap: one chunk at t=100, then nothing until t=110.
+    buf.push(data=b"\x00\x00" * 16000, captured_at=100.0)   # 1s
+    buf.push(data=b"\x00\x00" * 16000, captured_at=110.0)   # 1s
+    pcm, start = buf.snapshot_window(30.0, now=111.0)
+    assert start == 100.0                      # measured
+    # Inferring from length would say 111 - 2 = 109.0 — 9s wrong.
+    assert start != 111.0 - len(pcm) / (16000 * 2)

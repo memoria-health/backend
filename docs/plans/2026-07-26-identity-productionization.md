@@ -1,5 +1,7 @@
 # Identity Productionization & GPU Split Implementation Plan
 
+> Status (2026-07-27): implemented through Phase 3 — gpu/ split (10ed6c5 perception, ecbefea identity consolidation under `gpu/identity/`), versioned+authenticated `/state` contract seam (834e57d, `gpu/identity/contract.py`), baked production config + experiment flags deleted (68359d7), identity supervisor (`gpu/deploy/identity_supervisor.sh`, :8012), legacy reid brain deleted with sidecar as sole provider (dfb9b4e), probe/scratch cleanup (54d3ef1), checkpoint-review fixes (fc60821). Naming drift vs the plan: the backend remnant was renamed `src/services/reid/` → `src/services/identity/` (f61d9d8) — so "sidecar.py" landed as `src/services/identity/identity_client.py`, `run_identity.py` as `gpu/identity/service.py`, and the Phase-3 survivor files live under `src/services/identity/` (result.py, observations.py). Phase 4: validation commits present (fc60821, d21d463); the 4.4 telemetry discussion and PR are not verifiable in-repo — branch `feat/gateway-camera-ownership`, no PR opened as of this date.
+
 > **For Claude:** execute task-by-task; every task ends with the full test
 > suite green and a commit; adjudicated checkpoint review after each phase;
 > full-diff review before PR. Telemetry/monitoring discussion with Aryaman

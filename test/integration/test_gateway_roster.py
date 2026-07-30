@@ -151,3 +151,38 @@ async def test_roster_assigns_stable_unique_tunnel_ports(
     assert port_b >= 22002
     assert port_a != port_b
     assert await _port("gw-token-A") == port_a  # stable across polls
+
+
+@pytest.mark.asyncio
+async def test_roster_reports_backend_view_of_frames_arriving(
+    client: AsyncClient, auth_user, session: AsyncSession,
+) -> None:
+    """The roster hands back `online` — the SUBSCRIBER's view.
+
+    The gateway cannot tell a healthy publish from a zombie one: in the
+    2026-07-29 wifi blip its room, publications and connection_state all
+    read healthy while zero media left the box. Only this side knows,
+    and publisher.py's watchdog restarts on it, so the field must be
+    present on every camera row and must track the column.
+    """
+    _, email, _ = await _setup_patient(client, auth_user)
+    resp = await _provision(client, email, "gw-token-A", room="Living Room")
+    camera_id = resp["cameras"][0]["camera_id"]
+
+    async def _rows() -> dict[str, bool]:
+        r = await client.get(
+            "/v1/gateway/roster",
+            headers={"Authorization": "Bearer gw-token-A"},
+        )
+        assert r.status_code == 200, r.text
+        return {c["camera_id"]: c["online"] for c in r.json()["cameras"]}
+
+    # A freshly provisioned camera has published nothing yet.
+    assert (await _rows())[camera_id] is False
+
+    await session.execute(
+        text("UPDATE public.cameras SET online = true WHERE id = :id"),
+        {"id": camera_id},
+    )
+    await session.commit()
+    assert (await _rows())[camera_id] is True

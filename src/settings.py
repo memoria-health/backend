@@ -1,3 +1,4 @@
+from functools import lru_cache
 from typing import Annotated, Literal
 
 from pydantic import Field, field_validator
@@ -268,8 +269,11 @@ class Settings(BaseSettings):
     # identity provider since the legacy brain's deletion 2026-07-26).
     identity_state_url: str = Field(default="http://host.docker.internal:8012")
     # Bearer token for /state (gpu/identity/contract.py). Empty = no
-    # auth (local dev, host-only traffic); production sets
-    # NEMARA_IDENTITY_TOKEN on the service and this on the backend.
+    # auth (local dev, host-only traffic). ONE env name on BOTH sides:
+    # NEMARA_IDENTITY_STATE_TOKEN. The service used to read
+    # NEMARA_IDENTITY_TOKEN, so setting one name left the other side
+    # open with no error anywhere; it now reads this name and only
+    # falls back to the old one with a warning.
     identity_state_token: str = Field(default="")
     # Per-track motion floor for the person_motion branch gate.
     # 0.0 = parity (any present track qualifies).
@@ -827,5 +831,19 @@ class Settings(BaseSettings):
         return value
 
 
+@lru_cache(maxsize=1)
 def get_settings() -> Settings:
+    """Process-wide Settings, built ONCE.
+
+    Every call used to construct a fresh Settings, and Settings reads
+    `.env` from disk — so every request that injected settings did a
+    synchronous file read and parse inside an async handler. Env is
+    fixed for a process's lifetime in every environment we run
+    (container, Railway dyno, local uvicorn), so caching is safe and
+    the read disappears.
+
+    Tests that need to change env must call
+    `get_settings.cache_clear()` after patching (or construct
+    `Settings()` directly, which is unaffected).
+    """
     return Settings()

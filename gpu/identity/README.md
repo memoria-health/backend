@@ -2,7 +2,9 @@
 
 The 2026-07-24 architecture (docs/plans/2026-07-24-continuous-identity-
 architecture.md): per-camera continuous batches drive the pod's
-persistent EdgeTAM session; a three-rule identity layer sits on top.
+persistent EdgeTAM session (`gpu/perception/`, see
+docs/architecture/continuous-tracking.md); a three-rule identity layer
+sits on top.
 
 1. **Score** everyone on one calibrated scale — face weighted by pixel
    size, body (OSNet pool) as the workhorse (`scoring.py`).
@@ -12,29 +14,36 @@ persistent EdgeTAM session; a three-rule identity layer sits on top.
 3. **Harvest** — face-confirmed track + alone in frame → harvest the
    body pool liberally; nothing else ever harvests (`harvest.py`).
 
-Entry point: `tools/run_identity.py` (MJPEG overlay :8012 + /state).
+Entry point: `gpu/identity/service.py`, ex `tools/run_identity.py`
+(MJPEG overlay :8012 + the versioned, token-authenticated `/state` seam
+defined in `contract.py`); supervised launch via
+`gpu/deploy/identity_supervisor.sh`:
+
+    NEMARA_IDENTITY_ROOM=patient_<uuid> gpu/deploy/identity_supervisor.sh
+    # or directly: uv run python gpu/identity/service.py --room patient_<uuid>
+
 Pure modules are unit-tested (`test/unit/test_identity_*.py`).
 
-## Relationship to `src/services/identity/` (the legacy folder)
+## Relationship to `src/services/identity/` (the backend half)
 
-`reid/` holds TWO different things — do not delete it wholesale:
+The consolidation this section used to track is DONE (2026-07-27,
+commits ecbefea / dfb9b4e / f61d9d8): everything identity lives HERE —
+pod wire client (`pod_client.py`), body gallery (`gallery.py`),
+embedding math + codec (`matching.py`), screen/rendered-person veto
+(`display_veto.py`), evidence loop (`loop.py`), journal, service. The
+legacy per-tick brain (`inference.py` / `body_pipeline.py` / the old
+per-clip ledger) was deleted at P3 — **the sidecar is the only identity
+provider**; detection reads Patient State through the `/state` seam.
 
-| reid/ file | Role today | Fate |
-|---|---|---|
-| `sam_client.py` | pod wire client — **used by this service** | migrates here after P3 |
-| `embeddings.py` | ArcFace cosine/gallery — **used by this service** | migrates here after P3 |
-| `body_embeddings.py` | OSNet extraction — **used by this service** | migrates here after P3 |
-| `cross_clip_body_gallery.py` | body pool + hygiene — **used by this service** | migrates here after P3 |
-| `display_veto.py` | screen/rendered-person veto — **used by this service** | migrates here after P3 |
-| `remote_replay.py` | `RemoteObservations` types — **used by this service** | types migrate; pipeline dies |
-| `enrollment_processor.py` | face enrollment ingestion (API) | stays (serves the DB gallery) |
-| `inference.py` | LEGACY per-tick brain | **deleted at P3** (detection reads Patient State instead) |
-| `track_ledger.py` | LEGACY bind-once ledger | **deleted at P3** (replaced by `seat.py`) |
-| `body_pipeline.py` | LEGACY in-clip brain | **deleted at P3** |
-| `harvester.py` | LEGACY DB face harvest | reviewed at P3 |
-| `trace.py` | eval-rig instrumentation | stays with the eval rig |
+`src/services/identity/` (renamed from `services/reid`) keeps only what
+the BACKEND needs to consume and feed this service: the `/state` client
+(`identity_client.py`), verdict shapes (`result.py`, `observations.py`),
+the sticky bind-once-hold lock (`track_ledger.py` — keyed by the pod's
+stable track ids, PATIENT/UNKNOWN only), instrumentation (`trace.py`),
+and the caregiver-facing face-enrollment flow (`embeddings.py`,
+`enrollment_processor.py`, `storage.py`) whose vectors this pipeline
+reads back through the DB.
 
-P3 = detection-pipeline integration at `camera_ingest.py:1122` (the
-`IdentityResult` seam) after this service passes the eval matrix
-(TRACKER_EVAL_FINDINGS.md §5). Until then the legacy brain must stay
-runnable for A/B and fallback.
+Only `service.py` may import from `src/*` (DB session + repos +
+settings for gallery loads) — the known packaging exception until the
+GPU host gets its own config surface.

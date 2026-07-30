@@ -98,6 +98,36 @@ def detection_keys_for(identifier: str) -> tuple[str, str]:
     return f"{identifier}_detected", f"{identifier}_confidence"
 
 
+# ── state-episode exit gap ────────────────────────────────────────────
+# Seconds of UNBROKEN ABSENCE of positive evidence that ends a state
+# episode. Both edges read this — the rising edge in `event_promotion`
+# and the falling ("finished") edge in `services/scheduling/scheduler` —
+# so the two can never disagree about whether an episode is over.
+#
+# Derived from CRITICALITY, never from the behaviour. That is the point:
+# an episode ends when the evidence stops, so its LENGTH needs no
+# estimate, and adding a new detector requires no guess about how long
+# its activity runs. Replaced the per-detector `episode_gap_seconds`
+# (2026-07-29), which was an LLM-guessed duration and did not scale.
+EXIT_GAP_SAFETY_SECONDS = 60
+EXIT_GAP_ROUTINE_SECONDS = 300
+
+
+def episode_exit_gap_for(detector) -> int:
+    """Exit gap in seconds for a state detector. Safety states re-alert
+    sooner after a real lull (a caregiver needs nudging again); routine
+    states stay quiet. Duck-typed on `.category` like the other helpers
+    here, so unit tests can pass a SimpleNamespace."""
+    category = str(getattr(
+        getattr(detector, "category", None), "value",
+        getattr(detector, "category", None),
+    ))
+    return (
+        EXIT_GAP_SAFETY_SECONDS if category == "safety"
+        else EXIT_GAP_ROUTINE_SECONDS
+    )
+
+
 def cooldown_seconds_for(detector, default_seconds: int) -> int:
     """Per-detector point-shape re-fire spacing: the row value when
     set, else the legacy global default (parity for every row the P1
@@ -149,6 +179,7 @@ async def windowed_entry_verdict(
     threshold: float,
     now: datetime,
     cfg: EventingConfig,
+    floor: datetime | None = None,
 ) -> tuple[str, int]:
     """Windowed-count entry as a COUNT-CROSSING edge. With prior =
     qualifying ticks in the T-window before now (the current tick is
@@ -162,19 +193,29 @@ async def windowed_entry_verdict(
                                        again here would spam one event
                                        per tick for a long episode
 
-    Returns (verdict, count_including_current). Exit is implicit: a
-    lull long enough for the window to drain below M re-arms entry —
-    for M>1, T plays the anti-spam role episode_gap plays for M=1.
-    (M=1 never reaches this function; the caller keeps the legacy
-    rising edge for exact parity.)"""
+    Returns (verdict, count_including_current).
+
+    `floor` (2026-07-29) clamps the window to the START OF THE CURRENT
+    EPISODE. Without it, T alone decided both entry AND anti-spam, and
+    the two jobs conflict: a window wider than the episode-exit gap
+    still holds ticks from the PREVIOUS episode, so a genuinely new
+    episode reads `prior >= M` and reports "ongoing" — it could never
+    fire. Episode boundaries are now owned by `event_promotion`'s
+    episode-open predicate; T's only remaining job is entry
+    accumulation inside one episode. Passing floor=None keeps the old
+    unclamped behavior for callers that have no episode context.
+    """
     window = max(cfg.entry_t_seconds, 1)
+    since = now - timedelta(seconds=window)
+    if floor is not None and floor > since:
+        since = floor
     prior = await qualifying_tick_count(
         session,
         patient_id=patient_id,
         detected_field=detected_field,
         conf_field=conf_field,
         threshold=threshold,
-        since=now - timedelta(seconds=window),
+        since=since,
         before=now,
     )
     count = prior + 1

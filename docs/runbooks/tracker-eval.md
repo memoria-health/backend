@@ -2,8 +2,10 @@
 
 > **2026-07-24 — the IDENTITY SERVICE supersedes this rig for live testing.** EdgeTAM won
 > the arm comparison (ids held through crossing/swap/partial-occlusion, live).
-> The new continuous service is `tools/run_identity.py` (see "Identity-service quickstart"
-> at the bottom). This rig stays for A/B reruns and trace-based scoring.
+> The continuous service is `gpu/identity/service.py` — formerly `tools/run_identity.py`,
+> consolidated under `gpu/identity/` in the 2026-07-27 refactor (`ecbefea`); see
+> "Identity-service quickstart" at the bottom. This rig stays for A/B reruns and
+> trace-based scoring (`src/services/identity/trace.py` + the soak-dashboard card survive).
 
 Built + deployed overnight 2026-07-23. The lean rig is **live now on the SAM3 arm** and verified. This is what to do in the morning.
 
@@ -23,12 +25,18 @@ Built + deployed overnight 2026-07-23. The lean rig is **live now on the SAM3 ar
 
 ## To switch to the SAM3+EdgeTAM arm
 
-Two spots (I kept the pod untouched last night, so its arm label is read from a backend env too):
+Two spots (pod + backend; the backend env is the arm *label* the trace records):
+
+> **Stale as of 2026-07-27:** the legacy `/workspace/start_continuous.sh` +
+> `restart_tracker.sh` supervisor is DISABLED — `scripts/pod.sh deploy` renames it
+> `.disabled` and launches a file-based supervisor (`/workspace/start_sam_supervisor.sh`,
+> written by `scripts/deploy_continuous_remote.sh`). The tracker arm is still selected by
+> `NEMARA_TRACKER` (`gpu/perception/continuous.py`, default `edgetam`).
 
 ```bash
-# 1) Pod (functional — the actual tracker):
-#    edit /workspace/start_continuous.sh: NEMARA_SAM3_STRIDE line stays, change
-#    export NEMARA_TRACKER=sam3  ->  =edgetam  ; then bash /workspace/restart_tracker.sh
+# 1) Pod (functional — the actual tracker): add `export NEMARA_TRACKER=sam3`
+#    to the supervisor heredoc in scripts/deploy_continuous_remote.sh, then
+#    scripts/pod.sh deploy    (omit the export / redeploy to revert to edgetam)
 # 2) Backend (label only):
 sed -i '' 's/NEMARA_TRACKER=sam3/NEMARA_TRACKER=edgetam/' .env
 docker compose -f docker/docker-compose.local.yml up -d --force-recreate --no-deps backend
@@ -84,24 +92,30 @@ All env, one recreate each (`docker compose -f docker/docker-compose.local.yml u
 
 Remove the `# Tracker eval rig` block at the bottom of `.env`, then `make backend-up`.
 
-## Identity-service quickstart (2026-07-24 — the new architecture, live)
+## Identity-service quickstart (2026-07-24 architecture; paths updated 2026-07-27)
 
 One process: continuous tracking + three-rule identity + live overlay.
+(`tools/run_identity.py` became `gpu/identity/service.py` in the `ecbefea`
+consolidation — same service, same port.)
 
 ```bash
-cd ~/nemara-v2-soak
-pkill -f live_tracker_view.py   # spine replaces the viewer
+pkill -f live_tracker_view.py   # spine replaces the viewer (tools/live_tracker_view.py)
 # LiveKit creds: exported in env, or already present via .env
-uv run python tools/run_identity.py --room patient_75a30940-b5e2-4608-afa3-b31a1e1fcda6
+uv run python gpu/identity/service.py --room patient_75a30940-b5e2-4608-afa3-b31a1e1fcda6
+# production form (restart-on-exit supervisor, same service):
+#   NEMARA_IDENTITY_ROOM=patient_<uuid> gpu/deploy/identity_supervisor.sh
 # open http://localhost:8012/    (all cameras, PATIENT box, lag HUD)
 # state JSON: http://localhost:8012/state
 ```
 
-Prereqs: pod on EdgeTAM (`bash scripts/pod.sh ssh` … or just check
-http://localhost:8000/health), backend container STAYS STOPPED (the spine
-owns the A40), DB up (face enrollment gallery).
+Prereqs: pod up in EdgeTAM mode (`scripts/pod.sh health`, or check
+http://localhost:8000/health through the tunnel), DB up (face enrollment
+gallery). Historical note (2026-07-24 rig): the backend container stayed
+stopped so the spine owned the A40 — since then the backend consumes this
+service's `/state` (`src/services/identity/identity_client.py`), so both run.
 
-What to verify against the test matrix (TRACKER_EVAL_FINDINGS.md §5):
+What to verify against the test matrix
+(`docs/research/2026-07-23-tracker-eval-findings.md` §5):
 acquire at the door (face lock → green PATIENT box), hold through movement
 / crossing / partial occlusion (seat rides the track), solo harvest filling
 the body pool (watch body scores rise on far/seated re-locks), release on

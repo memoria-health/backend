@@ -1,5 +1,7 @@
 # Detection v2 Implementation Plan
 
+> Status (2026-07-27): implemented — P0–P4 built (see the embedded per-phase status notes below), P5 compiler shipped as `src/services/detection/scheduling/compiler_v2.py`, P6 soak tooling shipped. The detector model described here was subsequently reshaped and is NOT the current contract: 2026-07-18 refactors (evidence_branch→requires_motion 1f42625, snapshot bucket retired, schedule_config dissolved into when_scope 150f82b, duty 'sampled'→'thinned' d93edc8) and the 2026-07-26 detector-axis reconciliation phases C–H2 (`shape` replaced by `alert_trigger`+`is_sustained` 1043491/76fa214, catalog remap 8e90d4f, duration+trailing firing + schedule→absence 53b7a9e, M-of-N now an internal confidence gate 22c5d3e, crowd fallback made global 06de5b9, stored where_scope dropped 146d693). Read the live contract from code and `docs/architecture/`. Both v2 flags still default False in `src/settings.py` (soak rigs enable via env). `src/services/reid/` refs herein are stale — that tree was deleted/renamed 2026-07-26 (dfb9b4e, f61d9d8); identity now lives in `src/services/identity/` + `gpu/identity/` + `gpu/perception/`.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Full technical spec: `docs/architecture/detection-architecture-v2.md`. Evidence base: `docs/architecture/detection-inference-architecture.md` §4.
 
 **Goal:** Replace the single-call, everything-every-tick detection pipeline with the validated v2 architecture — per-detector subject scoping, gated activation, seven locked perception buckets, two eventing primitives — at roughly today's cost, starting with the live seizure-detector fix.
@@ -141,7 +143,7 @@ Dimension classification, the feasibility hard-reject list with plain-language r
 ## Phase 6 — Reference detectors + soak  *(milestone)*
 
 **Soak runbook (superseded 2026-07-14 by the formal 4-hour protocol —
-`docs/plans/2026-07-14-soak-protocol.md`: TP/FP truth-scoring, gate-tuning
+`docs/runbooks/soak-protocol.md`: TP/FP truth-scoring, gate-tuning
 segments, live watcher. The list below remains as the original outline):**
 1. Local stack up; apply nothing (all deltas already on the local DB).
 2. Flip flags in `.env`: `NEMARA_DETECTION_V2_SCHEDULER_ENABLED=true`, `NEMARA_DETECTION_V2_DECISION_ENABLED=true` (recreate the backend container — hot-reload lies). There is no rapid flag anymore (Ledger row 5): seizure runs as a regular rapid-bucket detector whenever the scheduler flag is on and the detector is enabled.

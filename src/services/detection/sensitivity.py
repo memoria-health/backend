@@ -64,6 +64,14 @@ CENSOR_CATEGORIES = frozenset(
     c for c in SENSITIVITY_CATEGORIES if c != "emotional_distress"
 )
 
+# The ONE carve-out to "censored clips carry audio" (Aryaman
+# 2026-07-29). Everywhere else the sound stays: the visual is censored
+# but a cry for help must remain audible, and that is the whole reason
+# audio was kept. Intimacy is the case where the audio IS the exposure —
+# blurring the picture and shipping the sound would defeat the censor
+# entirely. These clips ship silent.
+SILENT_CATEGORIES = frozenset({"intimate_situation"})
+
 # Hard ceiling on the VLM call. A hung call must not hold the archival
 # task (and the raw clip bytes) open indefinitely — on expiry the
 # caller censors full-frame, same as any other screen failure.

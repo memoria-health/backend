@@ -313,9 +313,27 @@ def _censor_person_mask_sync(in_path: str, out_path: str) -> None:
         raise CensorError(f"censor: cannot decode {in_path}")
     encoder: _FrameEncoder | None = None
     try:
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        if not fps or fps <= 0 or fps > 120:
-            fps = 4.0  # livekit_worker_target_fps default; sane fallback
+        # Trust our OWN encoder, not the container's self-report. This
+        # function is only ever called on a clip this system just
+        # encoded (single caller: clip_archival), and we encode at
+        # clip_fps — so the rate is known, not something to discover.
+        #
+        # Reading it from the file was the weaker choice twice over.
+        # The old fallback was a hardcoded 4.0, the ANALYSIS rate,
+        # which is half the real clip rate — so any failed read wrote a
+        # half-speed censored copy with the audio running twice as long
+        # as the video. And the guard around it only rejected zero,
+        # negative, or absurd values: a wrong-but-plausible reading
+        # sailed straight through (a variable-frame-rate file reports
+        # 0.25 fps — measured), which would have written a clip 32x too
+        # slow with nothing flagged anywhere.
+        fps = float(get_settings().clip_fps)
+        probed = cap.get(cv2.CAP_PROP_FPS)
+        if probed and abs(probed - fps) > 0.5:
+            log.warning(
+                "censor: clip reports %.2f fps but clips are encoded at "
+                "%.2f — using the encoder's rate", probed, fps,
+            )
         ok, frame = cap.read()
         if not ok:
             raise CensorError("censor: clip decoded to 0 frames")
@@ -403,12 +421,18 @@ async def _censor_person_mask_subprocess(in_path: str, out_path: str) -> None:
         )
 
 
-async def _censor_full_frame(in_path: str, out_path: str) -> None:
+async def _censor_full_frame(
+    in_path: str, out_path: str, *, keep_audio: bool = True,
+) -> None:
     """Tier 2: pure-ffmpeg full-frame blur, source audio kept
     (2026-07-28: censored clips carry audio — product call; the visual
-    is censored, the cry for help must stay audible). Deliberately no
-    OpenCV/ultralytics in this path so a broken CV stack can never take
-    the last-resort censor down with it."""
+    is censored, the cry for help must stay audible). `keep_audio=False`
+    drops the track instead — the intimate-situation carve-out.
+    Deliberately no OpenCV/ultralytics in this path so a broken CV stack
+    can never take the last-resort censor down with it."""
+    audio_args = (
+        ["-map", "0:a?", "-c:a", "copy"] if keep_audio else ["-an"]
+    )
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg",
@@ -416,7 +440,7 @@ async def _censor_full_frame(in_path: str, out_path: str) -> None:
             "-y",
             "-i", in_path,
             "-vf", _FFMPEG_BLUR_FILTER,
-            "-map", "0:v", "-map", "0:a?", "-c:a", "copy",
+            "-map", "0:v", *audio_args,
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
@@ -479,10 +503,17 @@ async def _mux_source_audio(source_path: str, video_path: str) -> None:
 
 async def censor_clip(
     in_path: str, out_path: str, *, full_frame: bool = False,
+    keep_audio: bool = True,
 ) -> None:
     """Censor the clip at `in_path` into `out_path` (video pixelated/
     blurred; the SOURCE audio track is carried over — 2026-07-28
     product call: visuals are censored, sound stays).
+
+    ``keep_audio=False`` ships the clip SILENT. One caller uses it:
+    an intimate-situation verdict, where the audio is itself the
+    exposure and carrying it would defeat the blur
+    (`sensitivity.SILENT_CATEGORIES`). Everywhere else audio stays,
+    because a cry for help is exactly what must remain audible.
 
     ``full_frame=True`` skips tier 1 entirely — used when the caller has
     no per-clip verdict to trust (sensitivity screen failed), so the
@@ -497,7 +528,9 @@ async def censor_clip(
     if not full_frame:
         try:
             await _censor_person_mask_subprocess(in_path, out_path)
-            await _mux_source_audio(in_path, out_path)
+            # Tier 1 writes video only, so silence is simply not muxing.
+            if keep_audio:
+                await _mux_source_audio(in_path, out_path)
             return
         except TimeoutError as exc:
             log.warning(
@@ -509,7 +542,7 @@ async def censor_clip(
                 "censor.person_mask_failed in=%s — falling back to "
                 "full-frame blur", in_path,
             )
-    await _censor_full_frame(in_path, out_path)
+    await _censor_full_frame(in_path, out_path, keep_audio=keep_audio)
 
 
 def _cli_main(argv: list[str] | None = None) -> int:

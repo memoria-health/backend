@@ -1,5 +1,7 @@
 # Persistent person identity in home video — literature + industry survey
 
+> Status (2026-07-27): proposals shipped in two waves. The §(d) recommendations (sticky hysteresis lock, multi-prototype pool gallery with max/top-k matching, multi-pose harvest per face lock, carried-tracklet TTL) landed in the 2026-07-19 identity-persistence layer. The underlying problem this survey addresses — identity re-decided per 10s clip — was then eliminated at the root by the EdgeTAM-continuous pivot (2026-07-22): the pod holds one persistent tracking session per camera with stable track ids (`gpu/perception/continuous.py`), and the backend binds once and holds (`src/services/identity/track_ledger.py`), so cross-clip tracklet re-association no longer exists. Kept as the evidence record behind both designs.
+
 > Researched 2026-07-19 (night of soak #2), prompted by Bedroom PATIENT↔UNKNOWN
 > label flicker: identity is re-decided from scratch every 10 s tick; the only
 > cross-tick memory (OSNet body gallery) fragmented into 11 singleton clusters

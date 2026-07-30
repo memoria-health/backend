@@ -1,7 +1,21 @@
 # Video Data Collection — Feature Guide & Handoff
 
-*Last updated: 2026-06-24. Audience: anyone on the team (engineering or not) who needs to
-understand what this feature does, how to use it, and why it's built the way it is.*
+*Last updated: 2026-06-24; audited against the code 2026-07-27. Audience: anyone on the
+team (engineering or not) who needs to understand what this feature does, how to use it,
+and why it's built the way it is.*
+
+> **2026-07-27 audit — the feature is live and two things changed since this was written:**
+>
+> - **Privacy mode now hard-suspends recording.** If the patient's privacy mode is on, the
+>   recording gate is always closed regardless of consent (`src/services/data_collection/gate.py`
+>   — `privacy_mode_enabled` short-circuits `should_collect`). Privacy *suspends* collection
+>   without mutating the consent flag, and the privacy path discards in-flight footage rather
+>   than uploading it (`session.py`).
+> - **India data residency partially landed.** A second bucket setting `NEMARA_B2_BUCKET_IN`
+>   plus per-patient region routing (`src/services/region.py:b2_bucket_for`) now exists so
+>   India-collected video can be isolated; if the India bucket is unset, clips fall back to
+>   the default bucket with a warning. Item 3 under "left for later" is therefore in progress,
+>   not untouched.
 
 This document has three parts:
 
@@ -85,7 +99,8 @@ simply doesn't upload** (it won't crash), so a box with no creds is harmless.
 > accordingly.
 
 ### Deploy checklist (prod)
-Order matters — **the database change goes first** (see `PROD_MIGRATION_RUNBOOK.md`):
+Order matters — **the database change goes first** (the standing DB-before-deploy rule;
+see the "Database migrations" section of [setup-hosted-stack.md](./setup-hosted-stack.md)):
 
 1. **Apply the DB delta** to prod Supabase (adds two patient columns; idempotent, additive,
    safe to re-run):

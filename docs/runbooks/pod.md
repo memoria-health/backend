@@ -35,19 +35,22 @@ rebuild with §3.
 
 ## 2. Deploy code changes
 
-`continuous.py` / `server.py` / `sam_track.py` live in `sam_service/`.
-After editing:
+The pod code lives in `gpu/perception/` (`continuous.py` / `server.py` /
+`sam_track.py` / `face_worker.py` / `person_trigger.py`; renamed from
+`sam_service/` on 2026-07-26). After editing:
 
 ```bash
-scripts/pod.sh deploy    # ships sam_service/ + relaunches the supervisor
+scripts/pod.sh deploy    # ships gpu/perception/ + relaunches the supervisor
 scripts/pod.sh health    # confirm ticks resume (mode=ground/carry, drift=N)
 scripts/pod.sh logs 80   # tail the server log
 ```
 
 `deploy` runs `scripts/deploy_continuous_remote.sh` on the pod: it kills
-the old supervisor and relaunches uvicorn on the **edgetam venv** (one env
-hosts sam2 + sam3 + insightface). Note it uses `python -m uvicorn`, not
-the `uvicorn` binary (absent in that venv).
+any old supervisor (including the disabled legacy `start_continuous.sh`),
+rewrites the file-based supervisor `/workspace/start_sam_supervisor.sh`,
+and launches `uvicorn perception.server:app` on the pod's **system
+python** (`/usr/bin/python3 -m uvicorn` — the old edgetam `.venv` no
+longer exists; one system env hosts sam2 + sam3 + insightface).
 
 To watch the mask during a verification run, uncomment the
 `NEMARA_EDGE_DEBUG_DIR` line in `deploy_continuous_remote.sh`, deploy, do

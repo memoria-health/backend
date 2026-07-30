@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 from uuid import UUID
@@ -76,6 +78,13 @@ EMPTY_POLL_FRAMES = 4          # a motion-triggered empty-room poll ships
                                # check needs eyes, not density (a dense
                                # 40-frame poll cost ~4s GPU per 20s per
                                # empty room; measured 2026-07-24)
+EMPTY_MIN_GAP_S = 2.0          # motion may cut the empty-room nap short
+                               # (see run()), but never below this gap
+                               # between two polls — the motion flag
+                               # re-arms every 0.5s while anything moves,
+                               # and non-person motion never ends
+                               # empty-room mode, so without a floor a
+                               # TV polls the GPU ~5x the design rate.
 EMPTY_INTERVAL_S = 20.0        # poll cadence for an empty room. Each
                                # empty-room call is a ~3.5s SAM3 ground;
                                # at 5s two empty rooms saturated the pod
@@ -127,7 +136,14 @@ FACES_ENABLED = True           # False = pure tracking (the "yesterday"
 STALE_INTAKE_S = 10.0          # no fresh frames this long → clear tracks
                                # (a dead LiveKit reader must not leave a
                                # frozen track holding the seat forever)
-TRACK_SEND_W = 10 ** 9         # NATIVE ship resolution (Aryaman,
+# Env-overridable so the native-vs-downscaled question can be A/B'd
+# without a code change: NEMARA_TRACK_SEND_W=960 to test, unset to
+# restore native. The measured claim being tested (2026-07-29) is that
+# EdgeTAM "encodes at its own fixed internal res" so resolution can't
+# reach it — which sits right next to a 36ms/frame figure that turned
+# out to be 3-4x off, so it is worth re-checking rather than trusting.
+TRACK_SEND_W = int(os.environ.get("NEMARA_TRACK_SEND_W", str(10 ** 9)))
+_TRACK_SEND_W_DEFAULT = 10 ** 9  # NATIVE ship resolution (Aryaman,
                                # 2026-07-26). Measured: 640px shipping
                                # cut wire/encode ~9x but GPU only ~10%
                                # (EdgeTAM encodes at its own fixed
@@ -170,7 +186,28 @@ class IdentityHome:
     sam: SamServiceClient
     body_gallery: CrossClipBodyGallery
     face_matrix: np.ndarray                  # (N,512) enrollment, refreshed
-    pod_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Pod admission control. Was a single Lock ("single-flight A40"),
+    # which measurement on 2026-07-29 showed was the actual bottleneck:
+    # with both rooms occupied the machine sat ~97% IDLE (GPU 5-8%, 3 of
+    # 96 CPU cores, 5.6GB of 46GB) while cameras queued seconds behind
+    # each other. Measured back-to-back vs concurrent, same payloads:
+    # parallel finished 1.5-1.9x faster and pod-side compute per call
+    # did NOT rise (~1.9s either way) — the pod serves distinct camera
+    # sessions concurrently without contending.
+    #
+    # Still bounded, not removed: sessions are per-camera on the pod, so
+    # concurrency across cameras is safe, but unbounded admission would
+    # let a backlog burst arrive all at once. One slot per camera is the
+    # intent; NEMARA_POD_CONCURRENCY overrides.
+    #
+    # NOTE: a single camera still issues one call at a time — each
+    # CameraLoop awaits its own batch before starting the next — so
+    # per-session ordering on the pod is preserved by construction.
+    pod_lock: asyncio.Semaphore = field(
+        default_factory=lambda: asyncio.Semaphore(
+            max(1, int(os.environ.get("NEMARA_POD_CONCURRENCY", "2")))
+        )
+    )
     # Guards `seat`: candidates fold from per-camera worker THREADS
     # (asyncio.to_thread), so the read-modify-write must serialize.
     seat_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -371,6 +408,11 @@ class CameraLoop:
         self.stage_ms: dict = {}     # per-batch stage timings (measured)
         self.probe_ms: dict = {}     # per-probe stage timings (measured)
         self._body_cos: dict[int, float] = {}   # latest probe body scores
+        # Every probe's full scores (faces/body/fused cands), served at
+        # /probes for the soak dashboard's tick-correlated analysis
+        # view (Aryaman 2026-07-28). ~4000 ≈ 1.7h searching / days
+        # locked; memory is a few MB of floats.
+        self.probe_history: deque = deque(maxlen=4000)
         # Per-track sighting histories (2026-07-24, twice-revised): the
         # seat judges robust statistics over a track's recent face
         # sightings — top-K so back-of-head garbage can't dilute a real
@@ -381,8 +423,11 @@ class CameraLoop:
         # faces at NATIVE pixels (ring frames are downscaled for memory).
         self.latest_native: Optional[tuple[float, np.ndarray]] = None
         self.latest_jpeg: Optional[bytes] = None
-        self._raw_hud_at = 0.0       # last raw-heartbeat publish
-        self._annotated_at = 0.0     # last batch-annotated publish
+        # When the last empty-room poll was ATTEMPTED (stamped whether
+        # it succeeded or failed). run()'s nap floors itself off this,
+        # so a failing pod or a re-arming motion flag can't turn the
+        # early-wake into a retry storm.
+        self._empty_poll_at = 0.0
         self.hud = "waiting…"
         self.pod_ms = 0.0
         self.queue_ms = 0.0
@@ -402,27 +447,15 @@ class CameraLoop:
     # bounded, and the STREAM_CAPACITY=2 SDK queue caps what feeds it.
     RING_MAX = 300
 
-    # Raw-HUD heartbeat: the annotated HUD frame is only produced when
-    # a batch runs, and empty rooms deliberately run zero batches — so
-    # after a service restart the dashboard feeds stayed BLANK until
-    # someone entered a room (live 2026-07-27, pre-deploy scare). The
-    # intake path publishes a cheap raw frame every second instead;
-    # batch-annotated frames overwrite it whenever the pipeline runs.
-    RAW_HUD_EVERY_S = 1.0
-
     def push_frame(self, ts: float, bgr: np.ndarray) -> None:
-        if (ts - self._raw_hud_at >= self.RAW_HUD_EVERY_S
-                and ts - self._annotated_at > 5.0):
-            self._raw_hud_at = ts
-            try:
-                import cv2 as _cv2
-                ok, jpg = _cv2.imencode(
-                    ".jpg", bgr, [_cv2.IMWRITE_JPEG_QUALITY, 70],
-                )
-                if ok:
-                    self.latest_jpeg = jpg.tobytes()
-            except Exception:  # noqa: BLE001 — HUD must never hurt intake
-                pass
+        # Intake does NOT publish to the live view. `_publish` is the
+        # single writer, so the view is always a frame the tracker
+        # actually analysed, with boxes where it saw the person. A
+        # second writer here pushing fresher unboxed (or differently
+        # boxed) frames is what caused first the rewind and then the
+        # trailing/blank boxes — 2026-07-29, twice. Empty rooms still
+        # refresh: the empty-room poll publishes the newest frame every
+        # EMPTY_INTERVAL_S.
         self._next_idx += 1
         self.ring.append((self._next_idx, ts, bgr))
         if len(self.ring) > self.RING_MAX:
@@ -467,7 +500,43 @@ class CameraLoop:
                 interval = NONPATIENT_INTERVAL_S
             else:
                 interval = ACTIVE_INTERVAL_S
-            await asyncio.sleep(interval)
+            if interval == EMPTY_INTERVAL_S:
+                # Empty-room nap that motion can cut short (so a
+                # pass-by isn't missed for up to 20s), with two rules
+                # that the first version got wrong and that must not be
+                # removed (both found in review 2026-07-29):
+                #
+                # 1. ALWAYS wait at least once per pass. The first
+                #    version skipped the wait entirely when motion was
+                #    already flagged. A pass that never waits never
+                #    hands control back to the rest of the program, and
+                #    when intake has stalled (_step returns straight
+                #    away) this loop spins millions of times a second
+                #    with everything else frozen: the video reader, the
+                #    pod watchdog, the crash-and-restart paths, the
+                #    resubscribe walk. The web server runs on its own
+                #    thread, so /state keeps answering with frozen data
+                #    and the service looks healthy while being dead.
+                #
+                # 2. Never poll the GPU faster than EMPTY_MIN_GAP_S.
+                #    Motion re-flags within half a second of each
+                #    check for as long as anything is moving, and
+                #    moving things that aren't people (a TV, a fan, a
+                #    pet) never produce a track — so the room stays
+                #    "empty" while the flag keeps re-arming. Without a
+                #    floor that polls the shared GPU ~5x more than the
+                #    design intends, on a room with nobody in it.
+                deadline = self._empty_poll_at + EMPTY_INTERVAL_S
+                while True:
+                    await asyncio.sleep(0.25)
+                    now_w = time.time()
+                    if now_w >= deadline:
+                        break
+                    if (self.motion_pending
+                            and now_w - self._empty_poll_at >= EMPTY_MIN_GAP_S):
+                        break
+            else:
+                await asyncio.sleep(interval)
             try:
                 await self._step()
             except Exception:                # noqa: BLE001 — keep looping
@@ -488,6 +557,11 @@ class CameraLoop:
             return
         empty_poll = not self.state.tracks and self._last_shipped is not None
         if empty_poll:
+            # Stamp the ATTEMPT before anything can fail — run()'s nap
+            # floors off this, and a pod error that returns in
+            # milliseconds would otherwise let the loop retry as fast
+            # as the failure comes back.
+            self._empty_poll_at = now
             # Empty-room economy: still room → skip the pod entirely
             # (zero GPU); motion latched → a small fresh-frame existence
             # check. Chain continuity is irrelevant with nothing tracked,
@@ -520,7 +594,7 @@ class CameraLoop:
         )
         encode_ms = (time.time() - t_e) * 1000.0
         t_q = time.time()
-        async with self.home.pod_lock:       # single-flight A40
+        async with self.home.pod_lock:       # bounded pod admission
             t0 = time.time()                 # queue wait ends here
             obs = await self.home.sam.observe(
                 jpegs,
@@ -625,14 +699,31 @@ class CameraLoop:
             "publish": round((time.time() - t_p) * 1000.0, 1),
         }
         span = batch[-1][1] - batch[0][1]
+        # Split the pod round-trip into the pod's OWN reported compute
+        # and everything else (upload + response over the tunnel). The
+        # single `pod=` number conflated them, which made it impossible
+        # to tell a slow GPU from a saturated wire — and cost a whole
+        # afternoon of guessing (2026-07-29). pod_sam is the tracker
+        # itself; wire is what we pay to reach it.
+        # getattr, not obs.timings_ms: an older pod build (or a test
+        # double) has no such field, and losing a LOG LINE must never
+        # take the tracking loop down with an AttributeError.
+        pt = getattr(obs, "timings_ms", None) or {}
+        pod_total = pt.get("total", 0.0)
         log.info(
             "identity.batch cam=%s frames=%d span=%.1fs stride=%.0fms | "
-            "encode=%.0f queue=%.0f pod=%.0f publish=%.0f (ms)",
+            "encode=%.0f queue=%.0f pod=%.0f (compute=%.0f sam=%.0f "
+            "decode=%.0f wire=%.0f) publish=%.0f (ms)",
             self.camera_id, len(jpegs), span,
             span * 1000.0 / max(1, len(jpegs) - 1),
             encode_ms, self.queue_ms, self.pod_ms,
+            pod_total, pt.get("sam", 0.0), pt.get("decode", 0.0),
+            self.pod_ms - pod_total,
             self.stage_ms["publish"],
         )
+        # Same split on /state so the dashboard can show it live.
+        self.stage_ms["pod_compute"] = round(pod_total, 1)
+        self.stage_ms["wire"] = round(self.pod_ms - pod_total, 1)
 
     def _encode(
         self, batch: list, send_w: Optional[int],
@@ -658,11 +749,26 @@ class CameraLoop:
         return out, inv
 
     # ── overlay publish (sync, off the event loop) ───────────────────
-    def _publish(self, newest: tuple) -> None:
-        _idx, newest_ts, frame = newest
-        self.lag_s = time.time() - newest_ts
+    def _publish(self, pipeline_frame: tuple) -> None:
+        """Publish the live view — the ONLY writer of latest_jpeg.
+
+        Always draws on the frame the pipeline actually analysed, so
+        the boxes sit exactly where the tracker saw the person. That
+        is the whole job of this view: it is a DEBUG/DEV instrument
+        for judging whether tracking and the seat are correct, and
+        misplaced boxes make it useless for that (Aryaman
+        2026-07-29). The picture therefore runs one pod round-trip
+        behind real time; `lag_s` reports exactly how far, and /state
+        plus the watchdogs read it.
+
+        Being the only writer is what makes the view monotonic:
+        batches always advance, so the picture can never jump
+        backwards. The earlier design had a second, fresher writer
+        racing this one, which is what produced the visible rewind.
+        """
+        _idx, pipeline_ts, frame = pipeline_frame
+        self.lag_s = time.time() - pipeline_ts
         self.latest_jpeg = self._overlay(frame, self.home.seat, self._body_cos)
-        self._annotated_at = time.time()
 
     # ── OUT-OF-BAND IDENTITY (2026-07-24 decoupling) ─────────────────
     # Face (pod /faces, no SAM, ~25ms/crop) + body (local OSNet) + seat
@@ -875,6 +981,23 @@ class CameraLoop:
             ))
         self._body_cos = body_cos_by_tid
         self.home.fold_candidates(cands, now)
+        self.probe_history.append({
+            "ts": round(now, 1),
+            "locked": self.home.seat is not None,
+            "tracks": len(boxes),
+            "faces": [
+                [tid, round(cos, 3), int(px)]
+                for tid, (cos, px) in faces_by_tid.items()
+            ],
+            "body": [
+                [tid, round(cos, 3)] for tid, cos in body_cos_by_tid.items()
+            ],
+            "cands": [
+                [c.track_id, round(c.score, 3), c.anchor,
+                 bool(c.provisional)]
+                for c in cands
+            ],
+        })
         log.info(
             "identity.probe cam=%s tracks=%d faces=%s cands=%s",
             self.camera_id, len(boxes),

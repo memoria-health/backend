@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from collections import Counter
@@ -24,7 +25,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import (
+    FileResponse, HTMLResponse, JSONResponse, StreamingResponse,
+)
 from sqlalchemy import select, text
 
 from src.db.analysis import Analysis
@@ -98,6 +101,7 @@ _CAM_NAMES: dict[str, str] | None = None
 # row-level fallback fields legacy rows carry.
 _HOURLY_SQL = text("""
 select to_char(date_trunc('hour', a.created_at + :tzoff), 'MM-DD HH24:00') as h,
+       date_trunc('hour', a.created_at + :tzoff)          as hts,
        coalesce(a.detector_fields->>'vlm_model', '')     as m,
        count(*) filter (where a.provider != 'skipped')  as analyzed,
        coalesce(sum(c.calls_sent), 0)                    as calls,
@@ -112,7 +116,19 @@ select to_char(date_trunc('hour', a.created_at + :tzoff), 'MM-DD HH24:00') as h,
            coalesce((a.detector_fields->>'vlm_output_tokens')::bigint, 0))), 0) as tout,
        count(*) filter (where a.provider = 'gemini')     as g,
        count(*) filter (where a.provider = 'dashscope')  as d,
-       count(*) filter (where a.provider = 'openrouter') as o
+       count(*) filter (where a.provider = 'openrouter') as o,
+       -- Analyzed rows that report NO usage at all (neither ledger nor
+       -- row fields). They price as $0, which is a LIE of omission —
+       -- OpenRouter/Qwen calls currently land here (59 in the first
+       -- 19 h of this soak). Counted so the page can say its cost is a
+       -- FLOOR instead of quietly serving a total.
+       count(*) filter (
+           where a.provider != 'skipped'
+             and greatest(
+                 coalesce(c.led_in, 0),
+                 coalesce((a.detector_fields->>'vlm_input_tokens')::bigint, 0)
+             ) = 0
+       ) as unpriced
 from analyses a
 left join lateral (
     select count(*) filter (where not (e ? 'gate'))            as calls_sent,
@@ -122,7 +138,9 @@ left join lateral (
         coalesce(a.detector_fields->'sched_calls', '[]'::jsonb)) e
 ) c on true
 where a.created_at >= :since
-group by 1, 2 order by 1
+-- 1=hour label, 2=hour timestamp, 3=model. All three, or the model
+-- collapses and every row prices at the first model seen.
+group by 1, 2, 3 order by 2
 """)
 
 
@@ -138,19 +156,37 @@ async def _hourly(s) -> list:
     # hour + vlm_model; unattributed legacy rows price as lite). Keeps
     # the chart bill-accurate now that the primary is a flash-class
     # model — the old single-lite pricing would understate bars ~5x.
+    #
+    # These buckets are also the ONLY source of the page's headline
+    # $ figures (2026-07-29): they cover the WHOLE --since window,
+    # whereas the row loop in data() is capped at 400 rows for the tick
+    # log. Deriving totals from the loop understated the headline by
+    # the ratio of (window / 400 rows) — ~17x into a soak's second
+    # hour, which read as "$2/day" against a real ~$1.67/HOUR. One
+    # aggregate, one price table, no second accumulator.
     by_hour: dict[str, dict] = {}
     for r in rows:
         pin, pout = _MODEL_PRICE.get(r.m, _PRICE["lite"])
+        # Flash-CLASS is a price question, not a name question: key off
+        # the resolved rate, so a renamed or newly added flash model is
+        # counted the moment it lands in _MODEL_PRICE. (The old flag read the
+        # recipe tier out of the ledger call key, which this file's
+        # header already documents as no longer implying the model.)
+        is_flash = (pin, pout) == _PRICE["flash"]
         b = by_hour.setdefault(r.h, {
-            "h": r.h, "an": 0, "calls": 0, "tin": 0, "tout": 0,
-            "cost": 0.0, "g": 0, "d": 0, "o": 0,
+            "h": r.h, "hts": r.hts.isoformat(), "an": 0, "calls": 0,
+            "tin": 0, "tout": 0,
+            "cost": 0.0, "ftok": 0, "unp": 0, "g": 0, "d": 0, "o": 0,
         })
         b["an"] += r.analyzed
         b["calls"] += int(r.calls)
         b["tin"] += int(r.tin)
         b["tout"] += int(r.tout)
+        b["unp"] += int(r.unpriced)
         b["cost"] = round(
             b["cost"] + int(r.tin) * pin + int(r.tout) * pout, 4)
+        if is_flash:
+            b["ftok"] += int(r.tin) + int(r.tout)
         b["g"] += r.g; b["d"] += r.d; b["o"] += r.o
     out = list(by_hour.values())
     _HOURLY_CACHE = (now, out)
@@ -198,9 +234,11 @@ async def data() -> JSONResponse:
     cams: dict[str, dict] = {}
     ticks = []
     idticks = []
-    tot_in = tot_out = 0
-    cost = 0.0
-    flash_tok = 0
+    # NOTE: no token/cost accumulation in this loop. `rows` is the
+    # newest-400 slice that feeds the tick log and camera cards; summing
+    # money over it produced a headline that silently described only the
+    # last ~hour while being divided by the full window's hours. The $
+    # figures come from _hourly() (whole window) below.
     for r in rows:                       # newest → oldest
         f = r.detector_fields or {}
         cam = str(r.camera_id)[:8]
@@ -225,32 +263,6 @@ async def data() -> JSONResponse:
         c["errors"] += len(f.get("sched_call_errors") or ())
         for _, cf in (f.get("sched_confirm") or {}).items():
             c["confirm"]["pass" if cf.get("passed") else "SUPPRESSED"] += 1
-        row_in = int(f.get("vlm_input_tokens", 0))
-        row_out = int(f.get("vlm_output_tokens", 0))
-        tot_in += row_in
-        tot_out += row_out
-        led_in = led_out = 0
-        row_model = f.get("vlm_model")
-        for c2 in (f.get("sched_calls") or ()):
-            ci = int(c2.get("input_tokens", 0))
-            co = int(c2.get("output_tokens", 0))
-            tier = "flash" if ":flash:" in str(c2.get("key", "")) else "lite"
-            # Served-model pricing when recorded (2026-07-28+); recipe
-            # tier only as the legacy fallback.
-            mp = _MODEL_PRICE.get(str(c2.get("model") or row_model or ""))
-            pin, pout = mp if mp else _PRICE[tier]
-            cost += ci * pin + co * pout
-            led_in += ci
-            led_out += co
-            if tier == "flash":
-                flash_tok += ci + co
-        # Tokens outside the per-call ledger (confirm votes, legacy
-        # rows): confirm votes run the PRIMARY model, so price by the
-        # row's recorded model when present; lite only for true legacy.
-        mp = _MODEL_PRICE.get(str(row_model or ""))
-        pin, pout = mp if mp else _PRICE["lite"]
-        cost += max(0, row_in - led_in) * pin + max(0, row_out - led_out) * pout
-
         tracks = f.get("sig_tracks") or []
         amounts = [float(t.get("amount", 0.0)) for t in tracks]
         calls = f.get("sched_calls") or []
@@ -361,6 +373,45 @@ async def data() -> JSONResponse:
                 })
 
     hours = max((datetime.now(timezone.utc) - _SINCE).total_seconds() / 3600, 1e-6)
+
+    # ── money, from the whole-window hourly buckets (never from `rows`)
+    tot_in = sum(int(b["tin"]) for b in hourly)
+    tot_out = sum(int(b["tout"]) for b in hourly)
+    flash_tok = sum(int(b["ftok"]) for b in hourly)
+    cost = sum(float(b["cost"]) for b in hourly)
+    unpriced = sum(int(b["unp"]) for b in hourly)
+
+    # Rates. All MEASURED — no single-hour figure is ever multiplied out
+    # to a day (2026-07-29: quoting the busiest hour × 24 read as a
+    # "$53/day pace" against a real ~$26/day; the peak hour is a ceiling,
+    # not a cadence, and hours here range $0.02–$2.39).
+    #   day_pace  — cost/elapsed×24 over the whole window. The honest
+    #               all-in number once the window covers a real day.
+    #   hour_rate — the last COMPLETE hour bucket = $/hr at that hour's
+    #               occupancy. Judge "is an active hour expensive?" by
+    #               this; the in-progress hour is excluded so a bucket
+    #               five minutes old never reads as a cheap hour.
+    #   day_24h   — actual spend over the trailing 24 wall-clock hours,
+    #               once the window is that long. This is the real
+    #               day number; it replaces any extrapolation.
+    # An hour with NO analyses produces no bucket at all, so the last
+    # complete bucket is not necessarily the previous wall-clock hour.
+    # It ships with its own label and the UI prints it — an idle-gap
+    # rate must never masquerade as the current burn.
+    complete = hourly[:-1] if len(hourly) > 1 else []
+    hour_rate = float(complete[-1]["cost"]) if complete else None
+    hour_label = str(complete[-1]["h"]) if complete else None
+
+    # Trailing 24 h, summed from the buckets (local-naive hour stamps).
+    local_now_naive = datetime.now(_LOCAL_TZ).replace(tzinfo=None)
+    cutoff_24h = local_now_naive - timedelta(hours=24)
+    day_24h = (
+        round(sum(
+            float(b["cost"]) for b in hourly
+            if datetime.fromisoformat(b["hts"]) >= cutoff_24h
+        ), 4)
+        if hours >= 24 else None
+    )
     return JSONResponse({
         "now": _local_hms(datetime.now(timezone.utc)),
         "tz": _TZ_NAME,
@@ -387,7 +438,20 @@ async def data() -> JSONResponse:
         ],
         "totals": {
             "in": tot_in, "out": tot_out, "flash_tokens": flash_tok,
-            "cost": round(cost, 4), "day_pace": round(cost / hours * 24, 2),
+            "cost": round(cost, 4),
+            "hours": round(hours, 2),
+            # Whole-window average, not a 400-row sample. None until a
+            # full hour has elapsed: extrapolating the first minutes of a
+            # soak to a day produced absurd figures (47 seconds of a
+            # restart burst read as "$365/day"), which is the same
+            # over-extrapolation the removed hour_pace was guilty of.
+            "day_pace": round(cost / hours * 24, 2) if hours >= 1 else None,
+            "hour_rate": None if hour_rate is None else round(hour_rate, 4),
+            "hour_label": hour_label,
+            "day_24h": day_24h,
+            # >0 means `cost` is a FLOOR: that many analyzed calls
+            # reported no usage and priced as $0.
+            "unpriced_calls": unpriced,
         },
         "frames": frames,
     })
@@ -514,17 +578,87 @@ async def trace_data():
     return JSONResponse(out)
 
 
+def _ident_headers() -> dict[str, str]:
+    """Bearer for the identity service, read fresh each call so the
+    dashboard picks up a token set after it started."""
+    tok = os.environ.get("NEMARA_IDENTITY_STATE_TOKEN", "")
+    return {"Authorization": f"Bearer {tok}"} if tok else {}
+
+
+@app.get("/identity_stream/{cam_id}")
+async def identity_stream(cam_id: str):
+    """Proxy the identity service's annotated MJPEG stream.
+
+    The page used to embed :8012/stream directly in an <img>, which
+    cannot carry an Authorization header — so token-gating that
+    endpoint would have blanked the live view. Proxying keeps the
+    token server-side. DEV ONLY, same as the endpoint it fronts: this
+    is raw camera video with no room-privacy gating, and prod has no
+    live-feed path that bypasses the privacy rules.
+    """
+    import httpx
+
+    async def _pump():
+        async with httpx.AsyncClient(
+            timeout=None, headers=_ident_headers(),
+        ) as c:
+            async with c.stream(
+                "GET", f"http://localhost:8012/stream/{cam_id}",
+            ) as r:
+                if r.status_code != 200:
+                    return
+                async for chunk in r.aiter_bytes():
+                    yield chunk
+
+    return StreamingResponse(
+        _pump(), media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@app.get("/identity_snap/{name}")
+async def identity_snap(name: str):
+    """Same reason as /identity_stream: journal snapshots are <img>
+    sources and the endpoint behind them is now token-gated."""
+    import httpx
+
+    from fastapi.responses import Response
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=4.0, headers=_ident_headers(),
+        ) as c:
+            r = await c.get(f"http://localhost:8012/snap/{name}")
+        if r.status_code != 200:
+            return Response(status_code=r.status_code)
+        return Response(content=r.content, media_type="image/jpeg")
+    except Exception:                        # noqa: BLE001 — service down
+        return Response(status_code=502)
+
+
 @app.get("/identity_timeline")
 async def identity_timeline():
     """Proxy the identity service's 10s status samples (2h window) —
     the lane view above the live streams."""
     import httpx
     try:
-        async with httpx.AsyncClient(timeout=2.0) as c:
+        async with httpx.AsyncClient(timeout=2.0, headers=_ident_headers()) as c:
             r = await c.get("http://localhost:8012/timeline?n=720")
             return JSONResponse(r.json())
     except Exception:                        # noqa: BLE001 — service down
         return JSONResponse({"samples": []})
+
+
+@app.get("/identity_probes")
+async def identity_probes():
+    """Proxy the identity service's per-probe score history — every
+    face/body/candidate score, for the tick-correlated analysis view."""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=2.0, headers=_ident_headers()) as c:
+            r = await c.get("http://localhost:8012/probes?n=1600")
+            return JSONResponse(r.json())
+    except Exception:                        # noqa: BLE001 — service down
+        return JSONResponse({"probes": {}})
 
 
 @app.get("/identity_events")
@@ -533,7 +667,7 @@ async def identity_events():
     (events + confirm-latency stats) for the Identity events card."""
     import httpx
     try:
-        async with httpx.AsyncClient(timeout=2.0) as c:
+        async with httpx.AsyncClient(timeout=2.0, headers=_ident_headers()) as c:
             r = await c.get("http://localhost:8012/events?n=250")
             return JSONResponse(r.json())
     except Exception:                        # noqa: BLE001 — service down
@@ -547,7 +681,7 @@ async def identity_state():
     streams embed directly as cross-origin <img> tags."""
     import httpx
     try:
-        async with httpx.AsyncClient(timeout=2.0) as c:
+        async with httpx.AsyncClient(timeout=2.0, headers=_ident_headers()) as c:
             r = await c.get("http://localhost:8012/state")
             j = r.json()
             j["on"] = True
@@ -644,7 +778,7 @@ _PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <tr><td>Watching TV <span class="mut">(reclassified to scene; ~5-min entry)</span></td><td>scene</td><td>patient</td><td>event after sustained viewing</td></tr>
 <tr><td>Medication adherence</td><td>person crop</td><td>patient</td><td>event + notify</td></tr>
 <tr><td>Setup test</td><td>scene</td><td><b>anyone</b></td><td>event, fire-once</td></tr>
-<tr><td>Wandering</td><td>scene + door</td><td>patient</td><td>event + notify</td></tr>
+<tr><td>Wandering <span class="mut">(door-gated 2026-07-28: OFF until an exit door is set on the camera — NULL/unset config no longer runs the generic prompt)</span></td><td>scene + door</td><td>patient</td><td>event + notify</td></tr>
 <tr><td>Missed evening medication</td><td>scheduled/absence — ZERO calls</td><td>patient</td><td>absence event at deadline</td></tr>
 <tr><td>Drinking water <span class="mut">(create via web UI — tests the create→compile flow itself)</span></td><td>person crop</td><td>patient</td><td>event</td></tr>
 <tr><td>Sleep</td><td>scene</td><td>patient</td><td><b>record_only</b> — nightly row, NEVER an event</td></tr>
@@ -664,8 +798,11 @@ _PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <tr><td>7</td><td>Create "Drinking water (from a bottle)" in web UI, scoped to LIVING ROOM ONLY</td><td>compile succeeds; compiler's suggested name lands in the name field</td><td>web create flow</td></tr>
 <tr><td>7b</td><td>Drink from a bottle in the BEDROOM</td><td>NOTHING — room scope is structural: the detector isn't even in the bedroom camera's loadout (no call carries it)</td><td>tick log (bedroom calls list detectors)</td></tr>
 <tr><td>7c</td><td>Drink from a bottle in the LIVING ROOM</td><td>detector fires</td><td>Events feed</td></tr>
-<tr><td>8</td><td>Exit through the front door fully</td><td>wandering fires (door semantics)</td><td>Events feed</td></tr>
+<tr><td>8</td><td>FIRST set the LR exit door in the app (camera → Wandering → pick door), then exit fully through it</td><td>wandering fires; tick log shows the door-targeted prompt</td><td>Events feed + tick log</td></tr>
+<tr><td>8b</td><td>Walk out of the BEDROOM (no exit door configured there)</td><td>NOTHING — door-gate is structural: wandering absent from that camera's loadout</td><td>tick log detectors list</td></tr>
+<tr><td>8c</td><td>In the LR, walk out of frame NOT through the configured door (off-edge / behind furniture)</td><td>NOTHING (only the designated door counts)</td><td>Events feed stays quiet</td></tr>
 <tr><td>9</td><td>Tonight: do NOTHING at med window</td><td>missed-medication absence event at deadline, zero VLM calls attributed</td><td>Events + tick log (no calls)</td></tr>
+<tr><td>10</td><td>ANY event clip from 2026-07-28 ~23:30 on (VFR encode live)</td><td>clip plays the FULL ~26s window at true speed — no teleporting across still stretches, audio in sync, scrubber length honest</td><td>iOS event detail player</td></tr>
 </table></div>
 
 <h3 style="margin:10px 0 4px">C · Sleep + Activity (record-only — check tables, never the feed)</h3>
@@ -712,6 +849,15 @@ _PAGE = """<!doctype html><html><head><meta charset="utf-8">
 </script>
 <h3 style="margin:10px 0 4px">E · Standing negatives + daily rituals</h3>
 <p class="mut" style="font-size:12px;margin:0">NEGATIVES (should stay silent): empty rooms all day = $0 · you sitting still = $0 calls · TV playing in an empty room · fan/curtain motion. RITUALS: hour-6 + hour-24 cost audit (this page's $ vs tokens×list-price, flag >10% drift) · every morning <span class="mono">uv run python tools/run_daily_summaries.py</span> then compare vs recollection · watch phantom births stay ~0 (bedroom occupied) · identity restarts should be 0.</p>
+<p class="mut" style="font-size:12px;margin:8px 0 0"><b class="crit">OPEN TESTS — 2026-07-29 soak. Both prompt rewrites have NO positive control yet.</b><br>
+<b class="crit">1. Calling-for-help POSITIVE — do this first, it is a safety detector.</b> Actually shout for help on camera. It must fire. The rewritten prompt demands audible words quoted verbatim and treats unclear audio as no evidence, so OVER-suppression is now the real risk. If it does not fire, revert the prompt before continuing.<br>
+<b>2. Watching-TV POSITIVE.</b> Genuinely watch TV ~3 min, screen on, no laptop. Must fire, and must fire <b>exactly once</b> — the second half is the episode-latch fix.<br>
+<b>3. Watching-TV NEGATIVE.</b> Sit with a laptop facing the TV. Must stay silent; this was 5 false events in 25 min.<br>
+<b>4. Episode re-arm.</b> After test 2, stop &gt;5 min then watch again — should fire a second time (routine exit gap 300s, safety 60s).<br>
+<b>5. Audio fabrication watch.</b> Any <span class="mono">speech_transcript</span> containing "help" nobody said is a regression. The old prompt's own example leaked the LifeAlert catchphrase into transcripts.<br>
+<b>6. Patient-elsewhere, re-run on 3.6-flash.</b> You in one room, family in another: patient-scoped non-emergency detectors skip with <span class="mono">patient_elsewhere</span>, while fall and calling_for_help still run (severity &ge;80 exemption).<br>
+<b>7. Cost at hour 1.</b> 3.6-flash is ~5x input / 3x output vs lite. Yesterday's 19h was $20.62; identical traffic on 3.6-flash is ~$94 (~$118/day). If the first full-hour bar is far from that, check <span class="mono">vlm_model</span> in analyses before burning a day.<br>
+<b>8. Integration tests are UNRUN</b> for the episode change — they need the live Supabase DB and would insert analyses rows that skew this page. Run <span class="mono">pytest test/integration</span> during a pause, not mid-soak.</p>
 </div>
 <div class="card"><h2>Cameras</h2><div class="cams" id="cams"></div></div>
 <!-- Legacy "Identity — per camera" card removed (Aryaman 2026-07-24):
@@ -723,6 +869,7 @@ _PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <p class="mut" style="font-size:11.5px;margin:0 0 8px">Continuous EdgeTAM tracking + single-seat identity (2026-07-24). This card is the live system; the panels below ride the LEGACY batch pipeline (backend stopped) and stay frozen until P3 integration.</p>
 <div id="idsvc" class="mut">connecting…</div>
 <div id="idtl" style="margin-top:8px"></div>
+<div id="idprobes" style="margin-top:10px;max-height:340px;overflow-y:auto"></div>
 <div id="idstreams" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px"></div></div>
 <div class="card"><h2>Identity events — unsupervised journal <span class="mut" style="font-weight:400;font-size:12px">(every birth/death/lock, with the picture)</span></h2>
 <p class="mut" style="font-size:11.5px;margin:0 0 8px">The overnight record: one row per identity event, newest first, snapshot inline. <b>lock/moved</b> rows carry confirm-latency (track created → patient confirmed) — the number that must stay under a minute.</p>
@@ -795,7 +942,22 @@ async function refresh(){
     $("live").textContent=`LIVE · ${d.now} ${d.tz}`;
     $("flags").textContent=`sched=${d.flags.scheduler?"on":"OFF"} · decision=${d.flags.decision?"on":"OFF"} · idframes=${d.flags.id_frames?"on":"OFF"}`;
     $("since").textContent=`since ${d.since}`;
-    $("pace").textContent=`$${d.totals.cost} so far · $${d.totals.day_pace}/day pace`;
+    // Spend, then BOTH rates, explicitly labelled. The header used to
+    // read "$X so far · $Y/day pace" where X covered ~the last hour and
+    // Y divided it by the whole window — understating by ~17x. X is now
+    // whole-window; the live burn is the last-full-hour figure.
+    const unp=d.totals.unpriced_calls||0;
+    $("pace").textContent=
+      `${unp?"≥":""}$${d.totals.cost.toFixed(2)} over ${d.totals.hours}h`
+      + (d.totals.day_pace!=null
+          ? ` · $${d.totals.day_pace}/day avg incl. idle`
+          : ` · /day pace pending 1h`)
+      + (d.totals.day_24h!=null? ` · $${d.totals.day_24h.toFixed(2)} last 24h actual`:"")
+      + (d.totals.hour_rate!=null
+          ? ` · $${d.totals.hour_rate.toFixed(2)} spent in ${d.totals.hour_label} (one hour, not a daily rate)`
+          : ` · /hr pending first full hour`)
+      + (unp? ` · ${unp} calls UNPRICED (no usage recorded)`:"");
+    $("pace").style.color = unp? "var(--warn)" : "";
     // Tracking-consistency rollup over the visible tick window: of the
     // ticks someone was believed present, how many had a live track,
     // and how often a track dropped to zero while the room stayed
@@ -874,14 +1036,19 @@ async function refresh(){
       const mx=Math.max(...d.hourly.map(x=>x.calls),1);
       const totCalls=d.hourly.reduce((a,x)=>a+x.calls,0);
       const totCost=d.hourly.reduce((a,x)=>a+cost(x),0);
+      // This used to divide by hourly.length (buckets WITH data), giving
+      // a third pace that disagreed with the header's two. Buckets are
+      // now labelled for what they are: spend per hour that actually ran.
+      const perActive=totCost/Math.max(1,d.hourly.length);
       $("hourtotals").textContent=
         `Since start: ${totCalls} calls · $${totCost.toFixed(2)} estimated · `+
-        `on pace for $${(totCost/Math.max(1,d.hourly.length)*24).toFixed(2)}/day`;
+        `$${perActive.toFixed(2)}/hr averaged over ${d.hourly.length} active hour(s)`;
       $("hourly").innerHTML=`<div style="display:flex;align-items:flex-end;gap:8px;overflow-x:auto;padding:4px 0">`+
         d.hourly.map(x=>{
           const tip=`${esc(x.h)} — ${x.calls} calls from ${x.an} analyzed ticks\n`+
             `${(x.tin/1000).toFixed(1)}k tokens in, ${(x.tout/1000).toFixed(1)}k out\n`+
-            `Gemini ${x.g} · DashScope ${x.d} · OpenRouter ${x.o}`;
+            `Gemini ${x.g} · DashScope ${x.d} · OpenRouter ${x.o}`+
+            (x.unp? `\n${x.unp} call(s) unpriced — no usage recorded, billed as $0 here`:"");
           return `<div style="text-align:center;min-width:56px" title="${tip}">
           <div class="mono" style="font-size:11px">${x.calls}</div>
           <div style="height:${Math.max(3,Math.round(90*x.calls/mx))}px;background:var(--ok);border-radius:3px 3px 0 0;opacity:.85"></div>
@@ -952,7 +1119,7 @@ async function pollIdentity(){
     $("idsvc").innerHTML=h; window._idLastOk=Date.now();
     const cams=Object.keys(s.cameras||{});
     if(cams.length && idStreams!==cams.length){
-      $("idstreams").innerHTML=cams.map(c=>`<img src="http://localhost:8012/stream/${c}" style="width:calc(50% - 4px);min-width:280px;border-radius:6px">`).join('');
+      $("idstreams").innerHTML=cams.map(c=>`<img src="/identity_stream/${c}" style="width:calc(50% - 4px);min-width:280px;border-radius:6px">`).join('');
       idStreams=cams.length;
     }
   }catch(e){}
@@ -978,7 +1145,7 @@ async function pollIdEvents(){
     const evs=(j.events||[]).slice().reverse();
     $("idevents").innerHTML=evs.map(e=>{
       const [col,label]=EVK[e.kind]||['#ddd',e.kind];
-      const img=e.img?`<img src="http://localhost:8012/snap/${e.img}" loading="lazy" style="height:74px;border-radius:4px;vertical-align:middle;margin-right:8px">`:'';
+      const img=e.img?`<img src="/identity_snap/${e.img}" loading="lazy" style="height:74px;border-radius:4px;vertical-align:middle;margin-right:8px">`:'';
       const lat=e.confirm_latency_s!=null?` · confirm ${e.confirm_latency_s}s`:'';
       const sc=e.score!=null?` · ${e.score}@${e.anchor||''}`:'';
       return `<div style="display:flex;align-items:center;gap:6px;padding:3px 0;border-bottom:1px solid #222">${img}<div class="mono" style="font-size:12px"><span style="color:${col};font-weight:700">${label}</span> T${e.tid??'?'} · ${e.cam_name||((window._camnames||{})[(e.cam||'').slice(0,8)])||(e.cam||'').slice(0,8)}${sc}${lat}<br><span class="mut">${e.iso||''}</span></div></div>`;
@@ -989,6 +1156,9 @@ pollIdEvents(); setInterval(pollIdEvents, 5000);
 async function pollIdTimeline(){
   try{
     const j=await (await fetch('/identity_timeline')).json();
+    let pj={probes:{}};
+    try{pj=await (await fetch('/identity_probes')).json();}catch(e){}
+    const probesByCam=pj.probes||{};
     let samples=j.samples||[];
     if(!samples.length){$("idtl").innerHTML='';return;}
     // NATIVE 10s samples — no bucketing. The old 30s max-priority
@@ -1000,18 +1170,55 @@ async function pollIdTimeline(){
     const cams=[...new Set(samples.flatMap(s=>Object.keys(s[1])))].sort();const tnm=c=>(j.names||{})[c.slice(0,8)]||((window._camnames||{})[c.slice(0,8)])||c.slice(0,8);
     const t0=new Date(samples[0][0]*1000),t1=new Date(samples[samples.length-1][0]*1000);
     const hm=d=>`${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+    // Probe → tick correlation: tick #N is the sample's index in this
+    // window (labels shared by cell tooltips AND the score table).
+    // A probe belongs to the first sample at-or-after its timestamp.
+    const hms=d=>`${hm(d)}:${String(d.getSeconds()).padStart(2,'0')}`;
+    const fmtProbe=p=>{
+      const f=(p.faces||[]).map(([tid,c,px])=>`t${tid} ${c.toFixed(2)}@${px}px`).join(' ')||'—';
+      const b=(p.body||[]).map(([tid,c])=>`t${tid} ${c.toFixed(2)}`).join(' ')||'—';
+      const cd=(p.cands||[]).map(([tid,s,a,pr])=>`t${tid} ${s.toFixed(2)} ${a}${pr?'?':''}`).join(' ')||'—';
+      return {f,b,cd};
+    };
+    const tickOf=ts=>{
+      for(let i=0;i<samples.length;i++) if(samples[i][0]>=ts) return i;
+      return samples.length-1;
+    };
+    const probeRows=[];
+    const byCamTick={};
+    for(const cam of Object.keys(probesByCam)){
+      for(const p of probesByCam[cam]){
+        if(p.ts<samples[0][0]-10) continue;
+        const tick=tickOf(p.ts);
+        (byCamTick[cam+'|'+tick]=byCamTick[cam+'|'+tick]||[]).push(p);
+        probeRows.push({cam,tick,p});
+      }
+    }
     $("idtl").innerHTML=cams.map(cam=>{
-      const cells=samples.map(([ts,row])=>{
+      const cells=samples.map(([ts,row],i)=>{
         const st=row[cam]||'empty';
         const cls=st==='patient'?'ok':(st==='people'?'warn':'emp');
-        return `<i class="${cls}" title="${hm(new Date(ts*1000))} — ${st}"></i>`;
+        const ps=byCamTick[cam.slice(0,8)+'|'+i]||byCamTick[cam+'|'+i]||[];
+        const plines=ps.map(p=>{const x=fmtProbe(p);
+          return `${hms(new Date(p.ts*1000))} face ${x.f} | body ${x.b} | cand ${x.cd}`;}).join('&#10;');
+        return `<i class="${cls}" title="tick #${i} ${hm(new Date(ts*1000))} — ${st}${plines?'&#10;'+plines:''}"></i>`;
       }).join('');
       return `<div style="display:flex;align-items:center;gap:8px;margin:2px 0">
         <span class="mono mut" style="min-width:90px">${tnm(cam)}</span>
         <span class="mono mut" style="font-size:10px">${hm(t0)}</span>
         <div class="tl" style="flex:1">${cells}</div>
         <span class="mono mut" style="font-size:10px">${hm(t1)}</span></div>`;
-    }).join('')+`<div class="mut" style="font-size:10.5px;margin-top:2px">last 2h · one cell ≈ 10s · <span class="ok">green</span> patient · <span class="warn">amber</span> people, unidentified · light = empty</div>`;
+    }).join('')+`<div class="mut" style="font-size:10.5px;margin-top:2px">last 2h · one cell ≈ 10s = one tick # · <span class="ok">green</span> patient · <span class="warn">amber</span> people, unidentified · light = empty · hover a cell for its probes' scores</div>`;
+    // Full probe-score table, newest first — every probe, grouped by
+    // tick #, so score trajectories are analyzable without hovering.
+    probeRows.sort((a,b)=>b.p.ts-a.p.ts);
+    $("idprobes").innerHTML=probeRows.length?`<table style="width:100%">
+      <tr><th>time</th><th>tick</th><th>room</th><th>trk</th><th>face raw cos@px</th><th>body raw cos</th><th>fused cand (score anchor, ?=provisional)</th><th>seat</th></tr>`+
+      probeRows.slice(0,250).map(({cam,tick,p})=>{
+        const x=fmtProbe(p);
+        return `<tr><td class="mono">${hms(new Date(p.ts*1000))}</td><td class="mono">#${tick}</td><td>${tnm(cam)}</td><td class="mono">${p.tracks}</td><td class="mono">${x.f}</td><td class="mono">${x.b}</td><td class="mono">${x.cd}</td><td>${p.locked?'locked':'searching'}</td></tr>`;
+      }).join('')+`</table>`
+      :'<div class="mut" style="font-size:11px">no probe scores yet — identity service restart pending (activates tomorrow morning; the probe ring starts recording then)</div>';
   }catch(e){}
 }
 pollIdTimeline(); setInterval(pollIdTimeline, 10000);

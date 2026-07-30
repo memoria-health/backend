@@ -1,10 +1,12 @@
-# SETUP.md — Hosted production stack
+# Hosted production stack
 
-This doc describes the **deployed** Nemara stack: where each piece lives, how to access it, and how to operate it. The local-dev path is documented in [README.md](./README.md); this doc is for the cloud version we're running for the demo.
+This doc describes the **deployed** Nemara stack: where each piece lives, how to access it, and how to operate it. The local-dev path is documented in [README.md](../../README.md); this doc is for the cloud version.
+
+> **Freshness note (2026-07-27):** dashboard-side identifiers in this doc (Railway/Vercel/Supabase/LiveKit project IDs, free-tier limits, the prod demo login) were captured around 2026-06 and cannot be re-verified from the repo — check the dashboards if something doesn't match. This doc also predates two newer pieces of the stack: the **GPU perception/identity service** (`gpu/`, RunPod pod + identity sidecar on `:8012` — see [../runbooks/pod.md](../runbooks/pod.md)) and the **gateway/Pi camera path** (`../nemara-gateway`, `src/api/cameras_ingest.py`). Neither is covered below.
 
 > **TL;DR for a teammate cloning this repo today**: there is nothing to install or seed. The whole stack is already live in the cloud. You need:
 > 1. dashboard access on the four platforms (one-time invites, listed below),
-> 2. the credentials in `.env` — already committed in this repo,
+> 2. the credentials for `.env` — **no longer committed** (removed after a key-leak incident); get the shared values from a teammate and copy `.env.example`,
 > 3. the CLI tools listed in "[Day-to-day operating tools](#day-to-day-operating-tools)" if you want to deploy / read logs from a terminal.
 >
 > The web dashboard, both iOS apps, and the backend talk to the cloud stack out of the box. No `make fresh-seed` step needed.
@@ -43,7 +45,7 @@ This doc describes the **deployed** Nemara stack: where each piece lives, how to
             └──────────────────────┘
 ```
 
-The backend is the only component running our code; everything else is a managed service.
+In this diagram the backend is the only component running our code; everything else is a managed service. (Since then, our code also runs on the GPU perception/identity pod and the edge gateway — see the freshness note at the top.)
 
 ## What lives where
 
@@ -53,8 +55,8 @@ The backend is the only component running our code; everything else is a managed
 | Web dashboard | Vercel | project `prj_FUTkPl0C5Yc77EnAEtyZ5xYjzGfA`, team `sunnys-projects-8be52dc6` | `https://nemara-caregiver-web.vercel.app` |
 | Database / Auth / Realtime / Storage | Supabase Cloud | project ref `zgifmvjnggmgzvtnosnu`, org `gtpeceoncuvbtimhkvnc` | `https://zgifmvjnggmgzvtnosnu.supabase.co` |
 | Video / audio / data packets | LiveKit Cloud | project `nemara-pdx0uelu` (Aryaman's account) | `wss://nemara-pdx0uelu.livekit.cloud` |
-| LLM (default) | Google Gemini API | model `gemini-2.5-flash` | (key in `.env`) |
-| LLM (fallback) | OpenAI | model in `.env` | (key in `.env`) |
+| LLM (default) | Google Gemini API | ladder: `gemini-3.6-flash` primary → `NEMARA_GEMINI_FALLBACK_MODEL` retry | (key in `.env`) |
+| LLM (fallbacks) | OpenAI / OpenRouter (Qwen) / DashScope | see [docs/guides/vlm-routing.md](./vlm-routing.md) | (keys in `.env`) |
 | Push notifications | Apple APNs | Team `V8N59CF74G`, bundle `co.elephantlabs.nemara.caregiver` | (key in `.env`) |
 
 All four hosted services are on **free tiers** at the moment. Limits worth knowing:
@@ -144,9 +146,9 @@ railway logs | grep -E "mp4_remux|worker cam=|signature_failed|participant_joine
 
 ## Configuration: `.env`
 
-`.env` is **intentionally tracked in this private repo** so a teammate clone is fully runnable without copying secrets around. All Supabase/LiveKit/Gemini/OpenAI/APNs values inside it are live and match the deployed Railway env. If you rotate a credential, update both `.env` and the matching variable on Railway.
+`.env` is **gitignored** (it used to be tracked in this private repo; that stopped after a key-leak incident — see the comment in `.gitignore`). Copy `.env.example` and get the shared dev values from a teammate. **Railway's env store is the source of truth for prod** — if you rotate a credential, update Railway and tell whoever holds a local `.env`.
 
-The currently-tracked keys (full values in `.env`):
+The main keys (the authoritative, complete catalog is `src/settings.py` — every field is an env var with the `NEMARA_` prefix):
 
 ```
 # Environment + DB
@@ -159,18 +161,21 @@ NEMARA_SUPABASE_PUBLISHABLE_KEY
 NEMARA_SUPABASE_JWT_SECRET
 NEMARA_SUPABASE_SERVICE_ROLE_KEY
 
-# LLM providers
-NEMARA_GEMINI_API_KEY / _MODEL / _VIDEO_FPS / _MEDIA_RESOLUTION
-NEMARA_OPENAI_API_KEY / _MODEL / _FRAMES_FPS
+# LLM providers + per-account routing (see docs/guides/vlm-routing.md)
+NEMARA_GEMINI_API_KEY / _MODEL / _FALLBACK_MODEL / _VIDEO_FPS / _MEDIA_RESOLUTION
+NEMARA_OPENAI_API_KEY / _MODEL / _COMPILE_MODEL / _FRAMES_FPS
+NEMARA_OPENROUTER_API_KEY / _MODEL / _BASE_URL   (Qwen3-VL via OpenRouter)
+NEMARA_DASHSCOPE_API_KEY / _MODEL / _BASE_URL    (Qwen3-VL via Alibaba, native video)
+NEMARA_DEFAULT_VLM_PROVIDER                 gemini (global default; per-caregiver override in DB)
 
 # LiveKit
-NEMARA_LIVEKIT_URL                          wss://nemara-pdx0uelu.livekit.cloud
-NEMARA_LIVEKIT_API_KEY                      APITxi4Q…
-NEMARA_LIVEKIT_API_SECRET                   254B2sR…
+NEMARA_LIVEKIT_URL                          (dev .env now points at a memoria-dev LiveKit project; prod value on Railway)
+NEMARA_LIVEKIT_API_KEY
+NEMARA_LIVEKIT_API_SECRET
 NEMARA_LIVEKIT_WEBHOOK_API_KEY              (empty — falls back to API_KEY; do not set to anything else without re-checking livekit_webhooks.py)
 NEMARA_LIVEKIT_WORKER_TICK_SECONDS          10
-NEMARA_LIVEKIT_WORKER_WINDOW_SECONDS        15
-NEMARA_LIVEKIT_WORKER_TARGET_FPS            5
+NEMARA_LIVEKIT_WORKER_WINDOW_SECONDS        11   (was 15; trimmed 2026-07 to cut frames/call)
+NEMARA_LIVEKIT_WORKER_TARGET_FPS            4    (was 5)
 NEMARA_LIVEKIT_MOTION_STATE_TTL_SECONDS     15
 
 # Pairing + storage tunables
@@ -185,7 +190,7 @@ NEMARA_STORAGE_SIGNED_URL_DEFAULT_TTL_SECONDS
 NEMARA_APNS_TEAM_ID                         V8N59CF74G
 NEMARA_APNS_KEY_ID
 NEMARA_APNS_AUTH_KEY                        multi-line .p8 contents, BEGIN/END preserved
-NEMARA_APNS_BUNDLE_ID                       co.elephantlabs.nemara.caregiver
+NEMARA_APNS_BUNDLE_ID                       must match the caregiver app's bundle id (code default com.elephantlabs.nemara.caregiver; dev .env currently co.sunny.nemara.caregiver — check Railway for prod)
 NEMARA_APNS_ENVIRONMENT                     sandbox | production
 NEMARA_APNS_JWT_LIFETIME_SECONDS
 
@@ -197,7 +202,7 @@ Railway has the same set, set via `railway variables set …` during the origina
 
 ```bash
 # replace a single var on Railway
-railway variable set NEMARA_LIVEKIT_WORKER_TICK_SECONDS=5
+railway variables --set "NEMARA_LIVEKIT_WORKER_TICK_SECONDS=5"
 ```
 
 (Editing `.env` alone doesn't redeploy; Railway pulls from its own env store.)
@@ -213,14 +218,14 @@ railway up --service nemara-backend --detach
 railway logs --build
 ```
 
-The `Dockerfile` installs `ffmpeg` + `uv` + the project's dependencies; the `CMD` reads `$PORT` at start time so Railway can inject any port.
+The prod image is `docker/Dockerfile` (pinned via `railway.toml` → `dockerfilePath`); it installs `ffmpeg` + `uv` + the project's dependencies and pre-warms the YOLO/OSNet weights. The `CMD` reads `$PORT` at start time (default 8002) so Railway can inject any port.
 
 If a deploy seems live but `/ready` still 500s, check `railway logs` for stack traces — usually a missing or malformed env var. The webhook fix from the deploy session covers the most-painful failure mode (`NEMARA_LIVEKIT_WEBHOOK_API_KEY` accidentally bound to a comment block — see the corresponding commit message).
 
 **Web dashboard (Vercel)**
 
 ```bash
-cd nemara-caregiver-web
+cd nemara-web-app        # the dashboard's local checkout (Vercel project: nemara-caregiver-web)
 vercel --prod --yes
 ```
 
@@ -228,17 +233,11 @@ Vercel re-enables SSO protection by default on each project; if a fresh deploy r
 
 **Database migrations**
 
-Schema changes go in `supabase/schema.sql` for local dev AND in a timestamped file under `supabase/migrations/` for cloud. To push a migration:
+There is **no `supabase/migrations/` directory** — this repo uses an apply-deltas-only pattern. Schema changes go in `supabase/schema.sql` (the full schema, applied on local `supabase db reset`) AND in a matching one-shot delta file `scripts/apply_<change>_delta.sql` for the cloud DB. Deltas are run against prod manually (Supabase SQL editor for project `zgifmvjnggmgzvtnosnu`, or `psql "<prod NEMARA_DB_URL>" -f scripts/apply_x_delta.sql`), **before** the backend deploy that depends on them. **Never reset the prod DB** — deltas only.
 
-```bash
-cd nemara-backend
-supabase link --project-ref zgifmvjnggmgzvtnosnu     # one-time per machine
-supabase db push                                      # applies any new migrations
-```
+The cloud DB's connection string is the Railway `NEMARA_DB_URL` variable; you can connect directly with any postgres client.
 
-The cloud DB's connection string is in `.env` as `NEMARA_DB_URL`; you can also connect directly with any postgres client.
-
-**iOS apps**: not deployed — built and side-loaded onto wall phones / your caregiver phone via Xcode. The Hardcoded backend URL in `NemaraCam/AppSettings.swift` and the fallback URLs in `nemara-caregiver-app/Networking/AppConfig.swift` both point at the Railway URL, so fresh installs hit prod with zero configuration.
+**iOS apps**: not deployed — built and side-loaded onto wall phones / your caregiver phone via Xcode. The hardcoded backend URL in `nemara-camera-app/NemaraCam/Settings/AppSettings.swift` and the fallback URL in `nemara-caregiver-app/NemaraCaregiver/Networking/AppConfig.swift` both point at the Railway URL (`https://nemara-backend-production.up.railway.app`), so fresh installs hit prod with zero configuration. (Per-dev local overrides live in the caregiver app's gitignored `LocalAppConfig.swift` — don't commit them.)
 
 ## Request flow (end-to-end fall detection)
 
@@ -249,8 +248,8 @@ For when something feels off and you need to trace where things stop:
 3. On `participant_joined`, LiveKit Cloud fires a signed webhook to `https://nemara-backend-production.up.railway.app/v1/livekit/webhooks`. The backend verifies the JWT, looks up the camera row, resets `state='open'` + `no_people_count=0`, and starts a `RoomWorker` that subscribes to the new participant's tracks.
 4. Inside the `RoomWorker`, a `CameraIngest` task runs every `NEMARA_LIVEKIT_WORKER_TICK_SECONDS` (10s). On each tick:
    - If the camera is `closed` and there's no recent motion → skip (write a synthetic "skipped" row to `public.analyses` so the dashboard knows it ticked).
-   - Otherwise: snapshot the last 15s of frames + audio from the in-memory ring buffers, `ffmpeg`-remux into MP4, hand the MP4 to Gemini (or OpenAI as fallback).
-5. Gemini returns `people_present`, plus per-detector verdicts (`fall_detected`, `agitation_detected`, …). A row lands in `public.analyses` with the result.
+   - Otherwise: snapshot the last `NEMARA_LIVEKIT_WORKER_WINDOW_SECONDS` (11s) of frames + audio from the in-memory ring buffers, `ffmpeg`-remux into MP4, hand the MP4 to the caregiver's routed VLM (Gemini ladder by default, with a cross-provider fallback chain — see [docs/guides/vlm-routing.md](./vlm-routing.md)).
+5. The VLM returns `people_present`, plus per-detector verdicts (`fall_detected`, `agitation_detected`, …). A row lands in `public.analyses` with the result.
 6. `event_promotion.py` decides whether any detector hit warrants creating an `events` row (typically requires `*_detected=true` AND `*_confidence>=threshold`). If yes, a `public.events` insert happens.
 7. Supabase Realtime broadcasts the new `analyses` and `events` rows on the `supabase_realtime` publication. The web dashboard's `AnalysesFeed` and `EventsFeed` components are subscribed and update in real time.
 8. If an `events` row was created AND the caregiver has a registered APNs token, the backend also sends a push notification.

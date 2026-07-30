@@ -77,6 +77,23 @@ async def replace_assignments_for_camera(
                 f"refusing to assign across patients"
             )
 
+    # Per-assignment settings must SURVIVE a rewrite of the list.
+    # door_config is the caregiver's exit-door choice for wandering,
+    # and wandering only runs once it is set — so a delete+reinsert
+    # that dropped it silently turned wandering OFF on that camera
+    # whenever the user toggled any other detector, with nothing in
+    # the UI to say so (found in review 2026-07-29).
+    keep_stmt = select(
+        CameraDetector.detector_id, CameraDetector.door_config,
+    ).where(
+        CameraDetector.camera_id == camera_id,
+        CameraDetector.door_config.is_not(None),
+    )
+    preserved = {
+        row.detector_id: row.door_config
+        for row in (await session.execute(keep_stmt)).all()
+    }
+
     await session.execute(
         delete(CameraDetector).where(CameraDetector.camera_id == camera_id)
     )
@@ -84,7 +101,8 @@ async def replace_assignments_for_camera(
         now = datetime.now(UTC)
         await session.execute(
             insert(CameraDetector),
-            [{"camera_id": camera_id, "detector_id": d, "created_at": now}
+            [{"camera_id": camera_id, "detector_id": d, "created_at": now,
+              "door_config": preserved.get(d)}
              for d in requested],
         )
     await session.flush()

@@ -1,8 +1,11 @@
 # Continuous tracking + parallel identity — architecture & migration plan
 
+> Status (2026-07-27): implemented (P0–P3), with one deliberate deviation — identity did NOT land as the co-located backend module §2b recommends: Aryaman locked a separate identity service on the GPU host (2026-07-26), now `gpu/identity/service.py` (port 8012, supervised via `gpu/deploy/identity_supervisor.sh`), feeding the backend through the versioned `/state` contract (`gpu/identity/contract.py`) consumed by `src/services/identity/identity_client.py` — the sidecar is the only identity provider (dfb9b4e). Key commits: c1ee735 (continuous identity service), 77d546c (backend sidecar provider), dfb9b4e (legacy brain out). P4's SSE/push dashboard was not built (dashboards still poll); P5 edge endgame remains future. File refs herein to `src/services/reid/` and `sam_service/` are stale — see `src/services/identity/`, `gpu/identity/`, `gpu/perception/`.
+
 2026-07-24. Synthesized from a full-pipeline scour (5 mapped subsystems, file:line
 anchors verified against this worktree). Companion: the e2e flow sketch shared in
-session; `docs/CONTINUOUS_TRACKING.md` (pod engine); `TRACKER_EVAL_FINDINGS.md`.
+session; `docs/architecture/continuous-tracking.md` (pod engine);
+`docs/research/2026-07-23-tracker-eval-findings.md`.
 
 **Goal:** near-real-time, high-accuracy patient tracking+identity, FP-averse,
 scaling with activity (not camera count), feeding the detection pipeline through

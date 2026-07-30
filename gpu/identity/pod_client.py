@@ -65,6 +65,14 @@ class SamServiceClient:
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(
             connect=5.0, read=timeout_s, write=timeout_s, pool=timeout_s,
         ))
+        # Client stamp (2026-07-27): every request identifies WHO is
+        # driving the GPU — the pod logs it per batch, so a stale or
+        # foreign client is visible in one grep instead of a forensic
+        # nvidia-smi session.
+        import socket
+        self._client.headers["X-Nemara-Client"] = (
+            f"identity-service@{socket.gethostname()}"
+        )
         self._expected_face_model = expected_face_model
 
     async def aclose(self) -> None:

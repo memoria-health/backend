@@ -1,7 +1,9 @@
 # Tracker Eval — Findings, Weaknesses & Coverage
 
 Living record for the SAM3 vs SAM3+EdgeTAM capability eval. Started 2026-07-23.
-Companion to `TRACKER_EVAL_RUNBOOK.md` (how to run) — this is what we've learned.
+Companion to `docs/runbooks/tracker-eval.md` (how to run) — this is what we've
+learned. Outcome: EdgeTAM won (2026-07-24); the continuous identity service
+(`gpu/identity/service.py`) is built on it.
 
 ---
 
@@ -41,13 +43,14 @@ next window.
   across all 66 frames → in-window movement and brief occlusion are handled.
   *This is why "SAM sees every frame so movement shouldn't break it" is right —
   within a window.*
-- **Across ticks (the ~30s blind gap): fragile.** The pod (`continuous.py`)
+- **Across ticks (the ~30s blind gap): fragile.** The pod (`gpu/perception/continuous.py`)
   re-maps each new window's tracks onto the previous window's ids **by IoU**.
   - Stationary → boxes overlap → same id (stable). Observed: T4 held across
     ticks 16–26 while seated.
   - Moved during the gap → new position doesn't overlap the old → IoU fails →
     **new id (renumber).** Observed: T2→T4→T5→T6 on each locomotion.
-- **The ledger has no safety net on the SAM3 arm.** `track_ledger.py` keys
+- **The ledger has no safety net on the SAM3 arm.** `track_ledger.py`
+  (`src/services/identity/` — legacy, slated for deletion at P3) keys
   entries DIRECTLY by pod track_id and "never re-associates: no geometric
   stitcher, no fragment merge." Those SAM3-renumber *compensations were deleted*
   in favor of EdgeTAM's stable ids. So a renumber = a dead entry = re-acquire

@@ -1,5 +1,7 @@
 # Identity persistence — implementation plan
 
+> Status (2026-07-27): implemented, then superseded. W1–W7 shipped on the soak branch (2026-07-19). The per-tick reid brain this plan patched was then replaced in succession: track-anchored ledger (2026-07-21 plan) → EdgeTAM-continuous pivot (2026-07-22 plan) → GPU-host identity service (2026-07-24 + 2026-07-26 plans). The legacy in-process brain was deleted 2026-07-26 (dfb9b4e); `src/services/reid/` no longer exists — the files named here (inference.py, identity_lock.py, cross_clip_body_gallery.py, body_pipeline.py, body_detector.py, tracker.py) are gone. Surviving backend identity code lives in `src/services/identity/` (renamed from reid, f61d9d8); the pipeline itself is `gpu/identity/` + `gpu/perception/`.
+
 > Drafted 2026-07-19 ~02:00Z during soak #2, from live failures (bedroom
 > PATIENT flicker, seated/lying track death at 41% of occupied ticks,
 > lunch green-box FPs, aunt/uncle unidentified, blur↔identity r=0.52,

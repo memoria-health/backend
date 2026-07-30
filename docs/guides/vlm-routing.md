@@ -9,13 +9,21 @@ which vision model (VLM) analyzes a given family's camera feed._
 ## 1. The mental model (read this first)
 
 Every detection "tick" (a ~10s clip from a camera) is sent to **one vision model**
-to be analyzed. There are three possible models:
+to be analyzed. There are four possible providers:
 
 | Code value     | Model that actually runs                       | Provider / how it's billed |
 |----------------|------------------------------------------------|----------------------------|
-| `gemini`       | Google **Gemini 2.5 Flash** (native video)     | Google API key             |
-| `openai`       | **GPT-5.4-mini** (frame sampling)              | OpenAI API key             |
+| `gemini`       | Google Gemini **model ladder** (native video): primary **`gemini-3.6-flash`**, with an in-provider retry on the fallback tier (`NEMARA_GEMINI_FALLBACK_MODEL` — see the ⚠️ in §8) | Google API key |
+| `openai`       | **GPT-5.4** by default (`NEMARA_OPENAI_MODEL`; dev `.env` currently pins `gpt-5.4-mini`) — frame sampling | OpenAI API key |
 | `openrouter`   | **Qwen3-VL-32B-Instruct** (frame sampling)     | OpenRouter API key → "Qwen" in the UI |
+| `dashscope`    | **Qwen3-VL-32B-Instruct** via Alibaba DashScope (**native video + fps** — sandbox arm) | DashScope API key |
+
+> ⚠️ **`dashscope` persistence gap:** `analyses.provider` has a CHECK constraint
+> that currently allows only `('gemini','openai','openrouter','skipped')` —
+> `'dashscope'` is **not** in it (`supabase/schema.sql`, and no delta script adds
+> it). A tick that actually runs on DashScope will analyze fine but **fail to
+> save its row**, exactly the failure mode §8 warns about for `openrouter`.
+> Widen the constraint before routing anyone to `dashscope`.
 
 > **`openrouter` === Qwen.** In the web dashboard the badge says **"Qwen"**, but in
 > the database / code / env the value is the literal string **`openrouter`**. Don't
@@ -24,8 +32,8 @@ to be analyzed. There are three possible models:
 ### Which model a tick uses is decided in two layers
 
 1. **Per-account override** — the `caregivers.vlm_provider` column.
-   - If it's set to `gemini` / `openai` / `openrouter`, **that** model is used for
-     **every camera owned by that caregiver**.
+   - If it's set to `gemini` / `openai` / `openrouter` / `dashscope`, **that**
+     provider is used for **every camera owned by that caregiver**.
    - If it's `NULL` (the default for everyone), the account falls through to…
 2. **Global default** — the backend env var `NEMARA_DEFAULT_VLM_PROVIDER`
    (currently **`gemini`**). Used by any account whose column is `NULL`.
@@ -63,8 +71,8 @@ railway variables | grep -i openrouter      # run from the linked backend repo
 ```
 
 If the key is missing and you route an account to `openrouter`, the tick will
-**fall back** to gemini→openai automatically (see §6), so you won't get errors —
-you just won't get Qwen. So always confirm the key first.
+**fall back** through dashscope→gemini automatically (see §6), so you won't get
+errors — you just won't get Qwen. So always confirm the key first.
 
 ---
 
@@ -142,8 +150,9 @@ always overrides the default.
 
 To go back: `railway variables --set "NEMARA_DEFAULT_VLM_PROVIDER=gemini"` + redeploy.
 
-> Valid values for this env var are exactly `gemini` | `openai` | `openrouter`.
-> Anything else is treated as invalid and the code falls back to `gemini`.
+> Valid values for this env var are exactly `gemini` | `openai` | `openrouter` |
+> `dashscope`. Anything else is treated as invalid and the code falls back to
+> `gemini`. (`dashscope` is a sandbox arm — see the ⚠️ in §1 before using it.)
 
 ### Per-account vs. global — which should you use?
 
@@ -170,18 +179,27 @@ To go back: `railway variables --set "NEMARA_DEFAULT_VLM_PROVIDER=gemini"` + red
 
 Each choice has a **fallback chain** — if the chosen provider errors (outage, rate
 limit, bad key), the tick automatically tries the next one so detection never goes
-dark:
+dark. The chains as of 2026-07-27 (`_CHAINS` in `vlm_routing.py`):
 
 ```
-openrouter  →  gemini  →  openai      (Qwen first, then Google, then OpenAI)
-gemini      →  openai
-openai      →  gemini
+gemini      →  gemini-fallback-tier  →  dashscope  →  openrouter
+openrouter  →  dashscope  →  gemini
+openai      →  openrouter
+dashscope   →  openrouter
 ```
+
+Notes:
+- The **gemini fallback tier** is a second Gemini model on the same native-video
+  path (`NEMARA_GEMINI_FALLBACK_MODEL`) — it is chain-internal, not a routable
+  choice, and its analyses rows still say `provider = 'gemini'`.
+- A keyless provider in the chain (e.g. DashScope with no
+  `NEMARA_DASHSCOPE_API_KEY`) raises immediately and the chain moves on, so
+  keyless environments fail through cleanly.
 
 Practical consequence: if you set someone to `openrouter` but the OpenRouter key is
-missing/invalid, their ticks quietly run on **gemini** instead. So if you toggle to
-Qwen and the dashboard still says "Gemini," check the OpenRouter key (§2) and the
-backend logs.
+missing/invalid, their ticks quietly run on **gemini** instead (via the dashscope
+hop, which is skipped when keyless). So if you toggle to Qwen and the dashboard
+still says "Gemini," check the OpenRouter key (§2) and the backend logs.
 
 ---
 
@@ -216,15 +234,31 @@ Three ways, in order of convenience:
 - `src/services/detection/vlm_routing.py`
   - `resolve_vlm_provider()` — reads `caregivers.vlm_provider`, falls back to
     `settings.default_vlm_provider`, then to `gemini`. 60s cache.
-  - `run_vlm()` — runs the chosen provider with the fallback chain above.
-  - `_VALID = ("gemini", "openai", "openrouter")` — the only accepted values.
+  - `run_vlm()` — runs the chosen provider with the fallback chains above
+    (`_CHAINS`).
+  - `_VALID = ("gemini", "openai", "openrouter", "dashscope")` — the only
+    accepted values.
+- `src/services/detection/providers/` — `gemini.py` (native video, model
+  ladder), `openai.py`, `openrouter.py`, `dashscope.py`.
 - `src/settings.py` — `default_vlm_provider` (env `NEMARA_DEFAULT_VLM_PROVIDER`),
-  `openrouter_api_key` / `openrouter_model` / `openrouter_base_url`.
+  `gemini_model` / `gemini_fallback_model`,
+  `openrouter_api_key` / `openrouter_model` / `openrouter_base_url`,
+  `dashscope_api_key` / `dashscope_model` / `dashscope_base_url`.
+
+  > ⚠️ **`gemini_fallback_model` default is currently ambiguous** (as of commit
+  > `cd32111`, 2026-07-27): `src/settings.py` defines the field **twice** —
+  > once with default `gemini-3.1-flash-lite` (the intended fallback per the
+  > commit) and, a few lines below, a leftover older definition with default
+  > `gemini-3.5-flash`. In Python the **later definition wins**, so the
+  > effective in-code default is `gemini-3.5-flash` until the duplicate is
+  > removed. If the exact fallback model matters to you, set
+  > `NEMARA_GEMINI_FALLBACK_MODEL` explicitly in the environment.
 - `src/db/caregiver.py` — the `vlm_provider` column on the ORM.
 - Schema: `caregivers.vlm_provider text` (nullable) and the
   `analyses_provider_check` constraint must include `'openrouter'`
   (see `scripts/apply_vlm_provider_delta.sql` if migrating a fresh DB —
   **without that constraint value, Qwen ticks run fine but fail to save**).
+  The constraint does **not** yet include `'dashscope'` — see the ⚠️ in §1.
 
 ---
 

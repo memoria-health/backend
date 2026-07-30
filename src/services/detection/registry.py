@@ -101,13 +101,17 @@ async def get_enabled_loadout_for_camera(
 
     loadout: list[tuple[DetectorSpec, Detector]] = []
     for det, door_config in rows:
-        # Wandering is specialized PER SENSOR by the caregiver's exit-door choice.
-        if det.identifier in _WANDERING_IDENTIFIERS and door_config is not None:
-            # New-app assignment (only the exit-door picker ever writes a
-            # door_config). Active ONLY once >=1 door is set; unset / no_exit_door
-            # / empty => not watching this sensor.
-            doors = door_config.get("doors") or []
-            if not doors or door_config.get("no_exit_door"):
+        # Wandering is specialized PER SENSOR by the caregiver's exit-door
+        # choice, and runs ONLY once >=1 exit door is set on the assignment.
+        # A NULL door_config (room-scope seeding, never touched by the
+        # exit-door picker) is the same as unset: not watching this sensor.
+        # This matches the app's "inactive until exit doors are set" promise;
+        # the old grandfathered generic any-doorway prompt fired on every
+        # room exit (2026-07-28 soak: two false events in 2.5 minutes).
+        if det.identifier in _WANDERING_IDENTIFIERS:
+            cfg = door_config or {}
+            doors = cfg.get("doors") or []
+            if not doors or cfg.get("no_exit_door"):
                 continue
             loadout.append((
                 replace(
@@ -117,10 +121,5 @@ async def get_enabled_loadout_for_camera(
                 det,
             ))
             continue
-        # Everything else — including LEGACY wandering assignments with a NULL
-        # door_config (created before this feature: old app / room-scope seeding)
-        # — keeps its stored prompt. This grandfathers existing prod wandering so
-        # it doesn't go dark during the app-rollout gap; a caregiver on the new
-        # app opts into per-sensor doors when they configure that sensor.
         loadout.append((detector_spec_from_row(det), det))
     return loadout

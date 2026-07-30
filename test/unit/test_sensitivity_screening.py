@@ -132,9 +132,11 @@ class _FakeCensor:
 
     async def censor_clip(
         self, in_path: str, out_path: str, *, full_frame: bool = False,
+        keep_audio: bool = True,
     ) -> None:
         self.calls.append(
-            {"in_path": in_path, "out_path": out_path, "full_frame": full_frame}
+            {"in_path": in_path, "out_path": out_path,
+             "full_frame": full_frame, "keep_audio": keep_audio}
         )
         if self.raises:
             raise CensorError("boom")

@@ -386,7 +386,7 @@ class TestScratchSweep:
         )
         seen: dict[str, str] = {}
 
-        async def fake_censor(in_path, out_path, *, full_frame):
+        async def fake_censor(in_path, out_path, *, full_frame, keep_audio=True):
             seen["in"], seen["out"] = in_path, out_path
             with open(out_path, "wb") as f:
                 f.write(b"censored")

@@ -1,5 +1,7 @@
 # Data-Collection Consent UI — Implementation Plan (web + iOS)
 
+> Status (2026-07-27): implemented — web (`DataCollectionConsentModal.tsx`, `DataCollectionConsentGate.tsx`, `DataCollectionSettings.tsx` in nemara-web-app) and iOS (`DataCollectionConsentSheet.swift`, `DataCollectionCard.swift` in nemara-caregiver-app) both shipped; backend flag + `decided_at` stamping live in `src/schemas/patient.py` / `src/db/patient.py`.
+
 > **For Claude:** REQUIRED SUB-SKILL: superpowers:executing-plans. Companion to `2026-06-24-video-data-collection-recorder.md` (the backend recorder). Ship this **with** the recorder — recording must not run without the consent flow live.
 
 **Goal:** Per-patient consent for data collection on **both** the web app and the iOS caregiver app: a **first-open banner** (shown until a decision is recorded) + a **settings toggle** (changeable anytime), both driving the backend `data_collection_enabled` flag.

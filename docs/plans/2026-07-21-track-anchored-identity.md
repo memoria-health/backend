@@ -1,5 +1,7 @@
 # Track-anchored identity (binding ledger) — implementation plan
 
+> Status (2026-07-27): implemented, then superseded by the EdgeTAM-continuous pivot (2026-07-22 plan). Built and soaked (checkpoint f2c5115); the geometric stitcher stranded bindings on ghost tracks and deadlocked (`docs/runbooks/ghost-deadlock-known-fix.md`, 837da2b — fix deliberately not applied because the continuous pivot dissolves the bug class). The `TrackLedger` name and camera_ingest seam survive but the module was rewritten as the bind-once-hold binding brain keyed by pod stable ids (`src/services/identity/track_ledger.py`); the stitcher, fragment merge, mismatch accumulators, and verified-OTHER audit specified here were all deleted.
+
 **Date:** 2026-07-21 · **Status:** approved by Aryaman, building
 **Goal:** "Confirm the patient once and stay locked no matter where they
 go or what they do" — for ALL identities (PATIENT / OTHER / UNKNOWN
@@ -29,7 +31,7 @@ Pixels (SAM, within-clip) → **geometry (NEW stitcher, clip-to-clip)** →
 appearance (OSNet pool: births/gaps/cross-camera) → face (truth:
 confirm + audit). Each layer covers the failure modes of the one above.
 
-New component: `src/services/reid/track_ledger.py` — per-camera
+New component: `src/services/identity/track_ledger.py` (path at the time: `src/services/reid/`) — per-camera
 `TrackLedger` replacing `IdentityLock` at the exact same seam
 (`apply(identity, tick_mono)` + `stash_fields()` in camera_ingest),
 selected by `settings.reid_binding_mode: "legacy" | "track"` (env

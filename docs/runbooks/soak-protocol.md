@@ -1,5 +1,7 @@
 # Detection v2 — 4-hour soak protocol (2026-07-14)
 
+> Status (2026-07-27): moved from docs/plans/ — this is the reusable soak methodology (objectives, truth-CSV scoring, instrumentation map, rollback), not a one-shot plan. The original 2026-07-14 run itself aborted at ~50 min on substrate issues (Docker VM ≠ native experiment substrate); the 2026-07-18 24h cost soak succeeded it for the cost question. Date-specific setup details (branch commit, convulsion-rename delta, that day's detector loadout) are historical — adapt per run. The 2026-07-26 detector-axis reconciliation section at the bottom is still an OPEN gate: duration / trailing / absence / M-of-N firing paths have not yet been soak-validated and must be before detection is re-enabled.
+
 A formal experiment, not a vibe check. Four objectives, each with its
 own data, scoring, and pass bar. Locked context: no baseline period
 (fresh system), NO k-of-N configs anywhere (Aryaman: confirm is a

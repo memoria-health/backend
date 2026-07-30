@@ -254,3 +254,103 @@ async def test_pcm_rejects_invalid_channel_count() -> None:
     f = FrameSnapshot(width=320, height=240, data=_yuv420_blob(320, 240), captured_at=100.0)
     with pytest.raises(ValueError, match="pcm_num_channels"):
         await frames_to_mp4([f], fps=5, pcm=_silence_pcm(1.0), pcm_num_channels=0)
+
+
+# ── frames_to_vfr_mp4: wall-clock-faithful clips ──────────────────────
+
+
+@_pytestmark_ffmpeg
+@pytest.mark.asyncio
+async def test_vfr_clip_duration_matches_wall_clock_not_frame_count() -> None:
+    """Sparse, unevenly spaced frames (like a still scene) must play
+    for the real wall-clock span, not frame_count/fps. 8 frames over
+    20s at fixed 8fps would play 1s; VFR must play ~20s."""
+    from src.services.detection.mp4_remux import frames_to_vfr_mp4
+
+    width, height = 320, 240
+    # Burst at t=0-2s, then a long still gap, then a final frame at 18s.
+    times = [100.0, 100.5, 101.0, 101.5, 102.0, 108.0, 114.0, 118.0]
+    frames = [
+        FrameSnapshot(
+            width=width, height=height,
+            data=_yuv420_blob(width, height),
+            captured_at=t,
+        )
+        for t in times
+    ]
+    mp4 = await frames_to_vfr_mp4(frames, end_at=120.0)
+    info = _ffprobe(mp4)
+    duration = float(info["format"]["duration"])
+    # True span: first frame 100.0 -> end_at 120.0 = 20s.
+    assert 19.0 <= duration <= 21.0
+
+
+@_pytestmark_ffmpeg
+@pytest.mark.asyncio
+async def test_vfr_audio_muxes_full_length_without_truncation() -> None:
+    """PCM spanning the full window must not be -shortest-truncated by
+    a sparse video track, and leading audio from before the first
+    frame is trimmed so A/V t=0 align."""
+    from src.services.detection.mp4_remux import frames_to_vfr_mp4
+
+    width, height = 320, 240
+    rate = 16000
+    frames = [
+        FrameSnapshot(
+            width=width, height=height,
+            data=_yuv420_blob(width, height),
+            captured_at=100.0 + 2.0 * i,
+        )
+        for i in range(5)  # 100..108, end_at 110 -> 10s video
+    ]
+    # 12s of audio ending at 110.0 -> starts at 98.0; 2s must be
+    # trimmed so audio t=0 == first frame (100.0), leaving ~10s.
+    pcm = b"\x00\x00" * (rate * 12)
+    mp4 = await frames_to_vfr_mp4(
+        frames, end_at=110.0,
+        pcm=pcm, pcm_sample_rate=rate, pcm_num_channels=1,
+        pcm_starts_at=98.0,          # measured, not inferred from length
+    )
+    info = _ffprobe(mp4)
+    audio = next(s for s in info["streams"] if s["codec_type"] == "audio")
+    assert 9.0 <= float(audio["duration"]) <= 11.0
+    video = next(s for s in info["streams"] if s["codec_type"] == "video")
+    assert 9.0 <= float(video["duration"]) <= 11.0
+
+
+@pytest.mark.asyncio
+async def test_vfr_rejects_empty_window() -> None:
+    from src.services.detection.mp4_remux import frames_to_vfr_mp4
+
+    with pytest.raises(ValueError):
+        await frames_to_vfr_mp4([])
+
+
+@_pytestmark_ffmpeg
+@pytest.mark.asyncio
+async def test_vfr_single_frame_produces_playable_clip() -> None:
+    """A window that decimates to ONE frame (resolution switch at the
+    tail, or an empty post-roll) must still yield a playable clip with
+    a real duration — not a 0-length file that uploads as has_clip."""
+    from src.services.detection.mp4_remux import frames_to_vfr_mp4
+
+    frames = [FrameSnapshot(
+        width=320, height=240, data=_yuv420_blob(320, 240),
+        captured_at=100.0,
+    )]
+    mp4 = await frames_to_vfr_mp4(frames, end_at=105.0)
+    info = _ffprobe(mp4)
+    assert 4.0 <= float(info["format"]["duration"]) <= 6.0
+    video = next(s for s in info["streams"] if s["codec_type"] == "video")
+    assert 4.0 <= float(video["duration"]) <= 6.0
+
+
+# NOTE (2026-07-29): the audio-underrun displacement fix — using the
+# buffer's MEASURED first-chunk timestamp instead of inferring the
+# start from len(pcm)/bytes-per-second — is deliberately NOT covered
+# here. The MP4 muxer reports the audio track's duration as the
+# container duration once the audio ends early, so both the correct
+# and the displaced output probe identically. Proving it needs sample-
+# level decoding of a marked (non-silent) tone; covered instead by the
+# AudioBuffer.snapshot_window unit test, which pins the timestamp the
+# encoder now relies on.
