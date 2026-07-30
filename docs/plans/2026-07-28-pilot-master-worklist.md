@@ -78,20 +78,6 @@
       var; a process started before the token was set fails closed):
         export NEMARA_IDENTITY_STATE_TOKEN=$(grep '^NEMARA_IDENTITY_STATE_TOKEN=' .env | cut -d= -f2)
       Applies to identity_supervisor.sh, soak_dashboard.py, sentinel.py.
-- [ ] ~~**IDENTITY IS UNAUTHENTICATED RIGHT NOW.**~~ (kept for the
-      record — this was the state until 2026-07-29 18:30.)
-      `NEMARA_IDENTITY_STATE_TOKEN` is set NOWHERE — not in `.env`, not
-      on the identity service — and an empty token means `auth_ok()`
-      waves every caller through. The service binds `0.0.0.0:8012`, so
-      on the dev rig `/state` (seat + per-camera identity), `/probes`
-      (per-probe face/body scores) and `/stream` (LIVE ANNOTATED VIDEO,
-      including the bedroom) are open to anything on the LAN. Since
-      2026-07-29 the service says so loudly at every boot; nobody has
-      acted on it yet. Fix = pick a secret, set the SAME
-      `NEMARA_IDENTITY_STATE_TOKEN` in backend `.env` and in the
-      identity service's environment, restart both. Do it before the
-      box leaves this LAN; the same variable is already on the Phase-2
-      Railway env-ADD list.
 - [ ] Prod hygiene: delete Supabase auth user
       `claude-diag-probe-20260728@example.com`; confirm no local env/profile
       references the prod pooler (policy now has an incident behind it).
@@ -478,8 +464,30 @@ on the LAN is not a control for hardware in someone's home). ssh and
 rsync to the box now work plainly. Host + key path override via
 `NEMARA_GATEWAY_SSH_HOST` / `NEMARA_GATEWAY_SSH_KEY`.
 
-- [ ] ONE COMMAND STILL OWED, on the box (needs Aryaman — the sudoers
-      write was blocked here): install
+- FLEET SSH — root gap found + closed in code 2026-07-30. A box cut
+  from the golden image accepted only the account PASSWORD: prep and
+  firstboot regenerate HOST keys but never seeded authorized_keys, so
+  the reverse tunnel reached port 22 on any box and nothing got you
+  through it except the shared string in the repo. That is why the
+  password was load-bearing, and why "retire the password" was
+  premature advice. nemara-gateway `1c8421a`:
+  `deploy/ops_authorized_keys` (public keys, committed on purpose) is
+  seeded by prep-golden-image.sh and re-asserted by firstboot, both
+  additive + idempotent, verified on the real box (fresh home, re-run,
+  foreign key preserved, ssh-keygen -l parses, 0600/0700).
+  - [ ] Cut a golden image WITH the seeding step, boot ONE clone, and
+        confirm key-only ssh works on it.
+  - [ ] Ops key on the RELAY (pending Sunny) — the other half of
+        reaching a box nobody has touched.
+  - [ ] THEN PasswordAuthentication no, and append the key by hand to
+        every box already in the field. Not before: until then the
+        password is the only way into deployed hardware.
+- [ ] Sudoers rule — OPTIONAL, deprioritised (Aryaman 2026-07-30). The
+      gateway restarts ITSELF (os._exit + systemd, no ssh, no sudo, no
+      credentials), so the sentinel's ssh restart is only a backup for a
+      process alive-but-wedged past its own watchdog, on a dev-rig tool
+      prod replaces with an external pinger. If ever wanted, ON THE BOX
+      (not the Mac — that was why it failed):
       `/etc/sudoers.d/memoria-gateway-watchdog` granting NOPASSWD on
       `systemctl restart|is-active|status memoria-gateway` ONLY. Exact
       lines in nemara-gateway/GATEWAY_ACCESS.md §3. Until then the
