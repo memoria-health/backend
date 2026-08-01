@@ -197,6 +197,19 @@ class CameraSession:
         # a recycled number can never inherit the patient seat.
         import uuid as _uuid
         self.epoch = _uuid.uuid4().hex[:12]
+        # Serialises calls for THIS camera only. Until 2026-08-01 the
+        # pod held one global lock, so two requests for one camera were
+        # structurally impossible; now that the gate admits several
+        # cameras at once, the only thing left preventing it is the
+        # client sending one batch per camera at a time. That is a
+        # promise made in ANOTHER PROCESS, and everything below is
+        # read-modify-write: tick, next_id, last_masks, and EdgeTAM's
+        # session itself. A retry, a second identity instance, or a
+        # future client that pipelines would interleave two ticks and
+        # scramble track ids. Different cameras still run concurrently
+        # — this lock is per session, which is exactly the granularity
+        # the work has.
+        self._lock = threading.Lock()
         # persistent track_id -> last final mask (frame-0 resolution, bool)
         self.last_masks: "dict[int, np.ndarray]" = {}
         # consecutive carry ticks where the person trigger saw FEWER
@@ -447,6 +460,12 @@ class CameraSession:
         return out
 
     def observe(self, frames, *, person_thr: float, sam_pred) -> "dict[int, dict]":
+        with self._lock:
+            return self._observe_locked(
+                frames, person_thr=person_thr, sam_pred=sam_pred,
+            )
+
+    def _observe_locked(self, frames, *, person_thr: float, sam_pred) -> "dict[int, dict]":
         """One tick. Returns {frame_pos: {track_id: (bbox_xyxy, mask)}} with
         STABLE track ids across ticks. NEMARA_TRACKER=sam3 routes to SAM3's
         own whole-clip tracker; default 'edgetam' = SAM3-ground+EdgeTAM-carry."""

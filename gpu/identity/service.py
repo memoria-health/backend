@@ -670,9 +670,31 @@ async def _amain(args: argparse.Namespace) -> None:
                 )
                 os._exit(4)
 
+    # Extra pod workers. The pod serialises everything behind a
+    # process-global lock, so a second WORKER (own process, own lock,
+    # own model copy) is what actually overlaps two cameras — measured
+    # 1.5-1.9x with per-call compute unchanged. Unset the variable and
+    # every camera goes back to `sam`; that is the whole revert.
+    extra = [
+        u.strip() for u in os.environ.get("NEMARA_POD_URLS", "").split(",")
+        if u.strip() and u.strip().rstrip("/") != args.pod_url.rstrip("/")
+    ]
+    pods = [
+        SamServiceClient(
+            base_url=u, timeout_s=25.0, expected_face_model="buffalo_l",
+        )
+        for u in extra
+    ]
+    if pods:
+        log.info(
+            "identity.pod_pool workers=%d urls=%s",
+            len(pods) + 1, [args.pod_url, *extra],
+        )
+
     home = IdentityHome(
         patient_id=patient_id,
         sam=sam,
+        pods=pods,
         body_gallery=CrossClipBodyGallery(settings=settings),
         face_matrix=face_matrix,
         journal=EventJournal(Path("out/identity_soak")),

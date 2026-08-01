@@ -213,6 +213,35 @@ class IdentityHome:
     seat_lock: threading.Lock = field(default_factory=threading.Lock)
     seat: Optional[Seat] = None
     cameras: dict[str, "CameraLoop"] = field(default_factory=dict)
+    # Extra pod workers, one entry per additional base URL in
+    # NEMARA_POD_URLS (comma-separated). Empty = every camera talks to
+    # the single `sam` client, i.e. exactly today's behaviour — which is
+    # what makes this revertible by unsetting one variable.
+    pods: list[SamServiceClient] = field(default_factory=list)
+
+    def sam_for(self, camera_id: str) -> SamServiceClient:
+        """Which pod worker serves this camera.
+
+        The pod serialises ALL inference behind a process-global lock,
+        so two cameras on one worker take turns no matter how idle the
+        GPU is (measured 2026-07-29: 5-8% SM, 3 of 96 cores, 5.6GB of
+        46GB, while cameras queued seconds apart). Two SEPARATE pod
+        processes ran 1.5-1.9x faster with per-call compute unchanged,
+        because each has its own lock and its own model copy.
+
+        Assignment is a stable hash, not round-robin, because EdgeTAM
+        sessions live in a process-global `_SESSIONS` dict on the pod:
+        a camera that moved between workers would find no session and
+        silently re-ground every tick. Stable hash keeps each camera on
+        one worker for as long as the worker lives.
+        """
+        if not self.pods:
+            return self.sam
+        pool = [self.sam, *self.pods]
+        # sum of bytes, not hash(): PYTHONHASHSEED randomises str hashing
+        # per process, so a restart would reshuffle every camera onto a
+        # different worker and throw away all their sessions.
+        return pool[sum(camera_id.encode()) % len(pool)]
     journal: Optional[EventJournal] = None
     # camera-id-8-prefix → room name (from the cameras table) — every
     # user-facing surface shows ROOM NAMES, never raw ids (Aryaman).
@@ -596,7 +625,7 @@ class CameraLoop:
         t_q = time.time()
         async with self.home.pod_lock:       # bounded pod admission
             t0 = time.time()                 # queue wait ends here
-            obs = await self.home.sam.observe(
+            obs = await self.home.sam_for(self.camera_id).observe(
                 jpegs,
                 camera_id=f"identity_{self.camera_id}",
                 person_thr=0.4,
@@ -824,7 +853,7 @@ class CameraLoop:
                 # by 5-13s, so a close walk-past crops where the person
                 # WAS (live 2026-07-24, seat stayed empty through a
                 # clear pass). Full-frame is lag-immune for close faces.
-                hits = await self.home.sam.faces(
+                hits = await self.home.sam_for(self.camera_id).faces(
                     jpeg, face_boxes, full=(seat is None),
                 )
                 # COVERAGE scan (searching only): every ring frame since
@@ -860,7 +889,7 @@ class CameraLoop:
 
                         async def _scan(j: bytes):
                             async with sem:
-                                return await self.home.sam.faces(
+                                return await self.home.sam_for(self.camera_id).faces(
                                     j, [], full=True,
                                 )
 

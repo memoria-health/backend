@@ -27,8 +27,13 @@ class _SamSpy:
 
 
 def _loop_with(sam) -> CameraLoop:
+    # `sam_for` mirrors IdentityHome's per-camera pod routing (2026-08-01).
+    # With no extra workers configured every camera resolves to `sam`,
+    # which is exactly what the real one does when NEMARA_POD_URLS is
+    # unset — so this double stays faithful without modelling the pool.
     home = SimpleNamespace(
-        sam=sam, pod_lock=asyncio.Lock(), seat=None, cameras={},
+        sam=sam, pods=[], sam_for=lambda _cam_id: sam,
+        pod_lock=asyncio.Lock(), seat=None, cameras={},
         journal=None, name_of=lambda cam_id: cam_id,
     )
     lp = CameraLoop(camera_id="a", home=home)

@@ -70,14 +70,65 @@ _ready = False
 # instant 429 so the backend fails open in milliseconds. The
 # threading.Lock makes the SAM/face single-flight invariant explicit
 # for the to_thread hop (the semaphore alone already guarantees it).
-_busy = asyncio.Semaphore(1)
+_busy = asyncio.Semaphore(
+    max(1, int(os.environ.get("NEMARA_PERCEPTION_CONCURRENCY", "1")))
+)
 # How long a 2nd camera waits for the single GPU slot before 429. MUST
 # exceed one observe's service time or a concurrent camera always 429s
 # (2026-07-23: a ~5s living-room observe > the old 4s window starved the
 # bedroom — 183 429s). Env-tunable; the durable fix is keeping observe
 # service < this via the frame budget (fewer SAM frames).
 _ACQUIRE_TIMEOUT_S = float(os.environ.get("NEMARA_PERCEPTION_ACQUIRE_S", "10.0"))
-_perception_lock = threading.Lock()
+class _Gate:
+    """N-way admission to the perception pass, with `.locked()`.
+
+    Was a plain `threading.Lock()`, justified (2026-07-21) by "SAM
+    perception is ~10-20s of GPU work per request and the predictor is
+    a process singleton". The first half of that stopped being true on
+    2026-08-01: a pass costs 0.6-1.3s now, so the lock defends against
+    a cost that no longer exists while the A40 sits at 17% SM.
+
+    The second half was never a reason to serialise. Model weights are
+    read-only and a torch forward has no mutable module state; the
+    per-camera state lives in `continuous._SESSIONS`, keyed by camera.
+    What DID need serialising is the face worker's multiprocessing
+    pipe, and that now guards itself inside `FaceWorker.embed` — which
+    is where it belongs, since a global gate protecting it by accident
+    is a coincidence, not a design.
+
+    Defaults to 1, i.e. exactly the old behaviour. Raise
+    NEMARA_PERCEPTION_CONCURRENCY to admit more; that env var is the
+    whole revert.
+    """
+
+    def __init__(self, n: int) -> None:
+        self._sem = threading.BoundedSemaphore(max(1, n))
+        self._active = 0
+        self._mu = threading.Lock()
+
+    def __enter__(self):
+        self._sem.acquire()
+        with self._mu:
+            self._active += 1
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        with self._mu:
+            self._active -= 1
+        self._sem.release()
+        return False
+
+    def locked(self) -> bool:
+        """True if any pass is in flight — the self-recycle guard reads
+        this to avoid exiting mid-inference."""
+        with self._mu:
+            return self._active > 0
+
+
+_PERCEPTION_CONCURRENCY = max(
+    1, int(os.environ.get("NEMARA_PERCEPTION_CONCURRENCY", "1"))
+)
+_perception_lock = _Gate(_PERCEPTION_CONCURRENCY)
 
 # Upload sanity caps (review S4): reject absurd requests before they
 # reach decode; skip any decoded frame beyond a sane camera size (a
@@ -550,7 +601,10 @@ async def observe(
     """Run SAM perception on one tick's frames and return raw
     observations. Frame files MUST be named "<origidx>.jpg" — all
     outputs are keyed by that original index. Busy → instant 429 (the
-    backend fails open); one perception pass in flight at a time."""
+    backend fails open). Admission is NEMARA_PERCEPTION_CONCURRENCY
+    passes at a time (default 1); calls for the SAME camera serialise on
+    that camera's session lock regardless, since a session's tick
+    counter, id allocator and carried masks are read-modify-write."""
     if not _ready:
         raise HTTPException(503, "service warming up")
     if len(frames) > _MAX_FRAMES:

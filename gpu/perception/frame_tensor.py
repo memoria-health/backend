@@ -40,6 +40,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import logging
+import os
 
 import numpy as np
 
@@ -57,6 +58,10 @@ _IMG_STD = (0.229, 0.224, 0.225)
 _STAGED: contextvars.ContextVar = contextvars.ContextVar(
     "sam2_staged_frames", default=None,
 )
+
+# Largest batch we will prime (see prime_feature_cache). 24 frames costs
+# roughly 2.5 GB; the loop's own MAX_BATCH is 40, which measured 4.1 GB.
+_PRIME_MAX_FRAMES = int(os.environ.get("NEMARA_PRIME_MAX_FRAMES", "24"))
 
 _installed = False
 
@@ -165,6 +170,16 @@ def prime_feature_cache(predictor, state, chunk=16):
 
     imgs = state.get("images")
     if imgs is None or not hasattr(imgs, "shape"):
+        return False
+    # VRAM guard. The cache holds backbone features for EVERY frame at
+    # once, and that is not free: measured on the A40, priming a
+    # MAX_BATCH=40 batch costs 4.1 GB (6.7 GB peak reserved). Two
+    # cameras admitted concurrently, both in a batch-size runaway, would
+    # ask for ~8 GB of cache on top of the models. The win here is only
+    # ~14%, so give it up on oversized batches rather than risk an OOM
+    # that takes the whole pod down: above the cap we simply don't
+    # prime and upstream encodes per frame as it always did.
+    if int(imgs.shape[0]) > _PRIME_MAX_FRAMES:
         return False
     try:
         cache = {}

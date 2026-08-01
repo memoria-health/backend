@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import os
+import threading
 import time
 
 import numpy as np
@@ -161,6 +162,18 @@ class FaceWorker:
         self._conn = None
         self.provider: str = "unstarted"
         self._fail_streak = 0
+        # The pipe is a strict send->recv request/reply stream shared
+        # with ONE child. Two callers interleaving would hand thread A
+        # the reply meant for thread B — i.e. attach one person's face
+        # embedding to another person's crop, silently. That used to be
+        # impossible because the whole perception pass ran under a
+        # single global lock; once that lock widens to admit several
+        # cameras at once (2026-08-01), this is the thing standing
+        # between us and cross-person identity corruption. It lives
+        # HERE rather than at the call sites so no future caller can
+        # forget it. Serialising faces costs little: embed is a crop,
+        # not the tracker.
+        self._pipe_lock = threading.Lock()
         self._cooldown_until = 0.0
 
     def start(self, *, timeout_s: float = 180.0) -> str:
@@ -224,6 +237,11 @@ class FaceWorker:
         tick)."""
         if time.monotonic() < self._cooldown_until:
             return [], 0.0
+        # One in-flight request per child, always. See _pipe_lock.
+        with self._pipe_lock:
+            return self._embed_locked(crop_bgr)
+
+    def _embed_locked(self, crop_bgr: np.ndarray) -> tuple[list, float]:
         try:
             self._ensure()
             self._conn.send(("embed", crop_bgr))
