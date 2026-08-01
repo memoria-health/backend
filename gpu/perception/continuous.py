@@ -23,8 +23,6 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
-import tempfile
 import threading
 
 import numpy as np
@@ -44,11 +42,14 @@ _EDGE_ROOT = os.environ.get("NEMARA_EDGE_ROOT", "/workspace/edgetam")
 # IoU floor to consider a re-grounded SAM3 mask the SAME person as a carried
 # id. Below it → a genuinely new person → new id.
 _REMAP_IOU = float(os.environ.get("NEMARA_EDGE_REMAP_IOU", "0.30"))
-# Optimization: EdgeTAM is built for small frames (16fps on an iPhone). The
-# per-tick cost is dominated by init_state RE-ENCODING every frame, so we
-# track at a reduced width and scale bboxes back to full res on output. The
-# face pass still uses the full-res crop (server mask_crop resizes the
+# Optimization: EdgeTAM is built for small frames (16fps on an iPhone), so
+# we track at a reduced width and scale bboxes back to full res on output.
+# The face pass still uses the full-res crop (server mask_crop resizes the
 # track-res mask up), so identity quality is untouched. 0 disables.
+# (This constant's original note blamed "init_state RE-ENCODING every
+# frame" — measured 2026-08-01 and confirmed: that WAS 68% of every call.
+# It is now fixed at the source, see frame_tensor.py, so the width cap is
+# no longer load-bearing for latency — only for what SAM3/EdgeTAM see.)
 _TRACK_W = int(os.environ.get("NEMARA_EDGE_TRACK_W", "640"))
 # Ticks between SAM3 re-grounds. Higher = fewer expensive ground ticks, but
 # slower to catch a NEW person → keep modest until occupancy-triggered
@@ -218,16 +219,15 @@ class CameraSession:
                 )
                 for f in ctx
             ]
-        got: list = []
-        with torch.inference_mode(), torch.autocast(
-            "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available(),
-        ):
-            for pos, dets in sam_track.track_stream(
+        # Frame 0's masks are the ONLY thing this function uses, so ask
+        # for exactly that. The old shape opened a propagation stream
+        # and broke at the first yield — by which point SAM3 had already
+        # tracked all six context frames and we discarded five of them,
+        # for 1.4s of every ground tick (see sam_track.ground_frame0).
+        with torch.inference_mode():
+            got: list = sam_track.ground_frame0(
                 sam_pred, ctx, concept="person", thr=person_thr,
-            ):
-                if pos == 0:
-                    got = dets
-                    break
+            )
 
         h, w = frames[0].shape[:2]
         tw, th, _scale = _track_dims(w, h)
@@ -308,49 +308,61 @@ class CameraSession:
 
         if not seed:
             return {}
+        from perception import frame_tensor
+
         edge = _get_edge()
         h, w = frames[0].shape[:2]
         tw, th, scale = _track_dims(w, h)
         inv = 1.0 / scale if scale else 1.0
-        tmp = tempfile.mkdtemp(prefix="edgesess_")
-        try:
-            for i, fr in enumerate(frames):
-                f = fr if (tw, th) == (w, h) else cv2.resize(fr, (tw, th))
-                cv2.imwrite(os.path.join(tmp, f"{i:05d}.jpg"), f)
-            out: "dict[int, dict]" = {}
-            with torch.inference_mode(), torch.autocast(
-                "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available(),
-            ):
-                state = edge.init_state(tmp)
-                # Seeds are ALWAYS masks — the one matching currency
-                # (SAM3 concept masks or YOLO-seg retina masks; the
-                # 2026-07-24 box-prompt path was deleted with its
-                # grounder: rectangles were the wrong currency for
-                # adjacent people).
-                for tid, m in seed.items():
-                    edge.add_new_mask(
-                        state, frame_idx=0, obj_id=int(tid),
-                        mask=torch.from_numpy(
-                            np.ascontiguousarray(m)
-                        ).contiguous(),
+        # Track-res frames, in memory. These used to be JPEG-encoded into
+        # a temp dir so init_state could PIL-open and decode them back one
+        # at a time — 68% of every call, 98.7 ms/frame (see
+        # frame_tensor.py). Now they go to the GPU as one batched op.
+        tracked = [
+            fr if (tw, th) == (w, h) else cv2.resize(fr, (tw, th))
+            for fr in frames
+        ]
+        out: "dict[int, dict]" = {}
+        with torch.inference_mode(), torch.autocast(
+            "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available(),
+        ), frame_tensor.staged_frames(
+            tracked, edge, "cuda" if torch.cuda.is_available() else "cpu",
+        ):
+            # Path is ignored while frames are staged; kept only
+            # because init_state's signature requires it.
+            state = edge.init_state("<staged>")
+            # Encode all frames in one pass rather than N passes of 1
+            # (measured 1.166x end-to-end, masks unchanged). Fails safe:
+            # on any problem the cache is empty and upstream encodes per
+            # frame exactly as before.
+            frame_tensor.prime_feature_cache(edge, state)
+            # Seeds are ALWAYS masks — the one matching currency
+            # (SAM3 concept masks or YOLO-seg retina masks; the
+            # 2026-07-24 box-prompt path was deleted with its
+            # grounder: rectangles were the wrong currency for
+            # adjacent people).
+            for tid, m in seed.items():
+                edge.add_new_mask(
+                    state, frame_idx=0, obj_id=int(tid),
+                    mask=torch.from_numpy(
+                        np.ascontiguousarray(m)
+                    ).contiguous(),
+                )
+            for fidx, obj_ids, logits in edge.propagate_in_video(state):
+                fr_out: dict = {}
+                for j, oid in enumerate(obj_ids):
+                    mm = (logits[j, 0] > 0).cpu().numpy()  # track res
+                    bb = _mask_bbox(mm)
+                    if bb is None:
+                        continue
+                    # bbox -> FULL res for rows + face crops; the mask
+                    # stays track-res (server mask_crop resizes it up).
+                    bb_full = (
+                        bb[0] * inv, bb[1] * inv, bb[2] * inv, bb[3] * inv,
                     )
-                for fidx, obj_ids, logits in edge.propagate_in_video(state):
-                    fr_out: dict = {}
-                    for j, oid in enumerate(obj_ids):
-                        mm = (logits[j, 0] > 0).cpu().numpy()  # track res
-                        bb = _mask_bbox(mm)
-                        if bb is None:
-                            continue
-                        # bbox -> FULL res for rows + face crops; the mask
-                        # stays track-res (server mask_crop resizes it up).
-                        bb_full = (
-                            bb[0] * inv, bb[1] * inv, bb[2] * inv, bb[3] * inv,
-                        )
-                        fr_out[int(oid)] = (bb_full, mm)
-                    out[fidx] = fr_out
-            return out
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
+                    fr_out[int(oid)] = (bb_full, mm)
+                out[fidx] = fr_out
+        return out
 
     # ── SAM3-native tracking (NEMARA_TRACKER=sam3) ─────────────────
     def _track_native(self, frames, person_thr, sam_pred) -> "dict[int, dict]":
