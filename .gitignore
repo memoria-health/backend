@@ -59,3 +59,9 @@ yolo11n.pt
 # Accidental env backups (contain production keys) — never commit
 .env.bak.*
 .env.bak*
+
+# Stray dev logs. dash.log was committed by accident and then showed as
+# modified on every soak-dashboard run; nothing in the code writes to a
+# tracked path for it.
+dash.log
+*.log
