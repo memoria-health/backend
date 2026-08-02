@@ -93,7 +93,6 @@ async def _assign_detectors(session: AsyncSession, patient_id, camera_id) -> dic
 def _make_ingest(camera_id, patient_id, monkeypatch, *, identity, main):
     settings = get_settings().model_copy(update={
         "detection_v2_scheduler_enabled": True,
-        "motion_overlay_enabled": False,
     })
     monkeypatch.setattr(ci, "run_vlm", main)
 

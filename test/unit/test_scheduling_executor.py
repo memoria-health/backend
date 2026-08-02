@@ -349,7 +349,9 @@ async def test_overlay_call_runs_the_validated_recipe(monkeypatch) -> None:
     assert call["mp4"] == b"ovl"
     assert call["settings"].gemini_model == "flash-model"
     assert call["settings"].gemini_video_fps == "8"
-    assert call["settings"].motion_overlay_enabled is True
+    # The tint note travels as an explicit per-call argument, not via a
+    # global setting (2026-08-01).
+    assert call["motion_overlay"] is True
     idents = [d.identifier for d in call["detectors"]]
     assert idents == ["rapid_motion", "seizure"]
     # The seizure member runs its OVERLAY prompt variant, not the row's.
@@ -431,7 +433,7 @@ async def test_overlay_confirm_votes_carry_recipe(monkeypatch) -> None:
     for vote in flash.calls[1:]:
         assert vote["mp4"] == b"ovl"
         assert vote["settings"].gemini_video_fps == "8"
-        assert vote["settings"].motion_overlay_enabled is True
+        assert vote["motion_overlay"] is True
         assert [d.identifier for d in vote["detectors"]] == ["seizure"]
         assert "MOTION-OVERLAY" in vote["detectors"][0].prompt_fragment
     assert out.detector_fields["seizure_detected"] is True

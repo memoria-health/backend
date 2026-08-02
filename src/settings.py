@@ -85,11 +85,13 @@ class Settings(BaseSettings):
     # EXPERIMENT: tint moved regions red on the VLM clip (frame-diff overlay) so
     # the model can see small/sustained motion — a vibrating hand / tremor — that
     # is invisible in raw sampled frames. Off by default.
-    # NOTE (2026-07-23): the global SCENE tint was removed from camera_ingest —
-    # overlay is now a RAPID-lane recipe property ONLY (the seizure/overlay channel
-    # tints its own crop and sets this flag per-call in executor.py). Turning this
-    # ON globally now only mis-adds the tint note to clean scene/person calls; leave off.
-    motion_overlay_enabled: bool = Field(default=False)
+    # (`motion_overlay_enabled` removed 2026-08-01. It was a global toggle
+    # for what is a per-call artifact property — the RAPID/overlay channel
+    # tints its own crop, nothing else does. It is now an explicit
+    # `motion_overlay=` argument to gemini_provider, passed by the executor
+    # as `plan.channel == "overlay"`. As a global it was actively harmful:
+    # left true in .env, it added the red-tint note to every clean scene
+    # and person prompt.)
 
     openai_api_key: str = Field(default="")
     openai_model: str = Field(default="gpt-5.4")
@@ -198,8 +200,27 @@ class Settings(BaseSettings):
     # the ENTIRE backend process — event loop included — in the local
     # Docker VM; `asyncio.to_thread` cannot contain a native hang, so
     # tier 1 now runs out-of-process and is `kill()`ed at this deadline,
-    # falling back to the pure-ffmpeg full-frame tier in-process. A
-    # normal censor pass is seconds; 180s only trips on a wedged child.
+    # falling back to the pure-ffmpeg full-frame tier in-process.
+    #
+    # 180s. This is a HANG DETECTOR, not a budget.
+    #
+    # MEASURED 2026-08-01 in the local Docker VM (single-threaded CPU,
+    # 1080p, 8 fps source), because the module docstring's "a few
+    # ms-to-tens-of-ms per frame" is far too optimistic here:
+    #     11.1s clip /  88 frames -> 19s
+    #     26.3s clip / 210 frames -> 41s
+    # i.e. ~195 ms per frame, scaling linearly. A 26s clip is the
+    # TYPICAL case, so a healthy pass is ~40s and the longest clips seen
+    # (~34s) land near 55s.
+    #
+    # A 45s deadline was tried and reverted the same day: it sits below
+    # the normal-case cost, so ordinary clips would have timed out and
+    # degraded to the coarse full-frame blur — manufacturing the exact
+    # failure the deadline exists to catch. 180s is ~3x the realistic
+    # worst case, which is the right shape for a hang detector.
+    # If faster failover is wanted, make tier 1 cheaper (downscale
+    # before segmentation, or sample fewer frames) rather than cutting
+    # the deadline into the working range.
     # Env: NEMARA_CENSOR_TIMEOUT_SECONDS.
     censor_timeout_seconds: float = Field(gt=0, le=900, default=180.0)
 

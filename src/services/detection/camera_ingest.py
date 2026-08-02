@@ -1568,7 +1568,7 @@ class CameraIngest:
             # overlay (red tint) is a RAPID-lane recipe property only: the
             # seizure/overlay channel tints its OWN crop in the executor
             # (tint_window -> build_overlay_crop_mp4) and carries its own tint
-            # note per-call (executor.py: flash_update["motion_overlay_enabled"]).
+            # note per-call (executor.py: motion_overlay=plan.channel=="overlay").
             # The global scene tint was removed 2026-07-23 -- it silently tinted
             # EVERY scene-bucket detector's clip (fall / agitation / wandering /
             # calling_for_help / emergency / stove), a measured over-trigger.

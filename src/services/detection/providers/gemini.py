@@ -66,6 +66,7 @@ async def gemini_provider(
     settings: Settings,
     patient_in_clip: bool = False,
     model: str | None = None,
+    motion_overlay: bool = False,
 ) -> ProviderResult:
     if not settings.gemini_api_key:
         raise RuntimeError("NEMARA_GEMINI_API_KEY not configured")
@@ -86,11 +87,18 @@ async def gemini_provider(
                 f"NEMARA_GEMINI_VIDEO_FPS must be in [0, 24], got: {sample_fps}"
             )
 
-    # Gemini gets the native-video clip, which is the one the motion overlay is
-    # applied to — so its prompt explains the red tint. The frame-sampled
-    # providers use Re-ID's clean frames, so they leave this off.
-    built = build_prompt_and_schema(
-        detectors, motion_overlay=settings.motion_overlay_enabled)
+    # `motion_overlay` is a property of THIS CALL's artifact, not of the
+    # deployment: only the RAPID/overlay channel tints its crop, so only
+    # that channel's prompt should explain the red tint. The caller passes
+    # it (executor: `plan.channel == "overlay"`); every other path leaves
+    # it False.
+    #
+    # It used to be read from a global `settings.motion_overlay_enabled`,
+    # which was wrong in both directions: the scene tint was removed
+    # 2026-07-23 as a measured over-trigger, yet the flag stayed true in
+    # .env, so every scene and person prompt carried ~730 chars
+    # describing a red overlay that no scene clip has had since.
+    built = build_prompt_and_schema(detectors, motion_overlay=motion_overlay)
     identity_addendum = build_identity_addendum(patient_in_clip)
     full_prompt = f"{built.prompt}\n\n{_SPEECH_PROMPT_FRAGMENT}{identity_addendum}"
     properties = {**built.schema_properties, **_SPEECH_FIELDS}

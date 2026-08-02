@@ -88,7 +88,6 @@ def _make_ingest(
     patient_presence=None,
 ):
     settings = get_settings().model_copy(update={
-        "motion_overlay_enabled": False,
         # Don't inherit the live soak's VLM kill-switch — these tests
         # assert on whether the LLM was called.
         "reid_soak_only": False,

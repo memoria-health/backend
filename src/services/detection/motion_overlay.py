@@ -10,9 +10,12 @@ Works directly on I420 (YUV 4:2:0) to avoid two colour conversions per frame:
 brighten Y where it moved (so the tint shows even on dark areas), and push the
 half-res chroma (U/V) toward red on the motion mask.
 
-Gated by `settings.motion_overlay_enabled`; applied ONLY to the clip the VLM
-sees (Re-ID runs on the clean clip). Whenever this is on, the prompt MUST
-explain the tint, or detectors will misread red as blood / objects.
+Used ONLY by the RAPID/overlay channel, which tints its own crop in the
+executor (`tint_window` -> `build_overlay_crop_mp4`), and ONLY on the clip
+the VLM sees (Re-ID runs on the clean clip). The matching prompt note is
+requested per-call via `gemini_provider(motion_overlay=True)` — the tint
+and the note must travel together, or detectors misread red as blood or
+objects.
 """
 from __future__ import annotations
 

@@ -73,7 +73,7 @@ _FRAME_SAMPLING_PROVIDERS = frozenset({"openai", "openrouter", "dashscope"})
 # recipe's prompt semantics — a clean-clip prompt on tinted footage, or
 # vice versa, is exactly the mismatch that caused prod seizure
 # overfiring). Detectors without an entry keep their own fragment; the
-# provider's tint note (motion_overlay_enabled) explains the red channel.
+# provider's tint note (motion_overlay=True) explains the red channel.
 _OVERLAY_SPECS = {"seizure": rapid_seizure_spec()}
 
 
@@ -272,15 +272,15 @@ async def run_scheduled_calls(
                     "gemini_model": settings.rapid_model,
                     "gemini_video_fps": str(artifact_fps),
                 }
-                if plan.channel == "overlay":
-                    # The provider prepends the tint note (P0 pattern).
-                    flash_update["motion_overlay_enabled"] = True
                 flash_settings = settings.model_copy(update=flash_update)
                 result = await flash_provider(
                     mp4=mp4, detectors=(overlay_specs or specs),
                     log_tag=log_tag,
                     settings=flash_settings,
                     patient_in_clip=identity.patient_in_clip,
+                    # Only the overlay channel tints its crop, so only it
+                    # gets the provider's red-tint note.
+                    motion_overlay=(plan.channel == "overlay"),
                 )
                 used_provider = "gemini"
             else:
@@ -417,13 +417,13 @@ async def run_scheduled_calls(
                         }
                         vote_spec = due.spec
                         if plan.channel == "overlay":
-                            vote_update["motion_overlay_enabled"] = True
                             vote_spec = _OVERLAY_SPECS.get(ident, due.spec)
                         fs = settings.model_copy(update=vote_update)
                         res = await flash_provider(
                             mp4=artifact, detectors=[vote_spec],
                             log_tag=f"{log_tag} confirm:{ident}:{i}",
                             settings=fs, patient_in_clip=identity.patient_in_clip,
+                            motion_overlay=(plan.channel == "overlay"),
                         )
                     else:
                         _, res = await run_main_vlm(

@@ -68,7 +68,6 @@ def _make_ingest(
     camera_id, patient_id, monkeypatch, *, identity, main, sad: bool,
 ):
     settings = get_settings().model_copy(update={
-        "motion_overlay_enabled": False,
         # This suite pins the LEGACY branch; a developer .env with the
         # soak's v2 flags on must not leak into it.
         "detection_v2_scheduler_enabled": False,
