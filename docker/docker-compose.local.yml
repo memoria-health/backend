@@ -71,8 +71,16 @@ services:
       # Soak observability: identity-evidence frames + out/ artifacts the
       # backend writes must be readable from the host (dashboard, review).
       - ../out:/app/out
-    # Dev: never auto-restart, so `make backend-down` / Ctrl-stop is final.
-    restart: on-failure
+    # `unless-stopped`, not `on-failure`: an explicit `make backend-down`
+    # is still final (that is what "unless stopped" means), but the soak
+    # now survives Docker Desktop restarting. With on-failure it did not
+    # — 2026-08-01 the laptop slept at 01:24, Docker stopped the
+    # container with SIGKILL, and because on-failure only applies while
+    # the daemon is up, nothing brought it back. The soak was dead for
+    # EIGHTEEN HOURS and nobody knew until someone queried for events.
+    # The soak is the ship gate; it cannot gate anything if a closed lid
+    # silently ends it.
+    restart: unless-stopped
 
   # The caregiver dashboard (separate repo: ../../nemara-web-app), wired into
   # the same stack so `make stack-up` brings up Supabase + backend + dashboard
