@@ -35,7 +35,57 @@
 
 ## Phase 0 — pre-soak fixes (blocks soak data quality)
 
-- [ ] **PER-CAMERA POD PROCESSES — resume here (2026-07-29).** Proven
+- [x] IDENTITY LATENCY — CLOSED 2026-08-01, and NOT the way this item
+      predicted. Per-camera pod processes were the wrong fix; the pod
+      was never GPU-bound. Three harness defects, each measured before
+      and after (commits fd24075, 86b88dd):
+        1. every tick JPEG-encoded frames it already held decoded, wrote
+           them to a temp dir, and init_state PIL-decoded them back —
+           68% of every call, 98.7 ms/frame. Same work as one batched
+           GPU op: 4.2 ms.
+        2. ground ticks ran SAM3 propagation over 6 frames and used only
+           frame 0 — 2101 -> 694 ms, same detections, mask IoU 0.982.
+        3. the image encoder ran batch-of-1 per frame into a 1-entry
+           cache. Priming it: 1.166x, masks unchanged.
+      Result, both rooms occupied: sam 4965 -> ~800 ms, pod round-trip
+      7541 -> ~1400 ms, GPU 5-8% -> ~24%, capacity ~2.3 -> ~7 occupied
+      cameras. Open question #1 in identity-latency.md is answered:
+      EdgeTAM runs at 42 ms/frame against its published ~36. The model
+      was never slow.
+      MEASURED-NEGATIVE, do not re-try without new evidence: cross-camera
+      batching (only touches the ~31% encoder slice) and concurrency
+      (nothing left to overlap once the work got small — 2 workers and
+      in-process concurrency both landed within noise of 1 worker).
+      In-process concurrency is committed and default-OFF
+      (NEMARA_PERCEPTION_CONCURRENCY=1); it matters at 4-5 cameras, not 2.
+- [x] SOAK KEEPS DYING ON LAPTOP SLEEP — FIXED 2026-08-01 (4855ebc).
+      `restart: on-failure` only applies while the Docker daemon runs, so
+      a Docker Desktop restart left the backend dead. It was down
+      EIGHTEEN HOURS on 08-01 and nobody noticed until someone queried
+      for events. Now `unless-stopped`. THIS is why sleep/event data was
+      thin — not quiet detectors, a stopped system.
+- [ ] NIGHTLY SUMMARISER IS NOT SCHEDULED. `run_daily_summaries.py` is a
+      manual "every morning run this" ritual documented only in the soak
+      dashboard — no cron, no launchd. That is why sleep_nights had ONE
+      row. Sleep validation cannot depend on remembering a command.
+      Schedule it before the next soak night.
+- [ ] **SLEEP IS BROKEN — the blocker for the sleep ship gate.** All four
+      backfilled nights return `incomplete_night` DESPITE abundant input
+      (182-278 in-bed ticks/hour, 01:00-07:00). Ruled out: missing data,
+      and the night window (`_utc_naive` converts correctly). The defect
+      is in the state machine: onset lands in the MORNING (08:00 local on
+      07-30 with in-bed evidence from 22:00), wake is never found, and
+      one night produced TWENTY out-of-bed events clustered in 11 minutes
+      with duration_minutes=0 each — the confirmation guard that exists
+      to stop exactly that is not firing. Next step is tick-level: dump
+      sleep_activity classifications for one night and find where the
+      classifier and the state machine disagree.
+      ACTIVITY, by contrast, produces plausible output every day and
+      needs only validation against recollection.
+- [ ] Choking (5 events) and Agitation (1) fired in the last 7 days
+      though both are in this plan's "Left OFF" set. Either false
+      positives or the ON-set is not what we think — check before merge.
+- [ ] ~~PER-CAMERA POD PROCESSES~~ (superseded above). Original: Proven
       that the pod's `_perception_lock` (`perception/server.py:80`) is
       the real serialiser and that the A40 runs two independent pod
       processes in genuine parallel (1.6-1.8x, pod compute UNCHANGED at
