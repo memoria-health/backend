@@ -73,6 +73,10 @@ logging.getLogger("uvicorn.access").addFilter(_AccessLogQuietFilter())
 from src.api.cameras import router as cameras_router
 from src.api.cameras_ingest import router as cameras_ingest_router
 from src.api.caregivers import router as caregivers_router
+from src.api.briefing import router as briefing_router
+from src.api.presence import router as presence_router
+from src.api.home_report import router as home_report_router
+from src.api.review import router as review_router
 from src.api.detectors import router as detectors_router
 from src.api.devices import router as devices_router
 from src.api.events import router as events_router
@@ -172,6 +176,10 @@ def create_app() -> FastAPI:
     )
     app.include_router(health_router)
     app.include_router(caregivers_router)
+    app.include_router(briefing_router)
+    app.include_router(presence_router)
+    app.include_router(home_report_router)
+    app.include_router(review_router)
     app.include_router(patients_router)
     app.include_router(patient_members_router)
     app.include_router(detectors_router)

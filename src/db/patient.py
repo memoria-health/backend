@@ -90,3 +90,8 @@ class Patient(Base):
     privacy_mode_enabled: Mapped[bool] = mapped_column(
         Boolean, server_default=text("false"), default=False,
     )
+
+    # review-gate: hold alerts for human YES/NO before dispatch (additive)
+    require_review: Mapped[bool] = mapped_column(
+        Boolean, server_default=text("false"), default=False,
+    )

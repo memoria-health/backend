@@ -35,7 +35,7 @@ from uuid import UUID
 
 from src.db.camera import Camera
 from src.db.patient import Patient
-from src.services import clip_archival, email, push
+from src.services import clip_archival, email, push, review_gate
 from src.services.detection.analyses_store import add_analysis
 from src.services.detection.audio_buffer import AudioBuffer
 from src.services.detection.event_promotion import maybe_promote_analysis
@@ -813,25 +813,16 @@ class CameraIngest:
             # by Apple's push endpoint.
             if promotion.fired:
                 fired_ids = [ev.id for ev in promotion.fired]
+                # Review gate: when patients.require_review is OFF (default)
+                # this dispatches push+email exactly as before; ON holds the
+                # alerts for a reviewer verdict (60s auto-release). Additive.
                 asyncio.create_task(
-                    push.dispatch_event_pushes(
+                    review_gate.route_events(
                         sessionmaker=self._sessionmaker,
                         event_ids=fired_ids,
                         settings=self._settings,
                     ),
-                    name=f"push-dispatch-{self.camera_id}",
-                )
-                # Same fire-and-forget fan-out for email alerts. No-ops
-                # if Resend isn't configured or the caregiver hasn't
-                # enabled email; independent of push so one failing
-                # doesn't affect the other.
-                asyncio.create_task(
-                    email.dispatch_event_emails(
-                        sessionmaker=self._sessionmaker,
-                        event_ids=fired_ids,
-                        settings=self._settings,
-                    ),
-                    name=f"email-dispatch-{self.camera_id}",
+                    name=f"review-route-{self.camera_id}",
                 )
                 # Clip archival: reuse the MP4 we already built for
                 # the LLM as the pre-event clip; spawn one task per

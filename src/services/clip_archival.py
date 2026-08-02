@@ -43,6 +43,8 @@ import time
 from typing import TYPE_CHECKING
 from uuid import UUID
 
+from sqlalchemy import text as sa_text
+
 from src.db.event import Event
 from src.db.patient import Patient
 from src.services import storage
@@ -95,6 +97,27 @@ async def archive_event(
 
     `patient_id` is used only for the privacy re-check before upload.
     """
+    # REVIEW FAST-PATH: if held for human review, upload the pre-event MP4
+    # (already encoded for the LLM — the incident itself) IMMEDIATELY, before
+    # the post-roll wait. Reviewer gets video within seconds.
+    try:
+        async with sessionmaker() as s:
+            held = (await s.execute(
+                sa_text("select 1 from events where id = :id and review_gate = 'pending'"),
+                {"id": str(event_id)})).first()
+        if held:
+            pre_key = await storage.upload_clip(
+                event_id=event_id, mp4_bytes=pre_event_mp4,
+                settings=settings, sub_key="review-pre")
+            async with sessionmaker() as s:
+                await s.execute(
+                    sa_text("update events set review_clip_key = :k where id = :id"),
+                    {"k": pre_key, "id": str(event_id)})
+                await s.commit()
+            log.info("review fast-path pre-clip uploaded event=%s key=%s", event_id, pre_key)
+    except Exception:  # noqa: BLE001 — fast-path is best-effort
+        log.exception("review fast-path pre-clip failed event=%s", event_id)
+
     try:
         await _archive_one(
             event_id=event_id,
