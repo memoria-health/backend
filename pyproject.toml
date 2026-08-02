@@ -77,6 +77,14 @@ dependencies = [
     "ultralytics>=8.3",
     "boxmot>=11.0",
     "torch>=2.0",
+    # torchvision is pulled transitively by ultralytics/boxmot, but it
+    # MUST be declared here: `[tool.uv.sources]` only redirects DIRECT
+    # dependencies, so left transitive it resolved from plain PyPI while
+    # torch came from the CPU index. The ABI mismatch that produced was
+    # not a warning — the censor died at import with
+    # `RuntimeError: operator torchvision::nms does not exist`.
+    # Declaring it keeps both halves of the pair on the same index.
+    "torchvision>=0.15",
     # numpy is a transitive dep of several others; pin explicitly
     # because both the Re-ID code and the Pi motion detector / JPEG-to-
     # I420 path import it directly. Upper bound matches the boxmot
@@ -98,6 +106,27 @@ dev = [
     "mypy>=1.13",
     "types-pyjwt>=1.7",
 ]
+
+# ── torch: CPU-only wheels ──────────────────────────────────────────
+# The backend NEVER uses CUDA. Its only torch call is
+# `torch.set_num_threads(1)` in detection/censor.py, and inference runs
+# single-threaded on CPU by design (the 2026-07-28 libomp deadlock fix).
+# Default PyPI ships the CUDA build on Linux, which dragged ~2.9 GB of
+# `nvidia/*` runtime libraries plus a 659 MB `triton` GPU kernel
+# compiler into a 10.1 GB image — all of it unreachable, since
+# `torch.cuda.is_available()` is False in the container.
+#
+# This does NOT affect the GPU box: `requirements-gpu.txt` +
+# `scripts/gpu_setup.sh` install CUDA torch from the cu124 index on
+# their own, deliberately outside this lock.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
 
 [build-system]
 requires = ["hatchling"]
