@@ -104,6 +104,11 @@ async def _add_prior_event(
             camera_id=camera_id, category="routine", source="custom",
             icon_name="tv", title="Possible Watching TV", location="Living Room",
             occurred_at=occurred_at, created_at=occurred_at,
+            # The ORM declares these Mapped[...] without Python-side
+            # defaults, so they are required at construction even though
+            # supabase/schema.sql defaults all four. Values here mirror
+            # the DDL: has_clip false, narrative '', opened/reviewed false.
+            has_clip=False, narrative="", opened=False, reviewed=False,
         )
     )
     await session.flush()

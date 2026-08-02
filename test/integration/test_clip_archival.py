@@ -86,8 +86,12 @@ def _patch_censor(monkeypatch, *, raises: bool = False) -> list[dict[str, Any]]:
 
     async def _censor(
         in_path: str, out_path: str, *, full_frame: bool = False,
+        keep_audio: bool = True,
     ) -> None:
-        calls.append({"full_frame": full_frame})
+        # keep_audio records the intimate-situation carve-out: censored
+        # clips carry sound EXCEPT on a positive intimacy verdict, where
+        # the audio is itself the exposure.
+        calls.append({"full_frame": full_frame, "keep_audio": keep_audio})
         if raises:
             raise CensorError("censor stack down")
         with open(out_path, "wb") as f:
