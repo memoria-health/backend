@@ -86,8 +86,10 @@ _PIXELATE_FACTOR = 24
 # only macro shapes.
 # radius 28 (was 20): field feedback 2026-07-28 — 20 left too much
 # readable at clip resolutions.
+# radius 14 (was 28), 2026-08-03: halved — a full-frame smear left the
+# caregiver unable to tell whether the alert was real.
 _FFMPEG_BLUR_FILTER = (
-    "boxblur=luma_radius=28:luma_power=3:chroma_radius=14:chroma_power=3"
+    "boxblur=luma_radius=14:luma_power=3:chroma_radius=7:chroma_power=3"
 )
 
 # Max consecutive detection-dropout frames bridged with the previous
