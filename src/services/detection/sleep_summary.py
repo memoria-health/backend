@@ -1,62 +1,74 @@
-"""Nightly sleep summarizer — label-based state machine (v2, 2026-07-29).
+"""Nightly sleep record — three answers.
 
-v1 assumed ticks were motion-gated, so silence-between-ticks meant
-"asleep". The first real night disproved that: with a person visible in
-bed, the room state stays open and the bedroom ticks every ~10s ALL
-NIGHT — tick silence never happens in bed, so v1 never found an onset.
-v2 reads what the ticks actually SAY (the VLM's per-tick labels), not
-whether they exist.
+REWRITTEN 2026-08-03 (Aryaman). The night has exactly three outputs:
 
-Confirmation-streak rule (Aryaman 2026-07-29): sleep-start and
-sleep-end are only believed after the evidence PERSISTS — and once a
-streak meets its threshold, the recorded timestamp is the FIRST
-positive tick of that streak, not the moment confidence was reached.
+  1. when they fell asleep              -> sleep_onset
+  2. when they woke UP during the night -> awakenings[] (windows)
+  3. when they finally woke up          -> wake_time
 
-  bedtime     = first confident in-bed tick (identity-confirmed)
-  sleep onset = first in-bed tick of a streak with ONSET_CONFIRM of
-                sustained in-bed evidence: no awake/out-of-bed tick in
-                the window and >= ONSET_MIN_QUIET quiet ticks
-  disturbance = cluster of stirring/sitting_up ticks while asleep
-                (clusters split when > DISTURB_GAP apart)
-  out-of-bed  = awake/out evidence followed by sleep RESUMING within
-                RESUME_WINDOW (bathroom trips, 3am wanders, and the
-                nap-within-30-min-counts-as-the-night rule)
-  wake        = first tick of an awake streak (>= WAKE_MIN_TICKS within
-                WAKE_STREAK_SPAN) after which sleep does NOT resume
-                within RESUME_WINDOW. "Awake" is VISIBLE wakefulness:
-                sleep_detected false while the person is still seen,
-                'awake_in_bed' (eyes open / on the phone / talking),
-                or 'leaving_bed'.
-  blind gaps  = ticks stopping entirely while asleep (under-blanket:
-                the VLM sees no person, ticks skip). Sleep continues
-                through a gap; whatever evidence follows the gap
-                decides what it was. A night that ENDS in a gap gets
-                wake = last in-bed tick + a 'wake_unobserved' flag.
+## The shape
 
-Honesty rules unchanged: a window ending mid-sleep yields
-"incomplete_night" (the runner re-runs later); zero qualifying ticks
-yields "no_bed_entry"; in-bed ticks that are never identity-confirmed
-yield "no_confirmed_bed_entry" (a visitor napping must not open the
-patient's night). Pure function — no I/O, no clock reads.
+Bed occupancy is a STATE WE REMEMBER, entered and left by two crossing
+EVENTS, and never re-asked in between:
+
+    AWAY --entering_bed (+ identity confirmed once)--> IN BED
+    IN BED --leaving_bed--> AWAY
+
+That is the whole reason this works. A sleeper under a duvet cannot be
+re-detected, so any design that keeps asking "is someone in the bed?"
+fails exactly when it matters. Asking instead "did someone cross into or
+out of the bed?" is a motion question over a 15-26s video clip, which is
+what the model is good at. Measured on the 2026-08-02 night: three
+`leaving_bed` ticks in ~1350, all correct, matching the resident's own
+account to the minute — while the static question produced NINE phantom
+out-of-bed events on a night he never once left the bed.
+
+## Memory: silence never moves the state
+
+A tick where nobody is visible is NOT evidence of absence. It is usually
+evidence of the opposite — someone under the covers. State-dependent
+missingness: the gap is a symptom of the hidden state, so treating it as
+neutral biases the answer. Only a positive `leaving_bed` crossing ends
+occupancy, and only positive wakefulness ends sleep. Nothing is ever
+inferred from an absent observation.
+
+## Identity: asked once, at the crossing
+
+A visitor asleep in the bed must not become the patient's night, so the
+first `entering_bed` must be identity-confirmed. After that it is never
+consulted again — identity needs a visible upright person and a sleeper
+is neither (08-02: 110 confirmed ticks while awake, then zero across
+three hours of solid sleep).
+
+Pure function — no I/O, no clock reads.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 
-ONSET_CONFIRM = timedelta(minutes=15)   # in-bed evidence must persist
-ONSET_MIN_QUIET = 3                     # quiet ticks required in the window
-WAKE_MIN_TICKS = 2                      # awake ticks to form a streak
-WAKE_STREAK_SPAN = timedelta(minutes=10)
-RESUME_WINDOW = timedelta(minutes=30)   # sleep resuming within this merges
-DISTURB_GAP = timedelta(minutes=5)
+# Both thresholds come from ACTIGRAPHY, the clinical standard for
+# scoring sleep from the outside, validated against polysomnography.
+# They were 600/180 — invented by me, and roughly inverted.
+#
+# Onset: of the 4, 5, 6, 10 and 15-minute immobility criteria tested in
+# the actigraphy literature, FIVE minutes gave the most accurate sleep
+# latencies. 15 was evaluated and lost.
+ONSET_MIN_SECONDS = 300          # 5 min
+# Waking is deliberately harder to trigger than falling asleep — the
+# standard rule pairs a 5-minute onset with a 10-minute wake criterion.
+# The asymmetry is the point: brief restlessness is not waking up.
+WAKE_MIN_SECONDS = 600           # 10 min
+# Below this the tick is too uncertain to use at all.
 MIN_CONFIDENCE = 0.6
-WALK_BACK_MAX_GAP = timedelta(minutes=5)     # see the onset walk-back
-WALK_BACK_MAX_SPAN = timedelta(minutes=60)
+# Consecutive in-bed ticks that re-open occupancy when the return
+# crossing was missed. Small: a single tick could be a misread, but the
+# 08-02 return produced hundreds in a row.
+REENTRY_MIN_TICKS = 3
 
-# Tick classes, from (in_bed, activity):
-_QUIET, _RESTLESS, _SETTLING, _AWAKE, _OUT = range(5)
+_ENTER = "entering_bed"
+_LEAVE = "leaving_bed"
 
 
 @dataclass(frozen=True)
@@ -64,43 +76,123 @@ class SleepTick:
     """One labeled tick (from analyses detector_fields)."""
 
     at: datetime
-    in_bed: bool                 # sleep_detected
-    activity: str                # settling|stirring|sitting_up|leaving_bed|awake_in_bed|none
+    asleep: bool                 # sleep_detected — genuinely asleep
+    activity: str                # entering_bed|leaving_bed|stirring|sitting_up|awake_in_bed|none
     confidence: float            # sleep_confidence
-    # Identity gate: the night may only START on a streak containing a
-    # tick where identity POSITIVELY confirmed the patient — a visitor
-    # napping in the bed must never open the patient's night. Once
-    # open, unconfirmed ticks count (a person under covers can't
-    # face-confirm; persistence carries identity).
     patient_confirmed: bool = True
 
 
-def _classify(t: SleepTick) -> int:
-    if t.activity == "awake_in_bed":
-        return _AWAKE
-    if t.activity == "leaving_bed":
-        return _OUT
-    if t.in_bed:
-        if t.activity in ("stirring", "sitting_up"):
-            return _RESTLESS
-        if t.activity == "settling":
-            return _SETTLING
-        return _QUIET
-    # Not in bed, not leaving: a visible person who is not asleep —
-    # pre-bed phone time, sitting on the edge, standing in the room.
-    return _AWAKE
+def _in_bed(t: SleepTick) -> bool:
+    """Does this tick, on its own, prove the person is IN the bed?
 
-
-def summarize_night(
-    ticks: list[SleepTick],
-    *,
-    window_end: datetime,
-) -> dict:
-    """Fold one night's ticks (any order) into the nightly record.
-
-    `window_end` bounds how far observation extends — wake and
-    incomplete-night judgments are made relative to it.
+    Being asleep proves it. So do the in-bed activities — all three name
+    a person who is in the bed. `none` while awake proves nothing either
+    way and must not re-open a span.
     """
+    return t.asleep or t.activity in ("stirring", "sitting_up", "awake_in_bed")
+
+
+def _in_bed_spans(ts: list[SleepTick]) -> list[tuple[int, int]]:
+    """(start_idx, end_idx) index spans during which the patient is in bed.
+
+    The FIRST span must open on an identity-confirmed `entering_bed` —
+    that is the admissibility gate, and a visitor must never open the
+    patient's night.
+
+    After a `leaving_bed`, a span may re-open EITHER on another crossing
+    or on `REENTRY_MIN_TICKS` of direct in-bed evidence. Crossings alone
+    are too brittle to carry the night: on the 08-02 night the resident
+    got out of bed at 01:48 and back in minutes later, and the return
+    crossing was never emitted — so a crossings-only rule discarded the
+    following five hours of sleep entirely. Exits are reliable; entries
+    are not, and the night cannot hang on the unreliable one. Identity
+    is NOT re-checked on a re-entry — it was established at the gate,
+    and a sleeper cannot be face-confirmed anyway.
+    """
+    spans: list[tuple[int, int]] = []
+    start: int | None = None
+    opened_once = False
+    run = 0
+    for i, t in enumerate(ts):
+        if t.activity == _LEAVE:
+            if start is not None:
+                spans.append((start, i))
+                start = None
+            run = 0
+            continue
+        if start is not None:
+            continue                     # already in bed; nothing to do
+        if t.activity == _ENTER and (opened_once or t.patient_confirmed):
+            start, run, opened_once = i, 0, True
+            continue
+        # Evidence-based opening. Before the gate has ever been passed
+        # the evidence must ALSO be identity-confirmed — that is what
+        # keeps a visitor from opening the patient's night. Afterwards
+        # in-bed evidence alone is enough, because identity cannot see a
+        # sleeper and re-demanding it is asking for the impossible.
+        #
+        # Needed because `entering_bed` is not guaranteed: across ~1350
+        # ticks on the 08-02 night it fired ZERO times while
+        # `leaving_bed` fired three times, all correct. Hanging the whole
+        # night on the crossing that does not fire yields a blank record.
+        ok = _in_bed(t) and (opened_once or t.patient_confirmed)
+        run = run + 1 if ok else 0
+        if run >= REENTRY_MIN_TICKS:
+            start = i - run + 1
+            run = 0
+            opened_once = True
+    if start is not None:
+        spans.append((start, len(ts) - 1))
+    return spans
+
+
+def _sleep_runs(ts: list[SleepTick], lo: int, hi: int) -> list[tuple[int, int]]:
+    """Sustained sleep runs inside [lo, hi].
+
+    A break between two sleep runs is measured by the AWAKE TICKS ACTUALLY
+    OBSERVED in it — never by elapsed clock time. Two distinct things
+    otherwise masquerade as a wake-up:
+
+      * unobserved time. Ticks where nobody is visible are dropped
+        upstream, so a sleeper who slips under the duvet leaves a hole
+        with no ticks at all. Timing that hole reported a 26-minute
+        awakening at 06:26 on the 08-02 night, when the log plainly reads
+        "lying in bed under covers ... head on pillow" on both sides of
+        it. Silence must never become wakefulness.
+      * a single flicker tick, which spans zero seconds of observation.
+
+    Both collapse out naturally: with no awake ticks between two sleep
+    ticks, or with awake ticks spanning less than `WAKE_MIN_SECONDS`,
+    the runs are one run.
+    """
+    asleep_idx = [i for i in range(lo, hi + 1) if ts[i].asleep]
+    if not asleep_idx:
+        return []
+    runs: list[list[int]] = [[asleep_idx[0], asleep_idx[0]]]
+    for i in asleep_idx[1:]:
+        prev = runs[-1][1]
+        # Every index strictly between two asleep ticks is an OBSERVED
+        # awake tick (invisible ones never reach this list).
+        first_awake, last_awake = prev + 1, i - 1
+        if last_awake < first_awake:
+            runs[-1][1] = i                          # contiguous sleep
+            continue
+        if _gap(ts, first_awake, last_awake) < WAKE_MIN_SECONDS:
+            runs[-1][1] = i                          # flicker / too brief
+            continue
+        runs.append([i, i])
+    return [
+        (a, b) for a, b in runs
+        if _gap(ts, a, b) >= ONSET_MIN_SECONDS
+    ]
+
+
+def _gap(ts: list[SleepTick], a: int, b: int) -> float:
+    return (ts[b].at - ts[a].at).total_seconds()
+
+
+def summarize_night(ticks: list[SleepTick], *, window_end: datetime) -> dict:
+    """Fold one night's ticks (any order) into the nightly record."""
     ts = sorted(
         (t for t in ticks if t.confidence >= MIN_CONFIDENCE),
         key=lambda t: t.at,
@@ -108,181 +200,62 @@ def summarize_night(
     out: dict = {
         "bedtime": None, "sleep_onset": None, "wake_time": None,
         "duration_minutes": None, "disturbances": 0,
-        "out_of_bed_events": [], "flags": [],
+        "awakenings": [], "out_of_bed_events": [], "flags": [],
     }
-    cls = [_classify(t) for t in ts]
-    in_bed_idx = [i for i, c in enumerate(cls) if c in (_QUIET, _RESTLESS, _SETTLING)]
-    if not in_bed_idx:
-        out["flags"].append("no_bed_entry")
+    if not ts:
+        out["flags"].append("no_ticks")
         return out
-    confirmed_bed = [i for i in in_bed_idx if ts[i].patient_confirmed]
-    if not confirmed_bed:
+
+    spans = _in_bed_spans(ts)
+    if not spans:
+        # Either nobody was seen getting into bed, or the crossing was
+        # never identity-confirmed. Both mean the night is inadmissible.
         out["flags"].append("no_confirmed_bed_entry")
         return out
-    # Bedtime is set HERE, before the onset scan can bail out: a night
-    # where we plainly saw the patient get into bed but never found a
-    # sustained sleep run should still report when they went to bed,
-    # not a blank row. It is also anchored on the first IDENTITY-
-    # CONFIRMED in-bed tick — the first in-bed tick alone could be a
-    # visitor sitting on the bed earlier in the evening.
-    out["bedtime"] = ts[confirmed_bed[0]].at
+    out["bedtime"] = ts[spans[0][0]].at
 
-    # ── onset: first in-bed tick of a sustained in-bed streak ────────
-    onset_i: int | None = None
-    for i in in_bed_idx:
-        w_end = ts[i].at + ONSET_CONFIRM
-        if w_end > window_end:
-            break                      # window can't confirm any later start
-        quiet = 0
-        broken = False
-        confirmed = False
-        for j in range(i, len(ts)):
-            if ts[j].at > w_end:
-                break
-            if cls[j] in (_AWAKE, _OUT):
-                broken = True
-                break
-            if cls[j] == _QUIET:
-                quiet += 1
-            if ts[j].patient_confirmed:
-                confirmed = True
-        if not broken and quiet >= ONSET_MIN_QUIET and confirmed:
-            # First-positive anchor (Aryaman): the threshold was met at
-            # i's window, but the onset is the FIRST tick of the
-            # unbroken in-bed run containing it — walk back through
-            # contiguous in-bed evidence (settling/stirring included).
-            onset_i = i
-            anchor_at = ts[i].at
-            while onset_i > 0:
-                prev = onset_i - 1
-                if cls[prev] not in (_QUIET, _RESTLESS, _SETTLING):
-                    break
-                # Two bounds, both needed. A big time gap between
-                # adjacent ticks is a blind stretch, not evidence of
-                # lying there — walking across it invented hours of
-                # "sleep" nobody observed. And a hard span cap stops
-                # the walk reaching an unrelated earlier bed visit
-                # (e.g. a visitor's evening nap) and attributing this
-                # night's onset to it.
-                if ts[onset_i].at - ts[prev].at > WALK_BACK_MAX_GAP:
-                    break
-                if anchor_at - ts[prev].at > WALK_BACK_MAX_SPAN:
-                    break
-                onset_i = prev
-            break
-    if onset_i is None:
+    runs = [r for lo, hi in spans for r in _sleep_runs(ts, lo, hi)]
+    if not runs:
         out["flags"].append(
-            "no_sleep_onset" if ts[in_bed_idx[0]].at + ONSET_CONFIRM <= window_end
-            else "incomplete_night"
+            "incomplete_night" if ts[-1].at >= window_end else "no_sleep_onset"
         )
         return out
-    out["sleep_onset"] = ts[onset_i].at
 
-    # ── walk the night: disturbances, out-of-bed, wake ──────────────
-    wake: datetime | None = None
-    wake_unobserved = False
-    last_disturb: datetime | None = None
-    asleep_yet = False           # settling churn before the first quiet
-    i = onset_i + 1              # tick is falling asleep, not a disturbance
-    while i < len(ts):
-        c = cls[i]
-        if c == _QUIET:
-            asleep_yet = True
-        if c == _RESTLESS:
-            if asleep_yet and (
-                last_disturb is None or ts[i].at - last_disturb > DISTURB_GAP
-            ):
-                out["disturbances"] += 1
-            if asleep_yet:
-                last_disturb = ts[i].at
-            i += 1
-            continue
-        if c in (_AWAKE, _OUT):
-            # Candidate sleep-end streak starting here. Confirmation
-            # (Aryaman): the evidence must repeat — >= WAKE_MIN_TICKS
-            # awake/out ticks within WAKE_STREAK_SPAN — AND sleep must
-            # not resume within RESUME_WINDOW. Timestamp = FIRST tick.
-            streak = [j for j in range(i, len(ts))
-                      if ts[j].at - ts[i].at <= WAKE_STREAK_SPAN
-                      and cls[j] in (_AWAKE, _OUT)]
-            # Return scan is UNBOUNDED on purpose. A 3am wander that
-            # lasts hours is the clinically important event, and
-            # capping the scan turns it into a false wake that silently
-            # discards the rest of the night (v1 capped at 60min and
-            # was fixed for exactly this; the first v2 draft
-            # reintroduced the bug at 30min). If sleep resumes at ANY
-            # later point, this was an absence, not the end of the
-            # night. RESUME_WINDOW is only used below, to decide
-            # whether we have watched long enough to call a wake.
-            resume = next(
-                (j for j in range(i + 1, len(ts))
-                 if cls[j] in (_QUIET, _RESTLESS, _SETTLING)),
-                None,
-            )
-            # An absence needs the same confirmation as a wake: one
-            # stray misread tick (or a moment of open eyes) must not
-            # manufacture an out-of-bed event, and at 10s ticks the
-            # unguarded version produced hundreds of 1-minute entries.
-            if resume is not None and len(streak) < WAKE_MIN_TICKS:
-                i += 1
-                continue
-            if resume is not None:
-                # Sleep resumed: bathroom trip / wander / merged nap.
-                out["out_of_bed_events"].append({
-                    "at": ts[i].at.isoformat(),
-                    "duration_minutes": round(
-                        (ts[resume].at - ts[i].at).total_seconds() / 60),
-                })
-                i = resume + 1
-                continue
-            if len(streak) < WAKE_MIN_TICKS:
-                # A single stray awake tick with nothing after it —
-                # not enough evidence to end the night on. Skip it.
-                i += 1
-                continue
-            if window_end - ts[i].at < RESUME_WINDOW:
-                # Can't yet rule out a resume — night still in progress.
-                out["flags"].append("incomplete_night")
-                return out
-            wake = ts[i].at
-            break
-        i += 1                        # QUIET / SETTLING — sleep continues
+    # 1. when they fell asleep
+    out["sleep_onset"] = ts[runs[0][0]].at
 
-    if wake is None:
-        # Ticks ran out while asleep. If the window has moved well past
-        # the last tick, the person left the camera's view without an
-        # observed wake (or the VLM misread the morning): close the
-        # night at the last in-bed evidence and say so.
-        last_bed = ts[max(j for j in in_bed_idx)]
-        if window_end - last_bed.at >= RESUME_WINDOW:
-            wake = last_bed.at
-            wake_unobserved = True
-        else:
-            out["flags"].append("incomplete_night")
-            return out
-
-    out["wake_time"] = wake
-    if wake_unobserved:
+    # 3. when they finally woke up — end of the last sustained sleep run.
+    # If sleep was still running when observation ended, we did not see
+    # them wake and must not invent a time.
+    last_end = ts[runs[-1][1]].at
+    if runs[-1][1] == len(ts) - 1 and last_end >= window_end:
         out["flags"].append("wake_unobserved")
-    # Observation-gap honesty (2026-07-29): ticks stopping can mean
-    # under-blanket invisibility OR a pipeline/network outage (the
-    # first real night hid a 107-min full outage inside "quiet"). The
-    # night still folds — gaps count as sleep — but any substantial
-    # blind time is surfaced so nobody mistakes it for observation.
-    gap_min = 0
-    prior = out["sleep_onset"]
-    for t in ts:
-        if t.at <= prior:
-            continue
-        if wake is not None and t.at > wake:
-            break
-        d = (t.at - prior).total_seconds() / 60
-        if d >= 10:
-            gap_min += round(d)
-        prior = t.at
-    if gap_min >= 30:
-        out["flags"].append(f"observation_gap_{gap_min}m")
-    away = sum(e["duration_minutes"] for e in out["out_of_bed_events"])
-    out["duration_minutes"] = max(
-        0, round((wake - out["sleep_onset"]).total_seconds() / 60) - away)
+    else:
+        out["wake_time"] = last_end
+
+    # 2. wake-ups DURING the night, as WINDOWS (never a bare count —
+    # a count cannot be checked against what the person remembers).
+    awakenings = [
+        {
+            "from": ts[prev[1]].at.isoformat(),
+            "to": ts[nxt[0]].at.isoformat(),
+            "duration_minutes": round(_gap(ts, prev[1], nxt[0]) / 60),
+        }
+        for prev, nxt in zip(runs, runs[1:])
+    ]
+    out["awakenings"] = awakenings
+    out["disturbances"] = len(awakenings)
+    # Existing jsonb column, now holding NIGHT WAKE-UP windows. This
+    # record no longer claims to know whether anyone left the bed.
+    out["out_of_bed_events"] = awakenings
+
+    out["sleep_windows"] = [
+        {
+            "from": ts[a].at.isoformat(),
+            "to": ts[b].at.isoformat(),
+            "duration_minutes": round(_gap(ts, a, b) / 60),
+        }
+        for a, b in runs
+    ]
+    out["duration_minutes"] = round(sum(_gap(ts, a, b) for a, b in runs) / 60)
     return out

@@ -44,25 +44,51 @@ from datetime import date, datetime, timezone
 # growth); a quiet night is $0. Pin to the lite tier when per-detector
 # difficulty routing lands — this is an EASY visual task.
 _SLEEP_PROMPT_FRAGMENT = (
-    "sleep_detected: boolean. TRUE only if a person is lying in a bed IN "
-    "A SLEEPING POSITION with MINIMAL MOVEMENT — settled on or under the "
-    "covers, head down, AND their eyes are closed (when the face is "
-    "visible; if the face is turned away or buried, judge by the settled "
-    "sleeping posture alone). FALSE if no one is in the bed, they are "
-    "sitting up or on the edge, or standing / away from the bed. FALSE — "
-    "even while lying flat in bed — if the person is VISIBLY AWAKE: eyes "
-    "open, talking or on a phone call, holding/looking at a phone, "
-    "using a laptop, or watching TV. Awake in bed is NOT sleep.\n"
-    "sleep_activity: string, exactly one of: 'settling' (getting into "
-    "bed, arranging covers, lying down), 'stirring' (movement while "
-    "staying lying down — rolling over, shifting), 'sitting_up' (rising "
-    "to a sitting position in bed), 'leaving_bed' (getting out of bed "
-    "or already out and moving away), 'awake_in_bed' (in bed but "
+    # DELIBERATELY UNDER-SPECIFIED (Aryaman 2026-08-03). The previous
+    # version enumerated posture, head position and eye state, and
+    # crucially allowed "judge by the settled sleeping posture alone"
+    # when the face was not visible. The model took that route by
+    # default — on the 08-02 night every tick around the reported onset
+    # reasoned from posture and NONE mentioned eyes, so it called sleep
+    # at 02:19 while he lay awake until ~02:50. The camera has IR and
+    # reads eye state clearly (it said "eyes closed" freely from 04:00
+    # onward), so the fallback was never needed. The model knows what
+    # sleep is; asking plainly beats dictating a checklist it can
+    # satisfy without looking.
+    "sleep_detected: boolean. TRUE only if the person is genuinely "
+    "ASLEEP — unresponsive, not reacting to their surroundings. Lying "
+    "still is not enough: someone resting, settling, or lying awake in "
+    "the dark is NOT asleep. If you cannot tell, answer FALSE.\n"
+    # TRANSITIONS OUTRANK STATES (2026-08-03). Two bed-crossing EVENTS
+    # carry the whole night: our state machine knows the person is in bed
+    # from `entering_bed` until `leaving_bed` and asks nothing in
+    # between, so an occluded sleeper never has to be re-detected.
+    #
+    # `leaving_bed` already worked — 3 ticks on the 08-02 night, all
+    # correct, matching the resident's own account to the minute. But
+    # `settling` fired ZERO times across ~1350 ticks, because the old
+    # closing line said "pick the LAST state visible" and the last state
+    # after getting into bed is simply lying there. The event was being
+    # overwritten by the state that followed it. Hence the explicit
+    # priority rule below, and renaming `settling` -> `entering_bed` so
+    # both crossings read as the events they are.
+    "sleep_activity: string, exactly one of: 'entering_bed' (a person "
+    "GETS INTO the bed — climbs in, sits down onto it and lies back, "
+    "pulls the covers over themselves), 'leaving_bed' (a person GETS "
+    "OUT of the bed — pushes the covers off and stands, or is already "
+    "out and moving away), 'stirring' (movement while staying lying "
+    "down — rolling over, shifting), 'sitting_up' (rising to a sitting "
+    "position but STAYING in the bed), 'awake_in_bed' (in bed and "
     "clearly awake — eyes open, talking, on the phone, using a device), "
-    "'none' (no bed-related activity visible). Pick the LAST state "
-    "visible in the clip.\n"
-    "sleep_confidence: number 0-1. 0.7+ = the in-bed/out-of-bed state is "
-    "clearly visible.\n"
+    "'none' (no bed-related activity visible).\n"
+    "PRIORITY: if the person CROSSES INTO or OUT OF the bed at any point "
+    "in the clip, report that crossing — 'entering_bed' or "
+    "'leaving_bed' — even if they settle into some other state "
+    "afterwards. A crossing is never overwritten by what follows it. "
+    "Only when no crossing occurs do you report the last state you "
+    "saw.\n"
+    "sleep_confidence: number 0-1. 0.7+ = what you reported is clearly "
+    "visible.\n"
     "sleep_reasoning: 1 short sentence describing what you saw."
 )
 

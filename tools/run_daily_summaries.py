@@ -98,6 +98,20 @@ def _utc_naive(d: date, hour: int, tz) -> datetime:
     return local.astimezone(timezone.utc).replace(tzinfo=None)
 
 
+def _as_utc(ts: datetime | None) -> datetime | None:
+    """Naive-UTC (the summarizers' working convention) -> OFFSET-AWARE UTC,
+    for writing back to `sleep_nights`.
+
+    Those columns are `timestamptz`. Handing Postgres a naive value makes
+    it stamp the SESSION timezone, not UTC — so a night computed as
+    12:21 UTC was stored as 19:21+00 and every reader (dashboard, app)
+    saw times 7 hours out. The script's own stdout was right, which is
+    why this hid: only the stored row was wrong (found 2026-08-03)."""
+    if ts is None or ts.tzinfo is not None:
+        return ts
+    return ts.replace(tzinfo=timezone.utc)
+
+
 def _naive(ts: datetime) -> datetime:
     """DB timestamptz (offset-aware) -> naive-UTC, the summarizers'
     working convention. analyses.captured_at comes back aware; mixing
@@ -135,11 +149,28 @@ async def _run(night_date: date) -> None:
                     # room — reading that as "awake" would end real
                     # nights.
                     continue
+                activity = r.sa or "none"
+                # Back-compat: ticks recorded before 2026-08-03 used
+                # `settling` for the bed-entry event. Same crossing,
+                # renamed so both directions read as the events they are.
+                if activity == "settling":
+                    activity = "entering_bed"
                 by_cam.setdefault(r.cam, []).append(SleepTick(
                     at=_naive(r.captured_at),
-                    in_bed=(str(r.sd).lower() == "true"),
-                    activity=(r.sa or "none"), confidence=float(r.sc or 0.0),
-                    patient_confirmed=(r.pic == "true"),
+                    asleep=(str(r.sd).lower() == "true"),
+                    activity=activity,
+                    confidence=float(r.sc or 0.0),
+                    # NULL (identity never wrote the field — service off,
+                    # or the tick predates it) is NOT the same as an
+                    # explicit "false" (identity ran and said the person
+                    # is not the patient). The old `== "true"` collapsed
+                    # both to False, which contradicted SleepTick's own
+                    # `patient_confirmed: bool = True` default and meant
+                    # that with the identity service stopped EVERY night
+                    # returned a blank `no_confirmed_bed_entry` row.
+                    # Absent signal must not veto; only a positive
+                    # non-patient verdict may.
+                    patient_confirmed=(r.pic != "false"),
                 ))
             # ONE camera's ticks, not the patient's whole home. The
             # sleep detector can be assigned to any room; a living-room
@@ -149,7 +180,7 @@ async def _run(night_date: date) -> None:
             # saw a bed.
             ticks = max(
                 by_cam.values(),
-                key=lambda tl: sum(1 for t in tl if t.in_bed),
+                key=lambda tl: sum(1 for t in tl if t.asleep),
                 default=[],
             )
             if not ticks:
@@ -157,8 +188,10 @@ async def _run(night_date: date) -> None:
             night = summarize_night(ticks, window_end=window_end)
             await s.execute(_SLEEP_UPSERT, {
                 "pid": pid, "nd": night_date,
-                "bt": night["bedtime"], "so": night["sleep_onset"],
-                "wk": night["wake_time"], "dm": night["duration_minutes"],
+                "bt": _as_utc(night["bedtime"]),
+                "so": _as_utc(night["sleep_onset"]),
+                "wk": _as_utc(night["wake_time"]),
+                "dm": night["duration_minutes"],
                 "db": night["disturbances"],
                 "ob": json.dumps(night["out_of_bed_events"]),
                 "fl": json.dumps(night["flags"]),

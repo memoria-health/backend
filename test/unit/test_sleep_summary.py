@@ -1,164 +1,212 @@
-"""Unit tests for the sleep state machine v2 (label-based, pure function).
+"""Nightly sleep record — three outputs, driven by bed crossings.
 
-The fixtures mirror the FIRST REAL NIGHT (2026-07-28→29): ticks arrive
-every ~10s all night while a person is visible (the room state stays
-open), so the machine must read the labels, never tick-silence. The
-confirmation-streak rule: start/end are believed only after evidence
-persists, and the recorded time is the FIRST tick of the streak.
+Every sleep test below encodes something that actually went wrong on the
+2026-08-02 night, found by tracing the stored ticks. Ground truth for
+that night, from the resident: in bed ~01:45, brief trip out at 01:48,
+asleep ~02:50-03:00, slept straight through, woke 07:20-07:45, did not
+get out of bed until ~08:12.
 """
 
 from datetime import datetime, timedelta
 
 from src.services.detection.activity_summary import StateTick, summarize_day
-from src.services.detection.sleep_summary import SleepTick, summarize_night
+from src.services.detection.sleep_summary import (
+    ONSET_MIN_SECONDS,
+    SleepTick,
+    summarize_night,
+)
 
-_N = datetime(2026, 7, 28, 23, 30)         # naive-UTC convention
+_N = datetime(2026, 8, 2, 23, 0)           # naive-UTC convention
+_END = _N + timedelta(hours=14)
 
 
-def _t(mins, in_bed, activity="none", conf=0.9, pc=True):
+def _t(mins, asleep, activity="none", pc=True, conf=0.9) -> SleepTick:
     return SleepTick(
-        at=_N + timedelta(minutes=mins), in_bed=in_bed,
+        at=_N + timedelta(minutes=mins), asleep=asleep,
         activity=activity, confidence=conf, patient_confirmed=pc,
     )
 
 
-def _run(mins_from, mins_to, in_bed, activity="none", step=0.5, pc=True):
-    """A run of ticks every `step` minutes — the real 10s-30s cadence."""
-    out, m = [], mins_from
-    while m < mins_to:
-        out.append(_t(m, in_bed, activity, pc=pc))
+def _run(a, b, asleep, activity="none", step=0.5, pc=True) -> list[SleepTick]:
+    """A run of ticks every `step` minutes — the real 10-30s cadence."""
+    out, m = [], a
+    while m < b:
+        out.append(_t(m, asleep, activity, pc=pc))
         m += step
     return out
 
 
-def test_real_night_shape_continuous_ticks() -> None:
-    """Phone-in-bed pre-sleep, settling+stirring, quiet night with a
-    disturbance cluster and a bathroom trip, morning awake streak."""
-    ticks = (
-        _run(0, 60, False, "none")                # 23:30-00:30 phone, awake
-        + [_t(60, True, "settling")]              # 00:30 into sleep position
-        + _run(60.5, 75, True, "stirring", 2)     # settling churn
-        + _run(75, 210, True, "none")             # asleep
-        + _run(210, 212, True, "stirring", 0.5)   # 03:00 disturbance cluster
-        + _run(212, 240, True, "none")
-        + [_t(240, False, "leaving_bed")]         # 03:30 bathroom
-        + _run(241, 250, False, "none", 2)
-        + [_t(250, True, "settling")]             # 03:40 back
-        + _run(250.5, 420, True, "none")
-        + _run(420, 440, False, "awake_in_bed", 1)  # 06:30 awake on phone
-        + _run(440, 445, False, "leaving_bed", 2)
-    )
-    out = summarize_night(ticks, window_end=_N + timedelta(minutes=600))
-    assert out["bedtime"] == _t(60, True).at
-    # First-positive anchor: onset = 00:30 (start of the sustained
-    # in-bed streak), even though quiet confirmation lands later.
-    assert out["sleep_onset"] == _t(60, True).at
-    assert out["disturbances"] == 1               # one cluster, not N ticks
-    assert len(out["out_of_bed_events"]) == 1
-    assert out["out_of_bed_events"][0]["duration_minutes"] == 10
-    assert out["wake_time"] == _t(420, False).at  # first awake tick
-    # onset 00:30 -> wake 06:30 = 360m, minus 10 away
-    assert out["duration_minutes"] == 350
+def _enter(at=0.0, pc=True):
+    return [_t(at, False, "entering_bed", pc=pc)]
+
+
+def _leave(at):
+    return [_t(at, False, "leaving_bed")]
+
+
+# ── the three outputs ────────────────────────────────────────────────
+
+def test_reports_onset_wake_and_no_awakenings_on_a_clean_night() -> None:
+    ticks = _enter() + _run(1, 300, True) + _leave(300)
+    out = summarize_night(ticks, window_end=_END)
     assert out["flags"] == []
+    assert out["sleep_onset"] == _N + timedelta(minutes=1)
+    assert out["wake_time"] == _N + timedelta(minutes=299.5)
+    assert out["disturbances"] == 0
+    assert out["awakenings"] == []
 
 
-def test_blind_gap_under_blanket_continues_the_night() -> None:
-    """Ticks stop entirely for hours (VLM can't see the sleeper), then
-    in-bed quiet resumes: the gap is sleep, not a wake."""
+def test_a_real_awakening_is_reported_as_a_window() -> None:
     ticks = (
-        [_t(0, True, "settling")]
-        + _run(0.5, 30, True, "none")
-        + _run(300, 330, True, "none")            # resumes 4.5h later
-        + _run(330, 340, False, "awake_in_bed", 1)
+        _enter()
+        + _run(1, 120, True)
+        + _run(120, 135, False, "awake_in_bed")      # 15 min awake, real
+        + _run(135, 300, True)
+        + _leave(300)
     )
-    out = summarize_night(ticks, window_end=_N + timedelta(minutes=600))
-    assert out["wake_time"] == _t(330, False).at
-    assert out["out_of_bed_events"] == []
-    assert out["duration_minutes"] == 330
-    # The 4.5h blind stretch counts as sleep but must be DISCLOSED —
-    # a gap can also be a pipeline outage (learned 2026-07-29).
-    assert out["flags"] == ["observation_gap_270m"]
+    out = summarize_night(ticks, window_end=_END)
+    assert out["disturbances"] == 1
+    w = out["awakenings"][0]
+    # The window is bounded by what we OBSERVED: last tick seen asleep ->
+    # first tick seen asleep again. We cannot know the exact instant the
+    # eyes opened, so the window is deliberately the outer bound rather
+    # than the span of awake ticks.
+    assert w["from"] == (_N + timedelta(minutes=119.5)).isoformat()
+    assert w["to"] == (_N + timedelta(minutes=135)).isoformat()
+    assert w["duration_minutes"] == 16          # 15.5 min, rounded
 
 
-def test_night_ending_in_blind_gap_flags_unobserved_wake() -> None:
-    ticks = [_t(0, True, "settling")] + _run(0.5, 60, True, "none")
-    out = summarize_night(ticks, window_end=_N + timedelta(minutes=600))
-    assert out["wake_time"] == ticks[-1].at
+# ── bug 1: silence is not wakefulness (the 06:26 case) ───────────────
+
+def test_an_unobserved_gap_is_not_an_awakening() -> None:
+    """A sleeper slips under the duvet, `people_present` goes false, those
+    ticks are dropped upstream — leaving a hole with NO ticks. Timing that
+    hole with a clock reported a 26-minute awakening on a night whose log
+    reads 'lying in bed under covers' on both sides of it."""
+    ticks = (
+        _enter()
+        + _run(1, 120, True)
+        # 40 minutes with no ticks at all — nobody visible
+        + _run(160, 300, True)
+        + _leave(300)
+    )
+    out = summarize_night(ticks, window_end=_END)
+    assert out["disturbances"] == 0, "unobserved time must never become a wake-up"
+    assert out["awakenings"] == []
+    assert out["sleep_onset"] == _N + timedelta(minutes=1)
+
+
+# ── bug 2: a single flicker tick is not an awakening (05:15) ─────────
+
+def test_single_awake_tick_is_absorbed() -> None:
+    """Five isolated not-asleep ticks appeared across 5.5 hours on the
+    08-02 night, against two genuine awakenings of 5 and 11 minutes."""
+    ticks = (
+        _enter()
+        + _run(1, 120, True)
+        + [_t(120, False, "awake_in_bed")]           # one tick
+        + _run(120.5, 300, True)
+        + _leave(300)
+    )
+    out = summarize_night(ticks, window_end=_END)
+    assert out["disturbances"] == 0
+    assert out["sleep_onset"] == _N + timedelta(minutes=1)
+
+
+# ── bug 3: a missed re-entry crossing must not kill the night ────────
+
+def test_night_survives_a_missed_reentry_crossing() -> None:
+    """The 01:48 defect. He got out of bed and back in; only the EXIT was
+    emitted. A crossings-only rule discarded the following five hours."""
+    ticks = (
+        _enter()
+        + _run(1, 3, False, "awake_in_bed")
+        + _leave(3)
+        + _run(4, 6, False, "none")                  # out of the room
+        # back in bed — NO entering_bed event was produced
+        + _run(6, 300, True)
+        + _leave(300)
+    )
+    out = summarize_night(ticks, window_end=_END)
+    assert out["flags"] == []
+    assert out["sleep_onset"] is not None
+    assert out["duration_minutes"] > 280
+
+
+# ── occupancy: only leaving_bed ends it ──────────────────────────────
+
+def test_awake_in_bed_never_ends_occupancy() -> None:
+    """`awake_in_bed` was classified as out-of-room and produced nine
+    phantom exits on a night with zero `leaving_bed` ticks."""
+    ticks = (
+        _enter()
+        + _run(1, 100, True)
+        + _run(100, 130, False, "awake_in_bed")      # awake, still in bed
+        + _run(130, 300, True)
+        + _leave(300)
+    )
+    out = summarize_night(ticks, window_end=_END)
+    assert out["disturbances"] == 1                  # a wake-up, not an exit
+    assert out["sleep_onset"] == _N + timedelta(minutes=1)
+
+
+def test_leaving_bed_ends_the_last_sleep_run() -> None:
+    ticks = _enter() + _run(1, 200, True) + _leave(200) + _run(201, 260, False)
+    out = summarize_night(ticks, window_end=_END)
+    assert out["wake_time"] <= _N + timedelta(minutes=200)
+
+
+# ── identity: once, at the gate ──────────────────────────────────────
+
+def test_unconfirmed_entry_cannot_open_the_night() -> None:
+    """A visitor asleep in the bed must not become the patient's night."""
+    ticks = _enter(pc=False) + _run(1, 300, True, pc=False)
+    out = summarize_night(ticks, window_end=_END)
+    assert out["flags"] == ["no_confirmed_bed_entry"]
+    assert out["sleep_onset"] is None
+
+
+def test_identity_is_not_rechecked_after_the_gate() -> None:
+    """Identity needs a visible upright person; a sleeper is neither. On
+    08-02: 110 confirmed ticks while awake, then zero across three hours
+    of solid sleep."""
+    ticks = _enter(pc=True) + _run(1, 300, True, pc=False) + _leave(300)
+    out = summarize_night(ticks, window_end=_END)
+    assert out["flags"] == []
+    assert out["sleep_onset"] is not None
+
+
+# ── edges ────────────────────────────────────────────────────────────
+
+def test_still_asleep_at_window_end_reports_no_wake_time() -> None:
+    ticks = _enter() + _run(1, 300, True)
+    out = summarize_night(ticks, window_end=_N + timedelta(minutes=299))
+    assert out["wake_time"] is None
     assert "wake_unobserved" in out["flags"]
 
 
-def test_nap_within_resume_window_merges() -> None:
-    """Awake 20 min then back asleep: the night continues (Aryaman's
-    nap-within-30-min rule); the interlude records as out-of-bed."""
-    ticks = (
-        [_t(0, True, "settling")] + _run(0.5, 300, True, "none")
-        + _run(300, 320, False, "awake_in_bed", 2)   # 20 min awake
-        + _run(320, 380, True, "none")               # resumes < 30 min
-        + _run(380, 395, False, "leaving_bed", 2)
-    )
-    out = summarize_night(ticks, window_end=_N + timedelta(minutes=600))
-    assert len(out["out_of_bed_events"]) == 1
-    assert out["out_of_bed_events"][0]["duration_minutes"] == 20
-    assert out["wake_time"] == _t(380, False).at
-    assert out["duration_minutes"] == 380 - 20
+def test_dozing_shorter_than_the_onset_threshold_is_not_sleep() -> None:
+    brief = ONSET_MIN_SECONDS / 60 - 1
+    ticks = _enter() + _run(1, 1 + brief, True) + _leave(30)
+    out = summarize_night(ticks, window_end=_END)
+    assert out["sleep_onset"] is None
+    assert "no_sleep_onset" in out["flags"]
 
 
-def test_single_stray_awake_tick_does_not_end_the_night() -> None:
-    ticks = (
-        [_t(0, True, "settling")] + _run(0.5, 200, True, "none")
-        + [_t(200, False, "none")]                   # one VLM blip
-        + _run(200.5, 300, True, "none")
-        + _run(300, 315, False, "leaving_bed", 2)
-    )
-    out = summarize_night(ticks, window_end=_N + timedelta(minutes=600))
-    assert out["wake_time"] == _t(300, False).at
-    assert out["flags"] == []
+def test_low_confidence_ticks_are_ignored() -> None:
+    ticks = _enter() + _run(1, 300, True) + _leave(300)
+    ticks += [_t(150, False, "leaving_bed", conf=0.1)]    # junk exit
+    out = summarize_night(ticks, window_end=_END)
+    assert out["disturbances"] == 0
+    assert out["duration_minutes"] > 280
 
 
-def test_unconfirmed_visitor_never_opens_the_night() -> None:
-    ticks = [_t(m, True, "none", pc=False) for m in range(0, 60, 5)]
-    out = summarize_night(ticks, window_end=_N + timedelta(minutes=600))
-    assert out["flags"] == ["no_confirmed_bed_entry"]
-    assert out["bedtime"] is None
+def test_no_ticks_at_all() -> None:
+    out = summarize_night([], window_end=_END)
+    assert out["flags"] == ["no_ticks"]
 
 
-def test_confirmed_start_then_unconfirmed_night_accepted() -> None:
-    ticks = (
-        [_t(0, True, "settling", pc=True)]
-        + _run(0.5, 300, True, "none", pc=False)
-        + _run(300, 315, False, "leaving_bed", 2, pc=False)
-    )
-    out = summarize_night(ticks, window_end=_N + timedelta(minutes=600))
-    assert out["wake_time"] is not None
-    assert out["flags"] == []
-
-
-def test_window_ending_mid_sleep_is_incomplete() -> None:
-    ticks = [_t(0, True, "settling")] + _run(0.5, 100, True, "none")
-    out = summarize_night(ticks, window_end=_N + timedelta(minutes=110))
-    assert "incomplete_night" in out["flags"]
-    assert out["wake_time"] is None
-
-
-def test_low_confidence_ticks_ignored() -> None:
-    out = summarize_night(
-        [_t(0, True, "settling", conf=0.3)],
-        window_end=_N + timedelta(minutes=600))
-    assert out["flags"] == ["no_bed_entry"]
-
-
-def test_awake_in_bed_breaks_onset_streak() -> None:
-    """Lying in bed on the phone (awake_in_bed) must not count toward
-    sleep onset even if the VLM also marks in_bed=true."""
-    ticks = (
-        _run(0, 30, True, "awake_in_bed", 1)
-        + [_t(30, True, "settling")]
-        + _run(30.5, 60, True, "none")
-        + _run(60, 75, False, "leaving_bed", 2)
-    )
-    out = summarize_night(ticks, window_end=_N + timedelta(minutes=600))
-    assert out["sleep_onset"] == _t(30, True).at
-
+# ── activity summarizer (unchanged) ──────────────────────────────────
 
 def test_activity_state_timeline_time_weighted() -> None:
     base = datetime(2026, 7, 28, 9, 0)
@@ -181,34 +229,3 @@ def test_activity_state_timeline_time_weighted() -> None:
     assert out["room_transitions"] == 1
     assert out["labeled_minutes"] == 150.0
     assert out["label_ticks"] == 3
-
-
-def test_night_wander_over_an_hour_is_out_of_bed_not_wake() -> None:
-    """REGRESSION (deleted in the v2 rewrite, restored 2026-07-29): a
-    multi-hour 3am wander is the clinically important event. It must
-    record as out-of-bed and the night must continue — never a false
-    wake that silently discards the rest of the night."""
-    ticks = (
-        [_t(0, True, "settling")] + _run(0.5, 200, True, "none")
-        + _run(200, 210, False, "leaving_bed", 2)   # 02:50 wander out
-        + _run(320, 500, True, "none")              # back 2 hours later
-        + _run(500, 515, False, "leaving_bed", 2)   # real wake
-    )
-    out = summarize_night(ticks, window_end=_N + timedelta(minutes=700))
-    assert len(out["out_of_bed_events"]) == 1
-    assert out["out_of_bed_events"][0]["duration_minutes"] == 120
-    assert out["wake_time"] == _t(500, False).at
-    assert out["duration_minutes"] == 500 - 120
-
-
-def test_single_awake_misread_makes_no_out_of_bed_event() -> None:
-    """One stray awake tick mid-night is noise, not a bathroom trip."""
-    ticks = (
-        [_t(0, True, "settling")] + _run(0.5, 200, True, "none")
-        + [_t(200, False, "awake_in_bed")]          # single misread
-        + _run(200.5, 400, True, "none")
-        + _run(400, 415, False, "leaving_bed", 2)
-    )
-    out = summarize_night(ticks, window_end=_N + timedelta(minutes=700))
-    assert out["out_of_bed_events"] == []
-    assert out["wake_time"] == _t(400, False).at
