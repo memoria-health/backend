@@ -97,6 +97,8 @@ class PatientResponse(BaseModel):
     # the wire until both clients ship without the toggle.
     privacy_mode_enabled: bool
 
+    # Review-gate toggle (additive; absent on older backends)
+    require_review: bool | None = None
 
 class PhotoURLResponse(BaseModel):
     """Returned by `GET /v1/patients/{id}/photo-url`. Signed URL is
