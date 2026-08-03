@@ -174,7 +174,16 @@ async def _hourly(s) -> list:
         # header already documents as no longer implying the model.)
         is_flash = (pin, pout) == _PRICE["flash"]
         b = by_hour.setdefault(r.h, {
-            "h": r.h, "hts": r.hts.isoformat(), "an": 0, "calls": 0,
+            # LOCAL-NAIVE, deliberately. The SQL already shifted this into
+            # local time (`created_at + :tzoff`), but `created_at` is a
+            # timestamptz so the result stays tz-AWARE — carrying that
+            # offset through meant the trailing-24h sum compared an aware
+            # stamp against a naive cutoff and the whole /data endpoint
+            # 500'd with "can't compare offset-naive and offset-aware".
+            # Drop the tzinfo here so the JSON contract matches what every
+            # consumer already assumes (see cutoff_24h below).
+            "h": r.h, "hts": r.hts.replace(tzinfo=None).isoformat(),
+            "an": 0, "calls": 0,
             "tin": 0, "tout": 0,
             "cost": 0.0, "ftok": 0, "unp": 0, "g": 0, "d": 0, "o": 0,
         })
@@ -768,7 +777,7 @@ _PAGE = """<!doctype html><html><head><meta charset="utf-8">
   <span class="chip num" id="pace"></span>
 </header>
 <div class="card"><h2>SOAK TEST PLAN — 2026-07-28 wave (identity + privacy + detectors + sleep/activity)</h2>
-<p class="mut" style="font-size:12px;margin:0 0 8px">Every test is doable at a moment's notice. Narrate takes in chat ("fall, now") so Claude timestamps ground truth. Model: <span class="mono">gemini-3.5-flash-lite</span> everywhere; every call records model+tokens, so the 3.6-flash bill is arithmetic.</p>
+<p class="mut" style="font-size:12px;margin:0 0 8px">Every test is doable at a moment's notice. Narrate takes in chat ("fall, now") so Claude timestamps ground truth. Model: <span class="mono">gemini-3.5-flash-lite</span> everywhere; every call records model+tokens, so the 3.6-flash bill is arithmetic. <b>Thinking is ON</b> (<span class="mono">NEMARA_GEMINI_THINKING_LEVEL=high</span>, new 2026-08-01) — lite does not think by default and <span class="mono">minimal</span>/<span class="mono">low</span> measured as no-ops, so high is the real setting. Thought tokens bill at the OUTPUT rate and ride in the <span class="mono">thoughts</span> usage field; expect ~150-800 extra output tokens and ~+0.5-1.5s per call, so re-baseline the cost line before comparing to any pre-08-01 hour.</p>
 
 <h3 style="margin:10px 0 4px">A · Active detectors (10)</h3>
 <div class="tblwrap"><table>
@@ -786,24 +795,44 @@ _PAGE = """<!doctype html><html><head><meta charset="utf-8">
 </table></div>
 <p class="mut" style="font-size:12px;margin:4px 0 8px">Off by design: Meals (not on-demand) · Agitation/Choking (optional mimes) · General Emergency (redundant w/ Falls) · Stove (no kitchen cam) · Convulsion (DELETED — VLM below tremor Nyquist).</p>
 
+<p class="mut" style="font-size:12px;margin:4px 0 10px"><b class="crit">PREFLIGHT — the table above does NOT match the database (audited 2026-08-01).</b> Fix before running anything below, or tests will "fail" for the wrong reason.<br>
+<b>Setup test</b> and <b>Wandering</b> are listed active but are <b>is_on=false</b> — tests 8/8b/8c and the Discrimination drill cannot pass until they are flipped on. Setup test is the ONLY <span class="mono">anyone</span>-scoped detector, so Discrimination depends on it.<br>
+<b>Choking</b> and <b>Agitation</b> are <b>is_on=true</b> despite being "off by design" — that is where the 5 Choking + 1 Agitation events came from. Decide: leave on as FP telemetry, or flip off.<br>
+Also: <span class="mono">episode_gap_seconds</span> is DEAD (still stored — 900 on Watching TV, 300 on Meals — and read by nothing since 2026-07-29). Ignore it; the live number is the category exit gap.</p>
+
 <h3 style="margin:10px 0 4px">B · Moment's-notice detector tests</h3>
 <div class="tblwrap"><table>
 <tr><th>#</th><th>Do (≤2 min each)</th><th>Expect</th><th>Verify where</th></tr>
 <tr><td>1</td><td>Lie on the floor abruptly</td><td>ONE fall event ≤90s, clean clip</td><td>phone + Events feed</td></tr>
-<tr><td>2</td><td>Stay lying 3 more min</td><td>NO second fall event (anti-spam)</td><td>Events feed</td></tr>
 <tr><td>3</td><td>Shout "help, help me" while still</td><td>calling-for-help fires, transcript non-empty (audio path)</td><td>event body + tick log</td></tr>
 <tr><td>4</td><td>Pill-bottle mime to mouth</td><td>medication fires; person-crop call visible in tick log</td><td>tick log <span class="mono">person:</span> call</td></tr>
-<tr><td>5</td><td>Glance at TV 1 min, walk away</td><td>NOTHING (entry-rule negative)</td><td>Events feed stays quiet</td></tr>
 <tr><td>6</td><td>Watch TV ~5+ min</td><td>ONE watching-tv event around min 5</td><td>Events feed</td></tr>
 <tr><td>7</td><td>Create "Drinking water (from a bottle)" in web UI, scoped to LIVING ROOM ONLY</td><td>compile succeeds; compiler's suggested name lands in the name field</td><td>web create flow</td></tr>
-<tr><td>7b</td><td>Drink from a bottle in the BEDROOM</td><td>NOTHING — room scope is structural: the detector isn't even in the bedroom camera's loadout (no call carries it)</td><td>tick log (bedroom calls list detectors)</td></tr>
 <tr><td>7c</td><td>Drink from a bottle in the LIVING ROOM</td><td>detector fires</td><td>Events feed</td></tr>
 <tr><td>8</td><td>FIRST set the LR exit door in the app (camera → Wandering → pick door), then exit fully through it</td><td>wandering fires; tick log shows the door-targeted prompt</td><td>Events feed + tick log</td></tr>
-<tr><td>8b</td><td>Walk out of the BEDROOM (no exit door configured there)</td><td>NOTHING — door-gate is structural: wandering absent from that camera's loadout</td><td>tick log detectors list</td></tr>
-<tr><td>8c</td><td>In the LR, walk out of frame NOT through the configured door (off-edge / behind furniture)</td><td>NOTHING (only the designated door counts)</td><td>Events feed stays quiet</td></tr>
 <tr><td>9</td><td>Tonight: do NOTHING at med window</td><td>missed-medication absence event at deadline, zero VLM calls attributed</td><td>Events + tick log (no calls)</td></tr>
 <tr><td>10</td><td>ANY event clip from 2026-07-28 ~23:30 on (VFR encode live)</td><td>clip plays the FULL ~26s window at true speed — no teleporting across still stretches, audio in sync, scrubber length honest</td><td>iOS event detail player</td></tr>
 </table></div>
+<p class="mut" style="font-size:12px;margin:4px 0 8px"><b>MOVED TO pytest 2026-08-01 — do NOT hand-run these.</b> They are deterministic logic with no VLM judgment in them, so a human in a room is the wrong instrument; automated they run free forever. Old <b>2</b> (fall anti-spam — already covered by <span class="mono">test_state_episode_dedup.py</span>) · <b>5</b> (glance-at-TV entry-rule negative — a unit test on <span class="mono">windowed_entry_verdict</span>) · <b>7b</b>, <b>8b</b>, <b>8c</b> (all three assert a detector is structurally ABSENT from a camera's loadout — that is a scheduler unit test, not an afternoon).</p>
+
+<h3 style="margin:10px 0 4px">B2 · NEVER-TESTED variants <span class="mut" style="font-weight:400;font-size:12px">(audited 2026-08-01 against the detectors table — each row is a mechanism that is implemented and has never once run in production)</span></h3>
+<p class="mut" style="font-size:12px;margin:0 0 6px">Section B covers <span class="mono">leading</span> + <span class="mono">patient</span> + <span class="mono">ALWAYS</span> and nothing else. Everything below is a code path with <b>zero live instances</b>. Ordered cheapest-first; N1-N6 are the ones worth a 2-hour session.</p>
+<div class="tblwrap"><table>
+<tr><th>#</th><th>Untested mechanism</th><th>Setup</th><th>Do</th><th>Expect</th></tr>
+<tr><td>N1</td><td><span class="mono">alert_trigger=duration</span> — <b>duration_seconds is NULL on all 15 detectors</b>, so this trigger has never fired once</td><td>web UI: create "Sitting on the couch for more than 2 minutes", duration trigger, 120s</td><td>(a) sit 3 min unbroken &nbsp; (b) later, sit 45s and get up</td><td>(a) ONE event at the ~2 min mark, <b>not</b> at 0s &nbsp; (b) NOTHING. Internally this compiles to an M-in-T window (m=max(2,120/tick), t=120) — same machine as N5</td></tr>
+<tr><td>N2</td><td><span class="mono">alert_trigger=trailing</span> — Meals is the only one and it is OFF; <span class="mono">_evaluate_trailing</span> has never run</td><td>flip <b>Meals</b> is_on=true</td><td>mime eating at a table ~2 min, then leave the room and stay out &gt;5 min</td><td>SILENT while eating. ONE "…has finished" event ~5 min <b>after</b> you stop (routine exit gap 300s). Fires from the scheduler sweep, not a tick — so no VLM call is attributed to it</td></tr>
+<tr><td>N3</td><td><span class="mono">subject_scope=environment</span> — Stove is the only one, OFF, and we have no kitchen camera</td><td>web UI: create "A lamp left switched on in an empty room", scope <b>environment</b>, Living Room</td><td>turn a lamp on, leave the room completely, stay out 10 min</td><td><b>This one is expected to FAIL and that is the finding.</b> Env detectors must evaluate with nobody present, but the camera closes after <span class="mono">close_threshold</span> no-people ticks and the LLM stops. If it never fires, that confirms Phase-3 item 13 (env detectors never run in empty rooms) — a real design gap, not a detector bug</td></tr>
+<tr><td>N4</td><td>non-ALWAYS <span class="mono">when_scope</span> — Wandering's "10 PM - 6 AM" is the ONLY window in the table and it is OFF, so windowed scoping has never gated anything</td><td>web UI: create any simple detector scoped to a window covering <b>right now</b> (e.g. 11 AM - 1 PM)</td><td>trigger it inside the window; then edit the window to 3 hours from now and trigger again</td><td>inside: fires. outside: <b>structurally absent</b> from the camera's loadout — the tick log's detectors list must not name it, and it costs zero tokens (skip must be structural, not a wasted call that returns false)</td></tr>
+<tr><td>N5</td><td>multi-room <span class="mono">where_rooms</span> — every detector is single-room, null, or the ALL ROOMS sentinel; 2+ named rooms has no instance. Also exercises the <b>edit</b> path (untested since the UX v2 overhaul)</td><td>EDIT existing "Drinking water": add Bedroom alongside Living Room</td><td>drink from a bottle in the BEDROOM, then in the LIVING ROOM</td><td>bedroom NOW fires (it must have stayed silent in test 7b) and living room still fires. Confirms the edit actually recompiled the loadout rather than only updating the row</td></tr>
+<tr><td>N6</td><td>SAFETY exit gap (60s) — test 4 only covers the routine 300s gap</td><td>Choking is already is_on=true</td><td>mime choking, stop, wait 90s completely clear, mime again</td><td>TWO events. Same sequence on a ROUTINE detector at 90s must give only ONE (needs &gt;300s) — that contrast is the actual test</td></tr>
+<tr><td>N7</td><td><span class="mono">requires_motion=false</span> — only Watching TV and Stove carry it; never verified that a motionless person still gets ticks</td><td>none</td><td>sit dead still facing the TV for 4 min — no fidgeting, no phone</td><td>Watching TV keeps getting ticks with motion=false, while motion-gated detectors sit out those ticks. Read the tick log's per-call detector list, not the Events feed</td></tr>
+<tr><td>N8</td><td><span class="mono">record_only</span> must never reach the caregiver — asserted in prose in section C, checked by nothing</td><td>none</td><td>after any night/day of Sleep + Activity data</td><td><b>zero</b> rows in <span class="mono">events</span> for the Sleep and Activity detector ids, and zero pushes. Query the table; do not trust the feed looking empty</td></tr>
+<tr><td>N9</td><td>k-of-N <span class="mono">confirm</span> — implemented in decision.py, <b>zero detectors configure it</b>. No UI, SQL only. Kept in the core set because consensus voting is the most-cited false-positive lever in the literature and we have never once measured ours</td><td><span class="mono">update detectors set eventing = '{"confirm":{"k":2,"n":3}}' where name = &lt;throwaway&gt;</span></td><td>trigger the throwaway once</td><td>3 extra VLM calls on the SAME clip visible in the tick log, and it fires only if ≥2 agree. Watch the cost line — this multiplies spend per fire</td></tr>
+</table></div>
+<p class="mut" style="font-size:12px;margin:4px 0 8px"><b>DEFERRED — not pilot-blocking, do not spend session time here.</b>
+<b>N10</b> per-detector <span class="mono">cooldown_seconds</span> (NULL on all 15; everything silently uses the global default — a SQL poke with no pilot consequence) ·
+<b>N12</b> <span class="mono">degradation_warning</span> (('none' on all 15; the rapid_frequency warning copy has never rendered) ·
+<b>N11</b> <span class="mono">bucket=rapid</span> / the 8fps overlay channel — <b class="crit">ACCEPTED GAP, not a test</b>: no detector of this class exists at all (Convulsion was deleted and <span class="mono">test_rapid_seizure_path.py</span> went with it), so the entire RAPID pipeline ships with zero end-to-end coverage. Recorded here so it stops being rediscovered every few weeks.</p>
 
 <h3 style="margin:10px 0 4px">C · Sleep + Activity (record-only — check tables, never the feed)</h3>
 <div class="tblwrap"><table>
@@ -813,11 +842,11 @@ _PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <tr><td>Lie in bed awake on your phone 10 min before sleeping</td><td>ticks labeled NOT-asleep (propped/phone excluded by the strict definition) — bedtime starts only when you actually settle</td></tr>
 </table></div>
 
-<h3 style="margin:10px 0 4px">D · System drills (once each during the soak)</h3>
+<h3 style="margin:10px 0 4px">D · System drills <span class="mut" style="font-weight:400;font-size:12px">(the two infrastructure drills are QUARTERLY, not per-session — they test the network and the kill switch, neither of which changes when detector code does)</span></h3>
 <div class="tblwrap"><table>
 <tr><th>Drill</th><th>Do</th><th>Pass condition</th></tr>
-<tr><td>WIFI (the big one)</td><td>router off 3 min, hands OFF</td><td>gateway + backend + identity + GPU link all green ≤60s after restore, zero human action; watch the ssh tunnel (known weak link)</td></tr>
-<tr><td>Audio kill</td><td>flip Audio OFF in settings (web or iOS), speak near a camera 1 min, flip back</td><td>gateway log "video ONLY, audio killed" within seconds; no transcript for that window; audio returns on flip-back</td></tr>
+<tr><td>WIFI <span class="mut">(QUARTERLY)</span></td><td>router off 3 min, hands OFF</td><td>gateway + backend + identity + GPU link all green ≤60s after restore, zero human action; watch the ssh tunnel (known weak link)</td></tr>
+<tr><td>Audio kill <span class="mut">(QUARTERLY)</span></td><td>flip Audio OFF in settings (web or iOS), speak near a camera 1 min, flip back</td><td>gateway log "video ONLY, audio killed" within seconds; no transcript for that window; audio returns on flip-back</td></tr>
 <tr><td>Censor chain</td><td>towel test in a private room</td><td>clip_censored=true, dignity overlay in app, audio preserved, never autoplays</td></tr>
 <tr><td>Discrimination</td><td>uncle/aunt walks through alone, then both of you in frame</td><td>they are TRACKED but never seated as patient; Setup-test (anyone) fires; patient-scoped detectors do NOT fire on them; two real people = two tracks (no merge)</td></tr>
 <tr><td>Patient-elsewhere</td><td>you in bedroom (seat confirmed), visitor in LR</td><td>LR runs anyone-only; patient-scoped LR ticks skip with <span class="mono">identity_not_patient</span></td></tr>
