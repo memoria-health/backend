@@ -72,7 +72,12 @@ class Settings(BaseSettings):
     # benchmark winner (3.6-flash), fallback the newest lite tier —
     # outages degrade quality, never availability. Env:
     # NEMARA_GEMINI_FALLBACK_MODEL.
-    gemini_fallback_model: str = Field(default="gemini-3.5-flash-lite")
+    #
+    # 2026-08-03 (Aryaman): moved off 3.5-flash-lite. `.env` pins the
+    # PRIMARY to 3.5-flash-lite, so an identical fallback made the chain
+    # a no-op — a 3.5-lite outage had nowhere to go but the next
+    # provider. A different tier is the whole point of the hop.
+    gemini_fallback_model: str = Field(default="gemini-3.1-flash-lite")
     gemini_video_fps: str = Field(default="4")
     # Per-frame token budget Gemini spends on each image/video frame — the real
     # "how much detail does the VLM see" dial (independent of the pixels we
