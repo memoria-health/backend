@@ -81,6 +81,26 @@ class Settings(BaseSettings):
     # subtle detections (distant doors, hand positions, fine motion); costs more
     # tokens/latency per frame — dial down per-account if needed. Lowercased at call.
     gemini_media_resolution: str = Field(default="high")
+    # How hard the model reasons before answering. 'minimal' | 'low' |
+    # 'medium' | 'high' | '' (send nothing, i.e. the model's own default).
+    #
+    # MEASURED 2026-08-01 on gemini-3.5-flash-lite over real event clips:
+    # the model does NOT think by default, and 'minimal'/'low' are no-ops
+    # on it — all three returned thoughts_token_count = 0. 'medium' and
+    # 'high' both reason (~110-310 and ~160-770 thought tokens), costing
+    # roughly +0.5-1.5s. So on lite the only live rungs are medium/high.
+    # Set 'high' because the un-thought verdicts were not good enough
+    # (Aryaman 2026-08-01). Caveat worth knowing before trusting this
+    # dial to fix accuracy: on the four known choking false-positive
+    # clips, thinking did NOT reduce false fires (off 1/4, medium 1/4,
+    # high 1/4) — one rep each, so noise-dominated, and it measures
+    # suppression only, never recall.
+    #
+    # Thought tokens bill at the OUTPUT rate. That is a small share of the
+    # bill here — a scene call is ~13k input vs ~100 output — but it is not
+    # free, and it is already accounted for: `usage["output"]` below adds
+    # candidates + thoughts, with `usage["thoughts"]` carried separately.
+    gemini_thinking_level: str = Field(default="high")
 
     # EXPERIMENT: tint moved regions red on the VLM clip (frame-diff overlay) so
     # the model can see small/sustained motion — a vibrating hand / tremor — that

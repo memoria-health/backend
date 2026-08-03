@@ -51,6 +51,24 @@ def _media_resolution(value: str) -> genai_types.MediaResolution | None:
     return None
 
 
+_THINKING_LEVELS = {"minimal", "low", "medium", "high"}
+
+
+def _thinking_config(value: str) -> genai_types.ThinkingConfig | None:
+    """Map the env-string thinking level to a ThinkingConfig, or None to
+    send nothing and let the model use its own default.
+
+    Note this is `thinking_level`, NOT the Gemini-2.5-era
+    `thinking_budget` — a budget (even 0) is rejected outright by
+    gemini-3.5-flash-lite with 400 INVALID_ARGUMENT. Unknown strings
+    degrade to None rather than raising: a typo'd env value must fall
+    back to the model default, never take detection down."""
+    v = value.strip().lower()
+    if v not in _THINKING_LEVELS:
+        return None
+    return genai_types.ThinkingConfig(thinking_level=v.upper())
+
+
 def _map_type(t: str) -> genai_types.Type:
     if t == "boolean": return genai_types.Type.BOOLEAN
     if t == "number":  return genai_types.Type.NUMBER
@@ -136,6 +154,9 @@ async def gemini_provider(
     media_res = _media_resolution(settings.gemini_media_resolution)
     if media_res is not None:
         config_kwargs["media_resolution"] = media_res
+    thinking = _thinking_config(settings.gemini_thinking_level)
+    if thinking is not None:
+        config_kwargs["thinking_config"] = thinking
 
     # NOTE: model fallback lives in the ROUTING chain (vlm_routing's
     # gemini -> gemini_fallback tier), not here — a provider-internal
@@ -156,11 +177,18 @@ async def gemini_provider(
     if meta is not None:
         import dataclasses
 
-        # Billing truth (2026-07-19, the $14/day audit): Gemini 3.x
-        # models THINK by default and thinking tokens bill at the
-        # OUTPUT rate — but they live in `thoughts_token_count`, not
-        # `candidates_token_count`. Recording candidates alone made
-        # most of the real output bill invisible to our ledger.
+        # Billing truth (2026-07-19, the $14/day audit): thinking tokens
+        # bill at the OUTPUT rate but live in `thoughts_token_count`, not
+        # `candidates_token_count`. Recording candidates alone made most
+        # of the real output bill invisible to our ledger.
+        #
+        # Corrected 2026-08-01: the original note said "Gemini 3.x models
+        # THINK by default". That holds for 3.6-flash, NOT for
+        # 3.5-flash-lite — measured, lite returned 0 thought tokens with
+        # no config AND at thinking_level minimal/low, and reasoned only
+        # at medium/high. Whether thoughts are non-zero now
+        # depends on `gemini_thinking_level` (we send 'high'), so this
+        # accounting matters more than it did, not less.
         # `output` is now the BILLED output (candidates + thoughts);
         # `thoughts` rides separately for observability.
         thoughts = int(getattr(meta, "thoughts_token_count", 0) or 0)
