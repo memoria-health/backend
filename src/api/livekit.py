@@ -9,6 +9,16 @@ Supabase JWT. The body's `role` decides which path is checked:
                          the room must belong to one of their patients.
   - `role='broadcaster'` → same as viewer, plus canPublish=true for
                          audio (used by Phase 3 Talk mode).
+  - `role='gateway'`   → Bearer must be a valid gateway site token, and
+                         the camera named by `identity` must belong to
+                         THAT gateway (2026-08-03).
+
+The `gateway` role exists so the box never holds the LiveKit API
+secret. It used to sign its own tokens with the raw key+secret in
+`cameras.json`, which is how the PRODUCTION LiveKit credential ended up
+in three places at once — the box, a committed ops doc, and a leaked
+.env. With this path the secret lives only in the backend's env, so
+rotating it is a single change instead of a coordinated fleet update.
 
 We hand-roll the dual-auth dispatch rather than reusing the existing
 `CameraAuth`/`CaregiverAuth` deps because FastAPI's dep system
@@ -82,6 +92,21 @@ async def mint_livekit_token(
             room_join=True,
             can_publish=True,
             can_subscribe=True,           # camera subscribes to caregiver Talk audio (Phase 3)
+            can_publish_data=True,
+        )
+        identity = body.identity
+    elif body.role == "gateway":
+        # The box authenticates with its ONE stable site token — the same
+        # credential it already uses for /v1/gateway/roster — and gets a
+        # token scoped to a single camera it owns. Grants deliberately
+        # mirror the `camera` role: the gateway publishes AS that camera,
+        # so anything the camera app could do here, the box must too.
+        cam = await _resolve_gateway_camera_or_401(session, credentials, body)
+        grants = VideoGrants(
+            room=body.room,
+            room_join=True,
+            can_publish=True,
+            can_subscribe=True,
             can_publish_data=True,
         )
         identity = body.identity
@@ -170,6 +195,53 @@ async def _resolve_camera_or_401(
         if exc.status_code == status.HTTP_404_NOT_FOUND:
             raise
         raise _INVALID from None
+
+
+async def _resolve_gateway_camera_or_401(
+    session: SessionDep,
+    credentials: HTTPAuthorizationCredentials,
+    body: MintTokenRequest,
+) -> Camera:
+    """Authenticate a gateway site token and resolve the ONE camera it is
+    asking to publish as.
+
+    Three things must all hold, and each is a privilege-escalation stop:
+      1. the Bearer hashes to a row in `public.gateways`;
+      2. `identity` names a camera whose `gateway_id` is THAT gateway —
+         so one box can never mint a token for another box's camera;
+      3. `room` is that camera's own `livekit_room`.
+
+    Failures collapse to 401 without saying which of the three missed —
+    a caller probing for "does camera X exist" learns nothing.
+
+    NOTE: the same token->gateway lookup is currently inlined in
+    `cameras_ingest.gateway_roster`/`_wait`/`_provision_camera`. Worth
+    extracting to one shared helper; not done here because that means
+    touching three live prod paths in the same change as this one.
+    """
+    from sqlalchemy import text
+
+    from src.services.ingest.pi.auth import hash_ingest_token
+
+    if credentials.credentials is None or not credentials.credentials.strip():
+        raise _INVALID
+    digest = hash_ingest_token(credentials.credentials.strip())
+    gw = (await session.execute(
+        text("SELECT id FROM public.gateways WHERE token_hash = :d"),
+        {"d": digest},
+    )).first()
+    if gw is None:
+        raise _INVALID
+    gateway_id = gw[0]
+
+    cam = (await session.execute(
+        select(Camera).where(Camera.livekit_identity == body.identity)
+    )).scalar_one_or_none()
+    if cam is None or cam.gateway_id is None or cam.gateway_id != gateway_id:
+        raise _INVALID
+    if cam.livekit_room != body.room:
+        raise _INVALID
+    return cam
 
 
 async def _ensure_camera_room_match(cam: Camera, body: MintTokenRequest) -> None:
