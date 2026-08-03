@@ -212,7 +212,12 @@ async def test_dispatch_posts_to_apns_with_expected_shape(
     import json
     payload = json.loads(call["content"])
     assert payload["aps"]["alert"]["title"] == "Fall detected"
-    assert payload["aps"]["alert"]["body"] == "Maggie — Maggie fell near the bed."
+    # Name only. The narrative is deliberately absent — see the comment in
+    # `push._dispatch_one`. Asserted as an exact equality AND as a
+    # not-contains, because the equality alone would pass if someone changed
+    # the seeded narrative rather than the payload.
+    assert payload["aps"]["alert"]["body"] == "Maggie"
+    assert "fell near the bed" not in json.dumps(payload)
     assert payload["aps"]["sound"] == "default"
     assert payload["event_id"] == str(event_id)
     assert UUID(payload["patient_id"])  # is a uuid
