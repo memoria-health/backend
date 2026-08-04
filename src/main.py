@@ -106,6 +106,7 @@ from src.db import patient_face_embedding as _patient_face_embedding  # noqa: F4
 from src.db import pi_discovery as _pi_discovery  # noqa: F401
 from src.db.session import get_engine, get_sessionmaker
 from src.services import clip_archival, email, push
+from src.services.data_collection import manager as recorder_manager
 from src.services.detection.presence_cache import PresenceCache
 from src.services.detection.presence_sweeper import PresenceSweeper
 from src.services.detection.worker import DetectorWorker
@@ -136,6 +137,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # previous process — raw clip bytes must never outlive a crash.
     # See clip_archival.sweep_scratch_dir; runs before any clip work.
     clip_archival.sweep_scratch_dir()
+    # Same for the data-collection recorder's tempfiles, which are raw
+    # uncensored video/audio and had no sweep of their own until now.
+    recorder_manager.sweep_temp_dir()
     # Warm the censor's YOLO seg model off the startup path: the first
     # load pays weights download + torch init (measured minutes on a
     # cold host vs ~9s steady-state per censored clip). Daemon thread —

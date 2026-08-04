@@ -25,7 +25,6 @@ import json
 import logging
 import math
 import secrets
-import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
@@ -39,6 +38,7 @@ from sqlalchemy import select
 from src.db.camera import Camera
 from src.db.patient import Patient
 from src.services.data_collection.manager import RecorderManager
+from src.services.data_collection.manager import temp_root as recorder_temp_root
 from src.services.detection import frame_codec
 from src.services.detection.camera_ingest import CameraIngest
 from src.services.detection.patient_presence import PatientPresence
@@ -235,11 +235,11 @@ class RoomWorker:
         # cap bounds the whole room). Reuses the frames detection already
         # decodes — no extra LiveKit subscription. Inert unless a patient
         # has opted in; idle cameras pay an O(1) no-op feed.
-        recorder_temp_dir = Path(tempfile.gettempdir()) / "memoria-data-collection"
-        recorder_temp_dir.mkdir(parents=True, exist_ok=True)
+        # One shared directory, owned by the data_collection package, so
+        # the startup sweep in main.py knows where to look.
         self._recorder = RecorderManager(
             settings=settings,
-            temp_dir=recorder_temp_dir,
+            temp_dir=recorder_temp_root(),
             privacy_check=self._camera_privacy_check,
             region_lookup=self._patient_region,
         )

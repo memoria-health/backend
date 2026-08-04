@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import tempfile
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime, timezone
@@ -44,6 +46,54 @@ _Uploader = Callable[..., Awaitable[str]]
 # — the retired patient-level check took a patient id).
 _PrivacyCheck = Callable[[UUID], Awaitable[bool]]
 _RegionLookup = Callable[[UUID], Awaitable[str]]
+
+
+def temp_root() -> Path:
+    """The one directory recorder tempfiles live in.
+
+    Kept to itself so the startup sweep below is safe: nothing else
+    writes here, so whatever is present at boot is stranded.
+    """
+    path = Path(tempfile.gettempdir()) / "memoria-data-collection"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def sweep_temp_dir() -> int:
+    """Delete every recorder tempfile left over from a previous process.
+
+    Called once at startup, before any recording begins. The normal and
+    error paths both unlink their own temps, so anything sitting here at
+    boot was stranded by a SIGKILL or an OOM kill mid-session.
+
+    This matters more than ordinary tidying. Those files are RAW,
+    UNCENSORED video and audio — written before any sensitivity screen —
+    and without a sweep they stay on disk forever, growing by up to a
+    session's worth (hundreds of MB) per crash until the disk fills.
+    Event clips have had this sweep since 2026-07-29
+    (`clip_archival.sweep_scratch_dir`); the recorder never got one.
+
+    Best-effort; returns how many files were removed.
+    """
+    removed = 0
+    try:
+        root = temp_root()
+        for name in os.listdir(root):
+            try:
+                os.unlink(os.path.join(root, name))
+                removed += 1
+            except OSError:
+                continue
+    except OSError:
+        logger.warning("data_collection.temp_sweep failed", exc_info=True)
+        return removed
+    if removed:
+        logger.warning(
+            "data_collection.temp_sweep removed %d stranded recorder "
+            "tempfile(s) — raw footage left by a hard-killed process",
+            removed,
+        )
+    return removed
 
 
 def _default_encoder_factory(path: Path) -> StreamingMp4Writer:
