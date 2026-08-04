@@ -220,7 +220,7 @@ def _fake_cmd(monkeypatch, *argv_tail: str) -> None:
     monkeypatch.setattr(
         censor,
         "_person_mask_subprocess_cmd",
-        lambda in_path, out_path: [sys.executable, *argv_tail],
+        lambda in_path, out_path, **kw: [sys.executable, *argv_tail],
     )
 
 

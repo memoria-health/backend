@@ -99,6 +99,40 @@ _FFMPEG_BLUR_FILTER = (
 # elsewhere in frame → full-frame.
 _MASK_GAP_BRIDGE_FRAMES = 3
 
+# ── research mask mode (2026-08-04) ─────────────────────────────────
+#
+# A SECOND, separate treatment used only for the B2 research corpus.
+# It is not reachable from the caregiver-facing path and does not change
+# the event-clip treatment above in any way.
+#
+# It fills the person with a flat colour instead of pixelating them, and
+# hugs the body far more closely. That is a DELIBERATE REVERSAL of the
+# block-quantisation above, and the tradeoff has to be stated plainly:
+#
+#   The event-clip mask snaps to a block grid precisely so the boundary
+#   reads as crude rectangles rather than a figure, because a smooth
+#   silhouette leaks the body OUTLINE even at infinite pixelation. This
+#   mode leaks that outline ON PURPOSE. Pose and position are exactly
+#   what a research corpus needs; appearance and skin are exactly what
+#   it must not carry.
+#
+# So this is not "a better censor" — it is a different exposure trade,
+# only defensible because the corpus is opt-in under explicit, separate
+# consent and never reaches a caregiver's phone. Anything that would put
+# it in front of a caregiver is a bug.
+#
+# Flat green: it is not a colour a room produces, so a masked region is
+# unambiguous to a human reviewer and trivially separable to a model.
+_RESEARCH_FILL_BGR = (0, 255, 0)
+# Tight margin — 2% of the short side against the event path's 6%. Still
+# a real margin, because segmentation under-covers at body edges, but
+# small enough that the pose stays honest.
+_RESEARCH_DILATE_FRACTION = 0.02
+_RESEARCH_DILATE_MIN_PX = 5
+
+CENSOR_MODE_PIXELATE = "pixelate"  # event clips (default, unchanged)
+CENSOR_MODE_RESEARCH = "research"  # B2 corpus only
+
 _seg_model = None
 
 
@@ -168,6 +202,38 @@ def _dilate_mask(mask: np.ndarray, *, extra: bool = False) -> np.ndarray:
     k = max(15, int(min(h, w) * (0.12 if extra else 0.06))) | 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
     return (cv2.dilate(mask, kernel) > 0).astype(mask.dtype)
+
+
+def _research_dilate(mask: np.ndarray) -> np.ndarray:
+    """Tight dilation for the research mode — a real but small margin."""
+    import cv2
+
+    h, w = mask.shape[:2]
+    k = max(
+        _RESEARCH_DILATE_MIN_PX,
+        int(min(h, w) * _RESEARCH_DILATE_FRACTION),
+    ) | 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    return (cv2.dilate(mask, kernel) > 0).astype(mask.dtype)
+
+
+def _research_frame(
+    frame: np.ndarray, mask: np.ndarray | None,
+) -> "np.ndarray | None":
+    """Fill the person with flat colour, keeping the room intact.
+
+    Returns **None** when there is no mask. That is the whole safety
+    contract of this mode: the event path answers "I can't find anyone"
+    by pixelating the entire frame, but a full-frame smear is worthless
+    to a research corpus, and storing the frame raw is exactly the
+    exposure we are trying to prevent. So there is no third option —
+    the caller must drop the clip.
+    """
+    if mask is None or not mask.any():
+        return None
+    out = frame.copy()
+    out[_research_dilate(mask) > 0] = _RESEARCH_FILL_BGR
+    return out
 
 
 def _censor_frame(
@@ -301,7 +367,9 @@ class _FrameEncoder:
         self._stderr.close()
 
 
-def _censor_person_mask_sync(in_path: str, out_path: str) -> None:
+def _censor_person_mask_sync(
+    in_path: str, out_path: str, *, mode: str = CENSOR_MODE_PIXELATE,
+) -> None:
     """Tier 1, synchronous (runs inside the CLI child process — see
     `_cli_main`): STREAM one frame at a time — decode → person-mask
     pixelation → straight into the piped ffmpeg encoder — so peak
@@ -356,7 +424,19 @@ def _censor_person_mask_sync(in_path: str, out_path: str) -> None:
             elif last_mask is not None and gap < _MASK_GAP_BRIDGE_FRAMES:
                 gap += 1
                 mask = _dilate_mask(last_mask, extra=True)
-            encoder.write(_censor_frame(frame, mask))
+            if mode == CENSOR_MODE_RESEARCH:
+                censored = _research_frame(frame, mask)
+                if censored is None:
+                    # No subject found and the gap bridge is exhausted.
+                    # Research mode has no safe fallback (see
+                    # `_research_frame`), so the whole clip goes.
+                    raise CensorError(
+                        "censor: research mode could not locate the "
+                        "subject; clip must be dropped"
+                    )
+            else:
+                censored = _censor_frame(frame, mask)
+            encoder.write(censored)
             ok, frame = cap.read()
     except BaseException:
         if encoder is not None:
@@ -367,19 +447,26 @@ def _censor_person_mask_sync(in_path: str, out_path: str) -> None:
     encoder.close()
 
 
-def _person_mask_subprocess_cmd(in_path: str, out_path: str) -> list[str]:
+def _person_mask_subprocess_cmd(
+    in_path: str, out_path: str, *, mode: str = CENSOR_MODE_PIXELATE,
+) -> list[str]:
     """argv for the tier-1 child process. Split out as a seam so unit
     tests can substitute a scripted child (exit-code / sleep stand-ins)
     and exercise the real spawn/kill/timeout mechanics without YOLO."""
-    return [
+    argv = [
         sys.executable,
         "-m", "src.services.detection.censor",
         in_path,
         out_path,
     ]
+    if mode != CENSOR_MODE_PIXELATE:
+        argv += ["--mode", mode]
+    return argv
 
 
-async def _censor_person_mask_subprocess(in_path: str, out_path: str) -> None:
+async def _censor_person_mask_subprocess(
+    in_path: str, out_path: str, *, mode: str = CENSOR_MODE_PIXELATE,
+) -> None:
     """Tier 1: run the person-mask censor in an ISOLATED child process
     with a hard wall-clock deadline (`censor_timeout_seconds`).
 
@@ -399,7 +486,7 @@ async def _censor_person_mask_subprocess(in_path: str, out_path: str) -> None:
     """
     timeout = get_settings().censor_timeout_seconds
     proc = await asyncio.create_subprocess_exec(
-        *_person_mask_subprocess_cmd(in_path, out_path),
+        *_person_mask_subprocess_cmd(in_path, out_path, mode=mode),
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -505,7 +592,7 @@ async def _mux_source_audio(source_path: str, video_path: str) -> None:
 
 async def censor_clip(
     in_path: str, out_path: str, *, full_frame: bool = False,
-    keep_audio: bool = True,
+    keep_audio: bool = True, mode: str = CENSOR_MODE_PIXELATE,
 ) -> None:
     """Censor the clip at `in_path` into `out_path` (video pixelated/
     blurred; the SOURCE audio track is carried over — 2026-07-28
@@ -527,6 +614,19 @@ async def censor_clip(
     isolation. Raises `CensorError` only when tier 2 also fails — at
     which point the caller must drop the clip.
     """
+    if mode == CENSOR_MODE_RESEARCH:
+        # No tier-2 for research. Full-frame blur is useless to a corpus,
+        # so the only outcomes are "masked correctly" or "dropped" —
+        # CensorError propagates and the caller discards the clip.
+        if full_frame:
+            raise CensorError(
+                "censor: research mode has no full-frame fallback"
+            )
+        await _censor_person_mask_subprocess(in_path, out_path, mode=mode)
+        if keep_audio:
+            await _mux_source_audio(in_path, out_path)
+        return
+
     if not full_frame:
         try:
             await _censor_person_mask_subprocess(in_path, out_path)
@@ -571,12 +671,20 @@ def _cli_main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="skip person segmentation; blur the whole frame via ffmpeg",
     )
+    parser.add_argument(
+        "--mode",
+        choices=[CENSOR_MODE_PIXELATE, CENSOR_MODE_RESEARCH],
+        default=CENSOR_MODE_PIXELATE,
+        help="pixelate (caregiver-facing clips) or research (B2 corpus)",
+    )
     args = parser.parse_args(argv)
     try:
         if args.full_frame:
             asyncio.run(_censor_full_frame(args.in_path, args.out_path))
         else:
-            _censor_person_mask_sync(args.in_path, args.out_path)
+            _censor_person_mask_sync(
+                args.in_path, args.out_path, mode=args.mode,
+            )
     except Exception:  # noqa: BLE001 — any failure = nonzero exit
         import traceback
 
