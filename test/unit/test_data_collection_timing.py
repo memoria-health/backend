@@ -120,6 +120,26 @@ async def test_early_wake_writes_nothing(tmp_path) -> None:
     assert w.written == 1
 
 
+async def test_unreachable_debt_is_written_off_not_queued(tmp_path) -> None:
+    """A child slower than real time falls behind by a fixed amount every
+    second. Chasing that forever grows a queue and never catches up, so
+    past a cap the missing time is written off and counted."""
+    from src.services.data_collection import streaming_encoder as se
+
+    clock = _FakeClock()
+    w, _ = _writer_with_fake_proc(tmp_path, clock)
+    w.feed(_W, _H, _frame())
+    await w._fill_to_clock(w._latest, _FPS)
+
+    clock.advance(300.0)  # five minutes of stall
+    due = w._forgive_impossible_debt(clock.now)
+
+    assert due == int(_FPS * se._MAX_OUTSTANDING_SECONDS)
+    assert w.deficit_frames > 0
+    # Re-anchored, so the next call is not still owed the whole minute.
+    assert w._forgive_impossible_debt(clock.now) == due
+
+
 async def test_catch_up_burst_is_bounded_and_carried(tmp_path) -> None:
     """A long stall must not become one huge blocking write; the excess
     carries to the next wake rather than vanishing."""

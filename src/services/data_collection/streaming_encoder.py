@@ -59,6 +59,7 @@ import logging
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,18 @@ _MAX_BURST_SECONDS = 1.0
 # session is ending anyway. Anything still outstanding after this is
 # reported as `deficit_frames` rather than silently shortening the clip.
 _MAX_CLOSING_BURST_SECONDS = 30.0
+# Most unwritten time the pacer will keep chasing. Past this the encoder
+# is not merely late, it is too slow for the stream, and the missing
+# frames are written off rather than chased forever. See
+# `_forgive_impossible_debt`.
+#
+# Deliberately generous. A tighter cap (5s, tried 2026-08-04) wrote off
+# time the pacer would have recovered on its own: a busy event loop
+# stalls in bursts far longer than a frame, and catching up afterwards
+# is exactly what the pacer is for. Measured, 5s turned a clean 20.00s
+# clip into 15.20s under moderate load. This is a backstop for an
+# encoder that genuinely cannot keep up, not a pacing knob.
+_MAX_OUTSTANDING_SECONDS = 30.0
 
 
 def _i420_size(width: int, height: int) -> int:
@@ -256,6 +269,38 @@ class StreamingMp4Writer:
         except asyncio.CancelledError:
             pass
 
+    def _forgive_impossible_debt(self, now: float) -> int:
+        """Frames owed right now, with unreachable ones written off.
+
+        A child that encodes slower than real time falls behind by a
+        fixed amount every second, and no amount of catching up fixes
+        that — the shortfall is the child's throughput, not our pacing.
+        Chasing it forever just grows a queue.
+
+        So past `_MAX_OUTSTANDING_SECONDS` the excess is written off:
+        counted in `deficit_frames` and the timeline re-anchored so we
+        stop trying to make up time we cannot encode.
+
+        The honest cost: re-anchoring shifts everything after it, so once
+        `deficit_frames` is non-zero, offsets later in THIS clip are no
+        longer exactly `captured_at - clip_start`. That is why the
+        counter exists — a clip that lost time says so, rather than
+        quietly lying about when things happened.
+        """
+        due = round((now - self._grid_start) * self._fps) + 1 - self.written
+        cap = int(self._fps * _MAX_OUTSTANDING_SECONDS)
+        if due <= cap:
+            return due
+        forgiven = due - cap
+        self.deficit_frames += forgiven
+        self._grid_start += forgiven / self._fps
+        logger.warning(
+            "%s cannot keep up: wrote off %.1fs (%d frames) for %s",
+            type(self).__name__, forgiven / self._fps, forgiven,
+            self._out_path,
+        )
+        return cap
+
     async def _fill_to_clock(self, frame: bytes, max_burst: int) -> bool:
         """Write frames until the encoded count matches the wall clock.
 
@@ -272,7 +317,7 @@ class StreamingMp4Writer:
             self._grid_start = now
             due = 1
         else:
-            due = round((now - self._grid_start) * self._fps) + 1 - self.written
+            due = self._forgive_impossible_debt(now)
         if due <= 0:
             return True
 
@@ -318,7 +363,10 @@ class StreamingMp4Writer:
                 - self.written
             )
             if outstanding > 0:
-                self.deficit_frames = outstanding
+                # Add, never replace: the pacer may already have written
+                # off time mid-session (`_forgive_impossible_debt`), and
+                # overwriting here would hide it.
+                self.deficit_frames += outstanding
                 logger.warning(
                     "StreamingMp4Writer: clip is %.1fs short of the session "
                     "it recorded (%d frames); the encoder could not keep up",

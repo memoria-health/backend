@@ -461,9 +461,19 @@ def mask_stream_sync(
     Segmentation runs every `censor_stream_segment_every` frames and the
     mask is carried (extra-dilated) across the ones between: at 15fps a
     person moves very little in a few frames, and segmenting all of them
-    costs more than the budget allows. When segmentation finds nothing
-    and there is no earlier mask to carry, the frame is covered entirely
-    (`_research_frame`) — never left raw.
+    costs more than the budget allows.
+
+    When segmentation finds nothing, the SAME bounded bridge the
+    file-based censor uses applies (`_MASK_GAP_BRIDGE_FRAMES`): reuse the
+    last mask, widened, for a few frames, then cover the frame entirely.
+    Carrying a stale mask indefinitely would be worse than useless — a
+    person who moved would be uncovered while we masked where they used
+    to be.
+
+    Note this bites during the recorder's 45s linger, where the gate has
+    already gone false and the room may genuinely be empty: those frames
+    get covered rather than kept. Safe, and cheap in research value,
+    since an empty room at the tail of a session carries little.
     """
     import cv2
     import numpy as np
@@ -475,6 +485,7 @@ def mask_stream_sync(
 
     encoder = _FrameEncoder(width, height, float(fps), out_path)
     last_mask = None
+    gap = 0
     index = 0
     try:
         while True:
@@ -488,15 +499,13 @@ def mask_stream_sync(
             if index % every == 0:
                 fresh = _person_mask(model, frame)
                 if fresh is not None:
-                    last_mask = fresh
-                mask = fresh if fresh is not None else (
-                    _dilate_mask(last_mask, extra=True)
-                    if last_mask is not None else None
-                )
-            else:
-                mask = (
-                    _dilate_mask(last_mask, extra=True)
-                    if last_mask is not None else None
+                    last_mask, gap = fresh, 0
+                else:
+                    gap += 1
+            mask = None
+            if last_mask is not None and gap <= _MASK_GAP_BRIDGE_FRAMES:
+                mask = last_mask if gap == 0 else _dilate_mask(
+                    last_mask, extra=True
                 )
             encoder.write(_research_frame(frame, mask))
             index += 1
