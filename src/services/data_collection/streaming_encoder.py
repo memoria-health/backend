@@ -189,9 +189,13 @@ class StreamingMp4Writer:
 
     # ── lifecycle ───────────────────────────────────────────────────
 
-    async def start(self) -> None:
-        """Launch ffmpeg and the CFR pacer task."""
-        cmd = [
+    def _build_command(self) -> list[str]:
+        """argv for the child that turns piped raw I420 into the output
+        MP4. Overridden by `MaskingMp4Writer` to route frames through the
+        research censor instead of straight into ffmpeg — everything else
+        about this class (the pacer, the timeline, back-pressure) is
+        identical either way."""
+        return [
             "ffmpeg", "-hide_banner", "-loglevel", "error",
             "-f", "rawvideo",
             "-pix_fmt", "yuv420p",
@@ -208,6 +212,10 @@ class StreamingMp4Writer:
             "-f", "mp4",
             str(self._out_path),
         ]
+
+    async def start(self) -> None:
+        """Launch the encoder child and the CFR pacer task."""
+        cmd = self._build_command()
         self._proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
@@ -324,3 +332,39 @@ class StreamingMp4Writer:
                 except ProcessLookupError:
                     pass
         return self._out_path
+
+
+class MaskingMp4Writer(StreamingMp4Writer):
+    """Same writer, but every frame is masked on the way out.
+
+    Frames go to an isolated child process that segments the people in
+    them and fills those regions flat, then encodes the result. Raw
+    footage never reaches disk.
+
+    Doing it here rather than over the finished clip is what makes it
+    affordable: the recorder already holds decoded frames, so masking
+    inline skips both the decode a post-pass would need and its
+    re-encode. It also spreads the work across the session instead of
+    stalling on a burst at the end.
+
+    A child process rather than a thread, for the reason `censor.py`
+    already isolates tier 1: a native OpenMP deadlock in torch froze the
+    whole backend on 2026-07-28, event loop included. That hang lives
+    below Python, so a thread could not be recovered but a child can
+    always be killed.
+
+    The child dying takes the session's video with it — the pacer sees a
+    broken pipe and stops. That is the intended failure: research mode
+    has no safe fallback, so a clip that cannot be masked must not exist.
+    """
+
+    def _build_command(self) -> list[str]:
+        import sys
+
+        return [
+            sys.executable,
+            "-m", "src.services.detection.censor",
+            "-",  # in_path unused in stream mode
+            str(self._out_path),
+            "--stream-i420", f"{self._width}x{self._height}@{self._fps}",
+        ]

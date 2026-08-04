@@ -46,9 +46,65 @@ and it should be watched on the first soak.
 | 3 | Episodes store **everything** — reasoning text, k-of-N counters, latch state | Filtering happens at EXPORT, never at write. Losing it at write loses it forever |
 | 4 | Expert review IS the labelling tool | `review_gate` approve/reject is the TP/FP label |
 | 5 | Un-reviewed events stay **NULL**, queried and revisited later | No second queue. Replaces the earlier `auto` stamp |
-| 6 | Sensitive clips: **keep audio in B2**, behind an internal toggle | Caregiver-facing censored clips stay audio-stripped |
+| 6 | Sensitive clips: **keep audio in B2**, behind an internal toggle | `censor_clip` already keeps audio by default; the toggle only overrides the intimate-situation silence |
 | 7 | Sensitive + segmentation can't find the subject → **drop the clip** | Research corpora may have holes; caregiver alerts may not |
-| 8 | Coverage: build for something **closer to continuous** | See Phase A for the cost-shaped options |
+| 8 | **Masking is driven ONLY by the VLM sensitivity verdict** | Room class does NOT mask. A bedroom records raw unless a verdict says otherwise (2026-08-04) |
+| 9 | Censoring happens **inline, as frames arrive** — never as a post-pass | See "correct implementation" below |
+| 10 | On a first sensitive verdict, **discard the raw prefix** and restart masked | ~10s lost at the transition; nothing raw-and-sensitive ever persists |
+| 11 | Research mask = **flat fill, tight dilation**, research-only | DONE, `502717d`. Deliberately leaks body outline; see the module comment |
+| 12 | **Partner export is out of scope** | Dropped 2026-08-04 |
+| 13 | **Linger stays at 45s** | The increase was a workaround for the motion gate; redundant if motion is dropped |
+
+---
+
+## The correct implementation — inline censoring
+
+Doing this as a post-pass over the finished MP4 was wrong: it has to decode
+H.264 back into frames before it can segment anything, and a 15-minute clip is
+13,500 frames against an event clip's ~100. Inline, detection has **already
+decoded the frames** — so the decode and the re-encode both disappear, and raw
+uncensored video never reaches disk at all.
+
+**The seam already exists.** `RecorderManager` takes an injectable
+`encoder_factory`, and `SessionRecorder` only ever calls `start()`, `feed()` and
+`aclose()` on what it gets back. So a masking encoder is a drop-in peer of
+`StreamingMp4Writer`, and the session machine does not change at all.
+
+```
+room_worker._push_video → recorder.feed_video → session.feed_video
+                                                      │
+                             encoder_factory picks one of:
+                                                      │
+        StreamingMp4Writer ────────────────┬───────────┴── MaskingMp4Writer
+        (raw; today's path)                │                (new)
+                                           │
+                        raw I420 → child process → segment → flat fill
+                                     → _FrameEncoder → H.264 file
+```
+
+**Why a child process, not a thread.** Tier-1 censoring is isolated today
+because a native OpenMP deadlock in torch froze the whole backend on 2026-07-28,
+event loop included — a hang below Python that `asyncio.to_thread` cannot
+contain but `kill()` always can. Inline masking inherits that constraint. The
+child is long-lived for the session instead of per-clip, which also avoids
+paying model load (~2-4s) per clip.
+
+**Switching mid-session.** A verdict lands ~10s after the footage it judges, so
+frames before it are already written. Rather than leave them, the tick aborts the
+raw session (`SessionRecorder.abort()` — already built and tested for the privacy
+path, discards temps without muxing or uploading) and opens a fresh masked one.
+
+**Segmentation rate.** 15fps leaves 66ms a frame and segmentation costs tens of
+ms. Segment at a lower rate and carry the mask across intervening frames with
+wider dilation — `censor.py` already does exactly this for detection dropouts
+(`_MASK_GAP_BRIDGE_FRAMES`, `_dilate_mask(extra=True)`).
+
+**Open cost question.** The verdict needs a per-tick sensitivity screen.
+`sensitivity.screen_clip` is a separate VLM call, so running it every tick
+roughly doubles inference cost for a collecting camera. Adding the verdict to the
+existing detection call would be free but means touching the detection prompt,
+which the recorder has never done. **Implement with a settable cadence (screen
+every Nth tick) and let the number be the lever.**
 
 ---
 

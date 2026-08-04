@@ -249,6 +249,15 @@ class Settings(BaseSettings):
     # Env: NEMARA_CENSOR_TIMEOUT_SECONDS.
     censor_timeout_seconds: float = Field(gt=0, le=900, default=180.0)
 
+    # Inline recorder masking: run segmentation every Nth frame and carry
+    # the (extra-dilated) mask across the rest. At 15fps there is only
+    # ~66ms per frame and segmentation costs tens of ms, so segmenting
+    # every frame does not fit the budget. 5 → segment 3x a second; a
+    # person moves very little in 200ms and the wider dilation covers it.
+    # Lower is safer and more expensive. Env:
+    # NEMARA_CENSOR_STREAM_SEGMENT_EVERY.
+    censor_stream_segment_every: int = Field(ge=1, le=60, default=5)
+
     # ── Detector subscriber-bot (Phase 2) ───────────────────────
     # The bot lives inside the FastAPI process as an asyncio task tree
     # that subscribes to LiveKit rooms and runs the detector pipeline.

@@ -53,7 +53,7 @@ import os
 import subprocess
 import sys
 import tempfile
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from src.settings import get_settings
 
@@ -447,6 +447,69 @@ def _censor_person_mask_sync(
     encoder.close()
 
 
+def mask_stream_sync(
+    width: int, height: int, fps: float, out_path: str, stdin: Any = None,
+) -> None:
+    """Mask raw I420 frames arriving on stdin, straight into an MP4.
+
+    The inline half of the research censor. The recorder already holds
+    decoded frames, so piping them here skips the decode AND the
+    re-encode a post-pass over a finished clip would need — and raw
+    footage never reaches disk.
+
+    Segmentation runs every `censor_stream_segment_every` frames and the
+    mask is carried (extra-dilated) across the ones between: at 15fps a
+    person moves very little in a few frames, and segmenting all of them
+    costs more than the budget allows. A frame with no mask at all is
+    DROPPED along with the whole stream — research mode has no safe
+    fallback (see `_research_frame`).
+    """
+    import cv2
+    import numpy as np
+
+    stream = stdin if stdin is not None else sys.stdin.buffer
+    model = _get_seg_model()
+    frame_bytes = width * height * 3 // 2
+    every = max(1, int(get_settings().censor_stream_segment_every))
+
+    encoder = _FrameEncoder(width, height, float(fps), out_path)
+    last_mask = None
+    index = 0
+    try:
+        while True:
+            buf = stream.read(frame_bytes)
+            if not buf or len(buf) < frame_bytes:
+                break  # clean EOF, or a torn final frame we won't trust
+            yuv = np.frombuffer(buf, dtype=np.uint8).reshape(
+                (height * 3 // 2, width)
+            )
+            frame = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
+            if index % every == 0:
+                fresh = _person_mask(model, frame)
+                if fresh is not None:
+                    last_mask = fresh
+                mask = fresh if fresh is not None else (
+                    _dilate_mask(last_mask, extra=True)
+                    if last_mask is not None else None
+                )
+            else:
+                mask = (
+                    _dilate_mask(last_mask, extra=True)
+                    if last_mask is not None else None
+                )
+            censored = _research_frame(frame, mask)
+            if censored is None:
+                raise CensorError(
+                    "censor: no subject in a masked stream; clip dropped"
+                )
+            encoder.write(censored)
+            index += 1
+    except BaseException:
+        encoder.abort()
+        raise
+    encoder.close()
+
+
 def _person_mask_subprocess_cmd(
     in_path: str, out_path: str, *, mode: str = CENSOR_MODE_PIXELATE,
 ) -> list[str]:
@@ -664,8 +727,14 @@ def _cli_main(argv: list[str] | None = None) -> int:
         prog="python -m src.services.detection.censor",
         description="Censor a sensitive clip (blur persons, strip audio).",
     )
-    parser.add_argument("in_path", help="source clip (mp4)")
+    parser.add_argument("in_path", help="source clip (mp4), or - to stream")
     parser.add_argument("out_path", help="censored output clip (mp4)")
+    parser.add_argument(
+        "--stream-i420",
+        metavar="WxH@FPS",
+        help="read raw I420 frames from stdin instead of decoding in_path "
+             "(inline recorder masking); in_path is ignored",
+    )
     parser.add_argument(
         "--full-frame",
         action="store_true",
@@ -679,7 +748,11 @@ def _cli_main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
-        if args.full_frame:
+        if args.stream_i420:
+            dims, _, rate = args.stream_i420.partition("@")
+            w, _, h = dims.partition("x")
+            mask_stream_sync(int(w), int(h), float(rate), args.out_path)
+        elif args.full_frame:
             asyncio.run(_censor_full_frame(args.in_path, args.out_path))
         else:
             _censor_person_mask_sync(
