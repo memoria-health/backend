@@ -1,10 +1,114 @@
-# Handoff — B2 video data-collection recorder
+# Handoff — B2 data collection: annotations + recording censoring
 
-> **For Claude:** this is a FINISH-AND-VERIFY task, not a greenfield build. Most
-> of it exists and is tested. Read this whole file before writing code.
+> **For Claude:** this is a DISCUSSION-FIRST task. Two open design questions
+> need Aryaman's decision before any code. Do not start building from the June
+> design docs — they are superseded in the places noted below.
 
-**Goal:** get collected video actually landing in Backblaze B2 for real, and add
-the cold-storage transcode job that was designed but never built.
+---
+
+## Current state — what is actually true
+
+The recorder is **built, deployed and exercised against a real Backblaze
+bucket.** This is not a greenfield or a verify-it-works task.
+
+`src/services/data_collection/` is complete: `gate.py`, `session.py`,
+`manager.py`, `streaming_encoder.py` (stream-writes, never buffers frames),
+`mux.py`, `b2.py`, `keys.py`. Wired into the tick path via
+`src/services/detection/camera_ingest.py`. 9 test files, all passing.
+
+The gate (`gate.py:39`) is settled and uses only pre-existing signals:
+
+```python
+return bool(data_collection_enabled and motion_in_clip and gate_people_present)
+```
+
+**Encoding is settled. No transcode or codec work is wanted.** An earlier
+version of this handoff proposed an HEVC batch job from the June design doc —
+that is not on the table. Do not raise it.
+
+Today's object layout:
+
+- **Key:** `<prefix>/<caregiver_id>/<patient_id>/<YYYY-MM-DD>/<HHMMSS>Z__<room-slug>.mp4`
+  (`keys.py:54`)
+- **Metadata:** flat S3 object metadata, string values only (`b2.py:73`)
+
+---
+
+## Discussion 1 — video annotations (Aryaman's primary ask)
+
+**The need:** an efficient way to key into the raw video. Today a clip is an
+opaque MP4 plus a handful of session-level strings. There is no way to ask "show
+me the three seconds where the fall was detected" or "find every clip where
+identity was confirmed" without watching the footage.
+
+**Why the current mechanism cannot carry it:** S3 object metadata is capped at
+~2KB and is string-valued key/value only. It can hold "which patient, which
+room, which gate fired" and nothing time-indexed.
+
+**The detection pipeline already produces exactly the data wanted** — every tick
+writes an `analyses` row with `detector_fields` (per-detector confidence and
+reasoning), `people_present`, `motion_in_clip`, identity confidence, track ids,
+all stamped `captured_at`. The question is not how to generate annotations; it
+is where they should live relative to the video.
+
+**Options to put to Aryaman:**
+
+1. **Sidecar JSON object** beside the MP4 (same key, `.json`). Simple, portable,
+   travels to a data partner with the file. Costs a second object per clip and
+   is not queryable without fetching.
+2. **Embedded timed-metadata track inside the MP4.** Travels as one artifact and
+   seeks natively in players/tools. More encoding work — and note the constraint
+   above that encoding changes are unwanted, so this may be out on those grounds
+   alone.
+3. **Postgres table keyed by clip key.** Queryable across the whole corpus
+   without touching B2 — best for internal analysis, worst for handing a
+   partner a self-describing dataset.
+4. **Hybrid:** DB for querying, sidecar written at finalize for portability.
+
+**Questions that decide it:**
+- Is the consumer *us* (eval, FP analysis) or an *external data partner*? That
+  single answer probably picks the option.
+- Should an annotation be per-tick, or one summary per clip session?
+- Must a clip be self-describing once it leaves our infrastructure?
+
+---
+
+## Discussion 2 — recordings are RAW (pilot master worklist, item 6)
+
+From `docs/plans/2026-07-28-pilot-master-worklist.md`:
+
+> **6. [ ] Research/B2 recording censoring (recordings currently RAW) — gates
+> consent PDF → gates attestation → gates research-consent pilots.**
+
+Collected recordings are **uncensored**, unlike event clips, which go through
+`src/services/detection/censor.py`. This is a dependency chain, not a standalone
+item: censoring gates the consent PDF, which gates attestation, which gates any
+research-consent pilot.
+
+Related worklist items in the same chain: **7** consent attestation + BIPA
+biometrics clause, **8** sensitivity eval corpus with a measured false-negative
+rate, **9** censor soak on the Railway substrate (local numbers are Docker-VM
+numbers and do not transfer).
+
+**Never exercised** (worklist line 200): the data-collection exclusion field
+test — research consent on, motion on both cameras, and B2 receives **only**
+non-private clips. The privacy-exclusion path has never been tested in the
+field.
+
+---
+
+## Standing constraint — read before proposing anything
+
+Decided 2026-07-29, recorded in the worklist:
+
+> Pilot families are **OBSERVATION-FIRST**. Research consent is NOT assumed from
+> day one. The data-collection flag ships **OFF**; any research-consent home is
+> opt-in per family, later. **Do NOT build anything that presumes a consented
+> corpus exists.**
+
+Items 6–9 stay where they are and are explicitly *not* pulled forward for the
+pilot. So neither discussion above is pilot-blocking — they are the next
+substantive build once the pilot is running.
 
 ---
 
@@ -13,113 +117,17 @@ the cold-storage transcode job that was designed but never built.
 | | |
 |---|---|
 | Repo | `nemara-backend` |
-| Branch | cut a new one from `main` — `feat/b2-transcode-and-verify` |
-| `main` state | clean, but **4 commits unpushed** (security work — leave them alone, they are unrelated) |
-| Design docs | `docs/plans/2026-06-24-video-data-collection-recorder.md`, `docs/plans/2026-06-24-data-collection-consent-ui.md` |
+| Branch | cut from `main` once a direction is agreed |
+| `main` | clean; some unpushed commits are unrelated security work — leave them |
+| Read first | `docs/plans/2026-07-28-pilot-master-worklist.md` items 6–9 and line 200 |
+| Superseded | the June design docs, on encoding and on anything assuming consent |
 
-Do **not** start from any other branch. The other repos are irrelevant to this
-task except for the consent toggle, which is already shipped.
+**Baseline:** `.venv/bin/pytest test/unit -q` → **2 failed, 932 passed, 21
+errors**. Those 2 failures (`test_face_embedding_repo`) and the 21 errors are
+pre-existing and unrelated. Anything beyond that is yours. The integration suite
+cannot reach its fixtures in this environment; that is also pre-existing.
 
----
-
-## What already exists (do not rebuild)
-
-`src/services/data_collection/` is a complete package:
-
-| File | Role |
-|---|---|
-| `gate.py` | `should_collect()` — the ONE decision point |
-| `session.py` | `RecorderCtx`, per-session lifecycle |
-| `manager.py` | `RecorderManager`, owned by the RoomWorker |
-| `streaming_encoder.py` | ffmpeg stream-write — never buffers frames in RAM |
-| `mux.py` | audio/video muxing |
-| `b2.py` | S3-compatible upload, `b2_configured()` |
-| `keys.py` | object key scheme |
-
-**Wired into the tick path already** — `src/services/detection/camera_ingest.py`
-imports `should_collect`, `RecorderCtx` and `RecorderManager`. When the recorder
-is absent every hook is a deliberate no-op (see the comment at
-`camera_ingest.py:240`).
-
-**The gate** (`gate.py:39`) is exactly the designed contract — no new signals:
-
-```python
-return bool(data_collection_enabled and motion_in_clip and gate_people_present)
-```
-
-**Tests: 9 files, all passing.** `test_data_collection_{b2,e2e,gate,keys,mux}.py`,
-`test_recorder_{manager,privacy_drive}.py`, `test_session_recorder.py`,
-`test_camera_ingest_recorder.py`. Run them before you touch anything so you know
-your baseline.
-
-**Settings** (`src/settings.py:425`): `b2_key_id`, `b2_app_key` (both default
-`""`), `b2_bucket` (`memoria-data`), `b2_endpoint_url`, `b2_region`. Region
-routing for India isolation lives in `services/region.b2_bucket_for`.
-
-**Consent** is shipped: `patients.data_collection_enabled` +
-`data_collection_decided_at`, with UI on iOS and web.
-
----
-
-## What is missing — the actual work
-
-### 1. The batch transcode job (the main build)
-
-The design called for an **off-hot-path** job transcoding cold H.264 clips to
-HEVC, replacing the originals and updating object metadata. It does not exist —
-there is no such module in `data_collection/`.
-
-Requirements from the design, restated so you don't have to re-derive them:
-
-- **Decoupled from the recorder.** The real-time path must never wait on it.
-- Operates on **cold** objects only — do not transcode something still being
-  written. Use object age, not a flag you have to keep in sync.
-- Replaces the original and updates metadata.
-- AV1 was explicitly optional. Do not build it unless HEVC lands first.
-
-Open question for Aryaman, **ask before building**: where does this run? A
-Railway cron, a separate worker, or on-demand? That changes the design
-materially and is not recorded anywhere.
-
-### 2. It has never run against a real bucket
-
-`b2_key_id` and `b2_app_key` default to `""`, and `b2_configured()` exists
-precisely so everything no-ops without them. **Every passing test is against a
-fake.** Nobody has confirmed a byte reaching Backblaze.
-
-Before anything else: get credentials into a local `.env`, record one real
-session, and confirm the object in the bucket — right key scheme, right
-metadata, playable.
-
-### 3. Deferred decisions still owe a partner handoff doc
-
-The v1 design deliberately deferred a set of items that must be written up for
-the data partner. They are listed in the design doc; they have never been
-collated. Ask Aryaman for the partner context before writing it.
-
----
-
-## Verification
-
-1. `.venv/bin/pytest test/unit -q` — baseline is **2 failed, 932 passed, 21
-   errors**. The 2 failures (`test_face_embedding_repo`) and the 21 errors are
-   **pre-existing and unrelated**; do not chase them. Anything beyond that is
-   yours.
-2. Real B2 round trip: record → upload → fetch the object back → play it.
-3. Transcode job: cold clip in, HEVC out, original replaced, metadata correct,
-   and confirm the recorder's latency is untouched while it runs.
-
----
-
-## Gotchas
-
-- **Never buffer frames in RAM.** `streaming_encoder.py` stream-writes for a
-  reason: buffering a 1080p clip got a child process OOM-killed on 2026-07-28.
-- **Privacy interacts with this.** `test_recorder_privacy_drive.py` exists
-  because a private-room camera must abort an open session rather than let it
-  drift toward upload. Do not weaken that path.
-- **The unit suite is the only one that runs.** The integration suite cannot
-  reach its fixtures in this environment — that is pre-existing, not something
-  you broke, and not worth fixing as part of this.
-- Do not change `should_collect()`. The gate is settled and uses only existing
-  signals by design.
+**Gotchas:** never buffer frames in RAM (`streaming_encoder.py` stream-writes
+because buffering a 1080p clip got a child OOM-killed on 2026-07-28), and do not
+weaken `test_recorder_privacy_drive.py` — a private-room camera must abort an
+open session rather than let it drift toward upload.
