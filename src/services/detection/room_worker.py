@@ -945,7 +945,8 @@ class RoomWorker:
 
         def _push_audio(event: object) -> None:
             pcm = bytes(event.frame.data)  # type: ignore[attr-defined]
-            ingest.audio_buffer.push(data=pcm, captured_at=time.monotonic())
+            captured_at = time.monotonic()
+            ingest.audio_buffer.push(data=pcm, captured_at=captured_at)
             samples = array.array("h")
             samples.frombytes(pcm[: len(pcm) - (len(pcm) % 2)])
             if samples:
@@ -961,8 +962,10 @@ class RoomWorker:
                 )
                 meter.update(peak=0, chunks=0, last_log=now)
             # Fork to the data-collection recorder (sync, non-blocking;
-            # no-op unless this camera has an active session).
-            self._recorder.feed_audio(ingest.camera_id, pcm)
+            # no-op unless this camera has an active session). The same
+            # capture time the buffer gets goes with it, so the recorder
+            # can line audio up against video and spot a stream stall.
+            self._recorder.feed_audio(ingest.camera_id, pcm, captured_at)
 
         await self._consume_with_retry(
             label="audio",

@@ -197,10 +197,18 @@ class RecorderManager:
         if rec is not None:
             rec.feed_video(width, height, data)
 
-    def feed_audio(self, camera_id: UUID, pcm: bytes) -> None:
+    def feed_audio(
+        self, camera_id: UUID, pcm: bytes, captured_at: float | None = None
+    ) -> None:
+        """Route a chunk of captured audio to the camera's session.
+
+        ``captured_at`` is when the chunk arrived, on the same monotonic
+        clock as the video frames. It's what lets the session line the
+        two streams up and notice a stall in the audio stream.
+        """
         rec = self._sessions.get(camera_id)
         if rec is not None:
-            rec.feed_audio(pcm)
+            rec.feed_audio(pcm, captured_at)
 
     # ── session wiring ──────────────────────────────────────────────
 
@@ -226,7 +234,13 @@ class RecorderManager:
         """
         final_path = fs.video_path.with_suffix(".final.mp4")
         try:
-            await self._muxer(fs.video_path, fs.audio_path, final_path)
+            await self._muxer(
+                fs.video_path,
+                fs.audio_path,
+                final_path,
+                audio_offset_seconds=fs.audio_offset_seconds,
+                duration_seconds=fs.video_duration_seconds,
+            )
         except Exception:
             logger.exception("data_collection: mux failed; dropping session")
             self._cleanup(fs.video_path, fs.audio_path, final_path)
@@ -243,6 +257,16 @@ class RecorderManager:
             "room": fs.ctx.room,
             "gate": fs.ctx.gate,
             "confidence": "" if fs.ctx.confidence is None else str(fs.ctx.confidence),
+            # The clip's own time axis, carried on the object. With the
+            # encoder now filling to the wall clock, a moment inside this
+            # file sits at `captured_at - started_at` seconds — which is
+            # what lets anything time-indexed point into the footage
+            # without opening it.
+            "started_at": fs.session_start_utc.isoformat(),
+            "duration_seconds": (
+                "" if fs.video_duration_seconds is None
+                else f"{fs.video_duration_seconds:.3f}"
+            ),
         }
 
         task = asyncio.create_task(

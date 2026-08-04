@@ -67,12 +67,35 @@ class FinalizedSession:
     audio_path: Path | None
     session_start_utc: datetime
     ctx: RecorderCtx
+    # How far the audio needs to move to line up with the video, in
+    # seconds. Positive means audio began BEFORE the video's first frame,
+    # so that much has to come off the front; negative means it began
+    # after, so that much silence goes on the front. None when either
+    # side never produced a measured start time (no audio at all, or a
+    # test encoder that doesn't report one) — the muxer then leaves the
+    # audio where it is, which is the old behaviour.
+    audio_offset_seconds: float | None = None
+    # Encoded video length. Used to cap the muxed output exactly, so the
+    # container's duration is honest instead of whatever the longer
+    # stream happened to be.
+    video_duration_seconds: float | None = None
 
 
 class _Encoder(Protocol):
     async def start(self) -> None: ...
     def feed(self, width: int, height: int, data: bytes) -> None: ...
     async def aclose(self) -> Path: ...
+
+
+# Shape of the audio detection captures and hands us (see room_worker's
+# audio consumer). Two bytes per sample, one channel, 16 kHz.
+_AUDIO_SAMPLE_RATE = 16000
+_AUDIO_CHANNELS = 1
+_AUDIO_BYTES_PER_SAMPLE = 2
+# Slack before we treat a late audio chunk as a real gap. Normal network
+# jitter moves chunks around by tens of milliseconds; only a stall long
+# enough to shift everything after it audibly is worth patching.
+_AUDIO_GAP_TOLERANCE_SECONDS = 0.25
 
 
 class _LeadInFrame(Protocol):
@@ -113,6 +136,14 @@ class SessionRecorder:
         self._session_start_mono: float = 0.0
         self._session_start_utc: datetime | None = None
         self._linger_start_mono: float = 0.0
+        # Real time the first audio byte was captured, and how many bytes
+        # we've written since. Together these say what moment any point
+        # in the audio file belongs to — measured, never inferred from
+        # the file's length, because a stall in the audio stream would
+        # otherwise shift everything after it out of place for good.
+        # (`mp4_remux` learned this the hard way on event clips.)
+        self._audio_start_mono: float | None = None
+        self._audio_bytes: int = 0
 
     @property
     def is_active(self) -> bool:
@@ -156,15 +187,54 @@ class SessionRecorder:
         ):
             self._encoder.feed(width, height, data)
 
-    def feed_audio(self, pcm: bytes) -> None:
-        if self._audio_fh is not None and self.state in (
+    def feed_audio(self, pcm: bytes, captured_at: float | None = None) -> None:
+        """Append captured audio. ``captured_at`` is when the chunk was
+        received (same monotonic clock as the video frames); pass it so a
+        stall in the audio stream can be patched with silence instead of
+        sliding everything after it earlier.
+        """
+        if self._audio_fh is None or self.state not in (
             SessionState.RECORDING,
             SessionState.LINGERING,
         ):
-            try:
-                self._audio_fh.write(pcm)
-            except Exception:  # never propagate into the audio callback
-                logger.exception("SessionRecorder.feed_audio write failed")
+            return
+        try:
+            if captured_at is not None:
+                if self._audio_start_mono is None:
+                    self._audio_start_mono = captured_at
+                else:
+                    self._pad_audio_gap(captured_at)
+            self._audio_fh.write(pcm)
+            self._audio_bytes += len(pcm)
+        except Exception:  # never propagate into the audio callback
+            logger.exception("SessionRecorder.feed_audio write failed")
+
+    def _pad_audio_gap(self, captured_at: float) -> None:
+        """Insert silence for time the audio stream didn't cover.
+
+        The stream can drop out and reconnect mid-session. Bytes alone
+        can't tell: the file just runs on, so everything recorded after
+        the gap plays too early, by the length of the gap, for the rest
+        of the clip. Comparing where this chunk *belongs* against how
+        much audio we hold exposes the hole so we can fill it.
+        """
+        assert self._audio_start_mono is not None
+        bytes_per_second = (
+            _AUDIO_SAMPLE_RATE * _AUDIO_BYTES_PER_SAMPLE * _AUDIO_CHANNELS
+        )
+        belongs_at = (captured_at - self._audio_start_mono) * bytes_per_second
+        missing = int(belongs_at) - self._audio_bytes
+        if missing <= _AUDIO_GAP_TOLERANCE_SECONDS * bytes_per_second:
+            return
+        # Whole samples only — a half-sample of padding would flip every
+        # following sample's byte order and turn the rest into noise.
+        missing -= missing % (_AUDIO_BYTES_PER_SAMPLE * _AUDIO_CHANNELS)
+        self._audio_fh.write(b"\x00" * missing)
+        self._audio_bytes += missing
+        logger.info(
+            "SessionRecorder: filled a %.2fs hole in the audio stream "
+            "camera=%s", missing / bytes_per_second, self.camera_id,
+        )
 
     # ── transitions ─────────────────────────────────────────────────
 
@@ -178,6 +248,9 @@ class SessionRecorder:
         self._audio_path = self._temp_dir / f"{sid}.audio.pcm"
         self._session_start_mono = self._clock()
         self._session_start_utc = self._utcnow()
+        # Fresh session, fresh audio timeline.
+        self._audio_start_mono = None
+        self._audio_bytes = 0
 
         encoder = self._encoder_factory(self._video_path)
         await encoder.start()
@@ -214,6 +287,10 @@ class SessionRecorder:
             except Exception:
                 logger.exception("SessionRecorder audio file close failed")
 
+        audio_start = self._audio_start_mono
+        self._audio_start_mono = None
+        self._audio_bytes = 0
+
         video_path: Path | None = None
         if encoder is not None:
             try:
@@ -224,6 +301,21 @@ class SessionRecorder:
         if video_path is None or start_utc is None:
             return  # nothing usable to hand off
 
+        # Line the two streams up against the one clock they share.
+        # `first_frame_mono` is the moment the video's opening frame was
+        # taken; `audio_start` the moment its first sample was. The gap
+        # between them is how far the audio has to move. Both come from
+        # measurement, so a slow start on either side is corrected rather
+        # than baked in. Real encoders report these; test fakes don't,
+        # and then we simply don't shift anything.
+        video_start = getattr(encoder, "first_frame_mono", None)
+        duration = getattr(encoder, "duration_seconds", None)
+        offset = (
+            video_start - audio_start
+            if video_start is not None and audio_start is not None
+            else None
+        )
+
         try:
             await self._on_finalized(
                 FinalizedSession(
@@ -231,6 +323,8 @@ class SessionRecorder:
                     audio_path=audio_path,
                     session_start_utc=start_utc,
                     ctx=self._ctx,
+                    audio_offset_seconds=offset,
+                    video_duration_seconds=duration,
                 )
             )
         except Exception:
@@ -254,6 +348,8 @@ class SessionRecorder:
         self._audio_fh = None
         self._video_path = None
         self._audio_path = None
+        self._audio_start_mono = None
+        self._audio_bytes = 0
         self.state = SessionState.IDLE
 
         if audio_fh is not None:
