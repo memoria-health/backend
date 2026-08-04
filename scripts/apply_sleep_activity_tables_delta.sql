@@ -50,3 +50,13 @@ CREATE TABLE IF NOT EXISTS public.activity_days (
     computed_at   timestamptz NOT NULL DEFAULT now(),
     UNIQUE (patient_id, day_date)
 );
+
+-- RLS (2026-08-03). Supabase grants anon/authenticated full DML on every
+-- table in public and PostgREST exposes it, so RLS is the only control —
+-- and anon is the PUBLISHABLE key that ships in the app binary. Enabling
+-- it with no policy denies all non-owner access (fail closed); the backend
+-- reaches these through the service role, which bypasses RLS.
+-- Must live in THIS file: deltas are applied one at a time, so fixing it in
+-- a later delta leaves a live exposure window in between.
+alter table public.sleep_nights enable row level security;
+alter table public.activity_days enable row level security;
