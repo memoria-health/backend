@@ -81,12 +81,9 @@ def test_stream_masking_produces_a_playable_mp4(tmp_path, monkeypatch) -> None:
     assert "video" in probed
 
 
-@_ffmpeg
-def test_stream_masking_aborts_when_no_subject_is_found(
-    tmp_path, monkeypatch
-) -> None:
-    """No mask means the clip cannot be made safe, so the whole stream
-    fails rather than writing something raw or blurred."""
+def test_no_subject_still_covers_every_frame(tmp_path, monkeypatch) -> None:
+    """Segmentation finding nobody must not leak a raw frame. Keep it
+    simple: cover the frame and carry on, no clip-dropping special case."""
     out = tmp_path / "masked.mp4"
     monkeypatch.setattr(censor, "_get_seg_model", lambda: object())
     monkeypatch.setattr(censor, "_person_mask", lambda model, frame: None)
@@ -95,11 +92,35 @@ def test_stream_masking_aborts_when_no_subject_is_found(
         lambda: type("S", (), {"censor_stream_segment_every": 5})(),
     )
 
+    written: list = []
+
+    class _Enc:
+        def __init__(self, *a, **kw) -> None: ...
+        def write(self, frame) -> None: written.append(frame)
+        def close(self) -> None: ...
+        def abort(self) -> None: ...
+
+    monkeypatch.setattr(censor, "_FrameEncoder", _Enc)
     payload = bytes(_W * _H * 3 // 2) * 5
-    with pytest.raises(censor.CensorError):
-        censor.mask_stream_sync(
-            _W, _H, _FPS, str(out), stdin=io.BytesIO(payload)
-        )
+    censor.mask_stream_sync(_W, _H, _FPS, str(out), stdin=io.BytesIO(payload))
+
+    assert len(written) == 5
+    fill = np.array(censor._RESEARCH_FILL_BGR, np.uint8)
+    assert all((f == fill).all() for f in written)
+
+
+async def test_a_failed_child_marks_the_clip_untrustworthy(tmp_path) -> None:
+    """Nothing checked the child's exit code before. A person-finder that
+    fails to load would have produced a broken file that got uploaded
+    with nothing flagged anywhere."""
+    w = MaskingMp4Writer(tmp_path / "v.mp4", width=_W, height=_H, fps=_FPS)
+    w._build_command = lambda: [sys.executable, "-c", "import sys; sys.exit(3)"]
+    await w.start()
+    w.feed(_W, _H, bytes(_W * _H * 3 // 2))
+    await w.aclose()
+
+    assert w.exit_code == 3
+    assert w.ok is False
 
 
 def test_torn_final_frame_is_not_encoded(tmp_path, monkeypatch) -> None:

@@ -90,6 +90,11 @@ class StreamingMp4Writer:
     and finalizes, returning the output path.
     """
 
+    # How long to wait for the child to finish after stdin closes.
+    # Plain ffmpeg drains almost immediately; a subclass doing real work
+    # per frame needs longer, and killing it early truncates the clip.
+    _exit_timeout = _FFMPEG_EXIT_TIMEOUT
+
     def __init__(
         self,
         out_path: Path | str,
@@ -125,6 +130,12 @@ class StreamingMp4Writer:
         self._proc: asyncio.subprocess.Process | None = None
         self._pacer_task: asyncio.Task[None] | None = None
         self._closed = False
+        # How the encoder child ended. Anything other than 0 means the
+        # file it wrote cannot be trusted — with plain ffmpeg that is
+        # rare, but the masking subclass exits non-zero when the person
+        # finder fails to load, and uploading that clip would ship a
+        # broken or unmasked file with nothing flagged anywhere.
+        self.exit_code: int | None = None
 
     @property
     def out_path(self) -> Path:
@@ -324,14 +335,27 @@ class StreamingMp4Writer:
                 except Exception:
                     pass
             try:
-                await asyncio.wait_for(proc.wait(), timeout=_FFMPEG_EXIT_TIMEOUT)
+                await asyncio.wait_for(proc.wait(), timeout=self._exit_timeout)
+                self.exit_code = proc.returncode
             except (asyncio.TimeoutError, ProcessLookupError):
                 try:
                     proc.kill()
                     await proc.wait()
                 except ProcessLookupError:
                     pass
+                self.exit_code = -1  # killed: output is truncated
+            if self.exit_code:
+                logger.error(
+                    "%s child exited %s for %s — output cannot be trusted",
+                    type(self).__name__, self.exit_code, self._out_path,
+                )
         return self._out_path
+
+    @property
+    def ok(self) -> bool:
+        """True when the encoder child finished cleanly. False means the
+        file must not be uploaded."""
+        return self.exit_code == 0
 
 
 class MaskingMp4Writer(StreamingMp4Writer):
@@ -354,9 +378,14 @@ class MaskingMp4Writer(StreamingMp4Writer):
     always be killed.
 
     The child dying takes the session's video with it — the pacer sees a
-    broken pipe and stops. That is the intended failure: research mode
-    has no safe fallback, so a clip that cannot be masked must not exist.
+    broken pipe and stops, and ``ok`` goes False so the clip is never
+    uploaded.
     """
+
+    # Segmenting is real work, and at close the child still has whatever
+    # the pipe buffered to get through. Killing it at ffmpeg's 10s would
+    # truncate the clip.
+    _exit_timeout = 120.0
 
     def _build_command(self) -> list[str]:
         import sys

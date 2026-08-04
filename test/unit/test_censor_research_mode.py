@@ -70,10 +70,15 @@ def test_dilation_still_leaves_a_real_margin() -> None:
     assert censor._research_dilate(mask).sum() > mask.sum()
 
 
-def test_no_subject_returns_none_so_the_caller_drops() -> None:
+def test_no_subject_covers_the_whole_frame() -> None:
+    """Segmentation missing someone is a segmentation failure, not
+    evidence the room is empty — the gate upstream already said a person
+    is there. So the frame gets covered, never left raw."""
     frame = _frame()
-    assert censor._research_frame(frame, None) is None
-    assert censor._research_frame(frame, np.zeros((120, 160), np.uint8)) is None
+    for mask in (None, np.zeros((120, 160), np.uint8)):
+        out = censor._research_frame(frame, mask)
+        assert out is not None
+        assert (out == np.array(censor._RESEARCH_FILL_BGR, np.uint8)).all()
 
 
 async def test_research_mode_never_falls_back_to_full_frame(monkeypatch) -> None:

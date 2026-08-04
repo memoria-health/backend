@@ -219,19 +219,20 @@ def _research_dilate(mask: np.ndarray) -> np.ndarray:
 
 def _research_frame(
     frame: np.ndarray, mask: np.ndarray | None,
-) -> "np.ndarray | None":
+) -> np.ndarray:
     """Fill the person with flat colour, keeping the room intact.
 
-    Returns **None** when there is no mask. That is the whole safety
-    contract of this mode: the event path answers "I can't find anyone"
-    by pixelating the entire frame, but a full-frame smear is worthless
-    to a research corpus, and storing the frame raw is exactly the
-    exposure we are trying to prevent. So there is no third option —
-    the caller must drop the clip.
+    No mask means segmentation missed, not that the room is empty — the
+    gate upstream already established someone is present. So the frame
+    is filled entirely rather than left as-is. One rule, no special
+    cases: whether we mask at all is decided upstream by the sensitivity
+    verdict, and once we are masking, every frame gets covered one way or
+    another.
     """
-    if mask is None or not mask.any():
-        return None
     out = frame.copy()
+    if mask is None or not mask.any():
+        out[:] = _RESEARCH_FILL_BGR
+        return out
     out[_research_dilate(mask) > 0] = _RESEARCH_FILL_BGR
     return out
 
@@ -460,9 +461,9 @@ def mask_stream_sync(
     Segmentation runs every `censor_stream_segment_every` frames and the
     mask is carried (extra-dilated) across the ones between: at 15fps a
     person moves very little in a few frames, and segmenting all of them
-    costs more than the budget allows. A frame with no mask at all is
-    DROPPED along with the whole stream — research mode has no safe
-    fallback (see `_research_frame`).
+    costs more than the budget allows. When segmentation finds nothing
+    and there is no earlier mask to carry, the frame is covered entirely
+    (`_research_frame`) — never left raw.
     """
     import cv2
     import numpy as np
@@ -497,12 +498,7 @@ def mask_stream_sync(
                     _dilate_mask(last_mask, extra=True)
                     if last_mask is not None else None
                 )
-            censored = _research_frame(frame, mask)
-            if censored is None:
-                raise CensorError(
-                    "censor: no subject in a masked stream; clip dropped"
-                )
-            encoder.write(censored)
+            encoder.write(_research_frame(frame, mask))
             index += 1
     except BaseException:
         encoder.abort()
