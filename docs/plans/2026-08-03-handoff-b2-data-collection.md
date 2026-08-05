@@ -122,9 +122,7 @@ substantive build once the pilot is running.
 | Read first | `docs/plans/2026-07-28-pilot-master-worklist.md` items 6–9 and line 200 |
 | Superseded | the June design docs, on encoding and on anything assuming consent |
 
-**Baseline:** `.venv/bin/pytest test/unit -q` → **2 failed, 932 passed, 21
-errors**. Those 2 failures (`test_face_embedding_repo`) and the 21 errors are
-pre-existing and unrelated. Anything beyond that is yours. The integration suite
+**Baseline:** `.venv/bin/pytest test/unit -q` → **996 passed, 0 failed, 0 errors**. Anything beyond that is yours. The integration suite
 cannot reach its fixtures in this environment; that is also pre-existing.
 
 **Gotchas:** never buffer frames in RAM (`streaming_encoder.py` stream-writes

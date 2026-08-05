@@ -448,6 +448,47 @@ def _censor_person_mask_sync(
     encoder.close()
 
 
+def mask_people_in_still_sync(jpeg: bytes) -> bytes:
+    """Pixelate PEOPLE in one still, leaving the room itself visible.
+
+    For the exit-door picker on a PRIVATE camera. The caregiver has to
+    see the room to tap its doors, but privacy mode exists so they
+    cannot watch that room — and a still they can re-fetch is a
+    slideshow of it. Masking the people resolves both: doors are static
+    architecture, people are the thing being protected.
+
+    DIFFERENT FAIL RULE from `_censor_frame`, deliberately. There, a
+    frame with no segmented person is pixelated FULL-FRAME, because the
+    clip already carries a sensitive verdict and a missed body is the
+    unaffordable failure. Here the room IS the subject, so full-frame
+    pixelation would defeat the feature entirely. No person found →
+    return the frame unchanged, which is correct: an empty bedroom is
+    architecture.
+
+    Segmentation being UNABLE to run still raises, so the caller fails
+    closed and serves nothing rather than an unmasked private room.
+    """
+    import cv2
+    import numpy as np
+
+    arr = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if arr is None:
+        raise CensorError("door frame: could not decode JPEG")
+
+    # Raises on a broken CV stack — that propagates, by design.
+    mask = _person_mask(_get_seg_model(), arr)
+    if mask is None or not mask.any():
+        return jpeg  # nobody in shot; the room alone is not private
+
+    # Same treatment as the event path: generous dilation, person-relative
+    # block size, block-quantised region so the silhouette does not leak.
+    out = _censor_frame(arr, mask)
+    ok, buf = cv2.imencode(".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    if not ok:
+        raise CensorError("door frame: could not re-encode JPEG")
+    return bytes(buf)
+
+
 def mask_stream_sync(
     width: int, height: int, fps: float, out_path: str, stdin: Any = None,
 ) -> None:

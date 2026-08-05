@@ -103,8 +103,7 @@ especially for private rooms. That is a product decision, not yours to assume.
 
 ## Verification
 
-1. `.venv/bin/pytest test/unit -q` — baseline **2 failed, 932 passed, 21
-   errors**. Those 2 failures and 21 errors are pre-existing and unrelated.
+1. `.venv/bin/pytest test/unit -q` — baseline **996 passed, 0 failed, 0 errors**. A clean suite is the bar — anything failing is yours.
 2. Apply `scripts/apply_review_gate_delta.sql` locally (it has **not** run on
    prod — it is one of 23 pending deltas).
 3. Full loop by hand: turn `require_review` on for one patient → fire a detector

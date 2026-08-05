@@ -17,7 +17,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Request, Response, status
 from sqlalchemy import delete, func, select
 
 log = logging.getLogger(__name__)
@@ -25,6 +25,7 @@ log = logging.getLogger(__name__)
 from src.api import cameras_ingest as pi_ingest_module
 from src.api.deps import CameraAuth, CaregiverAuth, SessionDep, SettingsDep
 from src.services import room_classifier
+from src.services.detection import censor, frame_codec
 from src.services.ingest.pi.auth import mint_ingest_token
 from src.db.camera import Camera
 from src.repos import (
@@ -1086,3 +1087,96 @@ async def update_camera(
     # model_validate would fail since the ORM row has no `paired`
     # attribute (it's a Pydantic-only computed field).
     return _to_response(cam)
+
+
+def _latest_frame_jpeg(request: Request, identity: str) -> bytes | None:
+    """Newest buffered frame for `identity`, as JPEG.
+
+    Straight from the detection worker's in-process frame buffers — the
+    same source `home_report._live_frames` uses, and the same "zero extra
+    capture cost". Returns None when the camera is not currently being
+    ingested.
+    """
+    worker = getattr(request.app.state, "detector_worker", None)
+    if worker is None:
+        return None
+    for room_worker in getattr(worker, "_rooms", {}).values():
+        ingest = getattr(room_worker, "_ingests_by_identity", {}).get(identity)
+        if ingest is None:
+            continue
+        frames = ingest.frame_buffer.snapshot_last_seconds(4.0)
+        if not frames:
+            return None
+        data = frames[-1].data
+        # Live frames have been JPEG since 2026-07-19, but synthetic raw
+        # I420 still exists in tests — sniff rather than assume.
+        if frame_codec.is_jpeg(data):
+            return data
+        return frame_codec.i420_to_jpeg(
+            data, frames[-1].width, frames[-1].height
+        )
+    return None
+
+
+@router.get("/cameras/{camera_id}/door-frame")
+async def door_frame(
+    camera_id: UUID,
+    auth: CaregiverAuth,
+    session: SessionDep,
+    request: Request,
+) -> Response:
+    """One still for the exit-door picker.
+
+    Replaces the client subscribing to the camera's LiveKit track. That
+    old path could not work for a PRIVATE camera at all: privacy mode
+    restricts track subscription to `detector_worker_*` identities, so
+    the picker waited 6s for a track that would never arrive and then
+    reported "this sensor isn't streaming" — which was wrong. It was
+    streaming; the caregiver just may not watch it.
+
+    Serving the frame from the server side fixes that without opening a
+    hole. Letting the picker subscribe instead would have made it a
+    live-view bypass for exactly the rooms privacy mode protects.
+
+    PRIVATE cameras get people pixelated first (see
+    `censor.mask_people_in_still_sync`) — doors are static architecture,
+    people are the thing being protected, and a re-fetchable still is a
+    slideshow of the room. Masking failure serves NOTHING (503) rather
+    than an unmasked private room.
+    """
+    cam = await camera_repo.find_by_id(session, camera_id, caregiver_id=auth.id)
+    if cam is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="camera_not_found",
+        )
+    if not cam.livekit_identity:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="camera_not_paired",
+        )
+
+    jpeg = _latest_frame_jpeg(request, cam.livekit_identity)
+    if jpeg is None:
+        # Genuinely not being ingested — the honest version of the old
+        # message. The client can tell the caregiver to check the camera
+        # is online, which is now actually the problem when it appears.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="camera_not_streaming",
+        )
+
+    if cam.privacy_enabled:
+        try:
+            jpeg = await asyncio.to_thread(
+                censor.mask_people_in_still_sync, jpeg
+            )
+        except Exception:  # noqa: BLE001 — fail CLOSED, never serve raw
+            log.exception(
+                "door_frame.mask_failed camera_id=%s — serving nothing",
+                camera_id,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="privacy_mask_unavailable",
+            ) from None
+
+    return Response(content=jpeg, media_type="image/jpeg")
