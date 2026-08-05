@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import html
 import logging
+import secrets
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Response, status
@@ -43,6 +44,9 @@ from src.services import event_gate, storage
 router = APIRouter(prefix="/v1/event-gate", tags=["event-gate"])
 
 log = logging.getLogger(__name__)
+
+# Replaced with the real per-response nonce inside `_html`.
+_NONCE_SLOT = "__CSP_NONCE__"
 
 
 class QueueItem(BaseModel):
@@ -318,11 +322,37 @@ button { width:100%; padding:16px; font-size:17px; font-weight:600;
 
 
 def _html(body: str, *, status_code: int = 200) -> Response:
+    """Render one page, with a CSP narrow enough to survive review.
+
+    THIS PAGE MUST SET ITS OWN CSP. `SecurityHeadersMiddleware` applies
+    `default-src 'none'; form-action 'none'` to everything, which is
+    correct for a JSON API and fatal here: it blocks the inline style
+    (unstyled page), the inline countdown script, the <video> (media-src
+    falls back to default-src, so the clip renders as a dead black box),
+    and — worst — form submission, so neither verdict button can fire.
+    Observed live on 2026-08-05 after the middleware landed. The
+    middleware yields to a handler that sets the header itself, which is
+    why this works and why it must not be removed.
+    """
+    # Per-response nonce rather than 'unsafe-inline'. The narrative on
+    # this page is model-generated text; it is escaped, but allowing
+    # arbitrary inline script would mean one escaping slip is executable
+    # on the one device that can suppress alerts for every household.
+    nonce = secrets.token_urlsafe(16)
+    csp = (
+        "default-src 'none'; "
+        f"style-src 'nonce-{nonce}'; "
+        f"script-src 'nonce-{nonce}'; "
+        "media-src 'self'; "      # the clip, proxied from our own origin
+        "form-action 'self'; "    # the two verdict buttons
+        "base-uri 'none'; frame-ancestors 'none'"
+    )
     page = (
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        f"<title>Memoria alert review</title><style>{_CSS}</style></head>"
-        f"<body><div class='wrap'>{body}</div></body></html>"
+        f"<title>Memoria alert review</title>"
+        f"<style nonce='{nonce}'>{_CSS}</style></head>"
+        f"<body><div class='wrap'>{body.replace(_NONCE_SLOT, nonce)}</div></body></html>"
     )
     # These pages carry one household's clip and narrative. Keep them out
     # of every cache and out of any referrer sent to a third party.
@@ -330,6 +360,7 @@ def _html(body: str, *, status_code: int = 200) -> Response:
         content=page,
         status_code=status_code,
         headers={
+            "Content-Security-Policy": csp,
             "Cache-Control": "no-store, max-age=0",
             "Referrer-Policy": "no-referrer",
             "X-Robots-Tag": "noindex, nofollow",
@@ -374,7 +405,7 @@ def _decision_page(row: dict, *, token: str) -> str:
           "<button class='release'>Send now — this is real</button></form>"
         + "<p class='note'>Suppressing means the caregiver is never told "
           "about this alert.</p>"
-        + "<script>var n=" + str(left) + ",e=document.getElementById('c');"
+        + f"<script nonce='{_NONCE_SLOT}'>var n=" + str(left) + ",e=document.getElementById('c');"
           "setInterval(function(){if(n>0){n--;e.textContent=n;}},1000);</script>"
     )
 
