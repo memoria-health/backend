@@ -57,7 +57,7 @@ for _noisy in ("boxmot", "ultralytics"):
 class _AccessLogQuietFilter(logging.Filter):
     _QUIET_PATHS = frozenset({"/openapi.json", "/docs", "/redoc"})
 
-    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
+    def filter(self, record: logging.LogRecord) -> bool:
         args = record.args
         if isinstance(args, tuple) and len(args) >= 3:
             path = str(args[2]).split("?", 1)[0]
@@ -71,26 +71,26 @@ logging.getLogger("uvicorn.access").addFilter(_AccessLogQuietFilter())
 # Register every ORM model in SQLAlchemy metadata at startup so foreign
 # keys resolve when the first INSERT/SELECT runs. Imported for side
 # effects only.
+from src.api.briefing import router as briefing_router
 from src.api.cameras import router as cameras_router
 from src.api.cameras_ingest import router as cameras_ingest_router
 from src.api.caregivers import router as caregivers_router
-from src.api.briefing import router as briefing_router
-from src.api.presence import router as presence_router
-from src.api.home_report import router as home_report_router
-from src.api.review import router as review_router
 from src.api.detectors import router as detectors_router
 from src.api.devices import router as devices_router
+from src.api.review import router as review_router
 from src.api.events import router as events_router
 from src.api.face_embeddings import router as face_embeddings_router
 from src.api.feedback import router as feedback_router
 from src.api.health import router as health_router
+from src.api.home_report import router as home_report_router
 from src.api.internal.cameras import router as internal_cameras_router
 from src.api.livekit import router as livekit_router
 from src.api.livekit_webhooks import router as livekit_webhooks_router
 from src.api.pairing import router as pairing_router
 from src.api.patient_members import router as patient_members_router
 from src.api.patients import router as patients_router
-from src.api.pi_discovery import router as pi_discovery_router
+from src.api.presence import router as presence_router
+from src.api.security_headers import SecurityHeadersMiddleware
 from src.api.support import router as support_router
 from src.api.talk import router as talk_router
 from src.db import analysis as _analysis  # noqa: F401
@@ -121,7 +121,7 @@ def _warm_censor_model() -> None:
 
         censor._get_seg_model()
         logging.getLogger(__name__).info("censor model warmed")
-    except Exception:  # noqa: BLE001 — warmup is best-effort
+    except Exception:
         logging.getLogger(__name__).warning(
             "censor model warmup failed; will retry lazily on first "
             "censored clip", exc_info=True,
@@ -206,11 +206,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 def create_app() -> FastAPI:
+    # Interactive docs and the raw schema are developer conveniences, and
+    # outside local/test they are pure reconnaissance: production served
+    # /openapi.json unauthenticated, handing over all 53 paths and 68
+    # operations with request/response schemas. Same fail-closed shape as
+    # _require_internal_key — local and test keep the convenience, every
+    # other env gets nothing. Passing None also unmounts the routes, so
+    # this cannot be defeated by requesting the path directly.
+    _docs_enabled = get_settings().env in ("local", "test")
     app = FastAPI(
         title="nemara-backend",
         version="0.0.1",
         lifespan=lifespan,
+        docs_url="/docs" if _docs_enabled else None,
+        redoc_url="/redoc" if _docs_enabled else None,
+        openapi_url="/openapi.json" if _docs_enabled else None,
     )
+    # Baseline browser-facing headers on every response (HSTS, CSP,
+    # nosniff, frame-deny). See src/api/security_headers.py.
+    app.add_middleware(SecurityHeadersMiddleware)
     app.include_router(health_router)
     app.include_router(caregivers_router)
     app.include_router(briefing_router)
@@ -228,8 +242,6 @@ def create_app() -> FastAPI:
     # Pairing flow + LiveKit token minting.
     app.include_router(pairing_router)
     app.include_router(livekit_router)
-    # Pi-device announce + caregiver-facing discovered list.
-    app.include_router(pi_discovery_router)
     # Phase 2: webhook receiver feeding the in-process detector worker.
     app.include_router(livekit_webhooks_router)
     # Phase 3 caregiver Talk mode.
