@@ -38,13 +38,15 @@ create policy activity_days_member on public.activity_days
   using (has_patient_access(patient_id));
 
 -- ── review_devices ───────────────────────────────────────────────────
--- No patient_id — this is a per-USER device registration, so it scopes to
--- the authenticated user rather than to patient membership. A caregiver may
--- only ever see their own push tokens.
-alter table public.review_devices enable row level security;
-drop policy if exists review_devices_self on public.review_devices;
-create policy review_devices_self on public.review_devices
-  using (user_id = auth.uid());
+-- REMOVED (2026-08-05). The table no longer exists: operator paging moved
+-- to PagerDuty (src/services/pager.py), so we store no reviewer APNs
+-- tokens at all and there is nothing here to protect. apply_event_gate_
+-- delta.sql drops it. Leaving the statements in would abort this whole
+-- file on a database where that drop has already run.
+--
+-- This is the better outcome than the RLS policy that used to sit here:
+-- the safest version of a table holding push tokens for every operator is
+-- no table.
 
 -- ── body_pool_embeddings / gateways / pi_discoveries ────────────────
 -- These already have RLS enabled with ZERO policies, which denies every

@@ -39,7 +39,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from src.db.camera import Camera
 from src.db.caregiver import Caregiver
 from src.db.patient import Patient
-from src.services import clip_archival, email, push, review_gate
+from src.services import clip_archival, email, event_gate, push
 from src.services.detection.analyses_store import add_analysis
 from src.services.detection.audio_buffer import AudioBuffer
 from src.services.detection.event_promotion import maybe_promote_analysis
@@ -2048,16 +2048,48 @@ class CameraIngest:
             # by Apple's push endpoint.
             if promotion.fired:
                 fired_ids = [ev.id for ev in promotion.fired]
-                # Review gate: when patients.require_review is OFF (default)
-                # this dispatches push+email exactly as before; ON holds the
-                # alerts for a reviewer verdict (60s auto-release). Additive.
-                asyncio.create_task(
-                    review_gate.route_events(
+                # Event gate: when patients.event_gate_enabled is OFF
+                # (the default, and true for every patient today) this
+                # dispatches push+email exactly as before. ON holds the
+                # alert for an OPERATOR verdict, with an unconditional 60s
+                # auto-release. Not the caregiver `events.reviewed`
+                # feature — see src/services/event_gate.py.
+                #
+                # The hold is AWAITED, not spawned. Clip archival below
+                # decides whether to fast-path the operator's pre-roll by
+                # reading `gate_state='pending'`, so that state has to be
+                # committed before the archival task starts. Spawning both
+                # concurrently made it a race, and archival won it every
+                # time — the operator got a page with no clip. Two local
+                # round trips; everything slow still runs off-tick.
+                # Wrapped: neither statement in `hold_gated` was guarded,
+                # and this runs INLINE, ahead of the clip-archival loop
+                # below. A DB fault here would otherwise abandon the whole
+                # tick's fan-out — no routing AND no clips — where before
+                # the gate existed it would only have cost push/email.
+                # On failure, fall back to treating everything as free:
+                # dispatching an alert we could not gate is the right
+                # direction, since the gate may only ever remove alerts.
+                try:
+                    gated, free = await event_gate.hold_gated(
                         sessionmaker=self._sessionmaker,
                         event_ids=fired_ids,
                         settings=self._settings,
+                    )
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "event_gate.hold_failed cam=%s — dispatching ungated",
+                        self.camera_id,
+                    )
+                    gated, free = [], list(fired_ids)
+                asyncio.create_task(
+                    event_gate.route_events(
+                        sessionmaker=self._sessionmaker,
+                        gated=gated,
+                        free=free,
+                        settings=self._settings,
                     ),
-                    name=f"review-route-{self.camera_id}",
+                    name=f"event-gate-route-{self.camera_id}",
                 )
                 # Clip archival: reuse the MP4 we already built for
                 # the LLM as the pre-event clip; spawn one task per

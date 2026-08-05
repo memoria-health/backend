@@ -76,7 +76,32 @@ _PERSON_CLASS_ID = 0
 # Deliberately LOW confidence floor: a false-positive mask just blurs a
 # bit more of the frame (harmless); a false negative leaves skin
 # visible (the failure we exist to prevent).
-_SEG_CONFIDENCE = 0.20
+#
+# 0.20 was not low enough. Measured 2026-08-05 against event 62250996,
+# a real evening clip where the subject stands by the wardrobe door in
+# white clothing, roughly 111/255 mean brightness:
+#
+#     conf=0.20   detected  3/21 frames      <- what shipped
+#     conf=0.15   detected  6/21 frames
+#     conf=0.10   detected 12/21 frames
+#     conf=0.07   detected 21/21 frames
+#     conf=0.05   detected 21/21 frames
+#
+# Both failure paths treat "no mask" as "cover everything", so 18 of
+# those 21 frames came out filled edge to edge: the operator's clip was
+# a solid green rectangle for its whole duration, useless for judging
+# anything, and the caregiver's censored clip would have been a
+# full-frame blur for the same reason. Neither is a rendering bug, both
+# are this number.
+#
+# A bigger model is NOT the fix. yolo11x-seg at 0.20 managed only 7/21
+# on the same frames, for far more compute than the gate's 60s window
+# can spare. The threshold dominates.
+#
+# 0.05 rather than 0.07 for margin: average mask coverage barely moves
+# between them (0.81% vs 0.63% of frame), so the cost of going lower is
+# close to nothing, while a miss is expensive in both directions.
+_SEG_CONFIDENCE = 0.05
 # Pixelation factor: the masked region is downsampled by this per axis
 # and re-upsampled with nearest-neighbour. 24 → a 720p body becomes a
 # handful of flat blocks — posture readable, identity/exposure not.
@@ -124,11 +149,20 @@ _MASK_GAP_BRIDGE_FRAMES = 3
 # Flat green: it is not a colour a room produces, so a masked region is
 # unambiguous to a human reviewer and trivially separable to a model.
 _RESEARCH_FILL_BGR = (0, 255, 0)
-# Tight margin — 2% of the short side against the event path's 6%. Still
-# a real margin, because segmentation under-covers at body edges, but
-# small enough that the pose stays honest.
-_RESEARCH_DILATE_FRACTION = 0.02
-_RESEARCH_DILATE_MIN_PX = 5
+# Margin around the segmented person. 2% of the short side is ~21px on a
+# 1080p frame, which rounds off fingers and closes the gaps between limbs
+# — the silhouette reads as a blob rather than a person. That size was
+# compensating for a mask that arrived at ~160x160 and was upscaled with
+# nearest-neighbour; `_person_mask` now computes at full resolution and
+# interpolates before thresholding, so the mask itself is accurate to a
+# few pixels and the margin no longer has to cover for it.
+#
+# 0.5% (~5px at 1080p) still covers the under-coverage segmentation shows
+# at body edges, especially loose clothing and hair. Raise it if any real
+# footage shows skin outside the fill; that is the failure that matters,
+# and it is the reason this is a named constant rather than a literal.
+_RESEARCH_DILATE_FRACTION = 0.005
+_RESEARCH_DILATE_MIN_PX = 3
 
 CENSOR_MODE_PIXELATE = "pixelate"  # event clips (default, unchanged)
 CENSOR_MODE_RESEARCH = "research"  # B2 corpus only
@@ -166,15 +200,27 @@ def _person_mask(model, frame: np.ndarray) -> np.ndarray | None:
         classes=[_PERSON_CLASS_ID],
         conf=_SEG_CONFIDENCE,
         verbose=False,
+        # Compute masks at the input image's resolution rather than at the
+        # prototype resolution (~160x160). Without this the mask is
+        # produced ~12x smaller than a 1080p frame and every edge is
+        # reconstructed by upscaling, which is where the staircase edges
+        # come from. Costs some inference time, buys the outline.
+        retina_masks=True,
     )
     result = results[0]
     if result.masks is None or len(result.masks.data) == 0:
         return None
     stacked = result.masks.data.cpu().numpy()  # (n, mh, mw) in [0,1]
-    union = (stacked.max(axis=0) > 0.5).astype(np.uint8)
+    # Union in FLOAT, resize in float, threshold last. The old order
+    # thresholded to {0,1} first and then resized with INTER_NEAREST, so
+    # each source pixel became a hard rectangular block — the single
+    # biggest cause of the blocky silhouette. Interpolating the soft mask
+    # and cutting at 0.5 recovers a smooth boundary at no real cost.
+    union_f = stacked.max(axis=0).astype(np.float32)
     h, w = frame.shape[:2]
-    if union.shape != (h, w):
-        union = cv2.resize(union, (w, h), interpolation=cv2.INTER_NEAREST)
+    if union_f.shape != (h, w):
+        union_f = cv2.resize(union_f, (w, h), interpolation=cv2.INTER_LINEAR)
+    union = (union_f > 0.5).astype(np.uint8)
     return union if union.any() else None
 
 

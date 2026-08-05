@@ -106,6 +106,7 @@ async def home_report(
         events = (await session.execute(text(
             """select title, occurred_at at time zone :tz, reviewed from events
                where patient_id=:p and occurred_at > now() - interval '48 hours'
+                 and coalesce(gate_state,'none') not in ('pending','rejected')
                order by occurred_at desc limit 6"""),
             {"p": str(pid), "tz": body.timezone})).all()
         seen = (await session.execute(text(
@@ -116,6 +117,7 @@ async def home_report(
         week = (await session.execute(text(
             """select initcap(replace(lower(title),'possible ','')), count(*)::int
                from events where patient_id=:p and occurred_at > now() - interval '7 days'
+                 and coalesce(gate_state,'none') not in ('pending','rejected')
                group by 1 order by 2 desc limit 6"""), {"p": str(pid)})).all()
         act_rows = (await session.execute(text(
             """select (captured_at at time zone :tz)::date, count(*),

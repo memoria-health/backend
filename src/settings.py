@@ -803,6 +803,48 @@ class Settings(BaseSettings):
     # we refresh slightly under that to leave headroom.
     apns_jwt_lifetime_seconds: int = Field(ge=60, le=3600, default=3300)
 
+    # ── Event gate: operator paging + verdict links ─────────────
+    # The gate holds an alert and pages an operator (not a caregiver —
+    # see src/services/event_gate.py). Paging goes through PagerDuty
+    # rather than our own APNs because their app already holds Apple's
+    # critical-alerts entitlement and does repeat-until-acknowledged.
+    #
+    # `pagerduty_routing_key` is the Integration Key of a PagerDuty
+    # service (Service → Integrations → Events API v2). Empty disables
+    # paging: the gate still holds and still auto-releases, but nobody
+    # is told, so the gate silently does nothing. Never leave it empty
+    # in an environment where any patient has event_gate_enabled on.
+    pagerduty_routing_key: str = Field(default="")
+    pagerduty_events_url: str = Field(
+        default="https://events.pagerduty.com/v2/enqueue"
+    )
+
+    # Public origin of THIS backend, used to build the verdict link that
+    # travels inside the page. Must be reachable from a phone on cellular
+    # — a LAN address here produces a link that works only at your desk.
+    event_gate_public_base_url: str = Field(default="")
+
+    # HMAC key for verdict links. One link grants sight of a single
+    # household's clip and the power to suppress a single real alert, so
+    # treat it as a live credential: rotating it kills every outstanding
+    # link. Empty disables link minting (fail closed — the page then
+    # carries no action link rather than an unsigned one).
+    event_gate_link_secret: str = Field(default="")
+
+    # How long a verdict link stays valid. Deliberately longer than the
+    # auto-release so a link opened late renders "already dispatched"
+    # instead of a signature error, which would look like a bug.
+    event_gate_link_ttl_seconds: int = Field(ge=30, le=900, default=180)
+
+    # Bearer token for the operator-only queue endpoint. Cross-tenant by
+    # design — it reads every household. Never ship it in a client.
+    ops_api_token: str = Field(default="")
+
+    # Cadence of the durable auto-release sweeper. The in-process timer
+    # gives an exact 60s release but dies with the process; this sweeper
+    # is what stops a deploy mid-window from stranding an alert forever.
+    event_gate_sweep_seconds: int = Field(ge=5, le=300, default=15)
+
     # ── Clip archival (Phase 4) ─────────────────────────────────
     # Wait this many seconds after an event fires before snapshotting
     # the post-event buffer window. pre.mp4 (T-window..T) and post.mp4

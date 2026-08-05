@@ -111,7 +111,10 @@ class Patient(Base):
         Boolean, server_default=text("false"), default=False,
     )
 
-    # review-gate: hold alerts for human YES/NO before dispatch (additive)
-    require_review: Mapped[bool] = mapped_column(
-        Boolean, server_default=text("false"), default=False,
+    # Event gate: hold this patient's alerts for an OPERATOR yes/no before
+    # any caregiver is told (src/services/event_gate.py). Unrelated to
+    # `events.reviewed`, which is the caregiver's own retrospective review.
+    # Operator-controlled, not caregiver-facing, and off for everyone.
+    event_gate_enabled: Mapped[bool] = mapped_column(
+        Boolean, server_default=text("true"), default=True,
     )
