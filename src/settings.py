@@ -268,6 +268,18 @@ class Settings(BaseSettings):
         ge=1, le=60, default=3
     )
 
+    # Whether a research clip whose video was masked keeps its audio.
+    # ON by default: a masked clip is exactly where sound carries the most
+    # of what happened, and the corpus is opt-in. This is OURS to flip,
+    # not a per-family setting — hence a setting and not a column.
+    #
+    # It only decides whether we KEEP the audio. It can never cause any to
+    # be captured: `patients.audio_capture_enabled` severs the track at
+    # the publisher for facilities where recording audio is illegal, so
+    # when that is false no audio reaches us to keep.
+    # Env: NEMARA_DATA_COLLECTION_KEEP_SENSITIVE_AUDIO.
+    data_collection_keep_sensitive_audio: bool = True
+
     # ── Detector subscriber-bot (Phase 2) ───────────────────────
     # The bot lives inside the FastAPI process as an asyncio task tree
     # that subscribes to LiveKit rooms and runs the detector pipeline.

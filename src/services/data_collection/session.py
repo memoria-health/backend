@@ -94,6 +94,9 @@ class FinalizedSession:
     # frame is written twice to cover it) but the intermediate picture is
     # gone. A quality signal, not a fault.
     dropped_frames: int = 0
+    # Whether this session's video was masked. Decides whether the
+    # keep-sensitive-audio switch applies to it.
+    masked: bool = False
 
 
 class _Encoder(Protocol):
@@ -132,8 +135,10 @@ class SessionRecorder:
         utcnow: Callable[[], datetime],
         roll_seconds: float = 900.0,
         linger_seconds: float = 45.0,
+        masked: bool = False,
     ) -> None:
         self.camera_id = camera_id
+        self.masked = masked
         self._ctx = ctx
         self._temp_dir = Path(temp_dir)
         self._encoder_factory = encoder_factory
@@ -346,6 +351,7 @@ class SessionRecorder:
                         getattr(encoder, "deficit_seconds", 0.0)
                     ),
                     dropped_frames=int(getattr(encoder, "dropped", 0)),
+                    masked=self.masked,
                 )
             )
         except Exception:

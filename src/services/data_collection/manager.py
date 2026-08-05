@@ -161,6 +161,22 @@ class RecorderManager:
         self._retry_base_delay = retry_base_delay
         self._sleep = sleep
 
+        # Running tally of what the recorder did. Without this, collection
+        # can stop completely — cap reached, B2 unconfigured, every upload
+        # failing — and nothing anywhere says so. Read it via `stats`.
+        self.stats: dict[str, int] = {
+            "sessions_started": 0,
+            "sessions_masked": 0,
+            "clips_uploaded": 0,
+            "dropped_cap": 0,
+            "dropped_privacy": 0,
+            "dropped_encoder": 0,
+            "dropped_mux": 0,
+            "dropped_no_b2": 0,
+            "dropped_upload_failed": 0,
+            "clips_short": 0,
+        }
+
         self._sessions: dict[UUID, SessionRecorder] = {}
         self._pending_uploads: set[asyncio.Task] = set()
         # Detection ticks for one camera can OVERLAP (the tick loop is
@@ -210,11 +226,15 @@ class RecorderManager:
                         self._max_concurrent,
                         camera_id,
                     )
+                    self.stats["dropped_cap"] += 1
                     return
                 rec = self._make_recorder(
                     camera_id, ctx, masked=self._masked.get(camera_id, False)
                 )
                 self._sessions[camera_id] = rec
+                self.stats["sessions_started"] += 1
+                if self._masked.get(camera_id):
+                    self.stats["sessions_masked"] += 1
 
             await rec.on_tick(
                 collect, lead_in_frames=lead_in_frames, lead_in_audio=lead_in_audio
@@ -339,6 +359,7 @@ class RecorderManager:
             utcnow=self._utcnow,
             roll_seconds=self._roll_seconds,
             linger_seconds=self._linger_seconds,
+            masked=masked,
         )
 
     async def _handle_finalized(self, fs: FinalizedSession) -> None:
@@ -349,6 +370,19 @@ class RecorderManager:
         never blocks the tick.
         """
         final_path = fs.video_path.with_suffix(".final.mp4")
+        # A masked clip is where sound carries most of what happened, so
+        # it is kept by default. This switch is ours to flip; it can only
+        # DISCARD audio, never cause any to be captured (that is severed
+        # at the publisher by `patients.audio_capture_enabled`).
+        audio_path = fs.audio_path
+        if fs.masked and not getattr(
+            self._settings, "data_collection_keep_sensitive_audio", True
+        ):
+            logger.info(
+                "data_collection: dropping audio from a masked clip "
+                "(keep_sensitive_audio is off) camera=%s", fs.ctx.camera_id,
+            )
+            audio_path = None
         if not fs.encoder_ok:
             # The encoder child died. Its file is truncated at best, and
             # for a masked session there is no telling how much of it got
@@ -357,17 +391,19 @@ class RecorderManager:
                 "data_collection: encoder failed for camera %s; discarding "
                 "the clip", fs.ctx.camera_id,
             )
+            self.stats["dropped_encoder"] += 1
             self._cleanup(fs.video_path, fs.audio_path)
             return
         try:
             await self._muxer(
                 fs.video_path,
-                fs.audio_path,
+                audio_path,
                 final_path,
                 audio_offset_seconds=fs.audio_offset_seconds,
                 duration_seconds=fs.video_duration_seconds,
             )
         except Exception:
+            self.stats["dropped_mux"] += 1
             logger.exception("data_collection: mux failed; dropping session")
             self._cleanup(fs.video_path, fs.audio_path, final_path)
             return
@@ -447,6 +483,7 @@ class RecorderManager:
                         "discarding clip %s",
                         key,
                     )
+                    self.stats["dropped_privacy"] += 1
                     return
             except Exception:
                 logger.exception(
@@ -460,6 +497,7 @@ class RecorderManager:
                 logger.warning(
                     "data_collection: B2 not configured; discarding clip %s", key
                 )
+                self.stats["dropped_no_b2"] += 1
                 return
             # Data-residency: resolve the patient's region so India clips land
             # in the India bucket. A lookup failure defaults to US (never block
@@ -487,6 +525,13 @@ class RecorderManager:
                     final_path, key, metadata=metadata, settings=self._settings,
                     region=region,
                 )
+                self.stats["clips_uploaded"] += 1
+                if metadata.get("timeline_exact") == "false":
+                    self.stats["clips_short"] += 1
+                logger.info(
+                    "data_collection: uploaded %s (%s) stats=%s",
+                    key, metadata.get("duration_seconds"), self.stats,
+                )
                 return
             except Exception:
                 if attempt >= self._upload_retries:
@@ -495,6 +540,7 @@ class RecorderManager:
                         attempt,
                         key,
                     )
+                    self.stats["dropped_upload_failed"] += 1
                     return
                 logger.warning(
                     "data_collection: upload attempt %d failed key=%s; retrying",
