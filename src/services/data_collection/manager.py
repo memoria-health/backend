@@ -393,6 +393,18 @@ class RecorderManager:
                 "" if fs.video_duration_seconds is None
                 else f"{fs.video_duration_seconds:.3f}"
             ),
+            # Whether this clip's timeline can be trusted. "true" means
+            # duration equals the real session and an offset inside the
+            # file is exactly `captured_at - started_at`. "false" means
+            # the encoder fell too far behind to catch up, so the clip is
+            # short and later offsets have shifted — the consumer needs to
+            # know that without opening the file or reading our logs.
+            "timeline_exact": "false" if fs.deficit_seconds else "true",
+            "lost_seconds": f"{fs.deficit_seconds:.1f}",
+            # Frames overwritten before they could be encoded. Their time
+            # is still represented; the intermediate picture is not.
+            # A sharpness signal for whoever trains on this.
+            "dropped_frames": str(fs.dropped_frames),
         }
 
         task = asyncio.create_task(

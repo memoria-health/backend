@@ -400,6 +400,13 @@ class StreamingMp4Writer:
         return self._out_path
 
     @property
+    def deficit_seconds(self) -> float:
+        """Wall clock this clip could not represent at all. 0.0 on a
+        healthy clip; anything else means the file is that much shorter
+        than the session it recorded."""
+        return self.deficit_frames / self._fps if self._fps else 0.0
+
+    @property
     def ok(self) -> bool:
         """True when the encoder child finished cleanly. False means the
         file must not be uploaded."""

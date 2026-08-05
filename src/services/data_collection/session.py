@@ -83,6 +83,17 @@ class FinalizedSession:
     # empty, and for a masked session it may not have masked anything —
     # either way the clip must not be uploaded.
     encoder_ok: bool = True
+    # Frames of wall clock the encoder could not write at all. Zero on a
+    # healthy clip. Non-zero means the clip is genuinely SHORTER than the
+    # session it recorded, and offsets after the stall are no longer
+    # exactly `captured_at - started_at` — so it rides along to storage
+    # rather than staying a number in a log nobody reads.
+    deficit_seconds: float = 0.0
+    # Frames that arrived while the encoder was busy and were overwritten
+    # in the one-frame slot. Their time IS still represented (the newest
+    # frame is written twice to cover it) but the intermediate picture is
+    # gone. A quality signal, not a fault.
+    dropped_frames: int = 0
 
 
 class _Encoder(Protocol):
@@ -331,6 +342,10 @@ class SessionRecorder:
                     video_duration_seconds=duration,
                     # Test encoders don't report this; assume fine.
                     encoder_ok=bool(getattr(encoder, "ok", True)),
+                    deficit_seconds=float(
+                        getattr(encoder, "deficit_seconds", 0.0)
+                    ),
+                    dropped_frames=int(getattr(encoder, "dropped", 0)),
                 )
             )
         except Exception:
