@@ -205,22 +205,26 @@ async def hold_gated(
 async def route_events(
     *,
     sessionmaker: "async_sessionmaker",
-    event_ids: list[UUID],
+    gated: list[UUID],
+    free: list[UUID],
     settings: "Settings",
 ) -> None:
-    """Split fired events: gated → hold + page + timer; rest → dispatch.
+    """Dispatch the free events; page + time out the held ones.
 
     With `patients.event_gate_enabled` off (the default, and true for
     every patient today) every event lands in `free` and this is the
     old direct fan-out with an extra SELECT.
 
-    Callers that also spawn clip archival MUST `await hold_gated()`
-    themselves first and only then start this — see that function.
+    `gated` and `free` come from the caller's `hold_gated()` — this used
+    to recompute them, which meant an operator toggling the patient's gate
+    off in the milliseconds between the two calls reclassified an
+    already-held event as free: it dispatched immediately, stayed
+    'pending' because nothing settled it, and was then dispatched a
+    SECOND time by the sweeper 60s later. One classification, taken once,
+    at the moment of the hold.
     """
-    if not event_ids:
+    if not gated and not free:
         return
-    gated, free = await hold_gated(
-        sessionmaker=sessionmaker, event_ids=event_ids, settings=settings)
 
     if free:
         await _dispatch(sessionmaker=sessionmaker, event_ids=free, settings=settings)

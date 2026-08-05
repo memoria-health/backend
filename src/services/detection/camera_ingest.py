@@ -2062,15 +2062,31 @@ class CameraIngest:
                 # concurrently made it a race, and archival won it every
                 # time — the operator got a page with no clip. Two local
                 # round trips; everything slow still runs off-tick.
-                await event_gate.hold_gated(
-                    sessionmaker=self._sessionmaker,
-                    event_ids=fired_ids,
-                    settings=self._settings,
-                )
+                # Wrapped: neither statement in `hold_gated` was guarded,
+                # and this runs INLINE, ahead of the clip-archival loop
+                # below. A DB fault here would otherwise abandon the whole
+                # tick's fan-out — no routing AND no clips — where before
+                # the gate existed it would only have cost push/email.
+                # On failure, fall back to treating everything as free:
+                # dispatching an alert we could not gate is the right
+                # direction, since the gate may only ever remove alerts.
+                try:
+                    gated, free = await event_gate.hold_gated(
+                        sessionmaker=self._sessionmaker,
+                        event_ids=fired_ids,
+                        settings=self._settings,
+                    )
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "event_gate.hold_failed cam=%s — dispatching ungated",
+                        self.camera_id,
+                    )
+                    gated, free = [], list(fired_ids)
                 asyncio.create_task(
                     event_gate.route_events(
                         sessionmaker=self._sessionmaker,
-                        event_ids=fired_ids,
+                        gated=gated,
+                        free=free,
                         settings=self._settings,
                     ),
                     name=f"event-gate-route-{self.camera_id}",

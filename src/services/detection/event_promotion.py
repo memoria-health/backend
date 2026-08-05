@@ -682,6 +682,19 @@ async def _insert_event(
         review_notes=None,
         reviewed_at=None,
         created_at=datetime.now(timezone.utc),
+        # Event gate: stamp the hold IN THE INSERT, not afterwards.
+        # `events` is in the supabase_realtime publication, so the row is
+        # broadcast to the caregiver app the moment it commits. Stamping
+        # 'pending' in a later UPDATE left a window — small, but the whole
+        # point of the gate is that the family never sees a false alarm —
+        # where the row was published with gate_state NULL and the RLS
+        # policy therefore treated it as visible. Setting it here means a
+        # gated event is never visible to a caregiver at any instant.
+        # Null for every patient with the gate off, which is all of them.
+        gate_state="pending" if patient.event_gate_enabled else None,
+        gate_held_at=(
+            datetime.now(timezone.utc) if patient.event_gate_enabled else None
+        ),
     )
     session.add(row)
     await session.flush()

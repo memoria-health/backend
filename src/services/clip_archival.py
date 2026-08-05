@@ -76,6 +76,9 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# Strong refs for in-flight operator-clip tasks (see archive_event).
+_GATE_CLIP_TASKS: set[asyncio.Task] = set()
+
 
 async def archive_event(
     *,
@@ -204,7 +207,15 @@ async def archive_event(
         except Exception:  # noqa: BLE001 — best-effort, never fatal
             log.exception("event_gate.fast_path_failed event=%s", event_id)
 
-    asyncio.create_task(_gate_fast_path(), name=f"event-gate-clip-{event_id}")
+    # Keep a strong reference. asyncio only holds a weak one, so a
+    # fire-and-forget task can be collected mid-flight — the operator's
+    # clip would then silently never appear, indistinguishable from a slow
+    # upload. Same guard the rest of this codebase uses (see
+    # camera_ingest._bg_tasks, livekit_webhooks, room_classifier).
+    _task = asyncio.create_task(
+        _gate_fast_path(), name=f"event-gate-clip-{event_id}")
+    _GATE_CLIP_TASKS.add(_task)
+    _task.add_done_callback(_GATE_CLIP_TASKS.discard)
 
     try:
         await _archive_one(

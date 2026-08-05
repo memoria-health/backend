@@ -159,9 +159,15 @@ async def act_clip(token: str, session: SessionDep, settings: SettingsDep) -> Re
     # whenever the screen cleared the room, which is most of the time.
     # An operator seeing every household must never be served that. If
     # the masked clip is absent, they decide from the narrative.
+    # Settlement closes the clip too, not just the page. The token TTL is
+    # deliberately longer than the auto-release, so without this check a
+    # link kept open served a household's footage for a further ~2 minutes
+    # after the decision was already made. The page itself already refuses
+    # to act once settled; this makes the bytes follow the same rule.
     row = (await session.execute(text(
         """select e.gate_clip_key
-           from events e where e.id = :id"""), {"id": str(event_id)})).first()
+           from events e where e.id = :id and e.gate_state = 'pending'"""),
+        {"id": str(event_id)})).first()
     if row is None or not row[0]:
         raise HTTPException(status_code=404, detail="clip_not_ready")
     try:

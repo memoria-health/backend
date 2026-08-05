@@ -422,8 +422,12 @@ def test_gate_clip_is_spawned_not_awaited_before_the_caregiver_clip() -> None:
     from src.services import clip_archival
 
     src = inspect.getsource(clip_archival.archive_event)
-    spawn = src.find("asyncio.create_task(_gate_fast_path()")
-    archive = src.find("await _archive_one(")
+    # Whitespace-insensitive: the spawn is a multi-line call.
+    flat = " ".join(src.split())
+    spawn = flat.find("asyncio.create_task( _gate_fast_path()")
+    if spawn == -1:
+        spawn = flat.find("asyncio.create_task(_gate_fast_path()")
+    archive = flat.find("await _archive_one(")
     assert spawn != -1, "the gate clip is no longer spawned as a task"
     assert archive != -1
     assert spawn < archive, (

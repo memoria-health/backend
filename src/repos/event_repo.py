@@ -123,6 +123,16 @@ async def find_by_id(
         .where(
             Event.id == event_id,
             Patient.id.in_(accessible_patient_ids(caregiver_id)),
+            # Same event-gate filter as `list_for_patient`. Without it the
+            # by-id route is the hole: a caregiver who learned an id (the
+            # app caches ids from earlier pages) could still fetch a held
+            # or suppressed event's narrative and clip through
+            # GET /v1/events/{id} and /clip-url. The backend runs as the
+            # service role, so RLS does not cover this.
+            or_(
+                Event.gate_state.is_(None),
+                Event.gate_state.notin_(("pending", "rejected")),
+            ),
         )
     )
     return result.scalar_one_or_none()
