@@ -12,14 +12,15 @@ attempts.
 import asyncio
 import base64
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import select, update
 
 from src.api.deps import CaregiverAuth, SessionDep, SettingsDep
+from src.api.rate_limit import RateLimit, RateLimitPolicy
 from src.db.camera import Camera
 from src.db.camera_detector import CameraDetector
 from src.db.detector import Detector
@@ -51,6 +52,15 @@ from src.settings import Settings
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1", tags=["detector"])
+
+# Creating a detector compiles a plan through the VLM, and every tick it
+# then schedules is a paid call. Detectors are user-creatable with no
+# per-account cap, so a compromised account could drive spend without
+# bound (audit M1). 30/minute is far above real use — a caregiver adds a
+# handful, once — while capping automated creation.
+CREATE_DETECTOR_RATE_LIMIT = RateLimitPolicy(
+    name="detectors_create", limit=30, window_seconds=60,
+)
 
 
 # ── Wandering exit-door picker ──────────────────────────────────────
@@ -103,7 +113,7 @@ async def detect_doors_endpoint(
     taps elsewhere to override); the choice is saved via `set-wandering-door`."""
     try:
         image = base64.b64decode(body.image_base64, validate=True)
-    except Exception:  # noqa: BLE001
+    except Exception:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="invalid image_base64",
@@ -192,7 +202,7 @@ async def set_camera_wandering_door(
         cd = CameraDetector(
             camera_id=camera_id,
             detector_id=det.id,
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(UTC),
             door_config=door_config,
         )
         session.add(cd)
@@ -384,7 +394,7 @@ async def add_detectors_from_library(
         if d.identifier
     }
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     created: list[Detector] = []
     skipped: list[str] = []
     for i, key in enumerate(requested):
@@ -515,7 +525,7 @@ def _fmt_time(hhmm: str) -> str:
         h, m = int(h_str), int(m_str)
         suffix = "AM" if h < 12 else "PM"
         return f"{h % 12 or 12}:{m:02d} {suffix}"
-    except Exception:  # noqa: BLE001
+    except Exception:
         return hhmm
 
 
@@ -594,7 +604,7 @@ def _compose_plan(
             watches=watches, fires=fires, checks=checks,
             listens=bool(dims.get("needs_audio")),
         )
-    except Exception:  # noqa: BLE001 — preview must never block creation
+    except Exception:
         log.debug("detector plan composition failed", exc_info=True)
         return None
 
@@ -603,6 +613,7 @@ def _compose_plan(
     "/patients/{patient_id}/detectors",
     response_model=DetectorResponse,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(RateLimit(CREATE_DETECTOR_RATE_LIMIT))],
 )
 async def create_detector(
     patient_id: UUID,
@@ -651,7 +662,7 @@ async def create_detector(
             detail="patient_not_found",
         )
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     # where_rooms is the canonical room scope (None = every room).
     resolved_rooms = body.where_rooms
     det = Detector(
@@ -791,7 +802,7 @@ async def _compile_and_update_detector(
                 prompt_fragment=compiled.prompt_fragment,
                 schema_json=compiled.schema_json,
                 user_criteria=criteria,
-                updated_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(UTC),
                 **dims,
             )
         )
@@ -934,7 +945,7 @@ async def refine_detector(
         new_schedule = reinf.schedule if new_trigger == "absence" else None
         new_when = reinf.when_scope        # None if nothing usable was inferred
         new_where_hint = reinf.where_hint  # None if no place was named
-    except Exception:  # noqa: BLE001 — trigger re-inference is best-effort
+    except Exception:
         log.debug("refine: trigger re-inference failed; keeping current trigger", exc_info=True)
         new_trigger = det.alert_trigger
         new_sustained = det.is_sustained
@@ -990,7 +1001,7 @@ async def refine_detector(
                 identifier=det.identifier,
                 refinements=refinements,
             )
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="detector_preview_unavailable",

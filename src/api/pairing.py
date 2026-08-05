@@ -16,18 +16,26 @@ returns 401.
 """
 
 import secrets
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from urllib.parse import urlsplit, urlunsplit
 
 import bcrypt
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 
 from src.api.deps import SessionDep, SettingsDep
+from src.api.rate_limit import RateLimit, RateLimitPolicy
 from src.db.camera import Camera
 from src.schemas.pairing import PairRequest, PairResponse
 
 router = APIRouter(prefix="/v1", tags=["camera"])
+
+# Pairing codes are six digits (100000-999999). Unlimited guessing
+# exhausts that space, and the demo code below never expires, so this
+# endpoint is the single most brute-forceable thing in the API. 10 per
+# minute per caller leaves a real pairing (one or two attempts, typed
+# by hand from a screen) untouched while making enumeration useless.
+PAIR_RATE_LIMIT = RateLimitPolicy(name="cameras_pair", limit=10, window_seconds=60)
 
 # Stable identity marker for the App Review demo camera. The demo-pair
 # path matches the camera by THIS, not by pairing_code — the caregiver
@@ -41,6 +49,7 @@ DEMO_CAMERA_IDENTITY = "cam_demo"
     "/cameras/pair",
     response_model=PairResponse,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RateLimit(PAIR_RATE_LIMIT))],
 )
 async def pair_camera(
     body: PairRequest,
@@ -48,7 +57,7 @@ async def pair_camera(
     session: SessionDep,
     settings: SettingsDep,
 ) -> PairResponse:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     # App Review demo path: a configured, never-expiring, reusable code.
     # Lets an Apple reviewer pair a fresh NemaraCam install against the
