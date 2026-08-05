@@ -11,8 +11,12 @@ __pycache__/
 # with teammates via a secret manager / 1Password, not the repo). Prod
 # secrets live only in Railway. (.env was previously tracked for partner
 # onboarding; it has been untracked and its leaked secrets rotated.)
-.env
-.env.local
+# Catch-all, not a list. The enumerated form (.env, .env.local, .env.bak*)
+# missed anything not thought of in advance — on 2026-08-04 a working
+# `.env.local-backup-<ts>` matched none of them and would have been
+# committable. Ignore EVERY .env variant; allow only the example.
+.env*
+!.env.example
 
 # Local-start.sh runtime state (PIDs + log files for backend + ngrok)
 .dev/
