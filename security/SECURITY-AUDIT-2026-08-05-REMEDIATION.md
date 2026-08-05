@@ -102,13 +102,33 @@ Probed the deployed backend directly on 2026-08-05.
 
 ### New findings from this pass
 
-- **`NEMARA_DEMO_PAIRING_CODE` is set in production.** A never-expiring,
-  reusable six-digit code that pairs against one seeded row
-  (`DEMO_CAMERA_IDENTITY = "cam_demo"`). Needed for Apple App Review, which
-  cannot produce a live 10-minute pairing code. Blast radius is the demo row
-  only — **not** a path into real patient data. Accepted as Low; the new rate
-  limit closes the brute-force angle. Removing it risks failing App Review
-  right before the pilot.
+- **`NEMARA_DEMO_PAIRING_CODE` — a Critical in the code, NOT live in prod.**
+
+  The variable is set in production. `seed_demo_camera.py` attached the demo
+  camera to **the caregiver's first real patient**, so pairing with that
+  six-digit, never-expiring, reusable code returned a real `patient_id` and
+  `livekit_room`, and the `api_key` it handed back minted a room token whose
+  grants include `can_subscribe` — the live cameras in that person's home.
+
+  **Verified 2026-08-05: production has no `cam_demo` row.** The seeder was
+  never run there, so `_pair_demo_camera` returns 404
+  `demo_camera_not_provisioned` and the code reaches nothing. Not exploitable
+  as deployed.
+
+  Fixed in the code anyway (`84fef8d`), because the exposure would have been
+  created by the first person to run the seeder against production —
+  precisely the step App Review preparation calls for.
+
+  **Consequence to plan around: App Review pairing does not currently work in
+  production.** The code is configured but the camera it needs does not exist.
+  Before the next submission, run the fixed seeder with `--remote`, which now
+  creates a dedicated demo patient instead of borrowing a real one.
+
+  I initially assessed this as "scoped to the demo row, not a path into real
+  patient data" after reading only the pair handler. That was wrong, and only
+  reading the seed script showed it. Recorded because the reasoning error —
+  judging blast radius from the endpoint without checking what the data
+  actually points at — is the reusable lesson.
 - **`NEMARA_DASHSCOPE_API_KEY` exists in production** and was missing from the
   key-rotation list. Rotation list is now six keys, not five.
 - **`NEMARA_LIVEKIT_WEBHOOK_API_KEY` is absent in production** but present
