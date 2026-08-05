@@ -21,6 +21,7 @@ Requires the same deltas as test_gateway_roster.py.
 
 from __future__ import annotations
 
+import jwt as pyjwt
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import text
@@ -55,7 +56,18 @@ async def test_gateway_mints_token_for_its_own_camera(
     assert body["token"]
     # A JWT, not an opaque string — three dot-separated segments.
     assert body["token"].count(".") == 2
-    assert body["identity"] == cam["livekit_identity"]
+
+    # Assert on the GRANT, not on an echo of the request.
+    #
+    # This previously read `body["identity"]`, which MintTokenResponse
+    # has never carried (token / url / expires_at only), so the test has
+    # failed since it was added in e64848c. Restoring the intent rather
+    # than the line: the property worth pinning is that the minted token
+    # is scoped to this camera's identity and room — reading it back off
+    # the response would only prove the server echoed what we sent.
+    claims = pyjwt.decode(body["token"], options={"verify_signature": False})
+    assert claims["sub"] == cam["livekit_identity"]
+    assert claims["video"]["room"] == cam["livekit_room"]
 
 
 @pytest.mark.asyncio
