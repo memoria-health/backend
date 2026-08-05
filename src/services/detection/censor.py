@@ -76,7 +76,32 @@ _PERSON_CLASS_ID = 0
 # Deliberately LOW confidence floor: a false-positive mask just blurs a
 # bit more of the frame (harmless); a false negative leaves skin
 # visible (the failure we exist to prevent).
-_SEG_CONFIDENCE = 0.20
+#
+# 0.20 was not low enough. Measured 2026-08-05 against event 62250996,
+# a real evening clip where the subject stands by the wardrobe door in
+# white clothing, roughly 111/255 mean brightness:
+#
+#     conf=0.20   detected  3/21 frames      <- what shipped
+#     conf=0.15   detected  6/21 frames
+#     conf=0.10   detected 12/21 frames
+#     conf=0.07   detected 21/21 frames
+#     conf=0.05   detected 21/21 frames
+#
+# Both failure paths treat "no mask" as "cover everything", so 18 of
+# those 21 frames came out filled edge to edge: the operator's clip was
+# a solid green rectangle for its whole duration, useless for judging
+# anything, and the caregiver's censored clip would have been a
+# full-frame blur for the same reason. Neither is a rendering bug, both
+# are this number.
+#
+# A bigger model is NOT the fix. yolo11x-seg at 0.20 managed only 7/21
+# on the same frames, for far more compute than the gate's 60s window
+# can spare. The threshold dominates.
+#
+# 0.05 rather than 0.07 for margin: average mask coverage barely moves
+# between them (0.81% vs 0.63% of frame), so the cost of going lower is
+# close to nothing, while a miss is expensive in both directions.
+_SEG_CONFIDENCE = 0.05
 # Pixelation factor: the masked region is downsampled by this per axis
 # and re-upsampled with nearest-neighbour. 24 → a 720p body becomes a
 # handful of flat blocks — posture readable, identity/exposure not.
