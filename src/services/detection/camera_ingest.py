@@ -55,6 +55,7 @@ from src.services.detection.motion_cache import MotionCache
 from src.services.detection.patient_presence import PatientPresence
 from src.services.identity import trace
 from src.services.identity.track_ledger import TrackLedger
+from src.services.detection import sensitivity
 from src.services.detection.mp4_remux import Mp4RemuxError, frames_to_mp4
 from src.services.detection.providers.gemini import gemini_provider
 from src.services.detection.providers.types import ProviderResult
@@ -156,6 +157,10 @@ class _RecorderDecision:
     # the linger→finalize→upload route, so pre-privacy footage is dropped
     # on the device rather than uploaded.
     privacy: bool = False
+    # Whether this moment needs masking. None means the tick didn't ask
+    # (the screen runs on a cadence, not every tick). A True verdict is
+    # the ONLY thing that turns masking on — room class does not.
+    sensitive: bool | None = None
 
 
 def compute_reid_mode(
@@ -739,6 +744,42 @@ class CameraIngest:
             )
             return None
 
+    async def _screen_for_masking(self, mp4_bytes: bytes) -> bool | None:
+        """Ask whether this moment is sensitive enough to need masking.
+
+        Reuses the MP4 the tick already built for the detector, so this
+        costs one extra model call and no extra encoding. Runs on a
+        cadence (`data_collection_sensitivity_every_n_ticks`) because a
+        call per tick would roughly double inference cost on a recording
+        camera.
+
+        Returns None when we didn't ask, or when asking failed. None is
+        NOT "clean": it means no verdict, so nothing changes — a session
+        already masked stays masked, and an unmasked one stays unmasked.
+        Treating a failed screen as sensitive would mask on every network
+        blip; treating it as clean would be a claim we can't make.
+        """
+        every = int(
+            getattr(
+                self._settings,
+                "data_collection_sensitivity_every_n_ticks",
+                3,
+            )
+        )
+        if not mp4_bytes or self._tick_counter % max(1, every) != 0:
+            return None
+        try:
+            result = await sensitivity.screen_clip(
+                mp4_bytes, settings=self._settings
+            )
+        except Exception:  # noqa: BLE001 — never break a tick over this
+            log.warning(
+                "%s masking screen failed; leaving masking unchanged",
+                self._log_tag, exc_info=True,
+            )
+            return None
+        return bool(result.sensitive)
+
     async def _run_tick(self, pinned: "_PinnedTick | None" = None) -> None:
         """Run one tick, then drive the data-collection recorder.
 
@@ -771,6 +812,7 @@ class CameraIngest:
                 ctx=decision.ctx,
                 lead_in_frames=decision.lead_frames,
                 lead_in_audio=decision.lead_audio,
+                sensitive=decision.sensitive,
             )
         except Exception:
             log.exception("%s data-collection recorder tick failed", self._log_tag)
@@ -1901,6 +1943,7 @@ class CameraIngest:
                 # audio window WAS written to the side-file — which desynced
                 # A/V by ~window seconds. Record live-forward only; a paced
                 # lead-in replay is a future improvement.
+                decision.sensitive = await self._screen_for_masking(mp4_bytes)
 
             # W2 evidence admissibility (identity-persistence, 2026-07-19,
             # mechanism corrected per review F3): a degraded window —

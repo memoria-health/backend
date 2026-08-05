@@ -79,6 +79,10 @@ class FinalizedSession:
     # container's duration is honest instead of whatever the longer
     # stream happened to be.
     video_duration_seconds: float | None = None
+    # False when the encoder child died. Its output is truncated or
+    # empty, and for a masked session it may not have masked anything —
+    # either way the clip must not be uploaded.
+    encoder_ok: bool = True
 
 
 class _Encoder(Protocol):
@@ -325,6 +329,8 @@ class SessionRecorder:
                     ctx=self._ctx,
                     audio_offset_seconds=offset,
                     video_duration_seconds=duration,
+                    # Test encoders don't report this; assume fine.
+                    encoder_ok=bool(getattr(encoder, "ok", True)),
                 )
             )
         except Exception:

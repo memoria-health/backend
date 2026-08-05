@@ -258,6 +258,16 @@ class Settings(BaseSettings):
     # NEMARA_CENSOR_STREAM_SEGMENT_EVERY.
     censor_stream_segment_every: int = Field(ge=1, le=60, default=5)
 
+    # How often a recording camera asks whether the moment is sensitive.
+    # This is the ONLY thing that turns masking on — room class does not.
+    # It reuses the MP4 the tick already built for the detector, so the
+    # cost is one extra VLM call, not another encode. 3 → roughly every
+    # 30s of a recording session. Lower reacts sooner and costs more.
+    # Env: NEMARA_DATA_COLLECTION_SENSITIVITY_EVERY_N_TICKS.
+    data_collection_sensitivity_every_n_ticks: int = Field(
+        ge=1, le=60, default=3
+    )
+
     # ── Detector subscriber-bot (Phase 2) ───────────────────────
     # The bot lives inside the FastAPI process as an asyncio task tree
     # that subscribes to LiveKit rooms and runs the detector pipeline.

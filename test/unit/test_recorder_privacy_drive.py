@@ -25,7 +25,8 @@ class _FakeRecorder:
         self.on_tick_calls: list[tuple] = []
         self.abort_calls: list = []
 
-    async def on_tick(self, camera_id, collect, *, ctx, lead_in_frames, lead_in_audio):
+    async def on_tick(self, camera_id, collect, *, ctx, lead_in_frames,
+                      lead_in_audio, sensitive=None):
         self.on_tick_calls.append((camera_id, collect))
 
     async def abort_camera(self, camera_id):

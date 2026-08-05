@@ -35,7 +35,10 @@ from src.services.data_collection.session import (
     RecorderCtx,
     SessionRecorder,
 )
-from src.services.data_collection.streaming_encoder import StreamingMp4Writer
+from src.services.data_collection.streaming_encoder import (
+    MaskingMp4Writer,
+    StreamingMp4Writer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +103,12 @@ def _default_encoder_factory(path: Path) -> StreamingMp4Writer:
     return StreamingMp4Writer(path)
 
 
+def _masking_encoder_factory(path: Path) -> MaskingMp4Writer:
+    """Encoder for a session judged sensitive: identical timing, but
+    every frame is masked on the way out and raw never touches disk."""
+    return MaskingMp4Writer(path)
+
+
 async def _never_private(_camera_id: UUID) -> bool:
     """Default privacy check — used when no DB-backed check is injected
     (e.g. unit tests). Always permits the upload."""
@@ -119,6 +128,7 @@ class RecorderManager:
         settings: Any,
         temp_dir: Path | str,
         encoder_factory: Callable[[Path], Any] = _default_encoder_factory,
+        masking_encoder_factory: Callable[[Path], Any] = _masking_encoder_factory,
         muxer: _Muxer = mux_av,
         uploader: _Uploader = b2_module.upload_file_to_b2,
         clock: Callable[[], float] = time.monotonic,
@@ -132,6 +142,10 @@ class RecorderManager:
         region_lookup: _RegionLookup = _always_us,
     ) -> None:
         self._settings = settings
+        self._masking_encoder_factory = masking_encoder_factory
+        # Cameras whose current session must be masked. Set by a
+        # sensitive verdict, cleared when the session ends.
+        self._masked: dict[UUID, bool] = {}
         self._privacy_check = privacy_check
         self._region_lookup = region_lookup
         self._temp_dir = Path(temp_dir)
@@ -176,8 +190,15 @@ class RecorderManager:
         ctx: RecorderCtx,
         lead_in_frames: Sequence[Any] | None = None,
         lead_in_audio: bytes | None = None,
+        sensitive: bool | None = None,
     ) -> None:
+        """``sensitive`` is the tick's verdict on whether this moment
+        needs masking, or None when the tick didn't ask (it runs on a
+        cadence). A True verdict is the ONLY thing that turns masking on.
+        """
         async with self._lock_for(camera_id):
+            if sensitive:
+                await self._go_masked(camera_id)
             rec = self._sessions.get(camera_id)
             if rec is None:
                 if not collect:
@@ -190,7 +211,9 @@ class RecorderManager:
                         camera_id,
                     )
                     return
-                rec = self._make_recorder(camera_id, ctx)
+                rec = self._make_recorder(
+                    camera_id, ctx, masked=self._masked.get(camera_id, False)
+                )
                 self._sessions[camera_id] = rec
 
             await rec.on_tick(
@@ -200,6 +223,44 @@ class RecorderManager:
             # stays tight — a session that just finalized is back to IDLE.
             if not rec.is_active:
                 self._sessions.pop(camera_id, None)
+                # Session over. The next one starts unmasked again — a
+                # verdict applies to the moment it judged, not forever.
+                self._masked.pop(camera_id, None)
+
+    async def _go_masked(self, camera_id: UUID) -> None:
+        """Switch this camera to masked recording, discarding what the
+        current session has captured so far.
+
+        A verdict describes footage that is already on disk — the tick
+        judges a window that has passed. Masking forward would leave that
+        prefix sitting there unmasked, so it is thrown away instead. We
+        lose the seconds before the verdict; nothing sensitive survives
+        unmasked. Discarding is also far cheaper than going back and
+        masking it.
+
+        Sticky for the rest of the session: once a moment has been judged
+        sensitive, the session stays masked rather than flapping back and
+        forth on each verdict, which would chop it into fragments.
+
+        Caller holds the camera's lock.
+        """
+        if self._masked.get(camera_id):
+            return  # already masked, nothing to switch
+        self._masked[camera_id] = True
+        rec = self._sessions.pop(camera_id, None)
+        if rec is None or not rec.is_active:
+            return  # nothing captured yet; the next session starts masked
+        logger.info(
+            "data_collection: sensitive verdict for camera %s — discarding "
+            "the unmasked session and restarting masked", camera_id,
+        )
+        try:
+            await rec.abort()
+        except Exception:
+            logger.exception(
+                "data_collection: abort while going masked failed for %s",
+                camera_id,
+            )
 
     async def finalize_camera(self, camera_id: UUID) -> None:
         """Force-finalize a single camera's in-flight session (called when
@@ -262,12 +323,17 @@ class RecorderManager:
 
     # ── session wiring ──────────────────────────────────────────────
 
-    def _make_recorder(self, camera_id: UUID, ctx: RecorderCtx) -> SessionRecorder:
+    def _make_recorder(
+        self, camera_id: UUID, ctx: RecorderCtx, *, masked: bool = False,
+    ) -> SessionRecorder:
         return SessionRecorder(
             camera_id=camera_id,
             ctx=ctx,
             temp_dir=self._temp_dir,
-            encoder_factory=self._encoder_factory,
+            encoder_factory=(
+                self._masking_encoder_factory if masked
+                else self._encoder_factory
+            ),
             on_finalized=self._handle_finalized,
             clock=self._clock,
             utcnow=self._utcnow,
@@ -283,6 +349,16 @@ class RecorderManager:
         never blocks the tick.
         """
         final_path = fs.video_path.with_suffix(".final.mp4")
+        if not fs.encoder_ok:
+            # The encoder child died. Its file is truncated at best, and
+            # for a masked session there is no telling how much of it got
+            # masked — so it never leaves the box.
+            logger.error(
+                "data_collection: encoder failed for camera %s; discarding "
+                "the clip", fs.ctx.camera_id,
+            )
+            self._cleanup(fs.video_path, fs.audio_path)
+            return
         try:
             await self._muxer(
                 fs.video_path,
