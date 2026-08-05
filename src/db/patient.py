@@ -89,6 +89,16 @@ class Patient(Base):
     data_collection_decided_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, default=None,
     )
+    # WHICH wording they agreed to. `decided_at` records that a decision
+    # happened but not what was on screen at the time, so once the
+    # research policy text changes there is no way to tell who consented
+    # to what — the exact problem `caregivers.tos_version` already solves
+    # for the Terms. Same pattern: bump the version on a material change
+    # and re-prompt anyone below it. NULL = decided before versioning
+    # existed, or never asked.
+    data_collection_policy_version: Mapped[str | None] = mapped_column(
+        String, nullable=True, default=None,
+    )
 
     # ── Privacy mode (DEPRECATED 2026-07-27) ─────────────────────
     # Superseded by per-camera cameras.privacy_enabled (room-derived
