@@ -50,7 +50,25 @@ __all__ = [
     "RateLimitBackend",
     "RateLimitPolicy",
     "client_key",
+    "reset_all_rate_limits",
 ]
+
+# Every RateLimit built at import time, so tests can clear them between
+# cases. Counters otherwise live as long as the process: the suite drives
+# many requests through one app, exhausts a per-minute budget, and every
+# later test in that process gets a 429 that has nothing to do with what
+# it is asserting. Registering here keeps the limiter fully exercised in
+# tests, rather than disabling it under NEMARA_ENV=test — which would
+# leave the production path unexercised by every integration test.
+_REGISTRY: list["RateLimit"] = []
+
+
+def reset_all_rate_limits() -> None:
+    """Clear every limiter's counters. Test-support only."""
+    for limiter in _REGISTRY:
+        reset = getattr(limiter.backend, "reset", None)
+        if reset is not None:
+            reset()
 
 
 @dataclass(frozen=True)
@@ -148,6 +166,12 @@ class InMemorySlidingWindow:
         with self._lock:
             return len(self._hits)
 
+    def reset(self) -> None:
+        """Forget every counter. See `reset_all_rate_limits`."""
+        with self._lock:
+            self._hits.clear()
+            self._last_sweep = 0.0
+
     def _maybe_sweep(self, now: float) -> None:
         """Drop keys with no hits inside the window. Caller holds the lock."""
         if now - self._last_sweep < self._SWEEP_INTERVAL_SECONDS:
@@ -196,6 +220,7 @@ class RateLimit:
         self._backend: RateLimitBackend = backend or InMemorySlidingWindow(
             limit=policy.limit, window_seconds=policy.window_seconds,
         )
+        _REGISTRY.append(self)
 
     @property
     def policy(self) -> RateLimitPolicy:

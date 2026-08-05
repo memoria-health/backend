@@ -46,6 +46,23 @@ from src.settings import get_settings
 os.environ["NEMARA_RESEND_API_KEY"] = ""
 
 
+@pytest.fixture(autouse=True)
+def _reset_rate_limits():
+    """Clear rate-limit counters between tests.
+
+    The limiters are per-process and per-minute, so without this the
+    pairing tests exhaust the budget and every later test in the run
+    gets a 429 unrelated to what it asserts. Resetting (rather than
+    disabling the limiter under NEMARA_ENV=test) keeps the production
+    code path exercised by the integration suite.
+    """
+    from src.api.rate_limit import reset_all_rate_limits
+
+    reset_all_rate_limits()
+    yield
+    reset_all_rate_limits()
+
+
 @pytest_asyncio.fixture(autouse=True)
 async def _per_test_engine() -> AsyncIterator[None]:
     """asyncpg connections are bound to the event loop they were
