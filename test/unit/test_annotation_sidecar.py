@@ -44,6 +44,7 @@ _FALL = DetectorSpec(
     identifier="fall", detected_field="fall_detected",
     confidence_field="fall_confidence", name="Fall", category="safety",
     alert_trigger="leading", is_sustained=False,
+    threshold=0.70, reasoning_field="fall_reasoning",
 )
 _TV = DetectorSpec(
     identifier="tv", detected_field="tv_detected",
@@ -232,3 +233,102 @@ def test_sidecar_key_sits_beside_the_clip() -> None:
     assert sidecar_key("data/v1/a/b/2026-08-05/220000Z__bedroom.mp4") == (
         "data/v1/a/b/2026-08-05/220000Z__bedroom.json"
     )
+
+
+# ── evidence is not the same as an alert ────────────────────────────
+
+
+def _alert(offset: float, identifier: str, **kw):
+    base = dict(
+        id=uuid4(), detector_id=uuid4(),
+        occurred_at=_T0 + timedelta(seconds=offset),
+        title="t", category="safety", narrative="n",
+        identifier=identifier, alert_trigger="leading",
+    )
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+
+def test_a_span_below_threshold_is_not_an_alert() -> None:
+    """The model saw something we would never have told a caregiver
+    about. Recording it is useful; reading it as an alert is wrong."""
+    obs = [_obs(10, {"fall_detected": True, "fall_confidence": 0.3})]
+    out = build_sidecar(_clip(), obs, [], generated_at=_NOW,
+                        detector_specs=[_FALL])
+    d = out["detections"][0]
+    assert d["crossed_threshold"] is False
+    assert d["promoted"] is False
+    assert d["alert_event_ids"] == []
+
+
+def test_a_span_that_did_alert_links_to_it() -> None:
+    obs = [_obs(10, {"fall_detected": True, "fall_confidence": 0.95})]
+    alert = _alert(12, "fall")
+    out = build_sidecar(_clip(), obs, [alert], generated_at=_NOW,
+                        detector_specs=[_FALL])
+    d = out["detections"][0]
+    assert d["crossed_threshold"] is True
+    assert d["promoted"] is True
+    assert d["alert_event_ids"] == [str(alert.id)]
+
+
+def test_above_threshold_but_not_promoted_is_visible() -> None:
+    """Cleared the bar and still no alert -- k-of-N unfilled, patient
+    unconfirmed, mid-episode, or it lost the one-per-clip pick. That gap
+    is the most instructive thing in the file."""
+    obs = [_obs(10, {"fall_detected": True, "fall_confidence": 0.95})]
+    out = build_sidecar(_clip(), obs, [], generated_at=_NOW,
+                        detector_specs=[_FALL])
+    d = out["detections"][0]
+    assert d["crossed_threshold"] is True
+    assert d["promoted"] is False
+
+
+def test_justification_comes_from_the_most_confident_tick() -> None:
+    obs = [
+        _obs(10, {"fall_detected": True, "fall_confidence": 0.4,
+                  "fall_reasoning": "maybe knelt down"}),
+        _obs(20, {"fall_detected": True, "fall_confidence": 0.95,
+                  "fall_reasoning": "lying flat on the floor"}),
+    ]
+    out = build_sidecar(_clip(), obs, [], generated_at=_NOW,
+                        detector_specs=[_FALL])
+    assert out["detections"][0]["justification"] == "lying flat on the floor"
+
+
+def test_operator_rejection_is_carried_as_a_negative_label() -> None:
+    """A human calling it a false positive with the footage in front of
+    them is the best negative label this system produces."""
+    alert = _alert(10, "fall", gate_state="rejected")
+    out = build_sidecar(_clip(), [], [alert], generated_at=_NOW)
+    assert out["alerts"][0]["gate_state"] == "rejected"
+    assert out["alerts"][0]["operator_false_positive"] is True
+
+
+def test_auto_release_is_not_a_judgement() -> None:
+    """`auto` means the timer released it with nobody looking. Reading
+    that as 'a human approved it' would poison the labels."""
+    alert = _alert(10, "fall", gate_state="auto")
+    out = build_sidecar(_clip(), [], [alert], generated_at=_NOW)
+    assert out["alerts"][0]["operator_false_positive"] is False
+    assert out["alerts"][0]["gate_state"] == "auto"
+
+
+def test_duration_on_an_open_start_is_unknowable() -> None:
+    """The activity may have been running long before the clip began, so
+    the visible span is a floor. Saying False would be a claim we cannot
+    support."""
+    obs = [_obs(0, {"stove_detected": True, "stove_confidence": 0.9}),
+           _obs(10, {"stove_detected": True, "stove_confidence": 0.9})]
+    out = build_sidecar(_clip(), obs, [], generated_at=_NOW,
+                        detector_specs=[_STOVE])
+    d = out["detections"][0]
+    assert d["open_start"] is True
+    assert d["exceeded_duration_threshold"] is None
+
+
+def test_no_private_fields_leak_into_the_sidecar() -> None:
+    obs = [_obs(10, {"fall_detected": True, "fall_confidence": 0.9})]
+    out = build_sidecar(_clip(), obs, [], generated_at=_NOW,
+                        detector_specs=[_FALL])
+    assert not [k for k in out["detections"][0] if k.startswith("_")]

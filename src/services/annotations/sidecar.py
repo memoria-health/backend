@@ -101,6 +101,15 @@ class DetectorSpec:
     exit_gap_seconds: float | None = None
     # The "gone on too long" bar for duration detectors, if any.
     duration_threshold_seconds: float | None = None
+    # The confidence bar this detector must clear to promote, AFTER the
+    # sensitivity offset (`event_promotion._effective_threshold`). A tick
+    # can be positive and still sit under it, which is precisely the
+    # difference between "the model saw something" and "we would have
+    # told a caregiver".
+    threshold: float | None = None
+    # Field carrying the model's one-line justification. Catalog
+    # convention is `<id>_reasoning`.
+    reasoning_field: str | None = None
 
     @property
     def merge_gap(self) -> float:
@@ -184,6 +193,9 @@ def _spans_for(
             continue
         conf = _confidence(fields.get(spec.confidence_field))
         at = obs.captured_at
+        reason = (
+            fields.get(spec.reasoning_field) if spec.reasoning_field else None
+        )
         if current is not None and (
             (at - current["_last_at"]).total_seconds() <= spec.merge_gap
         ):
@@ -191,6 +203,14 @@ def _spans_for(
             current["tick_count"] += 1
             if conf is not None:
                 current["_confs"].append(conf)
+            # Keep the justification from the most convincing tick — the
+            # one a human reading this would want to see.
+            if reason and (
+                current["_best_conf"] is None
+                or (conf is not None and conf > current["_best_conf"])
+            ):
+                current["_reason"] = reason
+                current["_best_conf"] = conf
             continue
         if current is not None:
             spans.append(current)
@@ -199,6 +219,8 @@ def _spans_for(
             "_last_at": at,
             "tick_count": 1,
             "_confs": [conf] if conf is not None else [],
+            "_reason": reason,
+            "_best_conf": conf,
         }
     if current is not None:
         spans.append(current)
@@ -220,6 +242,10 @@ def _spans_for(
             "is_sustained": spec.is_sustained,
             "started_at": _iso(start),
             "ended_at": _iso(end),
+            # Kept only long enough to match alerts against; stripped
+            # before the sidecar is serialised.
+            "_start_dt": start,
+            "_end_dt": end,
             "start_offset_seconds": round(_offset(clip, start), 3),
             "end_offset_seconds": round(_offset(clip, end), 3),
             # Time between the first and last positive tick. With an open
@@ -232,15 +258,32 @@ def _spans_for(
             "mean_confidence": (
                 round(sum(confs) / len(confs), 4) if confs else None
             ),
+            # The model's own words, from the most confident tick in the
+            # span. This is what makes a row readable without opening the
+            # video, and it is the single most useful field for working
+            # out WHY something false-fired.
+            "justification": span["_reason"],
+            # Did this evidence ever clear the bar that would promote it?
+            # Below it, the model saw something we would never have told a
+            # caregiver about — still worth recording, but it is not an
+            # alert and must not be read as one.
+            "crossed_threshold": (
+                None if spec.threshold is None or not confs
+                else max(confs) >= spec.threshold
+            ),
+            "threshold": spec.threshold,
         }
         if spec.duration_threshold_seconds:
-            # Only meaningful for a closed span: an open one may already
-            # have been running long before the clip started.
-            entry["exceeded_duration_threshold"] = (
-                observed >= spec.duration_threshold_seconds
-            )
             entry["duration_threshold_seconds"] = (
                 spec.duration_threshold_seconds
+            )
+            # Unknowable on an open start: the activity may have been
+            # running long before this clip began, so the span we can see
+            # is a floor, not the real length. Saying False here would be
+            # a claim we cannot support.
+            entry["exceeded_duration_threshold"] = (
+                None if open_start
+                else observed >= spec.duration_threshold_seconds
             )
         out.append(entry)
     return out
@@ -286,6 +329,7 @@ def build_sidecar(
     for spec in specs:
         detections.extend(_spans_for(clip, observations, spec))
     detections.sort(key=lambda d: (d["started_at"], d["identifier"]))
+    _link_alerts_to_spans(detections, alerts)
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -341,6 +385,49 @@ def build_sidecar(
     }
 
 
+def _link_alerts_to_spans(
+    detections: list[dict[str, Any]], alerts: list[Any],
+) -> None:
+    """Say which spans actually became an alert.
+
+    A span with no alert is NORMAL, not a bug, and the gap between the two
+    is the most instructive thing in this file. Positive evidence does not
+    promote when it sits under the confidence bar, when a k-of-N window
+    has not filled, when a routine detector could not confirm the patient
+    (`subject_scope`), when the clock or room is out of the detector's
+    scope, when a state detector is already mid-episode so this is not a
+    rising edge, or when another detector won the one-event-per-clip pick.
+
+    Anyone training on this corpus needs to be able to tell "the model saw
+    it and we chose not to alert" from "the model never saw it". Those are
+    completely different failures.
+    """
+    for span in detections:
+        span["alert_event_ids"] = []
+        span["promoted"] = False
+    for alert in alerts:
+        ident = getattr(alert, "identifier", None)
+        at = alert.occurred_at
+        for span in detections:
+            if ident is not None and span["identifier"] != ident:
+                continue
+            # An alert fires at or near its evidence. Trailing alerts land
+            # on the closing edge, so allow the whole span plus a tick of
+            # slack on either side rather than requiring a strict interior
+            # match.
+            if (
+                span["_start_dt"] - timedelta(seconds=_DEFAULT_MERGE_GAP_SECONDS)
+                <= at
+                <= span["_end_dt"] + timedelta(seconds=_DEFAULT_MERGE_GAP_SECONDS)
+            ):
+                span["alert_event_ids"].append(str(alert.id))
+                span["promoted"] = True
+                break
+    for span in detections:
+        span.pop("_start_dt", None)
+        span.pop("_end_dt", None)
+
+
 def _alert_entry(clip: ClipFacts, alert: Any) -> dict[str, Any]:
     trigger = getattr(alert, "alert_trigger", None)
     return {
@@ -364,6 +451,22 @@ def _alert_entry(clip: ClipFacts, alert: Any) -> dict[str, Any]:
         # The moment this fired points backward — the footage it is about
         # may be in an earlier clip.
         "may_precede_clip": trigger in _BACKWARD_TRIGGERS,
+        # OPERATOR verdict, decided in the seconds before the alert was
+        # dispatched (`events.gate_state`): null | pending | approved |
+        # rejected | auto. `rejected` is a human calling it a false
+        # positive at the time, with the footage in front of them — the
+        # highest-quality negative label this system produces.
+        # `auto` means it released on the timer with nobody looking, which
+        # is NOT a judgement and must not be read as one.
+        #
+        # Deliberately NOT the caregiver's retrospective review
+        # (`events.reviewed` / `review_choice`), which sits one column
+        # away on the same table and means something entirely different:
+        # a family member looking back at an alert they already received.
+        "gate_state": getattr(alert, "gate_state", None),
+        "operator_false_positive": (
+            getattr(alert, "gate_state", None) == "rejected"
+        ),
     }
 
 
