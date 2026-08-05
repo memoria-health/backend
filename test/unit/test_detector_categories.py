@@ -133,3 +133,52 @@ def test_bool_severity_is_rejected_not_coerced_to_one():
         {"category": "safety", "alert_trigger": "leading", "severity": True}
     )
     assert got.severity == 50
+
+
+# ── The built-in catalog after reclassification ─────────────────────
+
+
+def test_catalog_categories_are_all_valid():
+    from src.services.detection import catalog
+
+    assert {s.category for s in catalog.CATALOG} <= EXPECTED
+
+
+def test_category_is_no_longer_a_near_constant():
+    """The change exists because 20 of 25 built-ins were 'safety', which is
+    what made the axis useless (scheduler.py:68). Guard the property, not the
+    exact counts, so adding a detector does not fail this."""
+    from collections import Counter
+
+    from src.services.detection import catalog
+
+    counts = Counter(s.category for s in catalog.CATALOG)
+    biggest = counts.most_common(1)[0][1]
+    assert biggest / len(catalog.CATALOG) < 0.8, (
+        f"one category holds {biggest}/{len(catalog.CATALOG)} of the catalog; "
+        f"it has collapsed back into a near-constant: {dict(counts)}"
+    )
+
+
+def test_reclassified_detectors_kept_their_severity():
+    """The whole safety argument for the reclassification: moving a label must
+    not move treatment. `distress` is the case that would bite — it leaves
+    'safety' but must stay above the inclusive-prompt threshold."""
+    from src.services.detection import catalog, catalog_v2
+
+    specs = {s.key: s for s in catalog.CATALOG}
+    assert specs["distress"].category == "behaviour"
+    assert catalog_v2.DIMS["distress"].severity >= INCLUSIVE_BIAS_SEVERITY
+    assert _is_high_stakes(
+        category="behaviour", severity=catalog_v2.DIMS["distress"].severity
+    ) is True
+
+
+def test_care_is_empty_and_that_is_deliberate():
+    """No built-in watches for the Care examples the product pitches (help to
+    the bathroom, company at meals, long stretches alone). Asserted so the gap
+    is visible in test output rather than discovered by a caregiver, and so
+    whoever fills it deletes this test on purpose."""
+    from src.services.detection import catalog
+
+    assert not [s for s in catalog.CATALOG if s.category == "care"]

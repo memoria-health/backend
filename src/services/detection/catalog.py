@@ -26,7 +26,7 @@ NOTE: `people_present` is NOT here — it's the always-on block synthesised in
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 
 # ══════════════════════════════════════════════════════════════════
 # Prompt fragments
@@ -853,7 +853,11 @@ class CatalogEntry:
     name: str
     icon_name: str
     description: str
-    category: str       # "safety" | "routine"
+    # Semantic label only — what KIND of thing this is, for wording,
+    # colour and filtering. How urgently it is treated is `severity`
+    # (catalog_v2.DIMS), which gates the scheduler's exemptions and the
+    # compile bias. See schemas/detector.py:DetectorCategory.
+    category: str       # safety | routine | behaviour | care
     cohort: str         # "child" | "adult" | "both"
     recommended: bool   # the library's "Recommended" UI group — only `fall`
     prompt_fragment: str
@@ -944,7 +948,7 @@ CATALOG: tuple[CatalogEntry, ...] = (
     CatalogEntry(
         key="agitation", name="Agitation", icon_name="figure.walk.motion",
         description="Pacing or restless body language sustained over time.",
-        category="safety", is_sustained=True, cohort="adult",
+        category="behaviour", is_sustained=True, cohort="adult",
         recommended=False, seeded=True, prompt_fragment=_AGITATION_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
@@ -1007,7 +1011,7 @@ CATALOG: tuple[CatalogEntry, ...] = (
     CatalogEntry(
         key="distress", name="Distress", icon_name="exclamationmark.bubble",
         description="Sustained crying or visible distress.",
-        category="safety", is_sustained=True, cohort="child",
+        category="behaviour", is_sustained=True, cohort="child",
         recommended=False, seeded=True, prompt_fragment=_DISTRESS_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
@@ -1058,7 +1062,7 @@ CATALOG: tuple[CatalogEntry, ...] = (
     CatalogEntry(
         key="child_device_usage", name="Electronic device usage", icon_name="ipad",
         description="A child using a phone or tablet for a sustained period.",
-        category="routine", cohort="child",
+        category="behaviour", cohort="child",
         recommended=False, prompt_fragment=_CHILD_DEVICE_USAGE_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
@@ -1161,7 +1165,7 @@ def _validate_catalog() -> None:
         seen_keys.add(e.key)
         if e.cohort not in ("child", "adult", "both"):
             raise ValueError(f"[catalog] {e.key}: bad cohort {e.cohort!r}")
-        if e.category not in ("safety", "routine"):
+        if e.category not in ("safety", "routine", "behaviour", "care"):
             raise ValueError(f"[catalog] {e.key}: bad category {e.category!r}")
         if e.alert_trigger not in ("leading", "trailing", "duration", "absence", "record_only"):
             raise ValueError(f"[catalog] {e.key}: bad alert_trigger {e.alert_trigger!r}")
@@ -1189,7 +1193,7 @@ def is_minor(date_of_birth: date | None) -> bool:
     is treated as NOT a minor — preserving the prior adult-default behaviour."""
     if date_of_birth is None:
         return False
-    today = datetime.now(timezone.utc).date()
+    today = datetime.now(UTC).date()
     age = today.year - date_of_birth.year - (
         (today.month, today.day) < (date_of_birth.month, date_of_birth.day)
     )
