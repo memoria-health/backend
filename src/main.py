@@ -77,7 +77,7 @@ from src.api.caregivers import router as caregivers_router
 from src.api.briefing import router as briefing_router
 from src.api.presence import router as presence_router
 from src.api.home_report import router as home_report_router
-from src.api.review import router as review_router
+from src.api.event_gate import router as event_gate_router
 from src.api.detectors import router as detectors_router
 from src.api.devices import router as devices_router
 from src.api.events import router as events_router
@@ -90,7 +90,6 @@ from src.api.livekit_webhooks import router as livekit_webhooks_router
 from src.api.pairing import router as pairing_router
 from src.api.patient_members import router as patient_members_router
 from src.api.patients import router as patients_router
-from src.api.pi_discovery import router as pi_discovery_router
 from src.api.support import router as support_router
 from src.api.talk import router as talk_router
 from src.db import analysis as _analysis  # noqa: F401
@@ -105,7 +104,7 @@ from src.db import patient as _patient  # noqa: F401
 from src.db import patient_face_embedding as _patient_face_embedding  # noqa: F401
 from src.db import pi_discovery as _pi_discovery  # noqa: F401
 from src.db.session import get_engine, get_sessionmaker
-from src.services import clip_archival, email, push
+from src.services import clip_archival, email, event_gate, pager, push
 from src.services.data_collection import manager as recorder_manager
 from src.services.detection.presence_cache import PresenceCache
 from src.services.detection.presence_sweeper import PresenceSweeper
@@ -194,13 +193,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.presence_sweeper = presence_sweeper
     await presence_sweeper.start()
+    # Durable half of the event gate's auto-release. The per-event
+    # asyncio timer dies with this process, so a deploy inside a hold
+    # window would strand an alert at 'pending' forever and no
+    # caregiver would ever be told. This sweeps those out. Runs
+    # unconditionally — it is a safety net, not a feature.
+    gate_sweeper = event_gate.GateSweeper(
+        settings=get_settings(), sessionmaker=get_sessionmaker(),
+    )
+    app.state.gate_sweeper = gate_sweeper
+    await gate_sweeper.start()
     try:
         yield
     finally:
+        await gate_sweeper.stop()
         await presence_sweeper.stop()
         await scheduler.stop()
         await worker.stop()
         await push.close()
+        await pager.close()
         await email.close()
         await engine.dispose()
 
@@ -216,7 +227,9 @@ def create_app() -> FastAPI:
     app.include_router(briefing_router)
     app.include_router(presence_router)
     app.include_router(home_report_router)
-    app.include_router(review_router)
+    # Operator-only event gate: pre-dispatch false-positive check.
+    # Bearer token separate from caregiver auth (deps.operator_auth).
+    app.include_router(event_gate_router)
     app.include_router(patients_router)
     app.include_router(patient_members_router)
     app.include_router(detectors_router)
@@ -228,8 +241,6 @@ def create_app() -> FastAPI:
     # Pairing flow + LiveKit token minting.
     app.include_router(pairing_router)
     app.include_router(livekit_router)
-    # Pi-device announce + caregiver-facing discovered list.
-    app.include_router(pi_discovery_router)
     # Phase 2: webhook receiver feeding the in-process detector worker.
     app.include_router(livekit_webhooks_router)
     # Phase 3 caregiver Talk mode.

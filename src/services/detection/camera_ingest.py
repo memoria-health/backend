@@ -39,7 +39,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from src.db.camera import Camera
 from src.db.caregiver import Caregiver
 from src.db.patient import Patient
-from src.services import clip_archival, email, push, review_gate
+from src.services import clip_archival, email, event_gate, push
 from src.services.detection.analyses_store import add_analysis
 from src.services.detection.audio_buffer import AudioBuffer
 from src.services.detection.event_promotion import maybe_promote_analysis
@@ -2048,16 +2048,19 @@ class CameraIngest:
             # by Apple's push endpoint.
             if promotion.fired:
                 fired_ids = [ev.id for ev in promotion.fired]
-                # Review gate: when patients.require_review is OFF (default)
-                # this dispatches push+email exactly as before; ON holds the
-                # alerts for a reviewer verdict (60s auto-release). Additive.
+                # Event gate: when patients.event_gate_enabled is OFF
+                # (the default, and true for every patient today) this
+                # dispatches push+email exactly as before. ON holds the
+                # alert for an OPERATOR verdict, with an unconditional 60s
+                # auto-release. Not the caregiver `events.reviewed`
+                # feature — see src/services/event_gate.py.
                 asyncio.create_task(
-                    review_gate.route_events(
+                    event_gate.route_events(
                         sessionmaker=self._sessionmaker,
                         event_ids=fired_ids,
                         settings=self._settings,
                     ),
-                    name=f"review-route-{self.camera_id}",
+                    name=f"event-gate-route-{self.camera_id}",
                 )
                 # Clip archival: reuse the MP4 we already built for
                 # the LLM as the pre-event clip; spawn one task per

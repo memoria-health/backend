@@ -5,6 +5,9 @@ Composition root for things every protected endpoint needs:
 - `CaregiverAuth` — verified Supabase JWT principal. Endpoints declare
   `auth: CaregiverAuth` to require a signed-in caregiver; the dep
   rejects with 401 if anything is wrong with the bearer token.
+- `OperatorAuth` — static bearer token for OUR OWN cross-tenant ops
+  endpoints. A separate credential from `CaregiverAuth` on purpose:
+  customer tokens must never satisfy an operator surface.
 - `SessionDep` — one async SQLAlchemy session per request.
 
 All `JwtVerificationError`s are flattened to the same opaque
@@ -15,6 +18,7 @@ real reason is logged for our own diagnostics.
 
 import asyncio
 import logging
+import secrets
 from typing import Annotated
 
 import bcrypt
@@ -91,6 +95,48 @@ async def caregiver_auth(
 
 
 CaregiverAuth = Annotated[SupabasePrincipal, Depends(caregiver_auth)]
+
+
+async def operator_auth(
+    settings: SettingsDep,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
+) -> None:
+    """Gate operator-only endpoints on a static bearer token.
+
+    Deliberately NOT `CaregiverAuth`. An operator surface reads across
+    every household in the product — narratives, rooms, clips — so it
+    must not be reachable by a customer token at all. Accepting a
+    Supabase JWT and then checking an email allow-list would make the
+    boundary a string comparison inside a token issued to customers;
+    this makes it a separate credential that no customer ever holds.
+
+    Fails closed when unset: with no token configured the endpoint is
+    unreachable rather than open. That matters because the natural
+    mistake — deploying without `NEMARA_OPS_API_TOKEN` — would
+    otherwise publish every household's events to anyone.
+
+    The token is compared with `compare_digest` to keep the check
+    constant-time, and never logged.
+    """
+    expected = settings.ops_api_token
+    if not expected:
+        log.warning("auth.operator_reject reason=ops_api_token_unset")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="ops_api_not_configured",
+        )
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        log.info("auth.operator_reject reason=missing_or_malformed_bearer")
+        raise _INVALID_AUTH_RESPONSE
+    if not secrets.compare_digest(credentials.credentials, expected):
+        log.warning("auth.operator_reject reason=bad_token")
+        raise _INVALID_AUTH_RESPONSE
+
+
+# No principal to return — the token identifies "an operator", not a
+# person. If operators ever become a team, this becomes a lookup that
+# returns who, and the endpoints keep their signature.
+OperatorAuth = Annotated[None, Depends(operator_auth)]
 
 
 # ── Camera api-key auth (Phase 0+) ────────────────────────────────

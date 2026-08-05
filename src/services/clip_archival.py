@@ -119,26 +119,58 @@ async def archive_event(
     screen runs for EVERY camera — privacy_enabled no longer gates
     clips, it gates live view).
     """
-    # REVIEW FAST-PATH: if held for human review, upload the pre-event MP4
-    # (already encoded for the LLM — the incident itself) IMMEDIATELY, before
-    # the post-roll wait. Reviewer gets video within seconds.
+    # EVENT-GATE FAST PATH: when the event is held for an operator verdict,
+    # upload the pre-event MP4 — the footage the model actually judged,
+    # already encoded for the LLM — immediately, instead of making the
+    # operator wait out the post-roll. They have 60 seconds to decide, so a
+    # clip that lands at T+20s is a clip that arrives too late to use.
+    #
+    # This path runs the SAME screen-then-censor resolution and the SAME
+    # region routing as the ordinary upload below. It has to: an operator
+    # sees every household in the product, including bedrooms and
+    # bathrooms, so this is the single clip in the system with the widest
+    # audience. It shipped bypassing both — raw bytes, default region —
+    # which inverted the invariant stated at the top of this module and
+    # put an India patient's footage in the US bucket. Never call
+    # `storage.upload_clip` from here with bytes that have not been
+    # through `resolve_clip_for_upload`.
     try:
         async with sessionmaker() as s:
             held = (await s.execute(
-                sa_text("select 1 from events where id = :id and review_gate = 'pending'"),
+                sa_text("select 1 from events where id = :id and gate_state = 'pending'"),
                 {"id": str(event_id)})).first()
         if held:
-            pre_key = await storage.upload_clip(
-                event_id=event_id, mp4_bytes=pre_event_mp4,
-                settings=settings, sub_key="review-pre")
             async with sessionmaker() as s:
-                await s.execute(
-                    sa_text("update events set review_clip_key = :k where id = :id"),
-                    {"k": pre_key, "id": str(event_id)})
-                await s.commit()
-            log.info("review fast-path pre-clip uploaded event=%s key=%s", event_id, pre_key)
-    except Exception:  # noqa: BLE001 — fast-path is best-effort
-        log.exception("review fast-path pre-clip failed event=%s", event_id)
+                patient = await s.get(Patient, patient_id)
+                patient_region = patient.region if patient is not None else "US"
+            resolution = await resolve_clip_for_upload(
+                pre_event_mp4, event_id=event_id, camera_id=camera_id,
+                settings=settings,
+            )
+            if resolution.upload_bytes is None:
+                # Fail-closed, same terminal as the main path: censoring
+                # failed, so nothing may leave. The operator decides from
+                # the narrative alone and the verdict page says so.
+                log.warning(
+                    "event_gate.fast_path_censor_drop event=%s camera=%s — "
+                    "no pre-clip for the operator (raw never uploaded)",
+                    event_id, camera_id,
+                )
+            else:
+                pre_key = await storage.upload_clip(
+                    event_id=event_id, mp4_bytes=resolution.upload_bytes,
+                    settings=settings, sub_key="gate-pre", region=patient_region)
+                async with sessionmaker() as s:
+                    await s.execute(
+                        sa_text("update events set gate_clip_key = :k where id = :id"),
+                        {"k": pre_key, "id": str(event_id)})
+                    await s.commit()
+                log.info(
+                    "event_gate.fast_path_clip event=%s key=%s censored=%s",
+                    event_id, pre_key, resolution.censored,
+                )
+    except Exception:  # noqa: BLE001 — fast path is best-effort, never fatal
+        log.exception("event_gate.fast_path_failed event=%s", event_id)
 
     try:
         await _archive_one(

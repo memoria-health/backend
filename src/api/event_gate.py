@@ -1,0 +1,365 @@
+"""Operator endpoints for the pre-dispatch event gate.
+
+Not the caregiver review feature — see `src/services/event_gate.py` for
+why those two things share a word and nothing else.
+
+Two surfaces, two different credentials, on purpose:
+
+  `GET /v1/event-gate/queue`
+      Operator bearer token (`OperatorAuth`). Cross-tenant listing for
+      the ops dashboard and for debugging. No customer token satisfies
+      it.
+
+  `GET|POST /v1/event-gate/act/{token}`
+      No session at all — the signed link IS the credential. This is
+      the page PagerDuty puts on the operator's phone: it renders the
+      clip inline and takes the verdict, because a login prompt inside
+      a 60-second window is a login prompt nobody completes.
+
+      GET only ever renders. POST performs the verdict, and only with
+      `confirm=1`, so the first tap on a phone in the dark shows a
+      confirmation rather than silently suppressing a real alert.
+
+      The page is single-use by construction: acting moves `gate_state`
+      off 'pending', and every path here refuses to act on anything not
+      'pending'. A reopened link renders what already happened.
+"""
+
+from __future__ import annotations
+
+import html
+import logging
+from uuid import UUID
+
+from fastapi import APIRouter, HTTPException, Response, status
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+from sqlalchemy import text
+
+from src.api.deps import OperatorAuth, SessionDep, SettingsDep
+from src.db.session import get_sessionmaker
+from src.services import event_gate, storage
+
+router = APIRouter(prefix="/v1/event-gate", tags=["event-gate"])
+
+log = logging.getLogger(__name__)
+
+
+class QueueItem(BaseModel):
+    event_id: str
+    title: str
+    narrative: str
+    patient_name: str
+    room: str
+    occurred_at: str
+    seconds_left: int
+    clip_url: str | None = None  # null while the fast-path upload is in flight
+
+
+_QUEUE_SQL = """
+    select e.id, e.title, coalesce(e.narrative, ''),
+           coalesce(nullif(p.preferred_name, ''), p.full_name),
+           coalesce(e.location, ''), e.occurred_at,
+           greatest(0, :auto - extract(epoch from now()
+                     - coalesce(e.gate_held_at, e.created_at)))::int,
+           coalesce(e.gate_clip_key,
+                    case when e.has_clip then e.clip_storage_key end)
+    from events e join patients p on p.id = e.patient_id
+    where e.gate_state = 'pending'
+    order by e.gate_held_at desc nulls last, e.created_at desc
+    limit 50
+"""
+
+
+@router.get("/queue", response_model=list[QueueItem])
+async def queue(
+    _: OperatorAuth, session: SessionDep, settings: SettingsDep
+) -> list[QueueItem]:
+    """Every currently-held event, across every household."""
+    rows = (await session.execute(
+        text(_QUEUE_SQL), {"auto": event_gate.AUTO_RELEASE_S})).all()
+    out: list[QueueItem] = []
+    for r in rows:
+        out.append(QueueItem(
+            event_id=str(r[0]), title=r[1], narrative=r[2], patient_name=r[3],
+            room=r[4], occurred_at=r[5].isoformat(), seconds_left=r[6],
+            clip_url=await _sign_clip(r[7], settings=settings),
+        ))
+    return out
+
+
+class ToggleBody(BaseModel):
+    patient_id: str
+    enabled: bool
+
+
+@router.post("/toggle", status_code=status.HTTP_204_NO_CONTENT)
+async def toggle(_: OperatorAuth, body: ToggleBody, session: SessionDep) -> None:
+    """Turn the gate on or off for one patient.
+
+    Operator-only, and not exposed to caregivers: whether we hold a
+    family's alerts for a false-positive check is our operational
+    decision, not a customer setting. Deliberately one patient at a
+    time — there is no "enable everywhere", because the blast radius of
+    a mistake there is every household at once.
+    """
+    row = (await session.execute(text(
+        """update patients set event_gate_enabled = :enabled
+           where id = :pid returning id"""),
+        {"enabled": body.enabled, "pid": body.patient_id})).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="patient_not_found")
+    await session.commit()
+    log.info(
+        "event_gate.toggled patient=%s enabled=%s", body.patient_id, body.enabled
+    )
+
+
+async def _sign_clip(key: str | None, *, settings) -> str | None:
+    """Signed URL for a clip key, or None. Never raises: a missing clip
+    must still let the operator read the narrative and decide."""
+    if not key:
+        return None
+    try:
+        return await storage.signed_url(
+            bucket=settings.storage_bucket_incident_clips,
+            key=key, settings=settings,
+            ttl_seconds=event_gate.AUTO_RELEASE_S * 4,
+        )
+    except Exception:  # noqa: BLE001
+        log.warning("event_gate.clip_sign_failed key=%s", key)
+        return None
+
+
+# ── the verdict page ─────────────────────────────────────────────────
+
+
+@router.get("/act/{token}", response_class=HTMLResponse)
+async def act_page(
+    token: str, session: SessionDep, settings: SettingsDep
+) -> Response:
+    """Render the decision page. Never mutates."""
+    event_id = event_gate.verify_verdict_token(token, settings=settings)
+    if event_id is None:
+        return _html(_expired_page(), status_code=status.HTTP_403_FORBIDDEN)
+    row = await _load(session, event_id, settings=settings)
+    if row is None:
+        return _html(_gone_page("This alert no longer exists."),
+                     status_code=status.HTTP_404_NOT_FOUND)
+    if row["gate_state"] != "pending":
+        return _html(_settled_page(row))
+    return _html(_decision_page(row, token=token))
+
+
+@router.post("/act/{token}", response_class=HTMLResponse)
+async def act_submit(
+    token: str,
+    action: str,
+    session: SessionDep,
+    settings: SettingsDep,
+    confirm: int = 0,
+) -> Response:
+    """Take the verdict.
+
+    `action` and `confirm` arrive as query parameters even though this
+    is a POST — the buttons are plain HTML forms whose `action`
+    attribute carries the query string and whose body is empty. That
+    keeps the page dependency-free (no multipart parsing) while still
+    keeping every mutation off GET, so a link preview or a prefetch in
+    the PagerDuty app cannot cast a vote.
+    """
+    event_id = event_gate.verify_verdict_token(token, settings=settings)
+    if event_id is None:
+        return _html(_expired_page(), status_code=status.HTTP_403_FORBIDDEN)
+    if action not in {"release", "suppress"}:
+        raise HTTPException(status_code=400, detail="bad_action")
+
+    row = await _load(session, event_id, settings=settings)
+    if row is None:
+        return _html(_gone_page("This alert no longer exists."),
+                     status_code=status.HTTP_404_NOT_FOUND)
+    if row["gate_state"] != "pending":
+        return _html(_settled_page(row))
+
+    # First tap shows the consequence in words and asks again. Suppress
+    # is unrecoverable — the caregiver is never told, and there is no
+    # second chance once the 60s is gone.
+    if not confirm:
+        return _html(_confirm_page(row, token=token, action=action))
+
+    result = await event_gate.act(
+        sessionmaker=get_sessionmaker(),
+        event_id=event_id,
+        approve=(action == "release"),
+        settings=settings,
+    )
+    log.info(
+        "event_gate.operator_verdict event=%s action=%s result=%s",
+        event_id, action, result,
+    )
+    return _html(_result_page(row, result=result))
+
+
+async def _load(session, event_id: UUID, *, settings) -> dict | None:
+    row = (await session.execute(text(
+        """select e.title, coalesce(e.narrative, ''),
+                  coalesce(nullif(p.preferred_name, ''), p.full_name),
+                  coalesce(e.location, ''), e.gate_state,
+                  greatest(0, :auto - extract(epoch from now()
+                            - coalesce(e.gate_held_at, e.created_at)))::int,
+                  coalesce(e.gate_clip_key,
+                           case when e.has_clip then e.clip_storage_key end)
+           from events e join patients p on p.id = e.patient_id
+           where e.id = :id"""),
+        {"id": str(event_id), "auto": event_gate.AUTO_RELEASE_S})).first()
+    if row is None:
+        return None
+    return {
+        "title": row[0], "narrative": row[1], "patient_name": row[2],
+        "room": row[3], "gate_state": row[4], "seconds_left": row[5],
+        "clip_url": await _sign_clip(row[6], settings=settings),
+    }
+
+
+# ── HTML ─────────────────────────────────────────────────────────────
+# Server-rendered, self-contained, no external assets. It loads on a
+# phone on cellular in a dark room in under a second, which is the only
+# requirement that matters. Every interpolated value is escaped: the
+# narrative is model-generated text and goes straight into the DOM.
+
+_CSS = """
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+body { margin:0; padding:20px; background:#0b0d10; color:#e9edf2;
+  font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+.wrap { max-width:520px; margin:0 auto; }
+h1 { font-size:22px; margin:0 0 4px; }
+.sub { color:#9aa4b2; font-size:15px; margin:0 0 16px; }
+video { width:100%; border-radius:12px; background:#000; margin-bottom:16px; }
+.narr { background:#151a21; border-radius:12px; padding:14px; margin-bottom:20px;
+  font-size:15px; }
+.count { font-variant-numeric:tabular-nums; color:#ffb020; font-weight:600; }
+form { display:block; margin:0 0 10px; }
+button { width:100%; padding:16px; font-size:17px; font-weight:600;
+  border:0; border-radius:12px; color:#fff; }
+.suppress { background:#c0392b; }
+.release { background:#1f7a3f; }
+.cancel { background:#2a313a; }
+.note { color:#9aa4b2; font-size:13px; margin-top:18px; }
+.big { font-size:19px; font-weight:600; margin:24px 0 8px; }
+"""
+
+
+def _html(body: str, *, status_code: int = 200) -> Response:
+    page = (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        f"<title>Memoria alert review</title><style>{_CSS}</style></head>"
+        f"<body><div class='wrap'>{body}</div></body></html>"
+    )
+    # These pages carry one household's clip and narrative. Keep them out
+    # of every cache and out of any referrer sent to a third party.
+    return HTMLResponse(
+        content=page,
+        status_code=status_code,
+        headers={
+            "Cache-Control": "no-store, max-age=0",
+            "Referrer-Policy": "no-referrer",
+            "X-Robots-Tag": "noindex, nofollow",
+        },
+    )
+
+
+def _header(row: dict) -> str:
+    who = html.escape(row["patient_name"])
+    what = html.escape(row["title"])
+    where = html.escape(row["room"])
+    sub = f"{who}{f' · {where}' if where else ''}"
+    return f"<h1>{what}</h1><p class='sub'>{sub}</p>"
+
+
+def _clip(row: dict) -> str:
+    if not row["clip_url"]:
+        return ("<div class='narr'>Clip still uploading. Decide on the "
+                "description below, or wait a few seconds and reload.</div>")
+    url = html.escape(row["clip_url"], quote=True)
+    return (f"<video controls autoplay muted playsinline preload='auto' "
+            f"src='{url}'></video>")
+
+
+def _decision_page(row: dict, *, token: str) -> str:
+    left = int(row["seconds_left"])
+    base = f"/v1/event-gate/act/{html.escape(token, quote=True)}"
+    return (
+        _header(row)
+        + _clip(row)
+        + f"<div class='narr'>{html.escape(row['narrative'])}</div>"
+        + f"<p class='sub'>Auto-sends to the caregiver in "
+          f"<span class='count' id='c'>{left}</span>s if you do nothing.</p>"
+        + f"<form method='post' action='{base}?action=suppress'>"
+          "<button class='suppress'>Suppress — false alarm</button></form>"
+        + f"<form method='post' action='{base}?action=release'>"
+          "<button class='release'>Send now — this is real</button></form>"
+        + "<p class='note'>Suppressing means the caregiver is never told "
+          "about this alert.</p>"
+        + "<script>var n=" + str(left) + ",e=document.getElementById('c');"
+          "setInterval(function(){if(n>0){n--;e.textContent=n;}},1000);</script>"
+    )
+
+
+def _confirm_page(row: dict, *, token: str, action: str) -> str:
+    base = f"/v1/event-gate/act/{html.escape(token, quote=True)}"
+    if action == "suppress":
+        question = "Suppress this alert?"
+        detail = (f"{html.escape(row['patient_name'])}'s caregiver will never "
+                  "be told about it. This cannot be undone.")
+        cls, label = "suppress", "Yes, suppress it"
+    else:
+        question = "Send this alert now?"
+        detail = (f"{html.escape(row['patient_name'])}'s caregiver is notified "
+                  "immediately, without waiting out the timer.")
+        cls, label = "release", "Yes, send it"
+    return (
+        _header(row)
+        + f"<p class='big'>{question}</p>"
+        + f"<p class='sub'>{detail}</p>"
+        + f"<form method='post' action='{base}?action={action}&confirm=1'>"
+          f"<button class='{cls}'>{label}</button></form>"
+        + f"<form method='get' action='{base}'>"
+          "<button class='cancel'>Cancel</button></form>"
+    )
+
+
+def _result_page(row: dict, *, result: str) -> str:
+    if result == "rejected":
+        line, note = "Suppressed.", "The caregiver will not be notified."
+    elif result == "approved":
+        line, note = "Sent.", "The caregiver has been notified."
+    else:
+        line, note = ("Already sent.",
+                      "The 60-second timer released this alert before your "
+                      "decision landed. The caregiver has been notified.")
+    return (_header(row) + f"<p class='big'>{line}</p><p class='sub'>{note}</p>"
+            + "<p class='note'>This link is now closed.</p>")
+
+
+def _settled_page(row: dict) -> str:
+    state = row["gate_state"]
+    note = {
+        "rejected": "It was suppressed. The caregiver was not notified.",
+        "approved": "It was sent to the caregiver.",
+        "auto": "The 60-second timer released it. The caregiver was notified.",
+    }.get(state, "It is no longer awaiting a decision.")
+    return (_header(row) + "<p class='big'>Already decided.</p>"
+            + f"<p class='sub'>{note}</p>"
+            + "<p class='note'>This link is now closed.</p>")
+
+
+def _expired_page() -> str:
+    return ("<p class='big'>This link has expired.</p>"
+            "<p class='sub'>Verdict links are valid for a few minutes. The "
+            "alert it referred to has already been sent or suppressed.</p>")
+
+
+def _gone_page(msg: str) -> str:
+    return f"<p class='big'>{html.escape(msg)}</p>"

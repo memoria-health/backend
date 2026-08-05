@@ -97,8 +97,13 @@ class PatientResponse(BaseModel):
     # the wire until both clients ship without the toggle.
     privacy_mode_enabled: bool
 
-    # Review-gate toggle (additive; absent on older backends)
-    require_review: bool | None = None
+    # NOTE: `patients.event_gate_enabled` is deliberately NOT on this
+    # schema. The event gate is an internal operator control (do WE hold
+    # this patient's alerts for a false-positive check before the family
+    # is told); it is read and written through /v1/event-gate/toggle
+    # behind the operator token, and no client has any use for it. Its
+    # predecessor `require_review` was echoed here and consumed by
+    # nothing.
 
 class PhotoURLResponse(BaseModel):
     """Returned by `GET /v1/patients/{id}/photo-url`. Signed URL is

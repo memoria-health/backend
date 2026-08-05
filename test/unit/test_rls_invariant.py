@@ -13,6 +13,10 @@ Anyone could have read, forged or TRUNCATEd patient sleep and activity records.
 Production was spared only because the two deltas that create those tables had
 not been applied yet.
 
+(`review_devices` no longer exists — 2026-08-05, operator paging moved to
+PagerDuty, so the reviewer push tokens it held are not stored at all. The
+history stays here because the lesson is about deltas, not that table.)
+
 Nothing caught it. Twenty-four static audit reports missed it because they
 never query a database, and the schema review missed it because the tables are
 created in delta scripts rather than schema.sql.
