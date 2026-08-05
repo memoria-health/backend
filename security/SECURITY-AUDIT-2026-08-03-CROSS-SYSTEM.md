@@ -1,5 +1,14 @@
 # Memoria — Cross-System Security Audit, 2026-08-03
 
+> **SUPERSEDED IN PART — see `SECURITY-AUDIT-2026-08-05-REMEDIATION.md`.**
+> That pass re-tested this document against production and found four items
+> here wrong or mis-stated: **C3 is refuted as written** (the mechanism named
+> does not exist — though the endpoint was dangerous for a different reason and
+> is now deleted), **H1 is overstated**, **H3 is confirmed** (it was carried
+> forward unverified), and **M4 is live** despite a source comment claiming
+> otherwise. Nine findings are now fixed. Read the newer document first; this
+> one is kept unedited as the point-in-time record.
+
 **Scope:** `nemara-backend`, `nemara-caregiver-app`, `nemara-web-app`,
 `nemara-caregiver-app-android`, and the seams between them (Supabase, LiveKit,
 APNs, Resend, Railway, Vercel). `nemara-gateway` excluded by request — it was
