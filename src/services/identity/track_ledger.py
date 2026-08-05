@@ -43,13 +43,13 @@ import logging
 import time
 from typing import TYPE_CHECKING
 
-from src.services.identity import trace
-from src.services.identity.observations import LABEL_PATIENT, LABEL_UNKNOWN
 from src.services.detection.patient_presence import (
     TIER_BODY,
     TIER_FACE,
     TIER_HELD,
 )
+from src.services.identity import trace
+from src.services.identity.observations import LABEL_PATIENT, LABEL_UNKNOWN
 
 if TYPE_CHECKING:
     from src.services.identity.result import IdentityResult
@@ -70,6 +70,17 @@ _TIER = {"face": 2, "pool": 1}
 
 def _bbox_area(b) -> float:
     return max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+
+
+def _iou(a, b) -> float:
+    """Intersection-over-union of two (x1, y1, x2, y2) boxes."""
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    if inter <= 0.0:
+        return 0.0
+    union = _bbox_area(a) + _bbox_area(b) - inter
+    return inter / union if union > 0.0 else 0.0
 
 
 @dataclasses.dataclass
@@ -117,6 +128,16 @@ class TrackLedger:
         # Lean eval rig: strip scene-extension so a real track loss reads
         # as a loss, not a 150s ghost-hold on "someone is in the room".
         self._lean_eval = bool(getattr(settings, "reid_lean_eval_mode", False))
+        # Blackout carry (2026-08-05). A lights-off IR switch changes the
+        # whole frame at once: EdgeTAM loses the mask and re-grounds under
+        # a NEW track_id. This ledger keys by pod track_id and never
+        # re-associates, so without this the bound patient retires and the
+        # re-acquired body is born UNKNOWN — exactly when someone is in bed
+        # at distance and neither a face nor an outfit will re-establish
+        # them. Window is short on purpose: the claim is physical, not
+        # statistical — nobody swaps places in the room in that time.
+        self._carry_max_gap_s = g("reid_blackout_carry_max_gap_s", 5.0)
+        self._carry_min_iou = g("reid_blackout_carry_min_iou", 0.30)
 
     # ── external surface (IdentityLock-compatible seam) ────────────────
 
@@ -173,14 +194,14 @@ class TrackLedger:
         return (e.last_bbox, float(e.confidence))
 
     def apply(
-        self, identity: "IdentityResult", *, tick_mono: float | None = None,
-    ) -> "IdentityResult":
+        self, identity: IdentityResult, *, tick_mono: float | None = None,
+    ) -> IdentityResult:
         """Fold this tick's tracks onto the ledger by stable id, bind/hold
         the patient, and rewrite the IdentityResult through the bindings.
         Never raises — a ledger bug must not break a tick."""
         try:
             return self._apply_inner(identity, tick_mono)
-        except Exception:  # noqa: BLE001
+        except Exception:
             log.exception("track_ledger.apply failed cam=%s", self._camera_id)
             return identity
 
@@ -222,6 +243,8 @@ class TrackLedger:
             seen.add(tid)
 
         self._takeover_check(tracks)
+        if born and not degraded:
+            self._carry_through_blackout(now, seen)
         if not degraded:
             self._retire(now, seen)
 
@@ -249,6 +272,87 @@ class TrackLedger:
                 confidence=seen_patient.confidence,
             )
         return self._rewrite(identity, degraded_hold=degraded)
+
+    def _carry_through_blackout(self, now: float, seen: set[int]) -> None:
+        """Move a PATIENT binding onto a track born THIS tick when the bound
+        track vanished moments ago in the same place.
+
+        The case: the room light goes off, the camera flips to IR, the whole
+        frame changes at once, EdgeTAM drops the mask and re-grounds the same
+        body under a NEW track_id. Because this ledger keys by pod track_id
+        and never re-associates, the bound entry would sit there un-sighted
+        until it retired while the live body sat next to it labelled UNKNOWN.
+        Worst at exactly the moment it matters least to be wrong about: a
+        person in bed, far from the lens, where neither a face nor an outfit
+        match will re-establish them for the rest of the night.
+
+        This is NOT the geometric stitcher this module deliberately deleted.
+        That one re-associated on similarity, across arbitrary gaps, as a
+        general mechanism. This is a physical claim with a hard time bound:
+        within a couple of seconds a person cannot have left and a different
+        person cannot have taken their place in the same box. Outside the
+        window it does nothing.
+
+        Refuses on ambiguity. Two plausible candidates means we cannot tell
+        which body is the patient, and mislabelling someone else AS the
+        patient is the one failure this ledger has always refused to risk
+        (see the pool-match FP guard). Doing nothing degrades to the old
+        behaviour; guessing does not.
+        """
+        if self._carry_max_gap_s <= 0.0:
+            return
+        holder = next(
+            (
+                e for e in self._entries.values()
+                if e.binding == LABEL_PATIENT and e.pid not in seen
+            ),
+            None,
+        )
+        if holder is None:
+            return
+        # Measure from the last REAL body sighting, not last_seen: the
+        # scene-extension overwrites last_seen every tick, so using it would
+        # let a phantom hold the window open indefinitely.
+        if now - holder.last_body_seen > self._carry_max_gap_s:
+            return
+
+        candidates = [
+            e for e in self._entries.values()
+            if e.pid in seen
+            and e.binding == LABEL_UNKNOWN
+            and e.first_seen >= now          # born on THIS tick
+            and _iou(e.last_bbox, holder.last_bbox) >= self._carry_min_iou
+        ]
+        if len(candidates) != 1:
+            if len(candidates) > 1:
+                log.info(
+                    "track_ledger.blackout_carry_ambiguous cam=%s n=%d — "
+                    "refusing to guess which body is the patient",
+                    self._camera_id, len(candidates),
+                )
+            return
+
+        heir = candidates[0]
+        gap = now - holder.last_body_seen
+        overlap = _iou(heir.last_bbox, holder.last_bbox)
+        # Inherit the provenance that earned the lock, not a fresh one: the
+        # heir has proven nothing itself, it is the same body under a new id.
+        heir.binding = LABEL_PATIENT
+        heir.provenance = holder.provenance
+        heir.confidence = holder.confidence
+        heir.bound_at = holder.bound_at
+        heir.last_face_confirm = holder.last_face_confirm
+        heir.last_body_seen = now
+        del self._entries[holder.pid]
+
+        log.info(
+            "track_ledger.blackout_carry cam=%s %d->%d gap=%.1fs iou=%.2f",
+            self._camera_id, holder.pid, heir.pid, gap, overlap,
+        )
+        trace.idevent(
+            tid=heir.pid, event="CARRIED", cause="blackout_reacquire",
+            gap_s=gap,
+        )
 
     def _birth(self, tid: int, t, now: float) -> _Entry:
         e = _Entry(
