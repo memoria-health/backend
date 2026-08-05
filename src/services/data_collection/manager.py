@@ -17,6 +17,7 @@ bandwidth bill).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import tempfile
@@ -28,6 +29,7 @@ from typing import Any
 from uuid import UUID
 
 from src.services.data_collection import b2 as b2_module
+from src.services.annotations.sidecar import sidecar_key
 from src.services.data_collection.keys import build_clip_key
 from src.services.data_collection.mux import mux_av
 from src.services.data_collection.session import (
@@ -49,6 +51,8 @@ _Uploader = Callable[..., Awaitable[str]]
 # — the retired patient-level check took a patient id).
 _PrivacyCheck = Callable[[UUID], Awaitable[bool]]
 _RegionLookup = Callable[[UUID], Awaitable[str]]
+# (FinalizedSession, clip key, clip metadata) -> the sidecar dict.
+_SidecarBuilder = Callable[..., Awaitable[dict]]
 
 
 def temp_root() -> Path:
@@ -140,6 +144,7 @@ class RecorderManager:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         privacy_check: _PrivacyCheck = _never_private,
         region_lookup: _RegionLookup = _always_us,
+        sidecar_builder: _SidecarBuilder | None = None,
     ) -> None:
         self._settings = settings
         self._masking_encoder_factory = masking_encoder_factory
@@ -148,6 +153,9 @@ class RecorderManager:
         self._masked: dict[UUID, bool] = {}
         self._privacy_check = privacy_check
         self._region_lookup = region_lookup
+        # Builds the note that travels with a clip. None (unit tests, a
+        # box with no DB) simply means no sidecar — never a failed upload.
+        self._sidecar_builder = sidecar_builder
         self._temp_dir = Path(temp_dir)
         self._encoder_factory = encoder_factory
         self._muxer = muxer
@@ -175,6 +183,8 @@ class RecorderManager:
             "dropped_no_b2": 0,
             "dropped_upload_failed": 0,
             "clips_short": 0,
+            "sidecars_uploaded": 0,
+            "sidecars_failed": 0,
         }
 
         self._sessions: dict[UUID, SessionRecorder] = {}
@@ -452,6 +462,7 @@ class RecorderManager:
                 fs.audio_path,
                 camera_id=fs.ctx.camera_id,
                 patient_id=fs.ctx.patient_id,
+                fs=fs,
             )
         )
         self._pending_uploads.add(task)
@@ -467,6 +478,7 @@ class RecorderManager:
         *,
         camera_id: UUID,
         patient_id: UUID,
+        fs: FinalizedSession | None = None,
     ) -> None:
         try:
             # Defense-in-depth: the CAMERA's privacy can flip on (room
@@ -511,13 +523,14 @@ class RecorderManager:
                     patient_id, key,
                 )
                 region = "US"
-            await self._upload_with_retry(final_path, key, metadata, region)
+            if await self._upload_with_retry(final_path, key, metadata, region):
+                await self._upload_sidecar(fs, key, metadata, region)
         finally:
             self._cleanup(video_path, audio_path, final_path)
 
     async def _upload_with_retry(
         self, final_path: Path, key: str, metadata: dict[str, str], region: str,
-    ) -> None:
+    ) -> bool:
         delay = self._retry_base_delay
         for attempt in range(1, self._upload_retries + 1):
             try:
@@ -532,7 +545,7 @@ class RecorderManager:
                     "data_collection: uploaded %s (%s) stats=%s",
                     key, metadata.get("duration_seconds"), self.stats,
                 )
-                return
+                return True
             except Exception:
                 if attempt >= self._upload_retries:
                     logger.exception(
@@ -541,7 +554,7 @@ class RecorderManager:
                         key,
                     )
                     self.stats["dropped_upload_failed"] += 1
-                    return
+                    return False
                 logger.warning(
                     "data_collection: upload attempt %d failed key=%s; retrying",
                     attempt,
@@ -549,6 +562,51 @@ class RecorderManager:
                 )
                 await self._sleep(delay)
                 delay *= 2
+        return False
+
+    async def _upload_sidecar(
+        self, fs: FinalizedSession | None, clip_key: str,
+        clip_metadata: dict[str, str], region: str,
+    ) -> None:
+        """Write the clip's note beside it in B2.
+
+        Strictly best-effort and always AFTER the clip is safely up. The
+        video is the irreplaceable thing; a note can be regenerated from
+        the database at any time, so nothing here may cost us a clip.
+
+        A missing sidecar therefore means "no note available", never "no
+        events happened" — a consumer must not read absence as evidence.
+        """
+        if self._sidecar_builder is None or fs is None:
+            return
+        try:
+            payload = await self._sidecar_builder(fs, clip_key, clip_metadata)
+            if not payload:
+                return
+            body = json.dumps(payload, separators=(",", ":")).encode()
+            key = sidecar_key(clip_key)
+            path = self._temp_dir / f"{Path(clip_key).stem}.sidecar.json"
+            path.write_bytes(body)
+            try:
+                await self._uploader(
+                    path, key,
+                    metadata={
+                        "clip_key": clip_key,
+                        "patient_id": str(fs.ctx.patient_id),
+                    },
+                    settings=self._settings,
+                    region=region,
+                    content_type="application/json",
+                )
+                self.stats["sidecars_uploaded"] += 1
+            finally:
+                self._cleanup(path)
+        except Exception:
+            self.stats["sidecars_failed"] += 1
+            logger.exception(
+                "data_collection: sidecar failed for %s (clip is safe)",
+                clip_key,
+            )
 
     def _cleanup(self, *paths: Path | None) -> None:
         for p in paths:

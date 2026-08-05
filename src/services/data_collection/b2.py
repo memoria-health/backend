@@ -33,6 +33,7 @@ async def upload_file_to_b2(
     settings: Any,
     session: Any = None,
     region: str | None = None,
+    content_type: str = _CONTENT_TYPE,
 ) -> str:
     """Upload the file at ``path`` to ``key`` in the region's B2 bucket.
 
@@ -69,7 +70,7 @@ async def upload_file_to_b2(
             Bucket=bucket,
             Key=key,
             ExtraArgs={
-                "ContentType": _CONTENT_TYPE,
+                "ContentType": content_type,
                 "Metadata": {k: str(v) for k, v in metadata.items()},
             },
         )

@@ -27,7 +27,7 @@ import math
 import secrets
 import time
 from collections.abc import Awaitable, Callable
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -242,6 +242,7 @@ class RoomWorker:
             temp_dir=recorder_temp_root(),
             privacy_check=self._camera_privacy_check,
             region_lookup=self._patient_region,
+            sidecar_builder=self._build_sidecar,
         )
 
     async def _camera_privacy_check(self, camera_id) -> bool:
@@ -256,6 +257,35 @@ class RoomWorker:
             # we can't positively confirm is allowed to leave the box.
             return True
         return cam.privacy_enabled
+
+    async def _build_sidecar(self, fs, clip_key: str, clip_metadata: dict):
+        """The note that travels with a clip: what the pipeline already
+        recorded inside this clip's window, re-expressed against its
+        timeline.
+
+        Reads only. Nothing new is computed for it, and a failure here
+        never costs the clip — the caller treats it as best-effort.
+        """
+        from src.services.annotations.fetch import (
+            build_for_clip,
+            clip_facts_from_upload,
+        )
+
+        clip = clip_facts_from_upload(
+            key=clip_key,
+            started_at=fs.session_start_utc,
+            duration_seconds=float(fs.video_duration_seconds or 0.0),
+            caregiver_id=fs.ctx.caregiver_id,
+            patient_id=fs.ctx.patient_id,
+            camera_id=fs.ctx.camera_id,
+            room=fs.ctx.room,
+            masked=bool(fs.masked),
+            timeline_exact=clip_metadata.get("timeline_exact") != "false",
+        )
+        async with self._sessionmaker() as session:
+            return await build_for_clip(
+                session, clip, generated_at=datetime.now(timezone.utc),
+            )
 
     async def _patient_region(self, patient_id) -> str:
         """Data-residency lookup for the recorder: resolve the patient's
