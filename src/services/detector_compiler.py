@@ -34,8 +34,8 @@ no video involved at compile time.
 
 from __future__ import annotations
 
-import logging
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from uuid import uuid4
@@ -175,9 +175,37 @@ caregiver's wording that conflicts with them.
 """
 
 
+# Severity at or above which a reactive detector gets the INCLUSIVE prompt.
+#
+# Mirrors `_EMERGENCY_SEVERITY` in detection/scheduling/scheduler.py, which
+# gates the cost exemptions. One concept — "this is high-stakes enough that a
+# miss matters more than a false alarm" — so the two must not drift. Not
+# imported, because scheduling importing the compiler (or vice versa) would be
+# a cycle; test_detector_categories.py asserts they stay equal instead.
+INCLUSIVE_BIAS_SEVERITY = 80
+
+# Categories whose members are high-stakes by default, used ONLY when a caller
+# has not supplied severity yet. Not a treatment rule — a compatibility shim so
+# pre-severity callers keep the exact behaviour they had.
+_LEGACY_HIGH_STAKES_CATEGORIES = frozenset({"safety"})
+
+
+def _is_high_stakes(*, category: str, severity: int | None) -> bool:
+    """Whether a reactive detector gets the INCLUSIVE prompt.
+
+    Severity decides when we have it. When we do not (older call sites,
+    fixtures), fall back to the pre-2026-08-05 category check so nothing
+    silently changes strictness — the failure mode we care about is a
+    high-stakes detector quietly becoming conservative and missing events.
+    """
+    if severity is not None:
+        return severity >= INCLUSIVE_BIAS_SEVERITY
+    return category in _LEGACY_HIGH_STAKES_CATEGORIES
+
+
 def _meta_prompt(
     *, identifier: str, name: str, description: str, user_text: str,
-    absence: bool, category: str,
+    absence: bool, category: str, severity: int | None = None,
 ) -> str:
     """The instructions the compiler sends to the LLM. `identifier` is
     interpolated everywhere the runtime block needs the stable key.
@@ -186,11 +214,24 @@ def _meta_prompt(
       - absence → conservative: only a clear positive
         counts, so a real miss surfaces the absence alert instead of being
         swallowed.
-      - reactive + safety  → inclusive: a missed emergency is far worse than a
-        false alarm, so fire on borderline signs.
-      - reactive + routine → conservative: a false alarm is just noise, so only
-        a clear, sustained occurrence fires (this is the "watching TV fired on a
-        glance" fix). The LLM is told to calibrate strictness to the stakes.
+      - reactive + high severity → inclusive: a missed emergency is far worse
+        than a false alarm, so fire on borderline signs.
+      - reactive + low severity  → conservative: a false alarm is just noise, so
+        only a clear, sustained occurrence fires (this is the "watching TV fired
+        on a glance" fix). The LLM is told to calibrate strictness to the stakes.
+
+    STAKES IS `severity`, NOT `category` (2026-08-05). This used to read
+    `category == "safety"`, which worked only while there were two categories
+    and "safety" doubled as "high stakes". With four semantic categories
+    (safety / routine / behaviour / care) that conflation breaks: filing a 3am
+    wandering detector under `behaviour` would silently hand it the strict
+    prompt and it would start missing things. Category is now labelling only;
+    severity carries the stakes, the same contract the scheduler already uses
+    for its cost exemptions.
+
+    `severity` is None for older callers that have not been threaded through
+    yet; those fall back to the previous category check so behaviour is
+    unchanged rather than silently loosened.
     """
     if absence:
         detected_guidance = (
@@ -201,12 +242,12 @@ def _meta_prompt(
             "would wrongly suppress that alert."
         )
         example = _FEW_SHOT_EXAMPLE_CONSERVATIVE
-    elif category == "safety":
+    elif _is_high_stakes(category=category, severity=severity):
         detected_guidance = (
-            "FIRST weigh the stakes: this is a SAFETY/health detector, so a "
-            "missed event could be an emergency. Be GENEROUS — use INCLUSIVE "
-            "criteria so borderline or partial signs still fire; set FALSE only "
-            "when you're confident nothing concerning happened."
+            "FIRST weigh the stakes: this is a HIGH-STAKES health or safety "
+            "detector, so a missed event could be an emergency. Be GENEROUS — "
+            "use INCLUSIVE criteria so borderline or partial signs still fire; "
+            "set FALSE only when you're confident nothing concerning happened."
         )
         example = _FEW_SHOT_EXAMPLE_INCLUSIVE
     else:
@@ -486,10 +527,15 @@ class InferredConfig:
     # Alerting spine (2026-07-26).
     alert_trigger: str               # "leading"|"trailing"|"duration"|"absence"
     is_sustained: bool               # instant vs sustained
-    category: str                    # "safety" | "routine"
+    category: str                    # safety | routine | behaviour | care
     icon_name: str
     sensitivity: str                 # "low" | "standard" | "high"
     schedule: dict | None = field(default=None)  # None unless alert_trigger=schedule
+    # How much a MISS costs, 0-100, judged INDEPENDENTLY of category.
+    # Drives the compile bias (>= INCLUSIVE_BIAS_SEVERITY), the
+    # scheduler's emergency exemptions and pack priority. 50 = the
+    # catalog default (dims.py), used when the model gave nothing usable.
+    severity: int = 50
     # Set only when is_sustained: the rising-edge episode gap (seconds).
     episode_gap_seconds: int | None = field(default=None)
     # Set only when alert_trigger == "duration": the "too long" threshold.
@@ -546,14 +592,37 @@ def _infer_meta_prompt(*, name: str | None, prompt: str) -> str:
         '     - "moderate" (~5 min): eating, on the phone, reading.\n'
         '     - "extended" (~15 min): watching TV, sleeping, sitting — a brief '
         'break (e.g. a bathroom trip) should NOT split the session.\n'
-        '  "category": "safety" | "routine".\n'
-        '     - "safety" = could be an emergency or cause harm if missed: '
-        'falls, wandering / leaving the house, fire / stove / hazards, choking, '
-        'aggression or injury, prolonged no-movement, medication missed. '
-        'When bodily harm or a health risk is plausible, choose "safety".\n'
-        '     - "routine" = everyday, non-emergency behaviour where a false '
-        'alarm is merely annoying noise: watching TV, using a phone or tablet, '
-        'a visitor arriving, eating a snack, reading, sitting on the couch.\n'
+        '  "category": "safety" | "routine" | "behaviour" | "care".\n'
+        '     This is a LABEL for how the caregiver thinks about the event. It '
+        'does NOT decide how urgently we treat it — "severity" below does that, '
+        'and you judge the two INDEPENDENTLY. A high-severity "behaviour" '
+        'detector is normal and correct.\n'
+        '     - "safety" = physical danger or a health emergency: falls, '
+        'wandering / leaving the house, fire / stove / hazards, choking, '
+        'injury, prolonged no-movement.\n'
+        '     - "routine" = the rhythm of an ordinary day, and whether it '
+        'held: meals, sleep and waking, medication taken, getting up and '
+        'about, time out of bed.\n'
+        '     - "behaviour" = how the person seems in themselves: '
+        'restlessness, agitation, pacing, sundowning, distress, calling out, '
+        'repetitive actions, time spent alone.\n'
+        '     - "care" = something a person needs help WITH, or the presence '
+        'and absence of that help: assistance to the bathroom, company at '
+        'meals, a visitor arriving, long stretches with nobody around.\n'
+        '     Pick the one a family member would use to describe it. If a '
+        'detector could be two, prefer the one naming what is OBSERVED over '
+        'the one naming why it matters — "pacing at night" is behaviour even '
+        'though it may signal a safety risk.\n'
+        '  "severity": integer 0-100 — how much a MISS costs, judged on its '
+        'own, independent of category.\n'
+        '     - 80-100 = a miss could mean harm: falls, wandering outside, '
+        'fire, choking, no movement for hours, a medication that must not be '
+        'skipped. Detectors at or above 80 are compiled with INCLUSIVE '
+        'criteria so borderline signs still fire.\n'
+        '     - 40-79 = worth knowing promptly but not an emergency: skipped '
+        'a meal, up much later than usual, sustained agitation.\n'
+        '     - 0-39 = context, not alarm: watching TV, reading, a visitor, '
+        'sitting on the couch.\n'
         '  "suggested_name": a short display name stating what the ALERT '
         "MEANS. Event titles read 'Possible <name>', so for "
         'alert_trigger="absence" the name MUST be phrased as the MISS '
@@ -604,8 +673,22 @@ def _coerce_inferred(raw: dict) -> InferredConfig:
         is_sustained = False
 
     category = raw.get("category")
-    if category not in ("safety", "routine"):
+    if category not in ("safety", "routine", "behaviour", "care"):
+        # Unrecognised -> safety. Deliberately the cautious default: an
+        # over-labelled detector is a cosmetic error, and severity (not this
+        # field) decides how it is actually treated.
         category = "safety"
+    # Severity is judged independently of category and decides treatment:
+    # the compile bias, the scheduler's emergency exemptions, pack priority.
+    # A non-numeric or out-of-range answer falls back to the catalog default
+    # (dims.py uses 50) rather than to an extreme — guessing "emergency"
+    # would make every malformed response run the inclusive prompt, and
+    # guessing 0 would make a real emergency conservative.
+    raw_severity = raw.get("severity")
+    severity: int = 50
+    if isinstance(raw_severity, (int, float)) and not isinstance(raw_severity, bool):
+        severity = max(0, min(100, int(raw_severity)))
+
     sensitivity = raw.get("sensitivity")
     if sensitivity not in ("low", "standard", "high"):
         sensitivity = "standard"
@@ -678,7 +761,7 @@ def _coerce_inferred(raw: dict) -> InferredConfig:
         ),
         alert_trigger=alert_trigger,
         is_sustained=is_sustained,
-        category=category, icon_name=icon,
+        category=category, severity=severity, icon_name=icon,
         sensitivity=sensitivity, schedule=schedule,
         episode_gap_seconds=episode_gap_seconds,
         when_scope=when_scope, where_hint=where_hint,
@@ -799,6 +882,6 @@ async def summarize_detector_prompt(
             if ln.strip()
         ]
         return lines[:5] or None
-    except Exception:  # noqa: BLE001 — summary is best-effort by contract
+    except Exception:
         log.warning("detector_compiler.summarize_failed", exc_info=True)
         return None

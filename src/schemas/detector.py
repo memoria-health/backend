@@ -13,8 +13,25 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class DetectorCategory(str, Enum):
+    """What KIND of thing this detector watches for. Semantic only.
+
+    Category carries no treatment meaning — it drives labelling, colour and
+    filtering, nothing else. How urgently something is treated is `severity`,
+    which already gates the scheduler's emergency exemptions and pack
+    priority (scheduling/scheduler.py:68 records why: the category axis
+    collapsed to "everything is safety except medication" on 2026-07-18, so
+    severity became the exemption contract).
+
+    Keeping the two apart is what makes four values safe. If treatment rode
+    on category, filing a 3am wandering detector under `behaviour` would
+    quietly give it a stricter prompt than the same detector under `safety`,
+    and it would start missing things.
+    """
+
     safety = "safety"
     routine = "routine"
+    behaviour = "behaviour"
+    care = "care"
 
 
 class DetectorSource(str, Enum):

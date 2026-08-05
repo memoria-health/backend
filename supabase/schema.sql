@@ -14,7 +14,7 @@ create extension if not exists pgcrypto;       -- gen_random_uuid()
 -- ENUMS
 -- ══════════════════════════════════════════════════════════════════
 
-create type detector_category    as enum ('safety', 'routine');
+create type detector_category    as enum ('safety', 'routine', 'behaviour', 'care');
 create type detector_source      as enum ('preset', 'custom');
 create type detector_sensitivity as enum ('low', 'standard', 'high');
 create type review_choice        as enum ('correct', 'wrong', 'unsure');
