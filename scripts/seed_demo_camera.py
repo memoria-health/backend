@@ -184,12 +184,45 @@ async def seed(email: str, code: str) -> None:
         )
 
 
+_LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "host.docker.internal"})
+
+
+def _db_host(url: str) -> str:
+    """Host portion of NEMARA_DB_URL, without ever touching the password."""
+    after_scheme = url.split("://", 1)[-1]
+    authority = after_scheme.split("/", 1)[0]
+    hostport = authority.rsplit("@", 1)[-1]  # drop user:pass@
+    return hostport.rsplit(":", 1)[0].strip("[]")
+
+
 def main() -> None:
     settings = get_settings()
     ap = argparse.ArgumentParser()
     ap.add_argument("--email", default=DEFAULT_EMAIL)
     ap.add_argument("--code", default=settings.demo_pairing_code or "424242")
+    ap.add_argument(
+        "--remote",
+        action="store_true",
+        help="required to write to a non-local database (e.g. production)",
+    )
     args = ap.parse_args()
+
+    # This script writes wherever NEMARA_DB_URL happens to point, with no
+    # signal about where that is. Running it against local left rows behind
+    # that broke three tests; running it against production is what it is
+    # FOR, and deserves more friction than an unlucky shell history.
+    #
+    # Same shape as the `supabase/.temp/project-ref` problem: a command
+    # that silently targets whatever database the environment names. Print
+    # the host (never the credentials) and make a remote write explicit.
+    host = _db_host(settings.db_url)
+    if host not in _LOCAL_HOSTS and not args.remote:
+        raise SystemExit(
+            f"refusing to seed: NEMARA_DB_URL points at {host!r}, not a local "
+            f"database.\nThis writes a pairable camera row with a reusable "
+            f"code. If that is genuinely what you want, re-run with --remote."
+        )
+    print(f"seeding against {host}")
     asyncio.run(seed(args.email, args.code))
 
 

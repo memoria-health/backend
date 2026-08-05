@@ -212,6 +212,51 @@ Ordered by what I would do next.
 
 ---
 
+## Three loose ends worth knowing about
+
+### The backend security fixes live in a commit labelled for annotations
+
+SEC-1 through SEC-6 are in **`daef424 feat(annotations): sidecar spans`**, not
+in a commit named for them. Two sessions were working this branch at once; the
+other one ran `git commit` between this session staging its files and
+committing them, so a shared index carried nine security files into its commit.
+
+Nothing was lost and the tests pass, but two consequences:
+
+- The work is unfindable by reading the log for anything security-shaped.
+- That session had already produced one revert (`1c86034`). A revert of
+  `daef424` would take the security fixes with it.
+
+Left as-is deliberately: rewriting history while another session holds the
+branch would corrupt its working state. Worth a follow-up commit or a note in
+the PR description when the branch lands.
+
+### `/v1/cameras/me/frames` is orphaned
+
+Deleting the Pi announce route removed the only caller of
+`consume_pending_ingest_token`. `pi-provision` can still *create* a pending
+ingest token, but nothing can retrieve it, so no valid bearer for the push
+endpoint can ever be obtained.
+
+This is safe — an unreachable endpoint is strictly less attack surface than a
+reachable one — but it is dead weight, and dead weight that looks live is how
+`pi_stream_url` ended up being flagged as a Critical that did not exist. Worth
+removing as a clean-up, along with the `pi_discoveries` table and the
+`pi_stream_url` / `pi_audio_url` columns.
+
+### `seed_demo_camera.py` now refuses non-local databases without `--remote`
+
+Added after running it against the local dev database during this pass left a
+`cam_demo` row behind that broke three tests. The failure was trivial to undo;
+the shape of it was not trivial — the script writes wherever `NEMARA_DB_URL`
+points, with no signal about where that is. Exactly the
+`supabase/.temp/project-ref` problem from H4: a routine command that silently
+targets whichever database the environment happens to name.
+
+It now prints the host and requires `--remote` for anything that is not
+localhost. Re-seeding production during App Review therefore needs one extra
+flag, which is the point.
+
 ## Note on the 08-03 meta-finding
 
 That audit's central point — 24 reports, 18 open PRs, nothing ever fixed —
