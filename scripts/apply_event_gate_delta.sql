@@ -10,10 +10,24 @@
 -- never ran on prod (it was one of the pending deltas). If a local DB has
 -- it applied, the old columns are dropped at the bottom of this file.
 
--- Per-patient opt in. FALSE everywhere means this whole feature is inert
--- until switched on for one patient at a time.
+-- Per-patient. ON BY DEFAULT (product decision, 2026-08-05).
+--
+-- READ THIS BEFORE APPLYING TO PRODUCTION. Default-true plus the backfill
+-- below means every EXISTING patient starts having their alerts held for
+-- up to 60s, and masked footage of their home shown to a Memoria reviewer,
+-- the moment this runs. That is the intended behaviour, but it is a change
+-- made TO households rather than BY them, so it should not land before the
+-- caregiver-facing "Evaluation mode" setting and its explainer are live in
+-- all three clients. Applying this alone leaves families opted in with no
+-- way to see it or turn it off.
 alter table public.patients
-  add column if not exists event_gate_enabled boolean not null default false;
+  add column if not exists event_gate_enabled boolean not null default true;
+-- Separate statement so re-runs and databases that already have the column
+-- (created with the old default of false) converge on the same state.
+alter table public.patients
+  alter column event_gate_enabled set default true;
+update public.patients set event_gate_enabled = true
+  where event_gate_enabled = false;
 
 -- null | pending | approved | rejected | auto
 alter table public.events add column if not exists gate_state text;

@@ -96,21 +96,37 @@ class ToggleBody(BaseModel):
 async def toggle(_: OperatorAuth, body: ToggleBody, session: SessionDep) -> None:
     """Turn the gate on or off for one patient.
 
-    Operator-only, and not exposed to caregivers: whether we hold a
-    family's alerts for a false-positive check is our operational
-    decision, not a customer setting. Deliberately one patient at a
-    time — there is no "enable everywhere", because the blast radius of
-    a mistake there is every household at once.
+    Writes the SAME `patients.event_gate_enabled` column the caregiver's
+    own "Evaluation mode" setting writes (PATCH /v1/patients/{id}). Last
+    writer wins, by decision on 2026-08-05.
+
+    That means this route can enable human review of a household that
+    never opted in, so every write here is logged at WARNING with the
+    before and after value. If we ever need to show who turned review on
+    for a given family, that log line is the only record — there is no
+    separate consent column to consult.
+
+    Deliberately one patient at a time: there is no "enable everywhere",
+    because the blast radius of a mistake there is every household.
     """
-    row = (await session.execute(text(
-        """update patients set event_gate_enabled = :enabled
-           where id = :pid returning id"""),
-        {"enabled": body.enabled, "pid": body.patient_id})).first()
-    if row is None:
+    # Read the prior value first, in the same transaction. A subquery
+    # inside RETURNING would read the post-update snapshot, so it cannot
+    # give us the "was" value the audit line needs.
+    was = (await session.execute(text(
+        "select event_gate_enabled from patients where id = :pid"),
+        {"pid": body.patient_id})).scalar_one_or_none()
+    if was is None:
         raise HTTPException(status_code=404, detail="patient_not_found")
+    await session.execute(text(
+        """update patients set event_gate_enabled = :enabled
+           where id = :pid"""),
+        {"enabled": body.enabled, "pid": body.patient_id})
     await session.commit()
-    log.info(
-        "event_gate.toggled patient=%s enabled=%s", body.patient_id, body.enabled
+    # WARNING, not INFO: this is us changing a household's privacy posture
+    # from the outside. It should be greppable and it should stand out.
+    log.warning(
+        "event_gate.toggled_by_operator patient=%s was=%s now=%s",
+        body.patient_id, was, body.enabled,
     )
 
 

@@ -106,5 +106,5 @@ class Patient(Base):
     # `events.reviewed`, which is the caregiver's own retrospective review.
     # Operator-controlled, not caregiver-facing, and off for everyone.
     event_gate_enabled: Mapped[bool] = mapped_column(
-        Boolean, server_default=text("false"), default=False,
+        Boolean, server_default=text("true"), default=True,
     )
