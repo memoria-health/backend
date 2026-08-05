@@ -62,8 +62,7 @@ _QUEUE_SQL = """
            coalesce(e.location, ''), e.occurred_at,
            greatest(0, :auto - extract(epoch from now()
                      - coalesce(e.gate_held_at, e.created_at)))::int,
-           coalesce(e.gate_clip_key,
-                    case when e.has_clip then e.clip_storage_key end)
+           e.gate_clip_key
     from events e join patients p on p.id = e.patient_id
     where e.gate_state = 'pending'
     order by e.gate_held_at desc nulls last, e.created_at desc
@@ -132,6 +131,51 @@ async def _sign_clip(key: str | None, *, settings) -> str | None:
 
 
 # ── the verdict page ─────────────────────────────────────────────────
+
+
+@router.get("/act/{token}/clip")
+async def act_clip(token: str, session: SessionDep, settings: SettingsDep) -> Response:
+    """Stream the operator's clip from OUR origin, under the same token.
+
+    The page used to embed a storage-signed URL directly. That fails in
+    exactly the situation the page is for: the signed URL is built from
+    `settings.supabase_url`, which locally is a LAN address the phone
+    cannot reach, and is plain http inside an https page, so Safari
+    blocks it as mixed content before it even tries. Both failures are
+    silent — you get a video element that will not play.
+
+    Proxying fixes both and is better anyway: the bytes leave from the
+    same origin as the page, under the same short-lived token, so no
+    separately-shareable storage URL for a household's footage ever
+    exists. Costs one hop through the backend for a file we only serve
+    for 60 seconds.
+    """
+    event_id = event_gate.verify_verdict_token(token, settings=settings)
+    if event_id is None:
+        raise HTTPException(status_code=403, detail="invalid_token")
+    # ONLY `gate_clip_key`. This used to fall back to `clip_storage_key`
+    # when the gate's own clip was missing, which quietly handed the
+    # operator the CAREGIVER's clip — screen-dependent, and unmasked
+    # whenever the screen cleared the room, which is most of the time.
+    # An operator seeing every household must never be served that. If
+    # the masked clip is absent, they decide from the narrative.
+    row = (await session.execute(text(
+        """select e.gate_clip_key
+           from events e where e.id = :id"""), {"id": str(event_id)})).first()
+    if row is None or not row[0]:
+        raise HTTPException(status_code=404, detail="clip_not_ready")
+    try:
+        data = await storage.download_object(
+            bucket=settings.storage_bucket_incident_clips,
+            key=row[0], settings=settings)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("event_gate.clip_proxy_failed event=%s", event_id)
+        raise HTTPException(status_code=502, detail="clip_unavailable") from exc
+    return Response(
+        content=data,
+        media_type="video/mp4",
+        headers={"Cache-Control": "no-store", "Accept-Ranges": "none"},
+    )
 
 
 @router.get("/act/{token}", response_class=HTMLResponse)
@@ -207,8 +251,7 @@ async def _load(session, event_id: UUID, *, settings) -> dict | None:
                   coalesce(e.location, ''), e.gate_state,
                   greatest(0, :auto - extract(epoch from now()
                             - coalesce(e.gate_held_at, e.created_at)))::int,
-                  coalesce(e.gate_clip_key,
-                           case when e.has_clip then e.clip_storage_key end)
+                  e.gate_clip_key
            from events e join patients p on p.id = e.patient_id
            where e.id = :id"""),
         {"id": str(event_id), "auto": event_gate.AUTO_RELEASE_S})).first()
@@ -217,7 +260,9 @@ async def _load(session, event_id: UUID, *, settings) -> dict | None:
     return {
         "title": row[0], "narrative": row[1], "patient_name": row[2],
         "room": row[3], "gate_state": row[4], "seconds_left": row[5],
-        "clip_url": await _sign_clip(row[6], settings=settings),
+        # Just whether there IS one. The page points at our own proxy
+        # route rather than a storage URL — see `act_clip`.
+        "has_clip": bool(row[6]),
     }
 
 
@@ -278,13 +323,18 @@ def _header(row: dict) -> str:
     return f"<h1>{what}</h1><p class='sub'>{sub}</p>"
 
 
-def _clip(row: dict) -> str:
-    if not row["clip_url"]:
+def _clip(row: dict, *, token: str) -> str:
+    if not row["has_clip"]:
         return ("<div class='narr'>Clip still uploading. Decide on the "
                 "description below, or wait a few seconds and reload.</div>")
-    url = html.escape(row["clip_url"], quote=True)
-    return (f"<video controls autoplay muted playsinline preload='auto' "
-            f"src='{url}'></video>")
+    src = f"/v1/event-gate/act/{html.escape(token, quote=True)}/clip"
+    # Deliberately NOT muted. The first version carried `muted` so the
+    # clip would autoplay, since browsers block autoplay with sound —
+    # but for "possible calling for help" the audio IS the evidence, and
+    # a silent autoplay quietly throws away half of what the operator
+    # needs to judge. Sound wins; the cost is one tap to start playback
+    # on iOS, inside a 60-second window that can afford it.
+    return (f"<video controls playsinline preload='auto' src='{src}'></video>")
 
 
 def _decision_page(row: dict, *, token: str) -> str:
@@ -292,7 +342,7 @@ def _decision_page(row: dict, *, token: str) -> str:
     base = f"/v1/event-gate/act/{html.escape(token, quote=True)}"
     return (
         _header(row)
-        + _clip(row)
+        + _clip(row, token=token)
         + f"<div class='narr'>{html.escape(row['narrative'])}</div>"
         + f"<p class='sub'>Auto-sends to the caregiver in "
           f"<span class='count' id='c'>{left}</span>s if you do nothing.</p>"

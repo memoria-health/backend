@@ -124,11 +124,20 @@ _MASK_GAP_BRIDGE_FRAMES = 3
 # Flat green: it is not a colour a room produces, so a masked region is
 # unambiguous to a human reviewer and trivially separable to a model.
 _RESEARCH_FILL_BGR = (0, 255, 0)
-# Tight margin — 2% of the short side against the event path's 6%. Still
-# a real margin, because segmentation under-covers at body edges, but
-# small enough that the pose stays honest.
-_RESEARCH_DILATE_FRACTION = 0.02
-_RESEARCH_DILATE_MIN_PX = 5
+# Margin around the segmented person. 2% of the short side is ~21px on a
+# 1080p frame, which rounds off fingers and closes the gaps between limbs
+# — the silhouette reads as a blob rather than a person. That size was
+# compensating for a mask that arrived at ~160x160 and was upscaled with
+# nearest-neighbour; `_person_mask` now computes at full resolution and
+# interpolates before thresholding, so the mask itself is accurate to a
+# few pixels and the margin no longer has to cover for it.
+#
+# 0.5% (~5px at 1080p) still covers the under-coverage segmentation shows
+# at body edges, especially loose clothing and hair. Raise it if any real
+# footage shows skin outside the fill; that is the failure that matters,
+# and it is the reason this is a named constant rather than a literal.
+_RESEARCH_DILATE_FRACTION = 0.005
+_RESEARCH_DILATE_MIN_PX = 3
 
 CENSOR_MODE_PIXELATE = "pixelate"  # event clips (default, unchanged)
 CENSOR_MODE_RESEARCH = "research"  # B2 corpus only
@@ -166,15 +175,27 @@ def _person_mask(model, frame: np.ndarray) -> np.ndarray | None:
         classes=[_PERSON_CLASS_ID],
         conf=_SEG_CONFIDENCE,
         verbose=False,
+        # Compute masks at the input image's resolution rather than at the
+        # prototype resolution (~160x160). Without this the mask is
+        # produced ~12x smaller than a 1080p frame and every edge is
+        # reconstructed by upscaling, which is where the staircase edges
+        # come from. Costs some inference time, buys the outline.
+        retina_masks=True,
     )
     result = results[0]
     if result.masks is None or len(result.masks.data) == 0:
         return None
     stacked = result.masks.data.cpu().numpy()  # (n, mh, mw) in [0,1]
-    union = (stacked.max(axis=0) > 0.5).astype(np.uint8)
+    # Union in FLOAT, resize in float, threshold last. The old order
+    # thresholded to {0,1} first and then resized with INTER_NEAREST, so
+    # each source pixel became a hard rectangular block — the single
+    # biggest cause of the blocky silhouette. Interpolating the soft mask
+    # and cutting at 0.5 recovers a smooth boundary at no real cost.
+    union_f = stacked.max(axis=0).astype(np.float32)
     h, w = frame.shape[:2]
-    if union.shape != (h, w):
-        union = cv2.resize(union, (w, h), interpolation=cv2.INTER_NEAREST)
+    if union_f.shape != (h, w):
+        union_f = cv2.resize(union_f, (w, h), interpolation=cv2.INTER_LINEAR)
+    union = (union_f > 0.5).astype(np.uint8)
     return union if union.any() else None
 
 

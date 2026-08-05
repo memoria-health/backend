@@ -119,58 +119,92 @@ async def archive_event(
     screen runs for EVERY camera — privacy_enabled no longer gates
     clips, it gates live view).
     """
-    # EVENT-GATE FAST PATH: when the event is held for an operator verdict,
-    # upload the pre-event MP4 — the footage the model actually judged,
-    # already encoded for the LLM — immediately, instead of making the
-    # operator wait out the post-roll. They have 60 seconds to decide, so a
-    # clip that lands at T+20s is a clip that arrives too late to use.
+    # EVENT-GATE FAST PATH — runs as a BACKGROUND TASK, never inline.
     #
-    # This path runs the SAME screen-then-censor resolution and the SAME
-    # region routing as the ordinary upload below. It has to: an operator
-    # sees every household in the product, including bedrooms and
-    # bathrooms, so this is the single clip in the system with the widest
-    # audience. It shipped bypassing both — raw bytes, default region —
-    # which inverted the invariant stated at the top of this module and
-    # put an India patient's footage in the US bucket. Never call
-    # `storage.upload_clip` from here with bytes that have not been
-    # through `resolve_clip_for_upload`.
-    try:
-        async with sessionmaker() as s:
-            held = (await s.execute(
-                sa_text("select 1 from events where id = :id and gate_state = 'pending'"),
-                {"id": str(event_id)})).first()
-        if held:
+    # When the event is held for an operator verdict, encode and upload the
+    # PRE-ROLL alone — the footage the model actually judged — so the
+    # operator sees video in seconds rather than after the post-roll. They
+    # have 60 seconds to decide; a clip that lands at T+20s is too late.
+    #
+    # Why a task and not an await: masking takes ~14s of single-threaded
+    # YOLO, while `_archive_one` below has only
+    # `frame_buffer_retention_seconds - clip_post_event_wait_seconds` of
+    # slack (2s today) before the post-roll it needs is evicted from the
+    # ring buffer. Awaiting the mask here cost the CAREGIVER their
+    # post-roll — observed 2026-08-05, event 2bdf15b5 logged
+    # `stale_window lag=18.7s` at the exact instant the mask finished and
+    # the family got an 11s clip instead of 26s. The operator's clip must
+    # never be able to degrade the caregiver's.
+    #
+    # The pre-roll arrives as FRAMES and is only encoded further down for
+    # the combined clip, so this encodes its own. (The original version of
+    # this block referenced a `pre_event_mp4` argument that has never
+    # existed on this function; it raised NameError the first time it ever
+    # ran, on 2026-08-05, because before then no patient had the gate on.)
+    #
+    # The operator's clip is ALWAYS masked, unconditionally — it does not
+    # use `resolve_clip_for_upload`, which asks a model whether this
+    # particular clip is sensitive. That is a reasonable question for the
+    # family who live in the house and the wrong one for a reviewer who
+    # sees every household in the product. No screen means no verdict to
+    # get wrong and no path that uploads unmasked footage. It also keeps
+    # Gemini off the operator's path entirely, so no 503 can blur, delay
+    # or drop the one clip that has 60 seconds to arrive.
+    async def _gate_fast_path() -> None:
+        try:
+            async with sessionmaker() as s:
+                held = (await s.execute(
+                    sa_text(
+                        "select 1 from events where id = :id "
+                        "and gate_state = 'pending'"),
+                    {"id": str(event_id)})).first()
+            if not held:
+                return
             async with sessionmaker() as s:
                 patient = await s.get(Patient, patient_id)
                 patient_region = patient.region if patient is not None else "US"
-            resolution = await resolve_clip_for_upload(
-                pre_event_mp4, event_id=event_id, camera_id=camera_id,
-                settings=settings,
+
+            # Pre-roll only: end at the last pre-event frame and mux just
+            # the pre-roll PCM. Same VFR encode as the combined clip, so
+            # timing and audio alignment behave identically. `pre_frames`
+            # is a snapshot list holding its own references, so buffer
+            # eviction cannot pull frames out from under this task while
+            # it runs alongside the post-roll capture.
+            pre_mp4 = await frames_to_vfr_mp4(
+                pre_frames,
+                fps=settings.clip_fps,
+                end_at=pre_end_captured_at,
+                pcm=pre_pcm if pre_pcm else None,
+                pcm_sample_rate=audio_buffer.sample_rate,
+                pcm_num_channels=audio_buffer.num_channels,
+                pcm_starts_at=pre_pcm_start,
             )
-            if resolution.upload_bytes is None:
-                # Fail-closed, same terminal as the main path: censoring
-                # failed, so nothing may leave. The operator decides from
-                # the narrative alone and the verdict page says so.
-                log.warning(
-                    "event_gate.fast_path_censor_drop event=%s camera=%s — "
-                    "no pre-clip for the operator (raw never uploaded)",
-                    event_id, camera_id,
-                )
-            else:
-                pre_key = await storage.upload_clip(
-                    event_id=event_id, mp4_bytes=resolution.upload_bytes,
-                    settings=settings, sub_key="gate-pre", region=patient_region)
-                async with sessionmaker() as s:
-                    await s.execute(
-                        sa_text("update events set gate_clip_key = :k where id = :id"),
-                        {"k": pre_key, "id": str(event_id)})
-                    await s.commit()
-                log.info(
-                    "event_gate.fast_path_clip event=%s key=%s censored=%s",
-                    event_id, pre_key, resolution.censored,
-                )
-    except Exception:  # noqa: BLE001 — fast path is best-effort, never fatal
-        log.exception("event_gate.fast_path_failed event=%s", event_id)
+            # Green silhouette (CENSOR_MODE_RESEARCH) rather than
+            # pixelation: it reads as a deliberate redaction at a glance
+            # on a phone, and posture, position and motion — the things
+            # that distinguish a fall from someone sitting down — survive
+            # it. Audio is KEPT: for "possible calling for help" the sound
+            # is the evidence, and masking the picture does not touch it.
+            masked = await _censor_bytes(
+                pre_mp4, full_frame=False, keep_audio=True,
+                mode=censor.CENSOR_MODE_RESEARCH,
+            )
+            pre_key = await storage.upload_clip(
+                event_id=event_id, mp4_bytes=masked,
+                settings=settings, sub_key="gate-pre", region=patient_region)
+            async with sessionmaker() as s:
+                await s.execute(
+                    sa_text("update events set gate_clip_key = :k where id = :id"),
+                    {"k": pre_key, "id": str(event_id)})
+                await s.commit()
+            log.info(
+                "event_gate.fast_path_clip event=%s key=%s masked=green bytes=%d",
+                event_id, pre_key, len(masked),
+            )
+        except Exception:  # noqa: BLE001 — best-effort, never fatal
+            log.exception("event_gate.fast_path_failed event=%s", event_id)
+
+    asyncio.create_task(_gate_fast_path(), name=f"event-gate-clip-{event_id}")
 
     try:
         await _archive_one(
@@ -539,6 +573,7 @@ def sweep_scratch_dir() -> int:
 
 async def _censor_bytes(
     mp4: bytes, *, full_frame: bool, keep_audio: bool = True,
+    mode: str = censor.CENSOR_MODE_PIXELATE,
 ) -> bytes:
     """Round-trip the in-memory clip through `censor.censor_clip` via
     tempfiles. The RAW tempfile (and the censored one) are unlinked in
@@ -554,6 +589,7 @@ async def _censor_bytes(
             out_path = f.name
         await censor.censor_clip(
             in_path, out_path, full_frame=full_frame, keep_audio=keep_audio,
+            mode=mode,
         )
         with open(out_path, "rb") as f:
             censored_bytes = f.read()

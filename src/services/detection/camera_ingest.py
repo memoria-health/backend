@@ -2054,6 +2054,19 @@ class CameraIngest:
                 # alert for an OPERATOR verdict, with an unconditional 60s
                 # auto-release. Not the caregiver `events.reviewed`
                 # feature — see src/services/event_gate.py.
+                #
+                # The hold is AWAITED, not spawned. Clip archival below
+                # decides whether to fast-path the operator's pre-roll by
+                # reading `gate_state='pending'`, so that state has to be
+                # committed before the archival task starts. Spawning both
+                # concurrently made it a race, and archival won it every
+                # time — the operator got a page with no clip. Two local
+                # round trips; everything slow still runs off-tick.
+                await event_gate.hold_gated(
+                    sessionmaker=self._sessionmaker,
+                    event_ids=fired_ids,
+                    settings=self._settings,
+                )
                 asyncio.create_task(
                     event_gate.route_events(
                         sessionmaker=self._sessionmaker,

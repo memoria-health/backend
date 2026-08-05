@@ -75,6 +75,20 @@ async def list_for_patient(
     elif only_unreviewed is False:
         stmt = stmt.where(Event.reviewed.is_(True))
 
+    # Event gate: never page a caregiver an alert that is still being
+    # checked for a false positive, or one an operator suppressed. The
+    # RLS policy in apply_event_gate_delta.sql enforces the same rule for
+    # Supabase Realtime and for direct client reads, but the backend
+    # connects as the service role, which bypasses RLS — so the filter
+    # has to be repeated here or this endpoint becomes the hole.
+    # `gate_state` is null for every patient with the gate off.
+    stmt = stmt.where(
+        or_(
+            Event.gate_state.is_(None),
+            Event.gate_state.notin_(("pending", "rejected")),
+        )
+    )
+
     if cursor:
         decoded = decode_cursor(cursor)
         if decoded is not None:

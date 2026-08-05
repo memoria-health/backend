@@ -158,7 +158,7 @@ def _row(**over) -> dict:
     base = {
         "title": "Possible fall", "narrative": "Maggie did not get up.",
         "patient_name": "Maggie", "room": "Kitchen", "gate_state": "pending",
-        "seconds_left": 42, "clip_url": "https://storage.test/clip.mp4?sig=abc",
+        "seconds_left": 42, "has_clip": True,
     }
     base.update(over)
     return base
@@ -211,7 +211,7 @@ def test_settled_page_explains_the_outcome_and_offers_no_buttons() -> None:
 def test_missing_clip_still_renders_a_decidable_page() -> None:
     """A censor drop or a slow upload must not leave the operator with
     a blank page and a running clock."""
-    page = api_gate._decision_page(_row(clip_url=None), token="tok")
+    page = api_gate._decision_page(_row(has_clip=False), token="tok")
     assert "<video" not in page
     assert "Maggie did not get up." in page
 
@@ -364,3 +364,71 @@ async def test_a_settled_event_cannot_be_settled_twice(
     assert second == "already_settled"
     # The second call asked to approve. It must not have dispatched.
     assert calls == []
+
+
+# ── the operator clip is always masked ───────────────────────────────
+
+
+def test_gate_fast_path_never_uploads_unmasked_bytes() -> None:
+    """Guard on the property that matters: the operator's clip is masked
+    unconditionally, not because a model judged it sensitive.
+
+    Read as source rather than executed because the fast path needs a
+    real camera tick, YOLO and ffmpeg. That makes this a weak test of
+    behaviour but a strong one of intent: it fails the moment someone
+    reintroduces the screen-dependent path, which is exactly how raw
+    footage of every household would quietly come back.
+    """
+    import inspect
+
+    from src.services import clip_archival
+
+    src = inspect.getsource(clip_archival.archive_event)
+    fast_path = src.split("EVENT-GATE FAST PATH")[1].split("try:")[1]
+    fast_path = fast_path.split("await _archive_one")[0]
+    # Comments in this block discuss the screen path at length; assert on
+    # the CODE, or the prose defeats the check.
+    fast_path = "\n".join(
+        ln for ln in fast_path.splitlines() if not ln.strip().startswith("#")
+    )
+
+    # It censors, in green-silhouette mode, keeping audio.
+    assert "_censor_bytes(" in fast_path
+    assert "CENSOR_MODE_RESEARCH" in fast_path
+    assert "keep_audio=True" in fast_path
+    # It does NOT consult the sensitivity screen for this clip.
+    assert "resolve_clip_for_upload" not in fast_path
+    # The only bytes uploaded are the censored ones.
+    upload = fast_path.split("upload_clip(")[1].split(")")[0]
+    assert "mp4_bytes=masked" in upload
+    assert "region=patient_region" in upload
+
+
+def test_gate_clip_is_spawned_not_awaited_before_the_caregiver_clip() -> None:
+    """The operator's masked clip must never delay the caregiver's.
+
+    Masking is ~14s of single-threaded YOLO. `_archive_one` has only
+    `frame_buffer_retention_seconds - clip_post_event_wait_seconds` of
+    slack (2s at current settings) before the post-roll it needs is
+    evicted from the ring buffer. Awaiting the mask inline therefore
+    silently truncated the FAMILY's clip from 26s to 11s — observed
+    2026-08-05 on event 2bdf15b5.
+
+    So: the fast path must be spawned, and the spawn must come before
+    the `_archive_one` call.
+    """
+    import inspect
+
+    from src.services import clip_archival
+
+    src = inspect.getsource(clip_archival.archive_event)
+    spawn = src.find("asyncio.create_task(_gate_fast_path()")
+    archive = src.find("await _archive_one(")
+    assert spawn != -1, "the gate clip is no longer spawned as a task"
+    assert archive != -1
+    assert spawn < archive, (
+        "the gate's masked clip must be spawned BEFORE _archive_one, and "
+        "never awaited ahead of it"
+    )
+    # And it must not be awaited inline anywhere.
+    assert "await _gate_fast_path()" not in src

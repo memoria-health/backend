@@ -40,6 +40,12 @@ class Event(Base):
     review_choice: Mapped[str | None] = mapped_column(ReviewChoiceEnum, default=None)
     review_notes: Mapped[str | None] = mapped_column(String(2000), default=None)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    # OPERATOR gate state — null | pending | approved | rejected | auto.
+    # Nothing to do with `reviewed` three lines up, which is the CAREGIVER
+    # looking back at an alert they already received. This one decides
+    # whether they receive it at all. See src/services/event_gate.py.
+    # Null for every patient with the gate off, which is all of them.
+    gate_state: Mapped[str | None] = mapped_column(String, default=None)
     # Bucket-relative key in `incident-clips`; NULL until clip archival
     # completes (post-event window captured + ffmpeg concat uploaded).
     clip_storage_key: Mapped[str | None] = mapped_column(String, default=None)

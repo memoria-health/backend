@@ -152,20 +152,30 @@ def _verdict_url(*, event_id: UUID, settings: "Settings") -> str | None:
 # ── routing ──────────────────────────────────────────────────────────
 
 
-async def route_events(
+async def hold_gated(
     *,
     sessionmaker: "async_sessionmaker",
     event_ids: list[UUID],
-    settings: "Settings",
-) -> None:
-    """Split fired events: gated → hold + page + timer; rest → dispatch.
+    settings: "Settings",  # noqa: ARG001 — kept for a uniform call shape
+) -> tuple[list[UUID], list[UUID]]:
+    """Stamp the hold and return `(gated, free)`. Fast: one SELECT, one UPDATE.
 
-    With `patients.event_gate_enabled` off (the default, and true for
-    every patient today) every event lands in `free` and this is the
-    old direct fan-out with an extra SELECT.
+    Split out of `route_events` and made awaitable by the caller because
+    of a race that cost us the operator's clip. `clip_archival`'s fast
+    path decides whether to upload the pre-roll by asking the database
+    whether the event is `gate_state='pending'`. Both that task and the
+    routing task were spawned in the same tick, so the archival query
+    routinely ran BEFORE the hold was committed, saw nothing pending,
+    and skipped the upload. The operator then got a verdict page with no
+    clip, which is the one thing the page exists to show.
+
+    Awaiting this before spawning archival makes the ordering explicit
+    rather than a coin flip. It costs the tick two round trips against
+    the local database, and it is the only part of the gate that has to
+    be synchronous.
     """
     if not event_ids:
-        return
+        return [], []
     async with sessionmaker() as session:
         rows = (await session.execute(text(
             """select e.id, p.event_gate_enabled from events e
@@ -179,11 +189,38 @@ async def route_events(
             # measure from. It has to be stamped in the same statement
             # that holds the event, or a crash between the two would
             # leave a held event with no release deadline.
+            # `gate_state is null` makes this idempotent. The caller awaits
+            # it and `route_events` calls it again, so without the guard the
+            # second call would push `gate_held_at` forward and quietly
+            # extend the deadline — or worse, re-hold an event a reviewer
+            # had already settled in between.
             await session.execute(text(
                 """update events set gate_state = 'pending', gate_held_at = now()
-                   where id = any(:ids)"""),
+                   where id = any(:ids) and gate_state is null"""),
                 {"ids": [str(i) for i in gated]})
             await session.commit()
+    return gated, free
+
+
+async def route_events(
+    *,
+    sessionmaker: "async_sessionmaker",
+    event_ids: list[UUID],
+    settings: "Settings",
+) -> None:
+    """Split fired events: gated → hold + page + timer; rest → dispatch.
+
+    With `patients.event_gate_enabled` off (the default, and true for
+    every patient today) every event lands in `free` and this is the
+    old direct fan-out with an extra SELECT.
+
+    Callers that also spawn clip archival MUST `await hold_gated()`
+    themselves first and only then start this — see that function.
+    """
+    if not event_ids:
+        return
+    gated, free = await hold_gated(
+        sessionmaker=sessionmaker, event_ids=event_ids, settings=settings)
 
     if free:
         await _dispatch(sessionmaker=sessionmaker, event_ids=free, settings=settings)

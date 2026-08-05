@@ -33,6 +33,28 @@ alter table public.events add column if not exists gate_clip_key text;
 create index if not exists events_gate_pending
   on public.events (gate_held_at) where gate_state = 'pending';
 
+-- Hide gated events from the caregiver. WITHOUT THIS THE GATE DOES NOTHING
+-- USEFUL: `events` is in the supabase_realtime publication, so the row is
+-- broadcast to the iOS app the instant it is inserted, which happens before
+-- the gate runs. Observed live on 2026-08-05 — the alert appeared in the app
+-- a second before the operator was even paged, and a suppressed false alarm
+-- would have stayed in the feed forever.
+--
+-- Realtime honours RLS, so narrowing the policy hides held events from the
+-- broadcast and from direct reads at once, with no client release.
+--
+--   pending  -> hidden while the operator decides
+--   rejected -> hidden forever (that is what suppression means)
+--   approved -> visible
+--   auto     -> visible (the 60s timer released it)
+--   null     -> visible; every patient with the gate off is unaffected
+drop policy if exists events_member on public.events;
+create policy events_member on public.events
+  using (
+    has_patient_access(patient_id)
+    and coalesce(gate_state, 'none') not in ('pending', 'rejected')
+  );
+
 -- `review_devices` is intentionally NOT recreated. Operator paging now goes
 -- through PagerDuty (src/services/pager.py), so we store no APNs tokens for
 -- reviewers, which removes both the table and the RLS surface it needed.
