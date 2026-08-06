@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Sequence
 
 from src.services.detection.scheduling.dims import CROP_BUCKETS, EffectiveDims
 from src.services.detection.scheduling.when_scope import is_active
-from src.services.identity.observations import LABEL_OTHER, LABEL_PATIENT
+from src.services.identity.observations import LABEL_PATIENT
 
 # Emergency line (2026-07-18, the enacted-choking miss): detectors at
 # or above this severity are EXEMPT from every cost gate — cross-camera
@@ -135,9 +135,12 @@ def resolve_due(
     patient_ids = {
         t.track_id for t in (tracks or ()) if t.label == LABEL_PATIENT
     }
-    other_ids = {
-        t.track_id for t in (tracks or ()) if t.label == LABEL_OTHER
-    }
+    # NOTE (2026-08-06): there is no verified-OTHER any more. The ledger
+    # rewrite deleted LABEL_OTHER along with the verified-OTHER audit (see
+    # track_ledger's "Deleted vs the track-anchored ledger"), so a track is
+    # only ever PATIENT or UNKNOWN and this set is ALWAYS empty. It is kept
+    # named here purely so the filter below reads honestly; the branch that
+    # consumed it was removed rather than left looking like a live guard.
 
     due: list[DueDetector] = []
     skipped: list[tuple[str, str]] = []
@@ -235,7 +238,12 @@ def resolve_due(
         # motion floor; still-condition detectors are presence-only (a
         # still person is the whole point of those).
         qualifying: list[int] | None = None
+        # Every body on camera, floor-independent. This is the crop pool:
+        # whether a detector RUNS is a cost question, but once it runs it
+        # must still be looking at a person (see the crop note below).
+        admissible: list[int] | None = None
         if tracks:
+            admissible = [t.track_id for t in tracks]
             # Emergency detectors ignore the motion floor: choking/
             # fidget-scale distress is LOW gross motion by nature
             # (hands at throat while seated reads ~0.01 — under any
@@ -252,7 +260,7 @@ def resolve_due(
             else:
                 # person_still is presence-only; person_motion on an
                 # unmeasurable window fails open to every track.
-                qualifying = [t.track_id for t in tracks]
+                qualifying = list(admissible)
             if not qualifying and settings.scheduler_person_requires_track:
                 skipped.append((ident, "below_motion_floor"))
                 continue
@@ -260,21 +268,86 @@ def resolve_due(
         # Target filtering — the per-track flavor of the fixed rule:
         # verified-OTHER tracks are never patient targets, UNKNOWN
         # tracks always are (suppression itself already ran above).
+        # Applied to BOTH lists: a non-patient body must never become a
+        # crop target either, or the fallback would hand a patient-scoped
+        # detector a picture of the wrong person.
         if d.subject_scope == "patient" and identity.attribution_ran:
-            if qualifying:
+            def _patient_only(ids: list[int]) -> list[int]:
+                # Patient located on THIS camera ⇒ target only them.
+                # Patient NOT verified anywhere ⇒ keep every body in view
+                # and crop each (up to the crowd cap). Absence of a lock is
+                # not evidence that the person on screen isn't the patient,
+                # and a patient-scoped detector must still run for them.
                 if patient_ids:
-                    qualifying = [t for t in qualifying if t in patient_ids]
-                else:
-                    qualifying = [t for t in qualifying if t not in other_ids]
+                    return [t for t in ids if t in patient_ids]
+                return list(ids)
+
+            if admissible:
+                admissible = _patient_only(admissible)
+            if qualifying:
+                qualifying = _patient_only(qualifying)
                 if not qualifying and settings.scheduler_person_requires_track:
                     skipped.append((ident, "no_qualifying_patient_track"))
                     continue
 
         # Target resolution: crop buckets get per-track targets (D3);
         # crowd ticks and box-less ticks fall back to full-scene.
+        #
+        # `crop_pool`, NOT `qualifying` (2026-08-06). Those answer two
+        # different questions and were sharing one list:
+        #
+        #   qualifying  — should this detector RUN for this person? The
+        #                 motion floor lives here, as a COST gate.
+        #   crop_pool   — if it runs, WHICH BODY do we crop to?
+        #
+        # The floor emptying `qualifying` used to empty the targets too, and
+        # because `scheduler_person_requires_track` defaults to False the
+        # detector then ran anyway — with no crop, on the full frame, and its
+        # answer trusted identically. That is the worst of both: the gate
+        # meant to save a call instead degraded the evidence and still paid.
+        #
+        # Observed 08-05 21:33: track 10 was present and labelled PATIENT
+        # with amount=0.0 (under the 0.03 floor), so `medication` — a
+        # hand-to-mouth detector — ran on the whole room at 4 fps and
+        # reported a pill being swallowed while the man held a camera.
+        #
+        # So: if we have decided to run a crop-bucket detector, it crops.
+        # Prefer the tracks that qualified; fall back to whatever bodies are
+        # admissible for this detector's subject scope.
+        # The rule (Aryaman 2026-08-06): the BUCKET decides. A person-bucket
+        # detector that runs is cropped — always — unless this is a crowd
+        # tick. If it cannot be cropped it does not run, because answering
+        # from the whole room is not a degraded answer, it is a wrong one.
+        crop_pool = qualifying if qualifying else admissible
         targets: tuple[int, ...] | None = None
-        if d.bucket in CROP_BUCKETS and not crowd and qualifying:
-            targets = tuple(qualifying)
+        if d.bucket in CROP_BUCKETS and not crowd:
+            if crop_pool:
+                targets = tuple(crop_pool)
+            elif d.severity >= _EMERGENCY_SEVERITY:
+                # No body to crop to, but a missed emergency is never worth a
+                # saved call — the same line that exempts these detectors from
+                # every other cost gate. Fall open to the full frame.
+                #
+                # This is not hypothetical: only 62.5% of ticks with a person
+                # visible carried a track box on the 08-05 night, so a rule of
+                # "no box ⇒ no run" would have blinded emergency detectors on
+                # a third of ticks, including while someone lay on the floor —
+                # precisely when a tracker is most likely to lose them.
+                pass
+            else:
+                # Cost-managed detector with nothing to crop. It does NOT get
+                # to answer from the whole room: that is how `medication`
+                # reported a pill being swallowed from a full-frame 4 fps view
+                # while the man held a camera (08-05 21:33).
+                #
+                # Covers both causes, deliberately — tracker ran and saw
+                # nobody, and tracker unavailable (dead sidecar, timeout).
+                # Boxes arrive FROM the identity sidecar, so its death takes
+                # cropping with it; `identity_client`'s "a dead sidecar must
+                # never silence detection" is honoured by the emergency branch
+                # above, which is where that doctrine actually matters.
+                skipped.append((ident, "no_croppable_target"))
+                continue
         due.append(DueDetector(
             spec=entry.spec, dims=d, target_track_ids=targets,
             windowed=windowed,

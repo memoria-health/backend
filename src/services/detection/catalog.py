@@ -579,26 +579,55 @@ _CHILD_DEVICE_USAGE_PROMPT_FRAGMENT = (
 )
 
 _CALLING_FOR_HELP_PROMPT_FRAGMENT = (
-    "calling_for_help_detected: boolean. TRUE only if the person on camera is "
-    "clearly calling for help — shouting 'help', 'somebody help', calling out a "
-    "caregiver's name in distress, or crying out that they have fallen, are "
-    "hurt, or cannot get up. BOTH a distressed delivery AND help-seeking "
-    "content should be evident.\n"
+    # REWRITTEN 2026-08-06 (Aryaman). The old rule required "BOTH a distressed
+    # delivery AND help-seeking content". Measured against the eval set, that
+    # cost us the only true positive we have: the model transcribed "Help me"
+    # correctly, attributed it to the person on camera correctly, and then
+    # declined because "the delivery is calm and monotone, lacking the
+    # distressed tone required". That is the exact failure we cannot ship — a
+    # frail, weak, winded or semi-conscious person who has fallen says "help
+    # me" QUIETLY. Requiring audible panic optimises for a demo and fails the
+    # patient.
+    #
+    # The discriminator is not TONE, it is whether they are SUMMONING someone
+    # versus CONVERSING. "Help me" called out to the room is a summons; "can
+    # you help me with this" said into a laptop is conversation. Tone is now
+    # only corroboration, never a requirement.
+    "calling_for_help_detected: boolean. TRUE if the person on camera is "
+    "trying to summon another person — to get help, get attention, or be "
+    "come to. This includes, in ANY language:\n"
+    "  - asking for help or rescue for THEMSELVES ('help', 'help me', "
+    "'somebody help', 'I need help', 'I've fallen', 'I can't get up', "
+    "'I'm hurt');\n"
+    "  - calling out a person's name, or a relation ('mum', 'nurse', "
+    "'beta'), to bring them to the room;\n"
+    "  - any equivalent appeal in another language — judge the MEANING of "
+    "what was transcribed, never the language it is in.\n"
+    "\n"
+    "Delivery does NOT have to be distressed, loud, or panicked. A calm, "
+    "weak, breathless or quiet appeal counts fully — a person who has fallen "
+    "and is exhausted or frightened often cannot raise their voice. If "
+    "distress IS present, it corroborates; its absence never disqualifies.\n"
     "\n"
     "Set FALSE if any of:\n"
-    "  - ordinary conversation, a normal phone call, or calling someone for a "
-    "routine reason (no distress);\n"
-    "  - the voice likely comes from a TV / radio / phone / device, or cannot "
-    "be attributed to the person on camera;\n"
-    "  - sounds of distress with no discernible call for help;\n"
-    "  - no person is visible, or the audio is too unclear to judge.\n"
+    "  - the word appears inside ORDINARY CONVERSATION rather than as an "
+    "appeal — discussing a task, helping someone else, a work or social call "
+    "('can you help me with this file', 'I helped her yesterday'). The test "
+    "is whether they are calling someone TO them, here, now;\n"
+    "  - the voice comes from a TV / radio / phone / laptop / speaker, or is "
+    "someone else's voice — check the `audio_source` you already reported: "
+    "if it is 'device', 'other_room' or 'none', this is FALSE;\n"
+    "  - nothing intelligible was transcribed. If `heard` is UNINTELLIGIBLE "
+    "or SILENCE you have no words to judge, so this is FALSE — do not infer "
+    "an appeal from tone, noise, or the person's posture alone.\n"
     "\n"
-    "calling_for_help_confidence: number 0–1. 0 = no call for help. 0.3–0.6 = a "
-    "raised or distressed voice but the help-seeking content is unclear. 0.7+ = "
-    "an unmistakable call for help.\n"
-    "calling_for_help_reasoning: 1 short sentence (e.g. 'person on the floor "
-    "shouted \"help, I've fallen\" at 5s', 'loud but ordinary phone "
-    "conversation', 'no person visible')."
+    "calling_for_help_confidence: number 0–1. 0 = no appeal. 0.3–0.6 = words "
+    "that MIGHT be an appeal but could be conversation. 0.7+ = a clear "
+    "appeal to be come to or helped, whatever the tone.\n"
+    "calling_for_help_reasoning: 1 short sentence quoting the words from "
+    "`heard` that decided it (e.g. 'said \"help me\" twice while on the "
+    "floor', 'said \"can you help me\" while working at a laptop — "
+    "conversation, not a summons', 'audio_source=device')."
 )
 
 _CHOKING_PROMPT_FRAGMENT = (

@@ -75,6 +75,7 @@ def test_people_present_is_always_merged_into_prompt_and_schema() -> None:
 
     # Schema contains description + people_* + fall_*.
     assert set(result.schema_properties.keys()) == {
+        "heard", "audio_source", "seen",
         "description",
         "people_present", "people_count",
         "fall_detected", "fall_confidence", "fall_reasoning",
@@ -83,7 +84,7 @@ def test_people_present_is_always_merged_into_prompt_and_schema() -> None:
     assert set(result.schema_required) == set(result.schema_properties.keys())
 
     # description must be first in required.
-    assert result.schema_required[0] == "description"
+    assert result.schema_required[:4] == ["heard", "audio_source", "seen", "description"]
 
     # Type-match the inner field shapes. The description field also
     # carries a schema-level style instruction (2026-07-19: flash-lite
@@ -108,6 +109,7 @@ def test_duplicate_detector_identifier_only_included_once() -> None:
     result = build_prompt_and_schema([fall, fall])
 
     assert set(result.schema_properties.keys()) == {
+        "heard", "audio_source", "seen",
         "description",
         "people_present", "people_count",
         "fall_detected", "fall_confidence", "fall_reasoning",
@@ -139,18 +141,18 @@ def test_duplicate_schema_field_across_detectors_raises_value_error() -> None:
     assert "fall_clone" in str(exc.value)
 
 
-def test_description_is_always_the_first_required_field() -> None:
+def test_evidence_fields_precede_description() -> None:
     """description must lead the required[] list — providers (Gemini's
     responseSchema, OpenAI's json_schema) preserve order, so this
     influences how the LLM is steered.
     """
     # Empty input
     r0 = build_prompt_and_schema([])
-    assert r0.schema_required[0] == "description"
+    assert r0.schema_required[:4] == ["heard", "audio_source", "seen", "description"]
 
     # Many inputs
     r1 = build_prompt_and_schema([_fall_spec(), _wandering_spec()])
-    assert r1.schema_required[0] == "description"
+    assert r1.schema_required[:4] == ["heard", "audio_source", "seen", "description"]
 
 
 def test_empty_detector_list_still_includes_people_present() -> None:
@@ -163,10 +165,11 @@ def test_empty_detector_list_still_includes_people_present() -> None:
     assert PEOPLE_PRESENT_SPEC.prompt_fragment in result.prompt
 
     assert set(result.schema_properties.keys()) == {
+        "heard", "audio_source", "seen",
         "description", "people_present", "people_count",
     }
     assert set(result.schema_required) == set(result.schema_properties.keys())
-    assert result.schema_required[0] == "description"
+    assert result.schema_required[:4] == ["heard", "audio_source", "seen", "description"]
 
 
 def test_primary_detection_added_when_two_or_more_firing_detectors() -> None:
@@ -182,7 +185,7 @@ def test_primary_detection_added_when_two_or_more_firing_detectors() -> None:
     assert "fall" in result.prompt
     assert "wandering" in result.prompt
     # description still leads the required list.
-    assert result.schema_required[0] == "description"
+    assert result.schema_required[:4] == ["heard", "audio_source", "seen", "description"]
 
 
 def test_primary_detection_omitted_for_single_or_no_firing_detector() -> None:
@@ -206,6 +209,7 @@ def test_caller_passing_people_present_explicitly_is_deduped() -> None:
     result = build_prompt_and_schema([PEOPLE_PRESENT_SPEC, _fall_spec()])
 
     assert set(result.schema_properties.keys()) == {
+        "heard", "audio_source", "seen",
         "description",
         "people_present", "people_count",
         "fall_detected", "fall_confidence", "fall_reasoning",

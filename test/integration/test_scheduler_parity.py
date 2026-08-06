@@ -122,9 +122,18 @@ async def _last_analysis(session: AsyncSession, patient_id) -> Analysis:
 async def test_flag_on_no_tracks_is_one_wide_call_with_event_parity(
     client: AsyncClient, auth_user, session: AsyncSession, monkeypatch,
 ) -> None:
-    """Reid down ⇒ every bucket degrades to the wide call: exactly one
-    provider call carrying the full loadout (person + snapshot members
-    included), fall still promotes to an event — parity with today."""
+    """Reid down ⇒ ONE wide call, and fall still promotes to an event.
+
+    NARROWED 2026-08-06. Parity used to mean the wide call carried the FULL
+    loadout, `medication` included. It no longer does: with no tracker there
+    is no body to crop to, and a cost-managed crop-bucket detector does not
+    get to answer a hand-to-mouth question from a whole-room 4 fps view —
+    that is exactly how it reported a swallowed pill while the man held a
+    camera (08-05 21:33).
+
+    What parity still guarantees, and what this test now pins: the wide call
+    happens, EMERGENCY detectors ride it regardless of tracker state (a
+    missed fall is never worth a saved call), and promotion is unchanged."""
     patient_id, camera_id = await _setup_patient_with_camera(
         client, auth_user, session,
     )
@@ -145,7 +154,10 @@ async def test_flag_on_no_tracks_is_one_wide_call_with_event_parity(
 
     assert len(main.calls) == 1, "no tracks ⇒ everything rides one wide call"
     called = {d.identifier for d in main.calls[0]["detectors"]}
-    assert called == set(_IDENTS)
+    # fall (95) and agitation (60) are scene-bucket, so unaffected.
+    # medication is person-bucket and cost-managed ⇒ skipped, not degraded.
+    assert called == {"fall", "agitation"}
+    assert "medication" not in called
 
     events = (await session.execute(
         select(Event).where(Event.patient_id == patient_id)
@@ -155,7 +167,9 @@ async def test_flag_on_no_tracks_is_one_wide_call_with_event_parity(
     row = await _last_analysis(session, patient_id)
     f = row.detector_fields
     assert len(f["sched_calls"]) == 1
-    assert set(f["sched_calls"][0]["detectors"]) == set(_IDENTS)
+    # Same narrowing as above — the stashed ledger must agree with what was
+    # actually called, and `medication` was skipped rather than degraded.
+    assert set(f["sched_calls"][0]["detectors"]) == {"fall", "agitation"}
     assert f["vlm_input_tokens"] == 5000
     assert f["vlm_output_tokens"] == 111
     assert "sig_env_motion" in f            # P2 signals still stashed

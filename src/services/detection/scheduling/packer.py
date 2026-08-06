@@ -40,8 +40,23 @@ if TYPE_CHECKING:
     from src.services.detection.scheduling.scheduler import DueDetector, DueSet
     from src.settings import Settings
 
-# Per-call member cap by FINAL recipe group. None = uncapped (D4).
-_SCENE_KEY_CAP: int | None = None
+# Per-call member cap by FINAL recipe group.
+#
+# The scene group was uncapped until 2026-08-06, which meant one flash-lite
+# call answering every enabled detector at once — 8 on the 08-05 night. That
+# is where the false positives came from, and it is measurable: the same
+# model, same clip, same audio and the same criteria verbatim from catalog.py
+# got 7/7 of that night's calling-for-help negatives RIGHT when asked as a
+# single-detector call, and fired on all of them when bundled. One shared
+# narrative gets written under pressure to be interesting across N questions,
+# and every member reads the same confabulation — which is how an English
+# conversation about a headache was reported as "Ayudame".
+#
+# 4 is a compromise, not a measurement: isolation is what tests clean, but a
+# call per detector multiplies the frame bill by the detector count. Splitting
+# severity-first means the highest-stakes members ride the first chunk and are
+# never diluted by the long tail of routine ones.
+_SCENE_KEY_CAP: int | None = 4
 _CROP_CAP = 3
 
 
@@ -159,9 +174,14 @@ def pack_calls(due_set: "DueSet", *, settings: "Settings") -> tuple[CallPlan, ..
         # typically micro-evidence (medication), exactly the dilution-
         # sensitive class.
         cap = _SCENE_KEY_CAP if key == _SCENE_KEY else _CROP_CAP
+        # `or [members]` preserves the always-emit-a-scene-call invariant:
+        # slicing an EMPTY member list yields no chunks at all, which would
+        # drop the anchor call that drives the presence state machine on a
+        # tick with nothing due (exactly what flag-off does).
         chunks = (
             [members] if cap is None
             else [members[i:i + cap] for i in range(0, len(members), cap)]
+            or [members]
         )
         for chunk in chunks:
             plans.append(CallPlan(

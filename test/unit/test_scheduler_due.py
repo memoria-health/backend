@@ -128,9 +128,19 @@ def test_parity_defaults_everything_due_even_with_reid_down() -> None:
         entries, signals=_signals(), identity=_identity(None),
         settings=_settings(), tick_index=7,
     )
-    assert _due_idents(ds) == ["fall", "stove_left_on", "medication"]
-    assert ds.skipped == ()
-    # No boxes anywhere ⇒ every artifact is scene-level.
+    # PARITY NARROWED 2026-08-06. It still holds for scene/snapshot buckets,
+    # but a COST-MANAGED crop-bucket detector with no body to crop no longer
+    # rides the full-frame call. Parity was written to guarantee "identical
+    # coverage to today's monolithic call"; what it actually guaranteed for
+    # these detectors was an answer drawn from evidence that cannot support
+    # it — `medication` reported a swallowed pill from a whole-room 4 fps
+    # view. Not answering beats answering wrong.
+    #
+    # Emergency detectors (severity >= 80) keep the old fail-open — see
+    # test_emergency_crop_detector_falls_open_without_a_box.
+    assert _due_idents(ds) == ["fall", "stove_left_on"]
+    assert dict(ds.skipped) == {"medication": "no_croppable_target"}
+    # No boxes anywhere ⇒ every artifact that still runs is scene-level.
     assert all(d.target_track_ids is None for d in ds.due)
 
 
@@ -226,6 +236,53 @@ def test_motion_floor_selects_moving_tracks_person_still_ignores_it() -> None:
     assert d2.target_track_ids == (1, 2)  # presence-only branch
 
 
+def test_a_running_crop_detector_always_gets_a_crop_target() -> None:
+    """The 2026-08-05 21:33 medication false positive.
+
+    Track 10 was present and labelled PATIENT with amount=0.0 — under the
+    0.03 floor. The floor emptied `qualifying`, and because
+    `scheduler_person_requires_track` defaults to False the detector ran
+    ANYWAY: with no target, which the packer routes to the full-frame scene
+    call. So a hand-to-mouth detector examined the whole room at 4 fps and
+    reported a pill being swallowed while the man was holding a camera.
+
+    The floor decides WHETHER a crop detector runs. It must never decide
+    WHAT it looks at. If it runs, it crops."""
+    tracks = (_track(1),)
+    signals = _signals(amounts={1: 0.0})            # dead still, under floor
+    ds = resolve_due(
+        [_entry("medication", bucket="person")], signals=signals,
+        identity=_identity(tracks),
+        settings=_settings(
+            scheduler_person_motion_floor=0.03,
+            scheduler_person_requires_track=False,  # the shipped default
+        ),
+        tick_index=0,
+    )
+    (d,) = ds.due
+    assert d.target_track_ids == (1,), (
+        "a person-bucket detector that runs must crop to the body, never "
+        "silently degrade to the full frame"
+    )
+
+
+def test_the_floor_still_skips_when_the_operator_opted_in() -> None:
+    """Separating the two decisions must not weaken the cost gate: with
+    requires_track=True the detector is SKIPPED, not run uncropped."""
+    ds = resolve_due(
+        [_entry("medication", bucket="person")],
+        signals=_signals(amounts={1: 0.0}),
+        identity=_identity((_track(1),)),
+        settings=_settings(
+            scheduler_person_motion_floor=0.03,
+            scheduler_person_requires_track=True,
+        ),
+        tick_index=0,
+    )
+    assert ds.due == ()
+    assert ("medication", "below_motion_floor") in ds.skipped
+
+
 # ─── Subject rule (fixed; fail-open) ─────────────────────────────
 
 
@@ -253,8 +310,13 @@ def test_no_attribution_never_suppresses_patient_scope() -> None:
     assert _due_idents(ds) == ["fall"]
 
 
-def test_patient_targets_prefer_patient_track_and_drop_verified_others() -> None:
-    tracks = (_track(1, "PATIENT"), _track(2, "OTHER"), _track(3))
+def test_patient_targets_prefer_the_locked_track() -> None:
+    """A track is only ever PATIENT or UNKNOWN (2026-08-06): the ledger
+    rewrite deleted LABEL_OTHER and the verified-OTHER audit, so there is no
+    such thing as a body verified NOT to be the patient.
+
+    Locked on this camera ⇒ target only them."""
+    tracks = (_track(1, "PATIENT"), _track(2), _track(3))
     ds = resolve_due(
         [_entry("medication", bucket="person")], signals=_signals(),
         identity=_identity(tracks, attribution_ran=True, patient_in_clip=True),
@@ -263,14 +325,21 @@ def test_patient_targets_prefer_patient_track_and_drop_verified_others() -> None
     (d,) = ds.due
     assert d.target_track_ids == (1,)   # locked patient track only
 
-    no_lock = (_track(2, "OTHER"), _track(3))
-    ds2 = resolve_due(
+
+def test_no_patient_lock_crops_every_body_in_view() -> None:
+    """Patient not verified anywhere ⇒ a patient-scoped detector still runs,
+    cropped, once per body in view (up to the crowd cap). Absence of a lock
+    is NOT evidence that the person on screen isn't the patient — and the
+    old fall-open-to-full-frame behaviour is what let `medication` answer
+    from a whole-room 4 fps view."""
+    tracks = (_track(2), _track(3))
+    ds = resolve_due(
         [_entry("medication", bucket="person")], signals=_signals(),
-        identity=_identity(no_lock, attribution_ran=True),
+        identity=_identity(tracks, attribution_ran=True),
         settings=_settings(), tick_index=0,
     )
-    (d2,) = ds2.due
-    assert d2.target_track_ids == (3,)  # UNKNOWN kept, verified OTHER dropped
+    (d,) = ds.due
+    assert d.target_track_ids == (2, 3)
 
 
 def test_anyone_scope_targets_every_track_per_person() -> None:
@@ -345,18 +414,40 @@ def test_unmeasurable_window_fails_open_past_raised_floors() -> None:
     assert fall.target_track_ids == (1,)   # every track fails open
 
 
-def test_emptied_patient_targets_fall_open_to_scene() -> None:
-    """All qualifying tracks verified-OTHER but the room is NOT
-    verified patient-free (an UNKNOWN could be off-frame): detector
-    stays due, degraded to the full scene."""
-    tracks = (_track(2, "OTHER"),)
+def test_emergency_crop_detector_falls_open_without_a_box() -> None:
+    """A missed emergency is never worth a saved call — the same line that
+    exempts these detectors from every other cost gate.
+
+    This is not hypothetical: only 62.5% of ticks with a person visible
+    carried a track box on the 08-05 night, so "no box ⇒ no run" would blind
+    emergency detectors on a third of ticks — including someone lying on the
+    floor, which is exactly when a tracker loses them."""
+    for tracks in (None, ()):                    # sidecar dead, and saw nobody
+        ds = resolve_due(
+            [_entry("choking", bucket="person", severity=100)],
+            signals=_signals(), identity=_identity(tracks),
+            settings=_settings(), tick_index=0,
+        )
+        (d,) = ds.due
+        assert d.target_track_ids is None        # full frame, but it RUNS
+
+
+def test_no_bodies_at_all_skips_a_crop_detector() -> None:
+    """Replaces test_emptied_patient_targets_fall_open_to_scene, which
+    constructed a verified-OTHER track — a state the ledger can no longer
+    produce (LABEL_OTHER is never assigned to anything).
+
+    The live case it was really guarding is this one: the tracker RAN and
+    found no body. A person-bucket detector cannot be cropped, so it does
+    not run. Answering from the whole room is not a degraded answer, it is
+    a wrong one."""
     ds = resolve_due(
         [_entry("medication", bucket="person")], signals=_signals(),
-        identity=_identity(tracks, attribution_ran=True, only_other=False),
+        identity=_identity((), attribution_ran=True),
         settings=_settings(), tick_index=0,
     )
-    (d,) = ds.due
-    assert d.target_track_ids is None
+    assert ds.due == ()
+    assert ("medication", "no_croppable_target") in ds.skipped
 
 
 # ── when_scope gating (recalibration 2026-07-14) ─────────────────────

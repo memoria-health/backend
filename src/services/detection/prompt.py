@@ -31,7 +31,47 @@ class DetectorSpec:
 
 BASE_PROMPT = (
     "You are monitoring a home camera to look after the person in view. "
-    "Respond with a JSON object containing every field below.\n\n"
+    "Respond with a JSON object containing every field below, FILLING THEM "
+    "IN THE ORDER GIVEN.\n\n"
+    # ── Evidence before verdict (2026-08-06) ──────────────────────────
+    # The prompt used to open with `description`, defined as justifying the
+    # detections ("justify whatever you detect below"). That is verdict-first
+    # reasoning: the model settles on a label and then writes prose to support
+    # it. It is the mechanism behind the 08-05/06 false positives — the
+    # narrative was accurate right up to the verb ("crouches down and FALLS
+    # onto the floor", "bends to clean the table then COLLAPSES"), because the
+    # sentence existed to justify a conclusion already reached.
+    #
+    # `observed` runs first and is deliberately verdict-free. Fields are
+    # generated in order, so committing to neutral observations first means
+    # the detections below are conditioned on evidence rather than the reverse.
+    # Measured on the 08-05 clips: forcing transcribe-then-attribute-then-
+    # describe before the question took flash-lite from firing on ordinary
+    # conversation to 8/8 correct, and recovered a real call for help that the
+    # verdict-first shape scored at 0.2 confidence.
+    # These are three SEPARATE fields, not one `observed` blob. The blob was
+    # tried first (2026-08-06) and silently failed: asked for an AUDIO line
+    # and a VIDEO line in one string, the model wrote only the video half —
+    # "A person is seated in a chair facing a desk with a laptop." — and then
+    # fired calling_for_help claiming 'At 00:08, the person clearly says
+    # "help me"'. A single string can be satisfied by any sentence, so it
+    # gets satisfied by the easy one. A required field cannot be skipped.
+    "heard: transcribe any speech VERBATIM. If words cannot be made out, "
+    "write exactly UNINTELLIGIBLE. If there is no sound, write SILENCE. "
+    "Never substitute a plausible-sounding phrase for one you did not hear, "
+    "and never translate into another language. This is the ONLY place "
+    "speech may be quoted — if a phrase does not appear here, no detector "
+    "below may claim it was said.\n"
+    "audio_source: exactly one of 'person_on_camera' (you can see them "
+    "speaking), 'device' (a TV, phone, laptop or speaker — including video "
+    "or music being played), 'other_room' (off-camera), 'none' (no speech), "
+    "'cannot_tell'. A person watching a video is 'device'.\n"
+    "seen: body position and how it changes, in plain physical terms "
+    "(standing, crouching, kneeling, lying, sitting, walking toward). Do NOT "
+    "write fell, collapsed, fainted, took, swallowed or drank — those are "
+    "conclusions and belong to the detectors below, not here. Write UNCLEAR "
+    "for anything you cannot resolve at this distance or resolution; "
+    "guessing here corrupts every field after it.\n\n"
     "description: write this for the caregiver who could not watch live — "
     "from it alone they should understand exactly what "
     "happened, start to finish, and why it was flagged. So justify whatever "
@@ -128,6 +168,32 @@ def build_prompt_and_schema(
     if motion_overlay:
         parts.append(_MOTION_OVERLAY_NOTE)
     schema_properties: dict[str, dict[str, str]] = {
+        # FIRST, deliberately: structured output is generated in property
+        # order, so this is what makes "evidence before verdict" real rather
+        # than advisory. See the note in BASE_PROMPT.
+        "heard": {
+            "type": "string",
+            "description": (
+                "Verbatim speech only, or UNINTELLIGIBLE, or SILENCE. Never "
+                "a plausible substitute, never translated. The only place "
+                "speech may be quoted."
+            ),
+        },
+        "audio_source": {
+            "type": "string",
+            "enum": [
+                "person_on_camera", "device", "other_room", "none",
+                "cannot_tell",
+            ],
+        },
+        "seen": {
+            "type": "string",
+            "description": (
+                "Plain physical body position only. No conclusions: never "
+                "'fell', 'collapsed', 'took a pill', 'drank'. UNCLEAR for "
+                "anything not resolvable."
+            ),
+        },
         "description": {
             "type": "string",
             # Schema-level reinforcement of the BASE_PROMPT rule —
@@ -141,7 +207,7 @@ def build_prompt_and_schema(
             ),
         },
     }
-    schema_required: list[str] = ["description"]
+    schema_required: list[str] = ["heard", "audio_source", "seen", "description"]
 
     # Always-on people_present block, RE-ENABLED. The LLM is the generic
     # presence detector again (camera_ingest's gate reads result.people_present
