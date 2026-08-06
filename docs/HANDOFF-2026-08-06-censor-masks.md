@@ -261,3 +261,74 @@ awakening at 05:49 invented by the hallucinated crossing.
 A detector can be `is_on` and assigned to nothing, and every surface still
 shows it as ON. For a pilot family that is silent failure of a feature they
 believe they bought. Worth an explicit "assigned to N cameras" signal.
+
+---
+
+## Activity — what it is for, and the edge cases to test
+
+**What we actually want from it (Aryaman, 2026-08-06): movement vs lethargy.**
+NOT granular posture classification. Whether the label is `sitting` or
+`standing` does not matter; both mean "not moving". The product signal is the
+ACTIVE FRACTION and how it trends, so the aggregation matters more than any
+individual label.
+
+### Measured over 2026-08-06 (3,630 person-present ticks)
+```
+sitting    59.7%   avg confidence 0.51
+lying      32.1%   avg confidence 0.96
+active      6.0%   avg confidence 0.98
+standing     2.2%   avg confidence 0.77
+```
+`lying` and `active` are confident and trustworthy — which is the half the
+product depends on. `sitting` is the low-confidence majority class and looks
+like the model's default bucket when unsure.
+
+**Under the movement-vs-lethargy framing that is mostly fine**, with ONE
+residual risk worth testing: low-confidence `sitting` may be SWALLOWING
+genuine movement, which would UNDERSTATE activity. That direction matters —
+overstating lethargy in an elderly patient is the error that triggers a false
+concern.
+
+### The edge case: seated exercise
+
+The prompt already makes a specific, falsifiable claim
+(`catalog.py:96-103`, `activity_summary.py:5`):
+
+> "actual physical activity and movement — engagement, not raw pixel motion.
+>  Seated EXERCISE is active; seated fidgeting is sitting."
+
+So this is not a new requirement, it is an existing assertion nobody has
+tested. If it fails, every seated-exercise minute is counted as lethargy.
+
+### Clips to capture (file under `~/Desktop/eval-set/activity/`)
+
+POSITIVES — must label `active` despite the person being seated:
+- `pos_seated_arm_raises` — seated, lifting arms overhead repeatedly
+- `pos_seated_leg_extensions` — seated, straightening/lowering legs
+- `pos_seated_weights` — seated, light dumbbells or a bottle as weight
+- `pos_seated_resistance_band`
+- `pos_seated_marching` — seated, alternating knee lifts
+- `pos_physio_routine` — a slow, low-amplitude physio set (the hardest case:
+  genuinely therapeutic movement that looks almost still)
+
+NEGATIVES — must NOT label `active`, and are the ones most likely to trip:
+- `neg_seated_fidgeting` — shifting, crossing legs, adjusting position
+- `neg_seated_gesturing` — talking with the hands, animated conversation
+- `neg_seated_eating` — repetitive hand-to-mouth, high pixel motion
+- `neg_seated_typing` — sustained hand movement, zero whole-body engagement
+- `neg_seated_phone_scrolling`
+
+The two adversarial pairs are `pos_seated_arm_raises` vs `neg_seated_gesturing`
+(similar arm motion, different intent) and `pos_seated_marching` vs
+`neg_seated_fidgeting` (similar leg motion, different intent). If the model can
+separate those, the "engagement, not raw pixel motion" claim holds.
+
+### How to test
+Run through `scratchpad/eval_new_config.py` with `activity` as the detector.
+**3x per clip** — single runs misled us repeatedly on 2026-08-06.
+
+Also worth checking on the same pass: does an explicit `unclear` state absorb
+much of the 59.7% `sitting`? If most of it moves, the timeline has been
+overstating sitting; if little moves, it is real and merely poorly calibrated.
+That is an hour against existing clips, not a soak — and it only matters if
+the seated-exercise cases above fail.
