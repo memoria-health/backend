@@ -186,3 +186,78 @@ it together on a call:
   already in `main.py` alongside boxmot/ultralytics.
 - Local `.env` now carries real PagerDuty / ops / event-gate values (added
   2026-08-06 so the gate can actually page). Local only; do not commit.
+
+---
+
+## Sleep — what changed, and what tonight's soak must answer
+
+### Ground truth from the 08-05/06 night
+Resident: asleep ~02:00, woke ~07:28-07:30, used a phone in bed ~8 min, dozed
+again, got out of bed 07:55. No fall, no genuine call for help except a
+deliberate 20:10 test.
+
+### Shipped (commit `9938d7e`)
+
+**1. Awakenings can be established by EVIDENCE, not just elapsed time.**
+`WAKE_MIN_EVIDENCED_TICKS = 3` consecutive positively-sighted awake ticks
+(`awake_in_bed` / `sitting_up` / `leaving_bed`, and only when the model already
+said awake) now end a sleep run even under `WAKE_MIN_SECONDS`. The 10-minute
+actigraphy rule buys certainty when the only signal is movement; it cost us a
+real 8-minute wake backed by 30 consecutive ticks of "looking at a glowing
+smartphone" plus a lamp being switched on. Unevidenced ticks
+(`asleep=False, activity=none`) keep the full 10 minutes — that is an absence
+of a sleep call, not a sighting.
+
+**2. A single false `leaving_bed` can no longer fabricate an awakening.**
+A crossing CLOSES the occupancy span, and `_sleep_runs` only ever saw one span,
+so the flicker rule that would have absorbed a lone tick never saw the seam.
+Runs are now merged across span boundaries with the same test, and the onset
+filter runs after the merge so a split night is not discarded as two short
+ones. On 08-06 this was one tick claiming "got out of bed and abruptly
+collapsed to the floor" between two ticks of lying asleep under the covers.
+
+**3. `run_daily_summaries.py` bound NAIVE window bounds against a timestamptz
+column**, so they were read in the client's local zone. On an IST machine every
+night silently truncated at 06:30 local, with no flag. Same tool, same rows:
+IST host reported 274 min, UTC container 359 min. Fixed with `_bind()`.
+
+Also corrected `MIN_CONFIDENCE`'s docstring: `sleep_confidence` is a VISIBILITY
+score, not a sleep probability (conf=1.0 ticks were 44.8% asleep; conf=0.95
+were 97.2%), because 1.0 is used equally for a confident ASLEEP and a confident
+AWAKE. Behaviour unchanged; only the claim it makes.
+
+### Result on that night, after the fixes
+```
+onset      01:56:53   (stable sleep; he announced "going to sleep" 01:54:12)
+wake       07:54:48   (matches getting out of bed)
+duration   350 min
+awakening  07:30:18-07:38:28, 8 min  — the real phone episode
+```
+Previously: onset 01:55:33, wake 06:29:58, 274 min, and a 0-minute phantom
+awakening at 05:49 invented by the hallucinated crossing.
+
+### What tonight's soak must answer
+
+1. **Does the evidenced-awakening rule hold on a second night?** It was tuned
+   to one. Watch for the opposite failure: 3 consecutive `awake_in_bed` ticks
+   fragmenting a night that was really continuous.
+2. **Does the new evidence-first prompt change sleep labelling at all?**
+   `heard` / `audio_source` / `seen` were added AFTER last night's data, so
+   every sleep number above predates them. Sleep labels could shift.
+3. **Does the IR blackout carry (`f9a07a7`) ever fire?** It has had NOTHING to
+   act on so far. It handles a track SWAP; the 01:57 loss was
+   `patient_left_view` — the body vanishing entirely — which is a different
+   failure. Grep for `track_ledger.blackout_carry`.
+4. **How long is the under-duvet blackout?** Last night: 03:03:33-04:02:14,
+   ~59 min, with only 2 visible ticks. Nothing in the perception stack sees a
+   person under covers in IR — `id_tracks` was `{}` and `people_count` 0 while
+   frames arrived fine. The night survived only because sparse glimpses stitch
+   the runs. A night with ZERO glimpses after onset would still truncate.
+5. **Sanity: is `Sleep` still assigned to the camera?** It was `is_on=true` but
+   assigned to NO camera and had never run once — found and fixed 08-06 01:59.
+   `cameras_detectors` is the join that matters, not `is_on`.
+
+### Sleep-adjacent product gap, unfixed
+A detector can be `is_on` and assigned to nothing, and every surface still
+shows it as ON. For a pilot family that is silent failure of a feature they
+believe they bought. Worth an explicit "assigned to N cameras" signal.
