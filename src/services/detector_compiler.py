@@ -149,11 +149,25 @@ caregiver's wording that conflicts with them.
    the room where something usually happens, or proximity to an object
    are never sufficient on their own. Say so explicitly.
 
-3. NAME THE COMPETING ACTIVITIES. List the things a person in a home is
-   most likely to be doing that could be mistaken for this behaviour,
-   and state that each one means FALSE. Always consider a laptop or
-   computer, a phone or tablet, reading, eating, cleaning, and talking
-   to someone.
+3. NAME THE COMPETING ACTIVITIES -- BUT ONLY THE ONES THAT TAKE THE SAME
+   FACULTY. A competing activity is one that CANNOT be done at the same
+   time as this behaviour because it needs the same attention. Watching
+   a screen needs the eyes, so a laptop, a phone, a tablet or a book
+   competes with it. Eating, drinking, holding a conversation, or having
+   the television on in the background do NOT need the eyes, so they
+   CO-OCCUR and must NOT make it false.
+
+   Ask: could a person plausibly do both at once? If yes, it co-occurs
+   and is irrelevant. If no, it competes and means FALSE. List only the
+   competing ones, and say plainly that co-occurring activities do not
+   change the answer.
+
+   Getting this wrong in either direction has cost us. Omitting LAPTOP
+   from Watching TV's competing list fired 5 events in 25 minutes at a
+   man working at his desk (2026-07-29). Then listing EATING as
+   competing fired 3 events in 19 minutes at a man who sat watching
+   television and eating -- the detector went false for 80 straight
+   seconds while nothing changed, and the episode expired (2026-08-06).
 
 4. NEVER RELY ON WHAT THE MODEL CANNOT KNOW. Do not refer to a person's
    habits, routine, usual spot, schedule, or medical history. The model
@@ -574,13 +588,20 @@ def _infer_meta_prompt(*, name: str | None, prompt: str) -> str:
         "10am'. Non-occurrence is only knowable at the window's end, so any "
         "'doesn't / hasn't happened by <time>' request is 'absence'. (A "
         "positive 'tell me WHEN she does X' is just 'leading' — use the active "
-        "window for the timing, not this.)\n\n"
+        "window for the timing, not this.)\n"
+        "  - 'record_only': the caregiver wants to SEE this on the timeline, "
+        "not be TOLD about it. An ordinary daily state that is never an "
+        "emergency and never needs a notification — watching TV, sitting, "
+        "reading, sleeping, moving about the house. Ask: would a phone alert "
+        "for this, every time it happened, be useful or annoying? If "
+        "annoying, it is 'record_only'. Prefer this for any routine state "
+        "unless the caregiver actually asked to be alerted.\n\n"
         "STEP 2 — `is_sustained`: true if the thing unfolds over a stretch "
         "(watching TV, pacing, eating, bathing, agitation, lying still); false "
         "if it's instantaneous (a fall, choking, arriving, leaving). "
         "'trailing' and 'duration' are always sustained.\n\n"
         "JSON fields:\n"
-        '  "alert_trigger": "leading" | "trailing" | "duration" | "absence"\n'
+        '  "alert_trigger": "leading" | "trailing" | "duration" | "absence" | "record_only"\n'
         '  "is_sustained": true | false\n'
         '  "duration_seconds": integer seconds — REQUIRED when '
         'alert_trigger="duration" (else null). Convert the stated time '
@@ -663,7 +684,9 @@ def _coerce_inferred(raw: dict) -> InferredConfig:
     Unknown enum values fall back to safe defaults; out-of-set icons
     fall back to 'eye'."""
     alert_trigger = raw.get("alert_trigger")
-    if alert_trigger not in ("leading", "trailing", "duration", "absence"):
+    if alert_trigger not in (
+        "leading", "trailing", "duration", "absence", "record_only",
+    ):
         alert_trigger = "leading"
     is_sustained = bool(raw.get("is_sustained"))
     # trailing / duration are sustained by definition; absence is neither.
