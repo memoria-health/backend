@@ -66,12 +66,29 @@ BASE_PROMPT = (
     "speaking), 'device' (a TV, phone, laptop or speaker — including video "
     "or music being played), 'other_room' (off-camera), 'none' (no speech), "
     "'cannot_tell'. A person watching a video is 'device'.\n"
-    "seen: body position and how it changes, in plain physical terms "
+    "seen: what is physically visible, in two parts.\n"
+    "  - BODY: position and how it changes, in plain physical terms "
     "(standing, crouching, kneeling, lying, sitting, walking toward). Do NOT "
     "write fell, collapsed, fainted, took, swallowed or drank — those are "
-    "conclusions and belong to the detectors below, not here. Write UNCLEAR "
-    "for anything you cannot resolve at this distance or resolution; "
-    "guessing here corrupts every field after it.\n\n"
+    "conclusions and belong to the detectors below, not here.\n"
+    "  - HANDS AND OBJECTS: anything the person is holding, and anything they "
+    "raise toward their face, mouth or body. Name the object only if you can "
+    "actually make it out (a cup, a bottle, a phone, a pill bottle) — "
+    "otherwise say an unidentified object, or say their hands are empty.\n"
+    "Write UNCLEAR for anything you cannot resolve at this distance or "
+    "resolution; guessing here corrupts every field after it.\n"
+    # The video twin of the `heard` rule. Without it the constraint was
+    # audio-only, and the same confabulation simply moved channel: on
+    # 2026-08-06 the drinking-water detector fired twice at 0.9 claiming
+    # "clearly seen lifting a water bottle to their mouth and drinking",
+    # while `seen` said "sitting in a chair at a desk, holding and looking
+    # down at a mobile phone" and the description agreed. No bottle existed
+    # in either field — it was invented at the verdict, exactly as the
+    # phantom "help me" had been before `heard` closed that door.
+    "This is the ONLY place objects and physical actions may be established. "
+    "If an object or a movement does not appear here, no detector below may "
+    "claim it happened — a detector that needs a cup reaching a mouth must "
+    "find that cup and that movement written above, or answer FALSE.\n\n"
     "description: write this for the caregiver who could not watch live — "
     "from it alone they should understand exactly what "
     "happened, start to finish, and why it was flagged. So justify whatever "
@@ -189,9 +206,11 @@ def build_prompt_and_schema(
         "seen": {
             "type": "string",
             "description": (
-                "Plain physical body position only. No conclusions: never "
-                "'fell', 'collapsed', 'took a pill', 'drank'. UNCLEAR for "
-                "anything not resolvable."
+                "Body position AND any object held or raised toward the "
+                "face/mouth/body. No conclusions: never 'fell', 'collapsed', "
+                "'took a pill', 'drank'. The only place objects and physical "
+                "actions are established — a detector may not claim one that "
+                "is absent here. UNCLEAR for anything not resolvable."
             ),
         },
         "description": {
