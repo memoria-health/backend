@@ -148,6 +148,86 @@ def _mask_bbox(m: np.ndarray):
     return (float(xs[0]), float(ys[0]), float(xs[-1]) + 1.0, float(ys[-1]) + 1.0)
 
 
+# ── per-frame mask retention for the event-gate censor ───────────────
+#
+# EdgeTAM already computes a full mask for every person on every frame of
+# every tick (`_propagate` -> out[fidx]); everything but the LAST frame was
+# thrown away, and only `last_masks` survived. The backend then re-ran
+# yolo11n-seg to censor gate clips and, at seated distance, scored 0.05 and
+# masked the whole frame -- the operator's page was a solid green rectangle
+# for its full duration, so the alert could not be judged and auto-released.
+#
+# So: keep what we already computed, for a few seconds, RLE-encoded. The
+# ~200MB figure that justified dropping masks is RAW full-res boolean
+# arrays; run-length encoded, a person mask is a few KB, so a whole tick is
+# a few hundred KB. Bounded by wall-clock, not by tick count, so a slow or
+# fast camera cannot change the memory ceiling.
+_MASK_RETENTION_SECONDS = 45.0
+
+# camera_id -> [(captured_at_epoch, width, height, {track_id: rle}), ...]
+_mask_window: "dict[str, list]" = {}
+_mask_window_lock = threading.Lock()
+
+
+def rle_encode(m: "np.ndarray") -> list[int]:
+    """Row-major run lengths of a binary mask, starting with a ZERO run.
+
+    Lossless and tiny for person-shaped masks. Decoded by the backend's
+    censor; the pair is covered by a round-trip test.
+    """
+    flat = np.ascontiguousarray(m.astype(bool)).reshape(-1)
+    if flat.size == 0:
+        return []
+    # Positions where the value changes, plus the ends.
+    idx = np.flatnonzero(np.diff(flat))
+    bounds = np.concatenate(([0], idx + 1, [flat.size]))
+    runs = np.diff(bounds).astype(int).tolist()
+    # Convention: first run is ZEROs. If the mask starts with a 1, emit a
+    # leading 0-length run so the parity is unambiguous.
+    return runs if not bool(flat[0]) else [0, *runs]
+
+
+def record_masks(
+    camera_id: str, captured_at: float, width: int, height: int, masks: dict,
+) -> None:
+    """Retain one frame's masks. Evicts anything older than the window."""
+    if not masks:
+        return
+    entry = (
+        float(captured_at), int(width), int(height),
+        {int(tid): rle_encode(m) for tid, m in masks.items()},
+    )
+    with _mask_window_lock:
+        buf = _mask_window.setdefault(camera_id, [])
+        buf.append(entry)
+        # Evict against the NEWEST timestamp seen, not this frame's — a
+        # late/out-of-order arrival must not drag the cutoff backwards and
+        # resurrect the window. Filtering the whole list rather than
+        # trimming a prefix, because a prefix trim silently strands older
+        # entries the moment anything arrives out of order (caught by the
+        # round-trip test, which fed a 100s-old frame after a fresh one).
+        newest = max(e[0] for e in buf)
+        cutoff = newest - _MASK_RETENTION_SECONDS
+        buf[:] = [e for e in buf if e[0] >= cutoff]
+
+
+def masks_between(camera_id: str, t0: float, t1: float) -> list[dict]:
+    """Retained frames whose capture time falls in [t0, t1], oldest first."""
+    with _mask_window_lock:
+        buf = list(_mask_window.get(camera_id, ()))
+    return [
+        {"captured_at": ts, "width": w, "height": h,
+         "masks": {str(k): v for k, v in mk.items()}}
+        for ts, w, h, mk in buf
+        if t0 <= ts <= t1
+    ]
+
+
+def forget_masks(camera_id: str) -> None:
+    with _mask_window_lock:
+        _mask_window.pop(camera_id, None)
+
+
 def _dump_overlay(frames, out, camera_id, tick, outdir) -> None:
     """Debug: save per-frame mask overlays for one tick, so we can SEE what
     EdgeTAM's mask does (follow the person vs drift onto the sofa)."""
@@ -571,3 +651,7 @@ def get_session(camera_id: str, *, reground_every: int = _REGROUND_EVERY) -> Cam
 def drop_session(camera_id: str) -> None:
     with _sessions_lock:
         _SESSIONS.pop(camera_id, None)
+    # The mask window is keyed by camera and would otherwise outlive the
+    # session that fills it — a camera removed from the home would leak
+    # its last 45s of masks until the process restarted.
+    forget_masks(camera_id)

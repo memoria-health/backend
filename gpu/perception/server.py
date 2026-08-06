@@ -317,6 +317,29 @@ def _observe_sync(
         session_out = session.observe(
             imgs, person_thr=person_thr, sam_pred=pred,
         )
+        # Retain this tick's per-frame masks for the event-gate censor
+        # (2026-08-06). They are already computed here and were dropped
+        # after the face pass; the backend then re-segmented the same
+        # pixels with a weaker model and, at seated distance, masked the
+        # whole frame green. Recorded before the loop mutates anything,
+        # and never allowed to break a tick.
+        try:
+            _t_tick = time.time()
+            for _pos, _dets in session_out.items():
+                if not _dets:
+                    continue
+                _h, _w = imgs[_pos].shape[:2]
+                continuous.record_masks(
+                    camera_id,
+                    # Frames are ~evenly spaced within the tick; the censor
+                    # matches on a window, not on an exact frame.
+                    _t_tick + (_pos / max(len(session_out), 1)),
+                    _w, _h,
+                    {tid: m for tid, (_bb, m) in _dets.items()},
+                )
+        except Exception:
+            log.warning("mask retention failed; censor falls back", exc_info=True)
+
         for pos in sorted(session_out):
             if pos >= len(pos_to_orig):
                 continue
@@ -655,3 +678,16 @@ async def observe(
         code, msg = payload["_error"]
         raise HTTPException(code, msg)
     return JSONResponse(payload)
+
+
+@app.get("/masks/{camera_id}")
+def masks(camera_id: str, t0: float, t1: float) -> dict:
+    """Retained per-frame person masks in [t0, t1], RLE-encoded.
+
+    Serves the event-gate censor so it can mask a clip from the SAME
+    segmentation that tracks the person, instead of re-running a weaker
+    model on the same pixels. Empty list = nothing retained for that
+    window; the caller must treat that as "cannot censor" and fail closed.
+    """
+    frames = continuous.masks_between(camera_id, t0, t1)
+    return {"camera_id": camera_id, "count": len(frames), "frames": frames}
