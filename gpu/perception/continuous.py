@@ -187,16 +187,41 @@ def rle_encode(m: "np.ndarray") -> list[int]:
     return runs if not bool(flat[0]) else [0, *runs]
 
 
-def record_masks(
-    camera_id: str, captured_at: float, width: int, height: int, masks: dict,
-) -> None:
-    """Retain one frame's masks. Evicts anything older than the window."""
+def record_masks(camera_id: str, captured_at: float, masks: dict) -> None:
+    """Retain one frame's masks. Evicts anything older than the window.
+
+    Dimensions are read FROM THE MASK ARRAYS, never passed in. They were
+    a caller-supplied parameter until 2026-08-06 and the caller passed
+    the FRAME's size — but `_track_edgetam` returns bboxes at full res
+    and masks at TRACK res (`_TRACK_W`, 640 by default), so every
+    retained mask was labelled 1920x1080 while actually being 640x360.
+    Decoding a 230k-pixel run-length stream into a 2.07M-pixel grid put
+    the whole silhouette in a thin band across the top of the frame:
+    plausible-looking coverage (~0.3%), person-sized, nowhere near the
+    person. Nothing downstream could catch it, because a mask is just a
+    mask. Reading the shape off the array makes the disagreement
+    impossible to express.
+
+    Masks in one frame all come from the same propagate and so share a
+    shape; any that somehow doesn't is dropped rather than encoded
+    against the wrong dimensions.
+    """
     if not masks:
         return
-    entry = (
-        float(captured_at), int(width), int(height),
-        {int(tid): rle_encode(m) for tid, m in masks.items()},
-    )
+    items = list(masks.items())
+    height, width = items[0][1].shape[:2]
+    kept = {}
+    for tid, m in items:
+        if m.shape[:2] != (height, width):
+            log.warning(
+                "record_masks: track %s mask is %s, frame is %s — dropped",
+                tid, m.shape[:2], (height, width),
+            )
+            continue
+        kept[int(tid)] = rle_encode(m)
+    if not kept:
+        return
+    entry = (float(captured_at), int(width), int(height), kept)
     with _mask_window_lock:
         buf = _mask_window.setdefault(camera_id, [])
         buf.append(entry)

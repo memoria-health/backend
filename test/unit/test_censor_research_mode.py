@@ -21,6 +21,9 @@ import pytest
 
 from src.services.detection import censor
 
+CAMERA_ID = "cafe1234-0000-4000-8000-000000000000"
+CLIP_START = 1_786_000_000.0
+
 
 def _frame(h: int = 120, w: int = 160) -> np.ndarray:
     """A frame with structure, so "was it changed?" is answerable."""
@@ -63,6 +66,57 @@ def test_mask_is_tighter_than_the_caregiver_treatment() -> None:
     assert research < caregiver
 
 
+def test_a_stale_mask_gets_a_motion_margin() -> None:
+    """Pod masks arrive at ~3fps while clips encode at 8, so a frame is
+    routinely covered by a silhouette from up to ~170ms earlier — about
+    63px of walking at 1080p, against a 5px research margin. The old
+    local segmenter ran on the frame being censored and never had this
+    gap, which is why the margin was tuned without it. Measured
+    2026-08-06 by rendering a real censored clip and seeing the subject
+    poke out of the fill.
+    """
+    mask = _mask()
+    exact = censor._research_dilate(mask).sum()
+    stale = censor._research_dilate(
+        mask, extra_px=censor._motion_margin_px(0.167, mask),
+    ).sum()
+    assert stale > exact
+
+
+def test_the_motion_margin_scales_with_the_subject_not_the_frame() -> None:
+    """Someone across the room is smaller in frame AND moves fewer
+    pixels per second, so the allowance is measured in body heights.
+    Scaling by the frame would over-cover distant subjects and
+    under-cover close ones."""
+    near = np.zeros((480, 640), dtype=np.uint8)
+    near[100:400, 200:300] = 1                     # 300px tall
+    far = np.zeros((480, 640), dtype=np.uint8)
+    far[100:160, 200:220] = 1                      # 60px tall
+    assert (
+        censor._motion_margin_px(0.2, near)
+        > censor._motion_margin_px(0.2, far)
+    )
+
+
+def test_an_exact_match_pays_no_motion_margin() -> None:
+    """A mask computed for THIS instant needs no travel allowance, and
+    over-covering costs the operator the judgement they were paged
+    for."""
+    mask = _mask()
+    assert censor._motion_margin_px(0.0, mask) == 0
+    assert censor._motion_margin_px(None, mask) == 0
+
+
+def test_the_motion_margin_is_bounded() -> None:
+    """Past the cap the fill would swallow the room and stop being a
+    redaction at all — the gap bridge and full-frame cover own that
+    case instead."""
+    mask = _mask()
+    huge = censor._motion_margin_px(30.0, mask)
+    capped = censor._motion_margin_px(censor._MOTION_MARGIN_MAX_S, mask)
+    assert huge == capped
+
+
 def test_dilation_still_leaves_a_real_margin() -> None:
     """Tight is not the same as none — segmentation under-covers at
     body edges, so some margin has to survive."""
@@ -84,7 +138,10 @@ def test_no_subject_covers_the_whole_frame() -> None:
 async def test_research_mode_never_falls_back_to_full_frame(monkeypatch) -> None:
     """A tier-1 failure must propagate, not quietly produce a blurred
     clip that then gets uploaded as though it were fine."""
-    async def boom(in_path, out_path, *, mode=censor.CENSOR_MODE_PIXELATE):
+    async def boom(
+        in_path, out_path, *, mode=censor.CENSOR_MODE_PIXELATE,
+        camera_id="", clip_start=0.0,
+    ):
         raise censor.CensorError("no subject")
 
     called = False
@@ -99,6 +156,7 @@ async def test_research_mode_never_falls_back_to_full_frame(monkeypatch) -> None
     with pytest.raises(censor.CensorError):
         await censor.censor_clip(
             "in.mp4", "out.mp4", mode=censor.CENSOR_MODE_RESEARCH,
+            camera_id=CAMERA_ID, clip_start=CLIP_START,
         )
     assert called is False
 
@@ -108,12 +166,16 @@ async def test_full_frame_request_in_research_mode_is_refused() -> None:
         await censor.censor_clip(
             "in.mp4", "out.mp4", full_frame=True,
             mode=censor.CENSOR_MODE_RESEARCH,
+            camera_id=CAMERA_ID, clip_start=CLIP_START,
         )
 
 
 async def test_default_mode_still_falls_back(monkeypatch) -> None:
     """The caregiver-facing path must be completely unchanged."""
-    async def boom(in_path, out_path, *, mode=censor.CENSOR_MODE_PIXELATE):
+    async def boom(
+        in_path, out_path, *, mode=censor.CENSOR_MODE_PIXELATE,
+        camera_id="", clip_start=0.0,
+    ):
         raise censor.CensorError("no subject")
 
     called = False
@@ -125,13 +187,17 @@ async def test_default_mode_still_falls_back(monkeypatch) -> None:
     monkeypatch.setattr(censor, "_censor_person_mask_subprocess", boom)
     monkeypatch.setattr(censor, "_censor_full_frame", full_frame)
 
-    await censor.censor_clip("in.mp4", "out.mp4")
+    await censor.censor_clip(
+        "in.mp4", "out.mp4", camera_id=CAMERA_ID, clip_start=CLIP_START,
+    )
     assert called is True
 
 
 def test_mode_reaches_the_child_process() -> None:
     argv = censor._person_mask_subprocess_cmd(
         "a.mp4", "b.mp4", mode=censor.CENSOR_MODE_RESEARCH,
+        camera_id=CAMERA_ID, clip_start=CLIP_START,
+        pod_url="http://pod.invalid",
     )
     assert "--mode" in argv
     assert argv[argv.index("--mode") + 1] == censor.CENSOR_MODE_RESEARCH
@@ -139,4 +205,7 @@ def test_mode_reaches_the_child_process() -> None:
 
 def test_default_mode_adds_no_flag() -> None:
     """Keeps the existing child invocation byte-identical."""
-    assert "--mode" not in censor._person_mask_subprocess_cmd("a.mp4", "b.mp4")
+    assert "--mode" not in censor._person_mask_subprocess_cmd(
+        "a.mp4", "b.mp4", camera_id=CAMERA_ID, clip_start=CLIP_START,
+        pod_url="http://pod.invalid",
+    )

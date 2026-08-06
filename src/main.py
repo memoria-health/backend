@@ -7,7 +7,6 @@ new aggregate appends one `include_router` line.
 
 import logging
 import os
-import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -114,20 +113,6 @@ from src.services.scheduling.scheduler import ScheduledDetectorRunner
 from src.settings import get_settings
 
 
-def _warm_censor_model() -> None:
-    """Preload YOLO seg weights for the clip censor (daemon thread)."""
-    try:
-        from src.services.detection import censor
-
-        censor._get_seg_model()
-        logging.getLogger(__name__).info("censor model warmed")
-    except Exception:
-        logging.getLogger(__name__).warning(
-            "censor model warmup failed; will retry lazily on first "
-            "censored clip", exc_info=True,
-        )
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Touch the engine so the lazy `lru_cache` factory binds at startup
@@ -140,19 +125,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Same for the data-collection recorder's tempfiles, which are raw
     # uncensored video/audio and had no sweep of their own until now.
     recorder_manager.sweep_temp_dir()
-    # Warm the censor's YOLO seg model off the startup path: the first
-    # load pays weights download + torch init (measured minutes on a
-    # cold host vs ~9s steady-state per censored clip). Daemon thread —
-    # never blocks startup, failure just re-raises lazily on first use.
-    # Still valuable now that tier-1 censoring runs in a child process
-    # (censor._censor_person_mask_subprocess): ultralytics resolves the
-    # bare "yolo11n-seg.pt" name against the process cwd, the warmup
-    # downloads it there (repo root locally, WORKDIR /app in the
-    # container), and the child inherits that cwd — so every censor
-    # subprocess finds the weights cached instead of re-downloading.
-    threading.Thread(
-        target=_warm_censor_model, name="censor-model-warmup", daemon=True
-    ).start()
+    # (No censor model warmup since 2026-08-06: the censor's person
+    # masks come from the perception pod's EdgeTAM segmentation over
+    # HTTP, so there are no local weights to download and no torch to
+    # initialize. The warmup existed to get `yolo11n-seg.pt` cached in
+    # the process cwd before the first censored clip; nothing in the
+    # censor path loads a model any more.)
     # Phase 2: in-process detector subscriber-bot. Webhook-driven; the
     # `/v1/livekit/webhooks` route reads `app.state.detector_worker`
     # to dispatch participant_joined/left events. Worker idles at

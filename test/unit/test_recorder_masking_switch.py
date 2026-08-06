@@ -76,8 +76,12 @@ def _mgr(tmp_path, made: list):
         made.append(e)
         return e
 
-    def masked(path):
+    def masked(path, *, camera_id, settings):
+        # The masking factory carries the camera + settings since
+        # 2026-08-06: its child fetches that camera's masks from the pod.
+        assert camera_id is not None
         e = _MaskEnc(path)
+        e.camera_id = camera_id
         made.append(e)
         return e
 

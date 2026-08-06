@@ -24,7 +24,7 @@ _UTC = datetime(2026, 8, 5, 9, 0, 0, tzinfo=timezone.utc)
 
 
 class _Enc:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, **_kw) -> None:
         self.path = Path(path)
         self.first_frame_mono = 100.0
         self.duration_seconds = 5.0

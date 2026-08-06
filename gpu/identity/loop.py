@@ -618,7 +618,7 @@ class CameraLoop:
         # identity again (face batches inside /observe were 3-5x the
         # cost and strangled the carry).
         t_e = time.time()
-        jpegs, inv_scale = await asyncio.to_thread(
+        jpegs, inv_scale, capture_ts = await asyncio.to_thread(
             self._encode, batch, TRACK_SEND_W,
         )
         encode_ms = (time.time() - t_e) * 1000.0
@@ -632,6 +632,7 @@ class CameraLoop:
                 face_interval=999,
                 face_cap=0,
                 detect_screens=want_screens,
+                capture_ts=capture_ts,
             )
             self.home.last_pod_ok = time.time()  # pod-progress watchdog feed
         self.pod_ms = (time.time() - t0) * 1000.0
@@ -756,15 +757,27 @@ class CameraLoop:
 
     def _encode(
         self, batch: list, send_w: Optional[int],
-    ) -> tuple[list[tuple[int, bytes]], float]:
+    ) -> tuple[list[tuple[int, bytes]], float, dict[int, float]]:
         """JPEG-encode a batch, optionally downscaled to send_w wide.
 
-        Returns (jpegs, inv_scale) — multiply pod bbox coords by
-        inv_scale to get back to ring-frame space.
+        Returns (jpegs, inv_scale, capture_ts) — multiply pod bbox coords
+        by inv_scale to get back to ring-frame space.
+
+        `capture_ts` maps each shipped frame index to WHEN THE FRAME WAS
+        RECEIVED, on this host's `time.time()`. It travels with the
+        request so the pod can stamp its retained masks with the frame's
+        real capture time instead of its own processing time (2026-08-06).
+        Two things were wrong with the pod stamping it itself: the lag
+        between capture and processing is seconds (`lag_s` ≈ 2.6 live),
+        and the pod is a different machine, so its clock carries an
+        unmeasured skew against the backend's. Echoing OUR stamp back
+        removes both at once — the censor's window arithmetic then
+        happens entirely in one clock.
         """
         out = []
+        stamps: dict[int, float] = {}
         inv = 1.0
-        for idx, _ts, bgr in batch:
+        for idx, ts, bgr in batch:
             img = bgr
             if send_w and bgr.shape[1] > send_w:
                 s = send_w / bgr.shape[1]
@@ -775,7 +788,8 @@ class CameraLoop:
             )
             if ok:
                 out.append((idx, jpg.tobytes()))
-        return out, inv
+                stamps[idx] = float(ts)
+        return out, inv, stamps
 
     # ── overlay publish (sync, off the event loop) ───────────────────
     def _publish(self, pipeline_frame: tuple) -> None:

@@ -2,24 +2,28 @@
 
 Like test_mp4_remux.py these shell out to real ffmpeg/ffprobe (the
 censor does at runtime) and are skipped when the binaries are missing.
-The YOLO seg model is NEVER loaded here — the seg seams
-(`_get_seg_model` / `_person_mask`) are monkeypatched so no weights
-download in CI.
+No pod is contacted — `pod_masks.fetch_window` and `_person_mask` are
+monkeypatched, so CI needs neither network nor a GPU host.
 
 Contracts under test:
 
   - AUDIO IS KEPT (2026-07-28 product call): a fixture clip WITH an
     audio track comes out of both censor tiers with its audio stream
     intact (ffprobe-verified) — visuals censored, sound stays.
-  - No-person frames of a sensitive clip are pixelated FULL-FRAME
+  - No-mask frames of a sensitive clip are pixelated FULL-FRAME
     (`_censor_frame` with mask=None), and masked frames keep pixels
     outside the dilated mask untouched.
+  - An unreachable pod (`PodMaskError`) falls back to tier 2 rather
+    than shipping anything unmasked — the fail-closed rule survived the
+    2026-08-06 switch from local YOLO to pod masks.
   - Tier 1 runs in an ISOLATED subprocess under a hard timeout
     (2026-07-28 native-torch-hang hardening): success uses the child's
     output; timeout kills the child; timeout/nonzero-exit both fall
     back to the pure-ffmpeg full-frame tier in-process. Tested with
     scripted stand-in children via the `_person_mask_subprocess_cmd`
-    seam — real spawn/kill mechanics, no YOLO weights ever loaded.
+    seam — real spawn/kill mechanics.
+  - The pod TOKEN never reaches the child's argv (it would be visible
+    in `ps`); it rides the environment.
   - When even tier 2 can't work (undecodable input), `CensorError`
     propagates so the caller drops the clip.
 """
@@ -112,7 +116,7 @@ async def _write_fixture(tmp_path) -> str:
 async def test_full_frame_censor_keeps_audio(tmp_path) -> None:
     in_path = await _write_fixture(tmp_path)
     out_path = str(tmp_path / "out.mp4")
-    await censor_clip(in_path, out_path, full_frame=True)
+    await _censor(in_path, out_path, full_frame=True)
     assert _codec_types(out_path) == {"video", "audio"}
 
 
@@ -122,54 +126,81 @@ async def test_full_frame_censor_raises_on_undecodable_input(tmp_path) -> None:
     with open(in_path, "wb") as f:
         f.write(b"this is not an mp4")
     with pytest.raises(CensorError):
-        await censor_clip(in_path, str(tmp_path / "out.mp4"), full_frame=True)
+        await _censor(in_path, str(tmp_path / "out.mp4"), full_frame=True)
 
 
-# ── person-mask tier (tier 1) — sync pipeline, seg seams mocked ─────
+# ── person-mask tier (tier 1) — sync pipeline, pod seams mocked ─────
+
+CAMERA_ID = "cafe1234-0000-4000-8000-000000000000"
+CLIP_START = 1_786_000_000.0
 
 
 def _run_person_mask_inprocess(monkeypatch) -> None:
     """Route censor_clip's tier 1 back in-process (thread, not
-    subprocess) so the seg-seam monkeypatches apply. The subprocess
+    subprocess) so the mask-seam monkeypatches apply. The subprocess
     mechanics themselves are covered by the subprocess-seam tests
     below; these tests pin the PIPELINE contract (frame treatment +
     audio kept)."""
 
-    async def _inprocess(in_path: str, out_path: str) -> None:
-        await aio.to_thread(censor._censor_person_mask_sync, in_path, out_path)
+    async def _inprocess(
+        in_path: str, out_path: str, *, mode: str = "pixelate",
+        camera_id: str = "", clip_start: float = 0.0,
+    ) -> None:
+        await aio.to_thread(
+            censor._censor_person_mask_sync, in_path, out_path, mode=mode,
+            camera_id=camera_id, clip_start=clip_start,
+            pod_url="http://pod.invalid", pod_token="",
+        )
 
     monkeypatch.setattr(censor, "_censor_person_mask_subprocess", _inprocess)
+
+
+def _stub_window(monkeypatch, mask_fn) -> None:
+    """Replace the pod fetch with an empty window, and `_person_mask`
+    with `mask_fn(shape)`. Keeps the real loop, indexing and encoder."""
+    monkeypatch.setattr(
+        censor.pod_masks, "fetch_window",
+        lambda *a, **kw: censor.pod_masks.MaskWindow([]),
+    )
+    monkeypatch.setattr(
+        censor, "_person_mask",
+        lambda window, frame_time, shape: mask_fn(shape),
+    )
+
+
+async def _censor(in_path: str, out_path: str, **kw) -> None:
+    await censor_clip(
+        in_path, out_path, camera_id=CAMERA_ID, clip_start=CLIP_START, **kw
+    )
 
 
 async def test_person_mask_tier_no_person_pixelates_and_keeps_audio(
     tmp_path, monkeypatch,
 ) -> None:
-    """Sensitive clip, seg finds nobody in any frame → every frame is
-    censored full-frame (never left raw); source audio muxed back."""
+    """Sensitive clip, the pod retained no mask for any frame → every
+    frame is censored full-frame (never left raw); audio muxed back."""
     _run_person_mask_inprocess(monkeypatch)
-    monkeypatch.setattr(censor, "_get_seg_model", lambda: object())
-    monkeypatch.setattr(censor, "_person_mask", lambda model, frame: None)
+    _stub_window(monkeypatch, lambda shape: None)
     in_path = await _write_fixture(tmp_path)
     out_path = str(tmp_path / "out.mp4")
-    await censor_clip(in_path, out_path)
+    await _censor(in_path, out_path)
     assert _codec_types(out_path) == {"video", "audio"}
 
 
 async def test_person_mask_tier_with_mask_keeps_audio(
     tmp_path, monkeypatch,
 ) -> None:
-    def _mask(model, frame):
-        h, w = frame.shape[:2]
+    def _mask(shape):
+        h, w = shape
         m = np.zeros((h, w), dtype=np.uint8)
         m[h // 4: h // 2, w // 4: w // 2] = 1
         return m
 
     _run_person_mask_inprocess(monkeypatch)
-    monkeypatch.setattr(censor, "_get_seg_model", lambda: object())
-    monkeypatch.setattr(censor, "_person_mask", _mask)
+    _stub_window(monkeypatch, _mask)
     in_path = await _write_fixture(tmp_path)
     out_path = str(tmp_path / "out.mp4")
-    await censor_clip(in_path, out_path)
+    await _censor(in_path, out_path)
     assert _codec_types(out_path) == {"video", "audio"}
 
 
@@ -181,38 +212,95 @@ async def test_person_mask_streaming_preserves_frame_count(
     the input's frame count — no frame dropped or duplicated at the
     open/close boundaries of the incremental encoder."""
     _run_person_mask_inprocess(monkeypatch)
-    monkeypatch.setattr(censor, "_get_seg_model", lambda: object())
-    monkeypatch.setattr(censor, "_person_mask", lambda model, frame: None)
+    _stub_window(monkeypatch, lambda shape: None)
     in_path = await _write_fixture(tmp_path)
     out_path = str(tmp_path / "out.mp4")
-    await censor_clip(in_path, out_path)
+    await _censor(in_path, out_path)
     n_in = _count_frames(in_path)
     assert n_in == 8  # fixture sanity
     assert _count_frames(out_path) == n_in
 
 
-async def test_seg_stack_failure_falls_back_to_full_frame(
+async def test_frame_time_advances_with_the_output_grid(
     tmp_path, monkeypatch,
 ) -> None:
-    """ultralytics missing / model load crash (now: inside the child
-    process) → tier 1 raises → tier 2 (pure ffmpeg) still produces a
-    censored, audio-free clip."""
-    def _boom():
-        raise ImportError("ultralytics is broken on this host")
+    """Each frame is looked up at clip_start + i/clip_fps.
+
+    This is the whole basis for indexing pod masks by capture time: the
+    VFR encode materializes the window onto a uniform fps grid whose
+    playback duration equals wall clock. If the censor ever stopped
+    advancing (or advanced at the wrong rate) every frame would silently
+    get the first frame's mask.
+    """
+    seen: list[float] = []
+
+    def _record(window, frame_time, shape):
+        seen.append(frame_time)
+        return None
 
     _run_person_mask_inprocess(monkeypatch)
-    monkeypatch.setattr(censor, "_get_seg_model", _boom)
+    monkeypatch.setattr(
+        censor.pod_masks, "fetch_window",
+        lambda *a, **kw: censor.pod_masks.MaskWindow([]),
+    )
+    monkeypatch.setattr(censor, "_person_mask", _record)
+    in_path = await _write_fixture(tmp_path)
+    await _censor(in_path, str(tmp_path / "out.mp4"))
+    fps = float(censor.get_settings().clip_fps)
+    assert seen == [CLIP_START + i / fps for i in range(len(seen))]
+    assert len(seen) == 8
+
+
+async def test_pod_unreachable_falls_back_to_full_frame(
+    tmp_path, monkeypatch,
+) -> None:
+    """Pod down / tunnel dead → tier 1 raises → tier 2 (pure ffmpeg)
+    still produces a censored clip. Nothing unmasked ever ships."""
+    def _boom(*a, **kw):
+        raise censor.pod_masks.PodMaskError("tunnel is dead")
+
+    _run_person_mask_inprocess(monkeypatch)
+    monkeypatch.setattr(censor.pod_masks, "fetch_window", _boom)
     in_path = await _write_fixture(tmp_path)
     out_path = str(tmp_path / "out.mp4")
-    await censor_clip(in_path, out_path)  # must not raise
+    await _censor(in_path, out_path)  # must not raise
     assert _codec_types(out_path) == {"video", "audio"}
+
+
+def test_the_pod_token_never_reaches_argv() -> None:
+    """argv is world-readable via `ps`, so the credential must travel in
+    the child's environment instead. Belt-and-braces against someone
+    later 'simplifying' the env plumbing into a flag."""
+    argv = censor._person_mask_subprocess_cmd(
+        "in.mp4", "out.mp4", camera_id=CAMERA_ID, clip_start=CLIP_START,
+        pod_url="http://pod.invalid",
+    )
+    secret = "s3cret-token-value"
+    assert secret not in " ".join(argv)
+    env = censor._censor_child_env(secret)
+    assert env["NEMARA_PERCEPTION_TOKEN"] == secret
+    # And an empty token UNSETS rather than blanks it, so "no token"
+    # means the same thing on both sides of the wire.
+    assert "NEMARA_PERCEPTION_TOKEN" not in censor._censor_child_env("")
+
+
+def test_clip_start_survives_the_argv_round_trip() -> None:
+    """Epoch seconds carry ~9 significant digits before the point. A
+    float formatted with '%f'-style rounding would land the window whole
+    milliseconds off; `repr` round-trips exactly."""
+    argv = censor._person_mask_subprocess_cmd(
+        "in.mp4", "out.mp4", camera_id=CAMERA_ID,
+        clip_start=1786012345.6789012, pod_url="http://pod.invalid",
+    )
+    parsed = float(argv[argv.index("--clip-start") + 1])
+    assert parsed == 1786012345.6789012
 
 
 # ── tier-1 subprocess isolation (2026-07-28 hardening) ───────────────
 #
 # Real child processes via the `_person_mask_subprocess_cmd` seam —
 # scripted stand-ins (exit codes, sleeps, or the real CLI in
-# --full-frame mode) so YOLO weights are never loaded, while the
+# --full-frame mode) so no pod is contacted, while the
 # spawn / wait_for / kill machinery under test is the production code.
 
 
@@ -226,7 +314,7 @@ def _fake_cmd(monkeypatch, *argv_tail: str) -> None:
 
 async def test_subprocess_success_end_to_end(tmp_path, monkeypatch) -> None:
     """censor_clip tier 1 via a REAL child running the REAL module CLI
-    (--full-frame stand-in for the YOLO pass, so no weights load):
+    (--full-frame stand-in for the mask pass, so no pod is contacted):
     child exits 0, its output is used, audio is stripped. Also proves
     `python -m src.services.detection.censor` imports headless."""
     in_path = await _write_fixture(tmp_path)
@@ -234,12 +322,12 @@ async def test_subprocess_success_end_to_end(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(
         censor,
         "_person_mask_subprocess_cmd",
-        lambda i, o: [
+        lambda i, o, **kw: [
             sys.executable, "-m", "src.services.detection.censor",
             i, o, "--full-frame",
         ],
     )
-    await censor_clip(in_path, out_path)
+    await _censor(in_path, out_path)
     assert _codec_types(out_path) == {"video", "audio"}
 
 
@@ -262,10 +350,14 @@ async def test_subprocess_timeout_kills_child_and_falls_back(
     monkeypatch.setattr(
         censor,
         "get_settings",
-        lambda: SimpleNamespace(censor_timeout_seconds=1.5),
+        lambda: SimpleNamespace(
+            censor_timeout_seconds=1.5,
+            perception_mask_url="http://pod.invalid",
+            perception_mask_token="",
+        ),
     )
     start = time.monotonic()
-    await censor_clip(in_path, out_path)  # must not raise, must not hang
+    await _censor(in_path, out_path)  # must not raise, must not hang
     elapsed = time.monotonic() - start
     assert elapsed < 30  # deadline tripped; we never sat out the sleep(60)
     # The child was killed AND reaped (proc.wait() ran before fallback).
@@ -281,7 +373,7 @@ async def test_subprocess_nonzero_exit_falls_back(tmp_path, monkeypatch) -> None
     in_path = await _write_fixture(tmp_path)
     out_path = str(tmp_path / "out.mp4")
     _fake_cmd(monkeypatch, "-c", "import sys; sys.exit(3)")
-    await censor_clip(in_path, out_path)  # must not raise
+    await _censor(in_path, out_path)  # must not raise
     assert _codec_types(out_path) == {"video", "audio"}
 
 
@@ -295,7 +387,7 @@ async def test_subprocess_failure_and_tier2_failure_raises(
         f.write(b"this is not an mp4")
     _fake_cmd(monkeypatch, "-c", "import sys; sys.exit(2)")
     with pytest.raises(CensorError):
-        await censor_clip(in_path, str(tmp_path / "out.mp4"))
+        await _censor(in_path, str(tmp_path / "out.mp4"))
 
 
 def test_cli_nonzero_exit_on_bad_input(tmp_path) -> None:
@@ -386,13 +478,19 @@ class TestScratchSweep:
         )
         seen: dict[str, str] = {}
 
-        async def fake_censor(in_path, out_path, *, full_frame, keep_audio=True, mode="pixelate"):
+        async def fake_censor(
+            in_path, out_path, *, full_frame, keep_audio=True,
+            mode="pixelate", camera_id="", clip_start=0.0,
+        ):
             seen["in"], seen["out"] = in_path, out_path
             with open(out_path, "wb") as f:
                 f.write(b"censored")
 
         monkeypatch.setattr(censor_mod, "censor_clip", fake_censor)
-        out = asyncio.run(clip_archival._censor_bytes(b"raw", full_frame=True))
+        out = asyncio.run(clip_archival._censor_bytes(
+            b"raw", full_frame=True, camera_id=CAMERA_ID,
+            clip_start=CLIP_START,
+        ))
         assert out == b"censored"
         scratch = clip_archival._scratch_dir()
         assert seen["in"].startswith(scratch)

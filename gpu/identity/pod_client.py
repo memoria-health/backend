@@ -135,26 +135,40 @@ class SamServiceClient:
         face_interval: int,
         face_cap: int,
         detect_screens: bool = False,
+        capture_ts: "dict[int, float] | None" = None,
     ) -> RemoteObservations:
         """POST ordered (orig_idx, jpeg_bytes) frames; parse the raw
         observations. Raises on transport/HTTP errors (fail-open is
         the caller's job). `detect_screens` asks the pod for one
         screen-concept pass on the newest frame (display-veto map
-        refresh, ~0.5s)."""
+        refresh, ~0.5s).
+
+        `capture_ts` maps frame index → this host's `time.time()` when
+        the frame arrived. The pod does not compute with it; it only
+        stamps retained masks so the censor can find the masks belonging
+        to a clip window in the clock the clip was timed in. Omitted
+        (old caller, or a caller with no stamps), the pod falls back to
+        its own processing time and the censor's matching gets sloppier
+        by the pipeline lag — degraded, never wrong."""
+        import json as _json
+
+        data = {
+            "camera_id": camera_id,
+            "person_thr": str(person_thr),
+            "face_interval": str(face_interval),
+            "face_cap": str(face_cap),
+            "detect_screens": "1" if detect_screens else "0",
+        }
+        if capture_ts:
+            data["capture_ts"] = _json.dumps(
+                {str(k): float(v) for k, v in capture_ts.items()},
+            )
         files = [
             ("frames", (f"{idx:05d}.jpg", jpeg, "image/jpeg"))
             for idx, jpeg in jpegs_by_index
         ]
         resp = await self._client.post(
-            f"{self._base}/observe",
-            data={
-                "camera_id": camera_id,
-                "person_thr": str(person_thr),
-                "face_interval": str(face_interval),
-                "face_cap": str(face_cap),
-                "detect_screens": "1" if detect_screens else "0",
-            },
-            files=files,
+            f"{self._base}/observe", data=data, files=files,
         )
         resp.raise_for_status()
         j = resp.json()

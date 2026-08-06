@@ -64,7 +64,7 @@ from sqlalchemy import text as sa_text
 from src.db.event import Event
 from src.db.patient import Patient
 from src.services import storage
-from src.services.detection import censor, sensitivity
+from src.services.detection import censor, pod_masks, sensitivity
 from src.services.detection.mp4_remux import Mp4RemuxError, frames_to_vfr_mp4
 
 if TYPE_CHECKING:
@@ -191,6 +191,10 @@ async def archive_event(
             masked = await _censor_bytes(
                 pre_mp4, full_frame=False, keep_audio=True,
                 mode=censor.CENSOR_MODE_RESEARCH,
+                camera_id=camera_id,
+                clip_start=pod_masks.monotonic_to_epoch(
+                    pre_frames[0].captured_at,
+                ),
             )
             pre_key = await storage.upload_clip(
                 event_id=event_id, mp4_bytes=masked,
@@ -367,6 +371,10 @@ async def _archive_one(
     resolution = await resolve_clip_for_upload(
         combined_mp4, event_id=event_id, camera_id=camera_id,
         settings=settings,
+        # First frame of the ASSEMBLED clip, converted to epoch — the
+        # censor indexes the pod's masks by capture time, and the clip's
+        # own timeline starts here.
+        clip_start=pod_masks.monotonic_to_epoch(clip_frames[0].captured_at),
     )
     # Drop our reference to the raw bytes the moment the decision is
     # made — from here only `resolution.upload_bytes` (raw only when the
@@ -454,6 +462,7 @@ async def resolve_clip_for_upload(
     event_id: UUID,
     camera_id: UUID,
     settings: "Settings",
+    clip_start: float,
 ) -> ClipResolution:
     """Run the screen-then-censor decision for one assembled clip.
 
@@ -530,6 +539,7 @@ async def resolve_clip_for_upload(
     try:
         censored_bytes = await _censor_bytes(
             mp4, full_frame=full_frame, keep_audio=keep_audio,
+            camera_id=camera_id, clip_start=clip_start,
         )
     except Exception:  # noqa: BLE001 — censor failure → drop, never raw
         log.exception(
@@ -585,11 +595,19 @@ def sweep_scratch_dir() -> int:
 async def _censor_bytes(
     mp4: bytes, *, full_frame: bool, keep_audio: bool = True,
     mode: str = censor.CENSOR_MODE_PIXELATE,
+    camera_id: UUID, clip_start: float,
 ) -> bytes:
     """Round-trip the in-memory clip through `censor.censor_clip` via
     tempfiles. The RAW tempfile (and the censored one) are unlinked in
     the finally — no raw clip bytes persist on disk past this call,
-    success or failure."""
+    success or failure.
+
+    `clip_start` is the EPOCH capture time of the clip's first frame.
+    Frame buffers stamp `captured_at` on the MONOTONIC clock and the
+    pod's masks are stamped in epoch, so callers convert once here (via
+    `pod_masks.monotonic_to_epoch`) and the censor never has to know two
+    clocks exist.
+    """
     in_path: str | None = None
     out_path: str | None = None
     try:
@@ -600,7 +618,7 @@ async def _censor_bytes(
             out_path = f.name
         await censor.censor_clip(
             in_path, out_path, full_frame=full_frame, keep_audio=keep_audio,
-            mode=mode,
+            mode=mode, camera_id=str(camera_id), clip_start=clip_start,
         )
         with open(out_path, "rb") as f:
             censored_bytes = f.read()
