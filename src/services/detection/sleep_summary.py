@@ -60,7 +60,31 @@ ONSET_MIN_SECONDS = 300          # 5 min
 # standard rule pairs a 5-minute onset with a 10-minute wake criterion.
 # The asymmetry is the point: brief restlessness is not waking up.
 WAKE_MIN_SECONDS = 600           # 10 min
+# ...but the 10 minutes buys CERTAINTY, and only when the evidence is
+# ambiguous. Actigraphy waits because all it has is movement, and a roll
+# looks like a wake. We often have better: the model reports WHAT it saw.
+# When it can see a person on a phone with the lamp on, waiting another
+# two minutes adds nothing — on the 08-06 night that rule discarded a real
+# 8-minute awakening backed by 30 consecutive device ticks.
+#
+# So an awakening is real if EITHER the observed awake time reaches
+# WAKE_MIN_SECONDS (unchanged, the ambiguous case) OR the model positively
+# SAW wakefulness for this many consecutive ticks.
+WAKE_MIN_EVIDENCED_TICKS = 3
+# Activities that are a SIGHTING of wakefulness rather than a failure to
+# see sleep. `none` is deliberately excluded: `asleep=False, activity=none`
+# is an absence of a sleep call, not evidence of anything, and the prompt
+# tells the model to answer False when it cannot tell.
+_AWAKE_ACTIVITIES = frozenset({"awake_in_bed", "sitting_up", "leaving_bed"})
 # Below this the tick is too uncertain to use at all.
+#
+# NOTE this is a VISIBILITY floor, not a sleep-probability. The prompt
+# defines the field as "0.7+ = what you reported is clearly visible", and
+# the 08-06 night bears that out: conf=1.0 ticks were only 44.8% asleep
+# while conf=0.95 ticks were 97.2% asleep, because 1.0 is used equally for
+# a confident ASLEEP and a confident AWAKE. It filters degenerate ticks
+# (empty description, conf 0.0) and nothing else — do not read it as
+# "how sure are we that they were asleep".
 MIN_CONFIDENCE = 0.6
 # Consecutive in-bed ticks that re-open occupancy when the return
 # crossing was missed. Small: a single tick could be a misread, but the
@@ -170,21 +194,63 @@ def _sleep_runs(ts: list[SleepTick], lo: int, hi: int) -> list[tuple[int, int]]:
         return []
     runs: list[list[int]] = [[asleep_idx[0], asleep_idx[0]]]
     for i in asleep_idx[1:]:
-        prev = runs[-1][1]
-        # Every index strictly between two asleep ticks is an OBSERVED
-        # awake tick (invisible ones never reach this list).
-        first_awake, last_awake = prev + 1, i - 1
-        if last_awake < first_awake:
-            runs[-1][1] = i                          # contiguous sleep
-            continue
-        if _gap(ts, first_awake, last_awake) < WAKE_MIN_SECONDS:
-            runs[-1][1] = i                          # flicker / too brief
-            continue
-        runs.append([i, i])
-    return [
-        (a, b) for a, b in runs
-        if _gap(ts, a, b) >= ONSET_MIN_SECONDS
-    ]
+        if _break_is_an_awakening(ts, runs[-1][1], i):
+            runs.append([i, i])
+        else:
+            runs[-1][1] = i
+    # NOT filtered by ONSET_MIN_SECONDS here. Runs from every span are
+    # merged across span boundaries first (see `summarize_night`), because
+    # a single false crossing splits a span and would otherwise turn one
+    # long sleep into two short ones — dropping BOTH.
+    return [(a, b) for a, b in runs]
+
+
+def _break_is_an_awakening(ts: list[SleepTick], prev_end: int, next_start: int) -> bool:
+    """Is the gap between two sleep runs a real wake-up?
+
+    Every index strictly between two asleep ticks is an OBSERVED awake
+    tick — invisible ones were dropped upstream and never reach this list,
+    which is what keeps silence from becoming wakefulness.
+    """
+    first, last = prev_end + 1, next_start - 1
+    if last < first:
+        return False                                 # contiguous sleep
+    if _gap(ts, first, last) >= WAKE_MIN_SECONDS:
+        return True                                  # long enough on its own
+    # Shorter than the duration rule — accept it only on positive sighting,
+    # and only if sustained. A lone tick is exactly the shape of the 05:49
+    # hallucination ("got out of bed and abruptly collapsed to the floor"
+    # between two ticks of lying asleep under the covers), so the same
+    # reasoning as REENTRY_MIN_TICKS applies: one tick can be a misread.
+    streak = 0
+    for i in range(first, last + 1):
+        t = ts[i]
+        if not t.asleep and t.activity in _AWAKE_ACTIVITIES:
+            streak += 1
+            if streak >= WAKE_MIN_EVIDENCED_TICKS:
+                return True
+        else:
+            streak = 0
+    return False
+
+
+def _merge_across_spans(
+    ts: list[SleepTick], runs: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    """Join runs whose separating break is not a real awakening.
+
+    `_sleep_runs` only ever sees one span, so a break created by a crossing
+    is invisible to it. This applies the identical test to the seams.
+    """
+    if not runs:
+        return []
+    merged: list[list[int]] = [list(runs[0])]
+    for a, b in runs[1:]:
+        if _break_is_an_awakening(ts, merged[-1][1], a):
+            merged.append([a, b])
+        else:
+            merged[-1][1] = b
+    return [(a, b) for a, b in merged]
 
 
 def _gap(ts: list[SleepTick], a: int, b: int) -> float:
@@ -214,7 +280,15 @@ def summarize_night(ticks: list[SleepTick], *, window_end: datetime) -> dict:
         return out
     out["bedtime"] = ts[spans[0][0]].at
 
-    runs = [r for lo, hi in spans for r in _sleep_runs(ts, lo, hi)]
+    # Spans are cut by crossings, and a crossing can be wrong. Merging
+    # across span boundaries with the SAME test used inside a span means a
+    # lone false `leaving_bed` can no longer manufacture an awakening it
+    # could never have produced mid-span. The onset filter runs last, on
+    # the merged runs, so a split night is not discarded as two short ones.
+    runs = _merge_across_spans(ts, [
+        r for lo, hi in spans for r in _sleep_runs(ts, lo, hi)
+    ])
+    runs = [(a, b) for a, b in runs if _gap(ts, a, b) >= ONSET_MIN_SECONDS]
     if not runs:
         out["flags"].append(
             "incomplete_night" if ts[-1].at >= window_end else "no_sleep_onset"
