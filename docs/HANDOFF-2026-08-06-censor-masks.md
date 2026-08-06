@@ -141,3 +141,48 @@ ee8a6f6  prompt: objects/actions only claimable if `seen` records them
 af0b1ec  unbundle calls, evidence before verdict, always crop
 9938d7e  sleep: evidenced awakenings, tz-correct window
 ```
+
+---
+
+## Security — state as of 2026-08-06 (NOT part of the mask task)
+
+The 08-05 security pass is **code-complete and committed**; what remains is
+credential rotation, which is deliberately deferred and is the riskiest item
+outstanding.
+
+**Done and committed** — rate limiting (`src/api/rate_limit.py`, a reusable
+FastAPI dependency, applied to `/cameras/pair` and detector creation), security
+headers (`src/api/security_headers.py`), owner-scoped deletes
+(`repos/access.py:owned_patient_ids`), the demo-camera seeder scoped to its own
+patient with a `--remote` guard. Findings and corrections are written up in
+`security/SECURITY-AUDIT-2026-08-05-REMEDIATION.md`.
+
+**NOT rotated — the open risk.** Deferred by Aryaman until he and Sunny can do
+it together on a call:
+
+- Backend keys swept into `origin/main` in commit `f1c0564` (Sunny's local
+  `.env.bak`): Gemini, OpenAI x2, OpenRouter, Resend, Dashscope, and the
+  Supabase service-role key + JWT secret. Supabase/DB values in that file were
+  local-only and are safe.
+- Gateway credentials from the committed `nemara-gateway/GATEWAY_ACCESS.md`:
+  the Tapo camera password (still `qwerty123`), the gateway SSH/sudo password,
+  the home Wi-Fi password, and the production LiveKit key + secret.
+- History purge is blocked by GitHub `refs/pull/*`, which cannot be
+  force-deleted — so **rotation is the only real remedy**, not history rewriting.
+
+**Also open**
+
+- Insights in `nemara-web-app` query production Postgres directly as
+  `nemara_readonly` with BYPASSRLS; tenant isolation is hand-written WHERE
+  clauses only. Fix is to route Insights through the backend API.
+- `apply_rls_sleep_activity_review_delta.sql` must ship in the SAME deploy
+  batch as the sleep/review deltas, and the demo camera must be seeded after it
+  (App Review pairing 404s in prod today).
+- iOS Universal Links (M4) — custom URL scheme is PKCE-mitigated but not fixed.
+- `NEMARA_LOG_LEVEL=DEBUG` makes the OpenAI SDK log whole request payloads,
+  including base64 video frames of the patient's bedroom. Prod is `INFO`, so
+  not live — but it is one env var from a PHI leak into Railway logs.
+  Suggested fix: add `openai._base_client` to the noisy-logger suppression
+  already in `main.py` alongside boxmot/ultralytics.
+- Local `.env` now carries real PagerDuty / ops / event-gate values (added
+  2026-08-06 so the gate can actually page). Local only; do not commit.
