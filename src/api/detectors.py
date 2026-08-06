@@ -498,7 +498,6 @@ async def infer_detector(
         schedule_config=(
             ScheduleConfig(**inferred.schedule) if inferred.schedule else None
         ),
-        episode_gap_seconds=inferred.episode_gap_seconds,
         plan=_compose_plan(
             name=body.name or "", prompt=body.prompt,
             alert_trigger=inferred.alert_trigger,
@@ -698,7 +697,6 @@ async def create_detector(
             body.schedule_config.model_dump() if body.schedule_config else None
         ),
         # Null unless sustained; the rising-edge episode gap.
-        episode_gap_seconds=body.episode_gap_seconds,
     )
     await detector_repo.insert(session, det)
 
@@ -941,7 +939,6 @@ async def refine_detector(
         new_trigger = str(getattr(reinf.alert_trigger, "value", reinf.alert_trigger))
         new_sustained = bool(reinf.is_sustained)
         new_duration = reinf.duration_seconds if new_trigger == "duration" else None
-        new_gap = reinf.episode_gap_seconds if new_sustained else None
         new_schedule = reinf.schedule if new_trigger == "absence" else None
         new_when = reinf.when_scope        # None if nothing usable was inferred
         new_where_hint = reinf.where_hint  # None if no place was named
@@ -950,7 +947,6 @@ async def refine_detector(
         new_trigger = det.alert_trigger
         new_sustained = det.is_sustained
         new_duration = det.duration_seconds
-        new_gap = det.episode_gap_seconds
         new_schedule = det.schedule_config
         new_when = None
         new_where_hint = None
@@ -1028,7 +1024,6 @@ async def refine_detector(
             "alert_trigger": new_trigger,
             "is_sustained": new_sustained,
             "duration_seconds": new_duration,
-            "episode_gap_seconds": new_gap,
             "schedule_config": new_schedule,
             "when_scope": when_scope,
             "where_rooms": where_rooms,

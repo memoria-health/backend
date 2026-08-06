@@ -109,7 +109,7 @@ class DetectorResponse(BaseModel):
     is_sustained: bool = False
     # Duration threshold (seconds) for alert_trigger == duration — the
     # user-meaningful "has it gone on too long" bar. Distinct from
-    # episode_gap_seconds (hysteresis) and from the internal M-of-N.
+    # the episode exit gap (hysteresis) and from the internal M-of-N.
     duration_seconds: int | None = None
     # Rooms the detector is scoped to (the canonical stored rep). None → every
     # room (back-compat with rows created before multi-room existed).
@@ -129,7 +129,6 @@ class DetectorResponse(BaseModel):
     # Null for reactive detectors; the evaluation window for `scheduled`.
     schedule_config: ScheduleConfig | None = None
     # Null unless shape == 'state'; the rising-edge episode gap (seconds).
-    episode_gap_seconds: int | None = None
     # Caregiver-facing summary of the compiled prompt (3-5 plain lines:
     # "Counts: …" / "Doesn't count: …" / "Caution: …"). Regenerated on
     # every compile. Null while compiling or if summarization failed.
@@ -181,7 +180,6 @@ class CreateDetectorRequest(BaseModel):
     sensitivity: DetectorSensitivity = DetectorSensitivity.standard
     schedule_config: ScheduleConfig | None = None
     # Set only for shape == 'state' (the rising-edge episode gap, seconds).
-    episode_gap_seconds: int | None = None
     # Create-as-draft: the review flow now creates the detector OFF, lands
     # the caregiver on the detail editor to check the compiled criteria,
     # and only then flips it on. Defaults True so any existing caller (and
@@ -233,7 +231,6 @@ class InferDetectorResponse(BaseModel):
     schedule_config: ScheduleConfig | None = None
     # Set when is_sustained: the inferred rising-edge episode gap (seconds).
     # The review screen may show/adjust it; null otherwise.
-    episode_gap_seconds: int | None = None
     # Compiled-behavior preview (pure classification, no extra LLM
     # spend). Null only if composition fails — the review screen then
     # hides the card rather than blocking creation.

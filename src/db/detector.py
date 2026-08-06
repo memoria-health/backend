@@ -84,7 +84,7 @@ class Detector(Base):
     is_sustained: Mapped[bool] = mapped_column(Boolean, default=False)
     # Duration threshold (seconds) for alert_trigger == 'duration' — the
     # user-meaningful "has it gone on too long" bar (stove left on, on the
-    # floor too long). Distinct from episode_gap_seconds and from M-of-N.
+    # floor too long). Distinct from the episode exit gap and from M-of-N.
     duration_seconds: Mapped[int | None] = mapped_column(Integer, default=None)
 
     # ── Scheduled ("absence") detectors ─────────────────────────────
@@ -95,16 +95,6 @@ class Detector(Base):
     # The per-tick detection (identifier/prompt_fragment/schema_json) is
     # unchanged — the schedule just inverts + windows when it fires.
     schedule_config: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
-
-    # ── Continuous ("state") detectors ──────────────────────────────
-    # Null for point_in_time / scheduled. When shape == 'state', the
-    # hysteresis gap (seconds) the activity must be ABSENT before a
-    # resumption counts as a NEW event — drives rising-edge episode
-    # promotion (see event_promotion). LLM-inferred at creation from the
-    # activity type (a brief/moderate/extended bucket mapped to seconds),
-    # so "watching TV" collapses a whole session into one event while a
-    # short lull in "pacing" starts a fresh one.
-    episode_gap_seconds: Mapped[int | None] = mapped_column(Integer, default=None)
 
     # Single-fire guard for the scheduler — the last date this scheduled
     # detector was evaluated (whether or not it fired). Internal; not

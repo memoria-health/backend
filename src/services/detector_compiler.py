@@ -524,16 +524,6 @@ async def compile_custom_detector(
 # compile still happens in the background on Create, as before.
 
 
-# Continuous ("state") detector hysteresis buckets → seconds. The model
-# picks a bucket by the activity; we map to seconds and clamp to a sane band
-# so a bad inference can't make a detector never re-fire. Retune centrally
-# here. Default bucket when the model omits/garbles it: "moderate".
-_GAP_BUCKET_SECONDS: dict[str, int] = {
-    "brief": 60,        # ~1 min — pacing / restlessness / agitation: a short lull = new
-    "moderate": 300,    # ~5 min — eating, on the phone, reading
-    "extended": 900,    # ~15 min — watching TV, sleeping, sitting: bridge brief breaks
-}
-_DEFAULT_GAP_BUCKET = "moderate"
 
 
 @dataclass(frozen=True)
@@ -551,7 +541,6 @@ class InferredConfig:
     # catalog default (dims.py), used when the model gave nothing usable.
     severity: int = 50
     # Set only when is_sustained: the rising-edge episode gap (seconds).
-    episode_gap_seconds: int | None = field(default=None)
     # Set only when alert_trigger == "duration": the "too long" threshold.
     duration_seconds: int | None = field(default=None)
     # Alert-meaning name nudge (2026-07-28): absence names must be
@@ -606,13 +595,6 @@ def _infer_meta_prompt(*, name: str | None, prompt: str) -> str:
         '  "duration_seconds": integer seconds — REQUIRED when '
         'alert_trigger="duration" (else null). Convert the stated time '
         '("10 minutes" -> 600, "an hour" -> 3600). Null if no length is given.\n'
-        '  "episode_gap": "brief" | "moderate" | "extended" | null. REQUIRED '
-        'when is_sustained (null otherwise): how long the activity must be '
-        'ABSENT before a return counts as a NEW, separate event.\n'
-        '     - "brief" (~1 min): pacing / restlessness / agitation.\n'
-        '     - "moderate" (~5 min): eating, on the phone, reading.\n'
-        '     - "extended" (~15 min): watching TV, sleeping, sitting — a brief '
-        'break (e.g. a bathroom trip) should NOT split the session.\n'
         '  "category": "safety" | "routine" | "behaviour" | "care".\n'
         '     This is a LABEL for how the caregiver thinks about the event. It '
         'does NOT decide how urgently we treat it — "severity" below does that, '
@@ -743,13 +725,6 @@ def _coerce_inferred(raw: dict) -> InferredConfig:
     # Sustained detectors always get a gap (default bucket if the model
     # omitted/garbled it) so they can never be left without a rising-edge
     # window. None for instant / schedule.
-    episode_gap_seconds: int | None = None
-    if is_sustained:
-        bucket = raw.get("episode_gap")
-        episode_gap_seconds = _GAP_BUCKET_SECONDS.get(
-            bucket if isinstance(bucket, str) else "",
-            _GAP_BUCKET_SECONDS[_DEFAULT_GAP_BUCKET],
-        )
 
     # Duration threshold: only for the duration trigger; null if not stated
     # (the review screen then prompts for it — never guessed).
@@ -786,7 +761,6 @@ def _coerce_inferred(raw: dict) -> InferredConfig:
         is_sustained=is_sustained,
         category=category, severity=severity, icon_name=icon,
         sensitivity=sensitivity, schedule=schedule,
-        episode_gap_seconds=episode_gap_seconds,
         when_scope=when_scope, where_hint=where_hint,
         duration_seconds=duration_seconds,
     )

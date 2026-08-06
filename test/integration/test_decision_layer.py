@@ -24,7 +24,7 @@ _V2 = SimpleNamespace(detection_v2_decision_enabled=True)
 async def _add_detector(
     session: AsyncSession, patient_id, ident: str, *,
     is_sustained: bool = True, eventing: dict | None = None,
-    cooldown_seconds: int | None = None, gap: int = 300,
+    cooldown_seconds: int | None = None,
     category: str = "routine", subject_scope: str | None = None,
 ) -> Detector:
     now = datetime.now(timezone.utc)
@@ -35,7 +35,7 @@ async def _add_detector(
         alert_trigger="leading", is_sustained=is_sustained, when_scope="ALWAYS",
         sensitivity="standard", is_on=True, created_at=now, updated_at=now,
         identifier=ident, prompt_fragment=None, schema_json=None,
-        always_on=False, episode_gap_seconds=gap if is_sustained else None,
+        always_on=False,
         eventing=eventing, cooldown_seconds=cooldown_seconds,
     )
     session.add(det)

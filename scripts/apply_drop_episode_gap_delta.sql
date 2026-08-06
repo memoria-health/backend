@@ -1,0 +1,21 @@
+-- Drop detectors.episode_gap_seconds — dead since 2026-07-29.
+--
+-- It was replaced that day by the criticality-derived episode exit gap
+-- (`scheduling.decision.episode_exit_gap_for`), because a per-detector gap
+-- needed an LLM-guessed activity duration and did not scale. The REPLACEMENT
+-- landed; the column did not leave. Until 2026-08-06 the compiler still
+-- inferred a value for it, the API still accepted and returned it, and every
+-- row still stored it — while no decision path read it. That is worse than
+-- deleted: it reads as a live, tunable knob. The `Watching TV` row carried
+-- 900 (15 min) and fragmented anyway, against the 300s constant that was
+-- actually in force.
+--
+-- ORDERING: the ORM mapping is removed in the same change (src/db/detector.py),
+-- so this delta must run BEFORE the backend deploy, per the standard order —
+-- an old process still SELECTing the column is fine (it is only dropped after
+-- that process is gone), but a NEW process must never SELECT a column that
+-- still exists in its mapping and not in the table.
+--
+-- Idempotent: safe to re-run.
+
+ALTER TABLE public.detectors DROP COLUMN IF EXISTS episode_gap_seconds;
