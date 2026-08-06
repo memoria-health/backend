@@ -332,3 +332,71 @@ much of the 59.7% `sitting`? If most of it moves, the timeline has been
 overstating sitting; if little moves, it is real and merely poorly calibrated.
 That is an hour against existing clips, not a soak — and it only matters if
 the seated-exercise cases above fail.
+
+---
+
+## Found while implementing (2026-08-06 evening) — the tracker, not the censor
+
+The consumer is built, deployed and verified: at seated/standing distance
+the operator clip is a person-shaped redaction with the room readable
+(0 fully-covered frames of 24, live camera and real pod). Commit
+`29eb471`.
+
+Three things the plan above did not anticipate, all found live:
+
+1. **Clock.** The pod stamped masks with ITS OWN clock at PROCESSING
+   time. Measured: pod runs +1.54s ahead of the backend host, processing
+   lags capture ~2.6s — every mask was ~4.1s from the frame it described.
+   The identity service now sends capture times through `/observe` and
+   the pod echoes them. Both wire fields are optional, so either service
+   can restart first (`test_pod_wire_compat`).
+
+2. **A bug in `23494b9`.** `record_masks` took width/height as a
+   parameter and the caller passed the FRAME's size, but EdgeTAM returns
+   masks at TRACK resolution. Every mask was labelled 1920x1080 while
+   actually being 640x360; decoding put the silhouette in a thin band
+   across the top of the frame — person-SIZED coverage, nowhere near the
+   person, invisible to anything downstream. Dimensions now come off the
+   array. Found by rendering a mask, not by reading numbers.
+
+3. **Motion.** Masks arrive at ~3fps, clips encode at 8, so a frame gets
+   a silhouette up to 170ms old — ~63px of walking at 1080p against a
+   5px research margin. The margin now scales with the measured gap and
+   the subject's own height.
+
+### OPEN, and the reason the gate still fails at night
+
+**SAM3 does not ground a recumbent person.** Watched live at 22:45 local
+as the subject got into bed:
+
+```
+tick=5360 mode=carry  seeded=1 live=1     <- tracking
+tick=5361 mode=ground seeded=0 live=0     <- lost, re-ground finds nobody
+tick=5362 mode=ground seeded=0 live=0
+```
+
+Mask retention then decays 96 -> 35 -> 0 as the pre-bed window ages out.
+The pod IS being polled (this is not the empty-room nap); grounding
+simply returns nothing. Reproduced offline against
+`neg_fp_2026-08-05_013723.mp4`, a bedroom clip with someone reclining
+partly behind the monitor: 0 tracks.
+
+Consequence, measured with the real live mask window at that moment: a
+gate clip would come back **24/24 frames fully covered** — the same green
+rectangle the censor work exists to remove, now caused upstream. Also no
+seat/patient attribution overnight, and any recorder session judged
+sensitive while the subject is in bed produces an all-green research clip
+worth nothing to the corpus.
+
+What is NOT affected: detection itself. Every suppression gate that reads
+tracks is behind `scheduler_person_requires_track` (unset -> False), and
+`patient_elsewhere` needs a SECOND camera holding a fresh claim. Sleep
+detectors run normally with `tracks=[]`.
+
+Not a quick fix, and not a mid-soak change. Both grounders struggle:
+`yoloseg` fragmented a recumbent person (torso as its own mask — see the
+note in `scripts/deploy_continuous_remote.sh`), which is why
+`NEMARA_GROUNDER=sam3`; SAM3 grounds nothing at all. Worth trying a
+compound prompt ("person lying in bed, or under a blanket") the way the
+display-veto concept was tuned, and measuring against the eval-set
+bedroom clips before touching the live pod.
