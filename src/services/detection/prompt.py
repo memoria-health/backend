@@ -33,6 +33,25 @@ BASE_PROMPT = (
     "You are monitoring a home camera to look after the person in view. "
     "Respond with a JSON object containing every field below, FILLING THEM "
     "IN THE ORDER GIVEN.\n\n"
+    # ── The base rate (2026-08-08) ────────────────────────────────────
+    # Stated globally, once, because it was stated nowhere: every
+    # detector fragment carries its own "when unsure, FALSE" fine print,
+    # but nothing ever told the model that all-FALSE is the EXPECTED
+    # output. Acquiescence bias on binary formats is measured behavior
+    # in LLMs (arXiv:2504.19445), and the standard mitigation is to
+    # state the prior and grant abstention explicitly. Measured need:
+    # 35 confabulated drinking-water fires in one day at conf 0.9-1.0,
+    # each one narrating a drink whose vessel `seen` never recorded.
+    "IMPORTANT — the base rate. Almost every clip shows ordinary life "
+    "with nothing to detect. Answering FALSE for every detector below "
+    "is the normal, correct output most of the time, and doing so when "
+    "the evidence holds nothing is a complete, correct job. You are "
+    "never asked to find something; you are asked whether the evidence "
+    "you recorded in `heard` and `seen` contains it. A TRUE whose "
+    "object, action, or words are not established there is the worst "
+    "error you can make: it sends a caregiver rushing to something "
+    "that never happened. No answer is improved by leaning TRUE. When "
+    "torn, FALSE.\n\n"
     # ── Evidence before verdict (2026-08-06) ──────────────────────────
     # The prompt used to open with `description`, defined as justifying the
     # detections ("justify whatever you detect below"). That is verdict-first
