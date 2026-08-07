@@ -98,19 +98,52 @@ _SLEEP_PROMPT_FRAGMENT = (
 # as sleep: labels ride motion ticks, silence persists the last state
 # (a posture change is physically a motion event), and the daily
 # summarizer time-weights the timeline. record_only — never an event.
+# POSTURE DOES NOT DECIDE THIS (2026-08-07, measured live).
+#
+# The fragment already said "exercising in ANY posture including seated
+# weights or floor exercises" and still returned `sitting` — at
+# confidence 1.0 — for continuous overhead arm raises, with `seen`
+# correctly reading "their arms are raised above their head for the
+# duration" and the reasoning saying "sitting passively with their arm
+# raised". Adding more instruction in that direction had already been
+# tried; the model was not missing the rule, it was taking an exit.
+#
+# The exit was "regardless of small hand/arm movements" on `sitting`.
+# It let repeated whole-arm exercise be filed as a small hand movement
+# and stop the analysis there. So the fix is to REMOVE the escape
+# hatch, not to restate the rule: `sitting` now requires the body to be
+# at rest, and the tie-break is stated explicitly in the direction that
+# matters.
+#
+# Why that direction: chair-based exercise is the prescribed
+# intervention for frail older adults precisely because standing and
+# walking are not available to them. Filing it as sedentary does not
+# just cost precision — it erases the only exercise that cohort does,
+# and the aggregate then reports lethargy, which is the alarming
+# reading rather than the safe one.
 _ACTIVITY_PROMPT_FRAGMENT = (
     "activity_detected: boolean. TRUE if the person is PHYSICALLY ACTIVE "
-    "— walking, exercising (including seated exercises like lifting "
-    "weights or stretching), doing chores, or otherwise physically "
-    "engaged in a task. FALSE if they are lying down, sitting passively "
-    "(reading, watching TV, using a phone — small hand movements do NOT "
-    "count as activity), or standing still.\n"
-    "activity_state: string, exactly one of: 'lying', 'sitting' "
-    "(seated and NOT physically exercising, regardless of small hand/arm "
-    "movements), 'standing' (upright but not going anywhere), 'active' "
-    "(walking, exercising in ANY posture including seated weights or "
-    "floor exercises, chores, physically engaged tasks). Pick the state "
-    "that best describes MOST of the clip.\n"
+    "— walking, exercising, doing chores, or otherwise physically "
+    "engaged in a task. Exercise COUNTS WHEREVER IT HAPPENS, including "
+    "sitting down: repeated arm raises, leg lifts, stretching, marching "
+    "in a chair, or using weights or a band while seated are ACTIVE. "
+    "FALSE if they are lying down, sitting at rest (reading, watching "
+    "TV, using a phone), or standing still.\n"
+    "activity_state: string, exactly one of: 'lying', 'sitting_still', "
+    "'sitting_moving', 'standing', 'active'.\n"
+    "  - 'sitting_still': seated and the body is at rest. Small "
+    "incidental hand movement still counts as still — typing, holding a "
+    "phone, turning a page.\n"
+    "  - 'sitting_moving': seated, but the arms, legs or trunk are "
+    "MOVING REPEATEDLY. Report what the body is doing; do NOT try to "
+    "decide whether it is exercise or conversation. Overhead arm "
+    "raises, leg lifts, marching in a chair, stretching, using a band "
+    "or weights, AND animated gesturing all belong here.\n"
+    "  - 'standing': upright but not going anywhere.\n"
+    "  - 'active': walking, chores, or whole-body movement while "
+    "upright.\n"
+    "Being seated does not by itself make the state 'sitting_still'. "
+    "Pick the state that best describes MOST of the clip.\n"
     "activity_confidence: number 0-1.\n"
     "activity_reasoning: 1 short sentence describing the activity level."
 )

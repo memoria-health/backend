@@ -294,10 +294,17 @@ def test_activity_state_timeline_time_weighted() -> None:
         s(120, "LR", "sitting", 0.2),
     ]
     out = summarize_day(ticks, window_end=base + timedelta(minutes=150))
+    # `sitting` is the LEGACY label, kept alongside the 2026-08-07
+    # still/moving split so historical ticks keep their minutes rather
+    # than silently vanishing from the record.
     assert out["state_minutes"] == {
-        "lying": 60.0, "sitting": 60.0, "standing": 0.0, "active": 30.0,
+        "lying": 60.0, "sitting": 60.0, "sitting_still": 0.0,
+        "sitting_moving": 0.0, "standing": 0.0, "active": 30.0,
     }
     assert out["active_fraction"] == 0.2
     assert out["room_transitions"] == 1
     assert out["labeled_minutes"] == 150.0
     assert out["label_ticks"] == 3
+    # Posture-derived measures: legacy `sitting` counts as sedentary.
+    assert out["sedentary_minutes"] == 120.0
+    assert out["upright_minutes"] == 30.0
