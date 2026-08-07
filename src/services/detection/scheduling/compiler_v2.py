@@ -153,6 +153,36 @@ _DISTANCE_CLASS = re.compile(
     r"at|scratch(es|ing)?|finger|hand[- ]?motion|utensil|cigarette|"
     r"remote)\b", re.I,
 )
+# Actions whose EVIDENCE lives at the person's own scale — a hand, an
+# object, the space between a hand and a face — not at room scale.
+#
+# These must compile to the `person` bucket so the scheduler crops to
+# the body. Answering them from a full 1080p room is not a degraded
+# answer, it is a wrong one: the object is a few dozen pixels after
+# downsampling, so the model has nothing to read and describes what is
+# LIKELY instead. That is not hypothetical —
+#
+#   - `medication` (preset, bucket=person) once ran full-scene at 4fps
+#     and "reported a pill being swallowed while the man held a camera"
+#     (scheduler.py:309).
+#   - a custom `drinking water` ask compiled to SCENE and produced 11
+#     false fires on 2026-08-06 and 8 more in one hour on 08-07,
+#     inventing a cup in the `seen` field itself while the subject sat
+#     with both hands on a laptop (verified against the clips).
+#
+# The second is why this class exists. `_STILL_ACTIVITY` was the only
+# route to `person`, so every ACTIVE body-scale ask — drinking, eating,
+# taking medication, grooming — fell through to `person_motion` and
+# `scene`, which is the one combination guaranteed to hallucinate.
+_BODY_SCALE_ACTION = re.compile(
+    r"\b(drink(s|ing)?|sip(s|ping)?|swallow(s|ing)?|eat(s|ing)?|"
+    r"chew(s|ing)?|bite(s)?|feed(s|ing)?|"
+    r"medicat(e|es|ion)|pill(s)?|tablet(s)?|dose|inhaler|"
+    r"brush(es|ing)?\s+(teeth|hair)|shav(e|es|ing)|groom(s|ing)?|"
+    r"wip(e|es|ing)|rub(s|bing)?|touch(es|ing)?\s+(face|mouth|head)|"
+    r"hand\s+to\s+(mouth|face)|to\s+(his|her|their)\s+(mouth|lips|face))\b",
+    re.I,
+)
 def _entry_confidence_for(
     is_sustained: bool, bucket: str, degradation: str, category: str,
 ) -> dict | None:
@@ -202,6 +232,11 @@ def classify_custom_dims(
         branch, subject, bucket = "environment", "environment", "scene"
     elif _STILL_ACTIVITY.search(hay):
         branch, subject, bucket = "person_still", "patient", "person"
+    elif _BODY_SCALE_ACTION.search(hay):
+        # Moving, but the evidence is at body scale — crop to the person.
+        # Checked BEFORE the person_motion default, which is what sent
+        # every drinking/eating/medication ask to the whole room.
+        branch, subject, bucket = "person_motion", "patient", "person"
     else:
         branch, subject, bucket = "person_motion", "patient", "scene"
 
