@@ -220,6 +220,7 @@ def _is_high_stakes(*, category: str, severity: int | None) -> bool:
 def _meta_prompt(
     *, identifier: str, name: str, description: str, user_text: str,
     absence: bool, category: str, severity: int | None = None,
+    is_sustained: bool = False,
 ) -> str:
     """The instructions the compiler sends to the LLM. `identifier` is
     interpolated everywhere the runtime block needs the stable key.
@@ -299,10 +300,40 @@ def _meta_prompt(
         f"not happening; 0.3–0.6 = ambiguous; 0.7+ = clearly happening.>\n\n"
         f"  {identifier}_reasoning: 1 short sentence explaining your "
         f"judgment, citing what you specifically saw.\n\n"
-        f"Match the rigor of this example:\n\n"
+        + (
+            # The detection/state split for sustained behaviours
+            # (Aryaman 2026-08-07). `_detected` above is ENTRY evidence
+            # — it may stay strict about engagement. `_state_active` is
+            # CONTINUATION, and it must NOT inherit that strictness:
+            # the backend latches an ongoing episode on this field, so
+            # criteria that flap with momentary attention re-open and
+            # re-alert one continuous session (measured: 3 TV alerts in
+            # 18 min on 2026-08-06).
+            f"  {identifier}_state_active: boolean. <SESSION-IN-PROGRESS "
+            f"criteria. This field answers a DIFFERENT, looser question "
+            f"than {identifier}_detected: not 'is the person actively "
+            f"engaged right now' but 'is this state plausibly still in "
+            f"progress'. Write it as: TRUE while the state's physical "
+            f"preconditions visibly hold; simultaneous other activities "
+            f"(using a laptop or phone, eating, chatting, glancing away) "
+            f"NEVER make it false. FALSE only on genuine EXIT evidence — "
+            f"name the 2-3 concrete exit conditions for this specific "
+            f"behaviour (e.g. the equipment or activity focus is gone/"
+            f"off, or no person is present). When unsure whether the "
+            f"state ended, TRUE — the backend applies its own exit "
+            f"hysteresis on top.>\n\n"
+            if is_sustained else ""
+        )
+        + f"Match the rigor of this example:\n\n"
         f"{example}\n\n"
-        "Total length under ~1500 characters. Return ONLY the three-field "
-        "instruction block — no preamble, no markdown, no quotes around it."
+        + (
+            "Total length under ~1800 characters. Return ONLY the "
+            "four-field instruction block — no preamble, no markdown, "
+            "no quotes around it."
+            if is_sustained else
+            "Total length under ~1500 characters. Return ONLY the three-field "
+            "instruction block — no preamble, no markdown, no quotes around it."
+        )
     )
 
 
@@ -328,22 +359,43 @@ def _gen_identifier() -> str:
     return f"custom_{uuid4().hex[:8]}"
 
 
-def _schema_for(identifier: str) -> dict[str, dict[str, str]]:
+def _schema_for(
+    identifier: str, *, is_sustained: bool = False,
+) -> dict[str, dict[str, str]]:
     """Standard {id}_detected/_confidence/_reasoning trio. Matches the
     schema the existing preset detectors use, so the dashboard's
     AnalysisRow renderer picks up custom detectors with no changes.
+
+    SUSTAINED detectors additionally carry `{id}_state_active` — the
+    detection/state split (Aryaman 2026-08-07). `_detected` is ENTRY
+    evidence: strict, engagement-shaped, what proves the state began.
+    `_state_active` is CONTINUATION: is the state plausibly still in
+    progress, where only genuine exit evidence (the TV off, the person
+    gone) answers false. The split exists because one boolean was
+    forced to be both: Watching TV compiled attention criteria
+    ("laptop → FALSE"), per-tick detection measured instantaneous
+    attention, attention flaps — three alerts in 18 minutes on Aug 6
+    for one continuous session, then record_only as the overcorrection.
+    The backend's episode machinery latches on continuation and votes
+    entry on `_detected`; both are stateless per-tick questions, so no
+    prior state ever needs to reach the prompt.
     """
-    return {
+    schema = {
         f"{identifier}_detected":   {"type": "boolean"},
         f"{identifier}_confidence": {"type": "number"},
         f"{identifier}_reasoning":  {"type": "string"},
     }
+    if is_sustained:
+        schema[f"{identifier}_state_active"] = {"type": "boolean"}
+    return schema
 
 
 _BACKTICK_FENCE_RE = re.compile(r"^```[a-zA-Z]*\s*|\s*```$", re.MULTILINE)
 
 
-def _clean_fragment(raw: str, identifier: str) -> str:
+def _clean_fragment(
+    raw: str, identifier: str, *, is_sustained: bool = False,
+) -> str:
     """Strip code fences, trim, and validate the output references the
     expected identifier. If the model wrapped the response in ```…```
     blocks (it sometimes does, despite the "no markdown" instruction),
@@ -357,12 +409,22 @@ def _clean_fragment(raw: str, identifier: str) -> str:
             f"compiled prompt does not reference '{identifier}_detected'; "
             f"got: {cleaned[:200]}…"
         )
+    # A sustained fragment without the continuation field would ship a
+    # state detector whose episode latch silently falls back to the
+    # flapping entry boolean — the exact failure the split removes. Fail
+    # the compile (→ next provider / "Compile failed" badge) instead.
+    if is_sustained and f"{identifier}_state_active" not in cleaned:
+        raise ValueError(
+            f"sustained compile missing '{identifier}_state_active'; "
+            f"got: {cleaned[:200]}…"
+        )
     return cleaned
 
 
 async def _compile_with_gemini(
     *, identifier: str, name: str, description: str, user_text: str,
     absence: bool, category: str, settings: Settings,
+    is_sustained: bool = False,
 ) -> str:
     """One Gemini call. Returns the cleaned prompt_fragment string."""
     if not settings.gemini_api_key:
@@ -380,6 +442,7 @@ async def _compile_with_gemini(
                     user_text=user_text,
                     absence=absence,
                     category=category,
+                    is_sustained=is_sustained,
                 ))],
             ),
         ],
@@ -391,12 +454,13 @@ async def _compile_with_gemini(
     raw = (response.text or "").strip()
     if not raw:
         raise RuntimeError("gemini returned empty compile response")
-    return _clean_fragment(raw, identifier)
+    return _clean_fragment(raw, identifier, is_sustained=is_sustained)
 
 
 async def _compile_with_openai(
     *, identifier: str, name: str, description: str, user_text: str,
     absence: bool, category: str, settings: Settings,
+    is_sustained: bool = False,
 ) -> str:
     """One OpenAI call. Returns the cleaned prompt_fragment string.
 
@@ -416,13 +480,14 @@ async def _compile_with_openai(
                 user_text=user_text,
                 absence=absence,
                 category=category,
+                is_sustained=is_sustained,
             )},
         ],
     )
     raw = (response.choices[0].message.content or "").strip()
     if not raw:
         raise RuntimeError("openai returned empty compile response")
-    return _clean_fragment(raw, identifier)
+    return _clean_fragment(raw, identifier, is_sustained=is_sustained)
 
 
 async def compile_custom_detector(
@@ -435,6 +500,7 @@ async def compile_custom_detector(
     settings: Settings,
     identifier: str | None = None,
     refinements: list[str] | None = None,
+    is_sustained: bool = False,
 ) -> CompiledDetector:
     """Compile a caregiver's natural-language description into a
     runtime-ready (identifier, prompt_fragment, schema_json) triple.
@@ -471,7 +537,7 @@ async def compile_custom_detector(
         fragment = await _compile_with_openai(
             identifier=identifier, name=name, description=description,
             user_text=user_text, absence=absence, category=category,
-            settings=settings,
+            settings=settings, is_sustained=is_sustained,
         )
         log.info(
             "detector_compiler.openai_ok identifier=%s name=%r fragment_chars=%d",
@@ -480,7 +546,7 @@ async def compile_custom_detector(
         return CompiledDetector(
             identifier=identifier,
             prompt_fragment=fragment,
-            schema_json=_schema_for(identifier),
+            schema_json=_schema_for(identifier, is_sustained=is_sustained),
         )
     except Exception as openai_err:
         log.warning(
@@ -492,7 +558,7 @@ async def compile_custom_detector(
         fragment = await _compile_with_gemini(
             identifier=identifier, name=name, description=description,
             user_text=user_text, absence=absence, category=category,
-            settings=settings,
+            settings=settings, is_sustained=is_sustained,
         )
         log.info(
             "detector_compiler.gemini_ok identifier=%s name=%r fragment_chars=%d",
@@ -501,7 +567,7 @@ async def compile_custom_detector(
         return CompiledDetector(
             identifier=identifier,
             prompt_fragment=fragment,
-            schema_json=_schema_for(identifier),
+            schema_json=_schema_for(identifier, is_sustained=is_sustained),
         )
     except Exception as gemini_err:
         log.error(

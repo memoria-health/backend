@@ -256,6 +256,24 @@ def _select_primary(
 _EPISODE_LOOKBACK_SECONDS = 12 * 3600
 
 
+def _continuation_field(det: "Detector", detected_field: str) -> str:
+    """The analyses field that keeps a sustained episode ALIVE.
+
+    `<identifier>_state_active` when the detector's schema declares it
+    (the detection/state split: entry is voted on the strict
+    `_detected`, continuation latches on the loose state question),
+    else the detected field — presets and pre-split customs keep their
+    exact prior behaviour. Duck-typed on `.identifier`/`.schema_json`
+    so unit tests can pass a SimpleNamespace.
+    """
+    ident = getattr(det, "identifier", None)
+    if not ident:
+        return detected_field
+    state_field = f"{ident}_state_active"
+    schema = getattr(det, "schema_json", None) or {}
+    return state_field if state_field in schema else detected_field
+
+
 async def _episode_boundary(
     session: AsyncSession,
     *,
@@ -464,7 +482,19 @@ async def maybe_promote_analysis(
             boundary = await _episode_boundary(
                 session,
                 patient_id=patient_id,
-                detected_field=detected_field,
+                # CONTINUATION is judged on the state field when the
+                # detector has one (detection/state split, 2026-08-07):
+                # `_detected` is strict ENTRY evidence and flaps with
+                # momentary attention, so an episode latched on it
+                # "ends" every time the person glances at a laptop —
+                # measured as 3 Watching-TV alerts in 18 minutes for
+                # one continuous session. `_state_active` answers the
+                # looser question the latch actually needs (is the
+                # session plausibly still in progress), so the episode
+                # survives the flapping and one entry event covers the
+                # whole sitting. Detectors without the field (all
+                # presets, pre-split customs) keep the old behaviour.
+                detected_field=_continuation_field(det, detected_field),
                 now=occurred_at,
                 exit_gap_seconds=exit_gap,
             )

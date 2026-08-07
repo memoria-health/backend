@@ -756,7 +756,7 @@ async def _compile_and_update_detector(
         compiled = await compile_custom_detector(
             name=name, description=description,
             user_text=user_text, absence=absence, category=category,
-            settings=settings,
+            settings=settings, is_sustained=is_sustained,
             identifier=identifier, refinements=refinements,
         )
     except Exception as e:
@@ -1042,6 +1042,7 @@ async def refine_detector(
                 absence=_is_absence(new_trigger),
                 category=det.category,
                 settings=settings,
+                is_sustained=det.is_sustained,
                 identifier=det.identifier,
                 refinements=refinements,
             )

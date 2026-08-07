@@ -74,3 +74,85 @@ def test_fine_detail_sustained_gets_gate_via_classify():
     )
     assert dims["degradation_warning"] == "distance_class"
     assert dims["eventing"] == {"entry": {"m": 3, "t_seconds": 300}}
+
+
+def test_instant_routine_gets_within_clip_confirm():
+    """Instant non-safety detectors get the within-clip k-of-N confirm
+    (2026-08-08, from the drinking-water FP episode: 35 fires/day at
+    conf 0.9-1.0 on an instant routine custom, and no code path had
+    ever set the confirm dial the executor already implements)."""
+    got = _entry_confidence_for(False, "person", "none", "routine")
+    assert got == {"confirm": {"k": 2, "n": 3}}
+    assert "entry" not in got            # confirm and entry never mix
+    # behaviour / care are non-safety stakes → same protection.
+    assert _entry_confidence_for(False, "scene", "none", "behaviour") == \
+        {"confirm": {"k": 2, "n": 3}}
+
+
+def test_instant_safety_stays_on_sight():
+    # A fall must not risk being outvoted by two noisier re-checks —
+    # the same stakes carve-out the sustained branch makes.
+    assert _entry_confidence_for(False, "scene", "none", "safety") is None
+    assert _entry_confidence_for(False, "scene", "distance_class", "safety") is None
+
+
+def test_classify_instant_custom_carries_confirm():
+    dims = classify_custom_dims(
+        name="Drinking water",
+        user_text="Ary takes a drink from any vessel, raising it to his mouth",
+        is_sustained=False,
+        category="routine",
+    )
+    assert dims["eventing"] == {"confirm": {"k": 2, "n": 3}}
+
+
+def test_continuation_field_prefers_state_active():
+    """Sustained episode latch reads `<id>_state_active` when the schema
+    declares it; presets and pre-split customs keep `_detected`."""
+    from types import SimpleNamespace
+    from src.services.detection.event_promotion import _continuation_field
+
+    split = SimpleNamespace(
+        identifier="custom_tv",
+        schema_json={
+            "custom_tv_detected": {"type": "boolean"},
+            "custom_tv_state_active": {"type": "boolean"},
+        },
+    )
+    assert _continuation_field(split, "custom_tv_detected") == \
+        "custom_tv_state_active"
+    presplit = SimpleNamespace(
+        identifier="custom_old",
+        schema_json={"custom_old_detected": {"type": "boolean"}},
+    )
+    assert _continuation_field(presplit, "custom_old_detected") == \
+        "custom_old_detected"
+    preset = SimpleNamespace(identifier="fall", schema_json=None)
+    assert _continuation_field(preset, "fall_detected") == "fall_detected"
+
+
+def test_schema_for_sustained_adds_state_active():
+    from src.services.detector_compiler import _schema_for
+    plain = _schema_for("custom_x")
+    assert "custom_x_state_active" not in plain
+    sustained = _schema_for("custom_x", is_sustained=True)
+    assert sustained["custom_x_state_active"] == {"type": "boolean"}
+    # The trio is untouched — dashboards key off it.
+    for k in ("custom_x_detected", "custom_x_confidence", "custom_x_reasoning"):
+        assert k in sustained
+
+
+def test_meta_prompt_sustained_includes_state_field():
+    from src.services.detector_compiler import _meta_prompt
+    sustained = _meta_prompt(
+        identifier="custom_x", name="Watching TV", description="d",
+        user_text="watching tv", absence=False, category="routine",
+        is_sustained=True,
+    )
+    assert "custom_x_state_active" in sustained
+    assert "NEVER make it false" in sustained
+    instant = _meta_prompt(
+        identifier="custom_x", name="Drinks", description="d",
+        user_text="drinks water", absence=False, category="routine",
+    )
+    assert "custom_x_state_active" not in instant
