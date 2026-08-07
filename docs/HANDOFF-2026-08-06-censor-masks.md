@@ -400,3 +400,89 @@ note in `scripts/deploy_continuous_remote.sh`), which is why
 compound prompt ("person lying in bed, or under a blanket") the way the
 display-veto concept was tuned, and measuring against the eval-set
 bedroom clips before touching the live pod.
+
+---
+
+## Watching TV — what was done and why (commit `8f085f2`)
+
+Read this before touching state detectors. TWO INDEPENDENT fixes landed here
+and they are easy to conflate; `record_only` is NOT a workaround for the
+flapping, and the flapping fix is NOT what stopped the spam.
+
+### The symptom
+`Watching TV` fired 3 events in 19 minutes (13:37:43, 13:47:43, 13:56:23) while
+the resident sat still watching television.
+
+### Fix 1 — the flapping was a COMPILED PROMPT bug, not a state-machine bug
+
+Tick by tick the detector alternated, at confidence 1.0 on BOTH sides:
+```
+13:44:03 true  0.8  "TV visibly on, individual oriented toward it"
+13:44:13 false 0.4  "TV is on, but one person is EATING, a competing activity"
+13:44:43 false 1.0  "...engaged in other activities, eating"
+13:46:03 true  1.0
+13:46:13-13:47:33  SIX consecutive false — 80 seconds
+```
+The model was following its prompt exactly. Clause 3 of the compiled fragment
+said *"NO COMPETING ACTIVITY HAS THEIR ATTENTION. Working on a laptop, using a
+phone or tablet, reading, EATING, cleaning, or holding a conversation all mean
+FALSE."* He was watching TV **and eating**, so the verdict tracked whether a
+bite fell inside each 15-26s window.
+
+That 80-second false run exceeded `EXIT_GAP_ROUTINE_SECONDS = 300` when
+combined with the sparse `thinned` duty cycle (measured gaps between positive
+ticks: 380s, 310s), so the episode legitimately closed and re-armed — twice.
+**The event machinery was correct throughout; its evidence was not.**
+
+The rule came from a real earlier fix: on 2026-07-29 Watching TV fired 5 times
+in 25 minutes at a man working on a laptop, because its competing list named
+phone/tablet/reading/eating but NOT laptop. So rule 3 was doing genuine work
+and could not simply be deleted.
+
+**The correction (`_HARD_RULES` rule 3): "competing" now means SAME FACULTY.**
+Watching a screen needs the eyes, so a laptop, phone, tablet or book competes.
+Eating, drinking, talking, knitting do NOT need the eyes — they CO-OCCUR and
+must not falsify the state. The test given to the compiler is: *could a person
+plausibly do both at once?* Both failure directions are recorded in the rule
+with dates, so the next person to touch it sees both walls.
+
+The live row's `prompt_fragment` was patched in place too (the row was compiled
+under the old rules). Anything compiled from now on gets it from the compiler.
+
+### Fix 2 — `record_only`, a classification the compiler could not express
+
+Independent of the flapping. `Watching TV` is a state a caregiver wants to SEE
+on a timeline, not be ALERTED about — a phone notification every time someone
+watches television is noise, not care.
+
+`record_only` already existed and is what `sleep` and `activity` use; it
+short-circuits promotion entirely (`event_promotion.py:418`), so no entry rule,
+no confirm, no cooldown, no episode. But the COMPILER could not emit it: its
+prompt offered four triggers and the validator rewrote anything unrecognised to
+`leading`. So **every custom detector alerted by construction**. The row was
+compiled `alert_trigger=leading, is_sustained=true` — correctly identified as a
+state, with nowhere to put that.
+
+Added `record_only` to the compiler prompt and validator, with a question the
+model can actually answer: *would an alert for this, every time it happened, be
+useful or annoying?* The live row was set to `record_only`.
+
+**So "it no longer fires an event" is the intended outcome, not a side effect.**
+Even with `leading` restored it would no longer spam, because Fix 1 removed the
+false-negative bursts that fragmented the episodes.
+
+### Known gap — record_only customs have no timeline surface
+
+Data is still collected: 3,657 TV ticks in the 12h after the change, 123 true.
+Nothing is lost.
+
+But `run_daily_summaries.py` has exactly two upserts, `_SLEEP_UPSERT` and
+`_ACTIVITY_UPSERT`. Sleep and Activity are built-ins with dedicated summarizers
+and tables (`sleep_nights`, `activity_days`). **A CUSTOM `record_only` detector
+has neither**, so its fields sit in `analyses` and nothing aggregates them into
+anything a caregiver can see.
+
+That is a gap, not a regression — before the change it alerted AND had no
+timeline. The natural follow-on is a generic summarizer for `record_only`
+customs (daily on/off spans per identifier), so "the caregiver sees it on the
+timeline" becomes true rather than aspirational.
