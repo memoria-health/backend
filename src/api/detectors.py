@@ -836,6 +836,43 @@ async def patch_detector(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="detector_not_found",
         )
+
+    # ON must mean "running somewhere" (Aryaman 2026-08-07).
+    #
+    # `is_on` is only one of three conditions the runtime checks — the
+    # third is a row in `cameras_detectors` (see detection/registry.py).
+    # Nothing tied them together, so a detector could be switched on
+    # while scoped to a room no camera has, and it ran on nothing while
+    # the app rendered it armed. That is exactly what happened to
+    # `sleep` overnight on 2026-08-06: scoped ["Bedroom"], the only
+    # camera's room named "Aryaman Bedroom", 3270 ticks, zero output,
+    # and no signal anywhere that a whole night had been lost.
+    #
+    # So refuse the write instead of self-healing it. A toggle that
+    # silently means nothing is worse than one that fails and says why:
+    # the caregiver picks a real room and turns it on again, and the
+    # state the app shows is the state the runtime is in.
+    #
+    # Only when the patient HAS cameras, though. Before the first one is
+    # paired every detector resolves to nothing, and that is onboarding,
+    # not breakage — detectors are set up alongside pairing, an
+    # all-rooms scope picks up each camera as it arrives (the reconciler
+    # runs on camera create), and refusing there would block the normal
+    # first-run flow to catch a problem that cannot exist yet.
+    turning_on = fields.get("is_on") is True
+    if turning_on or (rescope_rooms and det.is_on):
+        in_scope = await camera_detector_repo.cameras_in_scope(
+            session, det.patient_id,
+            source=det.source, where_rooms=det.where_rooms,
+            detector_id=det.id,
+        )
+        if not in_scope and await camera_detector_repo.patient_has_cameras(
+            session, det.patient_id,
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="detector_scope_matches_no_camera",
+            )
     # Replace the camera assignments to match the new room set (atomic:
     # deselected rooms stop, newly-selected rooms start). Custom detectors
     # only — presets (esp. wandering) carry per-camera door_config on their
@@ -851,13 +888,24 @@ async def patch_detector(
         await camera_detector_repo.set_detector_rooms(
             session, det.id, det.patient_id, fields["where_rooms"],
         )
-    if rescope_rooms:
+    if rescope_rooms or turning_on:
         # Re-derive links from the new where_rooms for ALL sources. For
         # presets this is the door_config-safe path set_detector_rooms
         # can't provide: the reconciler only inserts missing / deletes
         # stale links, never rewrites kept rows, so per-camera wandering
-        # door_config survives a rescope. NOT run on plain is_on toggles
-        # (rescope_rooms is False there) — the hot path stays link-free.
+        # door_config survives a rescope.
+        #
+        # ALSO on the is_on -> true transition (2026-08-07). This used to
+        # skip toggles to "keep the hot path link-free", which made ON a
+        # claim the runtime never checked: a detector whose links had
+        # drifted — camera renamed after scoping, room deleted, a row
+        # edited by hand — stayed dead no matter how many times the
+        # caregiver toggled it, because the only thing that rebuilt links
+        # was editing the rooms. A toggle is a human action a few times a
+        # day, not a hot path; paying one reconcile makes ON mean what it
+        # says. The guard above has already refused the write if the
+        # scope resolves to no camera, so this can only ever be filling
+        # in links that should already exist.
         await camera_detector_repo.sync_links_for_patient(
             session, det.patient_id,
         )
