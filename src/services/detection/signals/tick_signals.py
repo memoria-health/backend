@@ -57,7 +57,10 @@ from src.services.detection.signals.rapid_energy import (
     _MIN_FRAMES,
     _PERSIST_RATIO,
 )
-from src.services.identity.observations import LABEL_PATIENT
+from src.services.identity.observations import (
+    LABEL_PATIENT,
+    bbox_extracted_width,
+)
 
 if TYPE_CHECKING:
     from src.services.identity.observations import TrackObservation
@@ -228,16 +231,26 @@ def compute_tick_signals(
 
     env_motion = 0.0
     track_motion: list[TrackMotion] = []
-    # Extracted-frame width the track boxes live in. 0 = no native
-    # frames this window, so no scaling (and no face_valid verdict) is
-    # possible.
-    extracted_w = min(sample_width, native_w) if native_w else 0
+
+    # The grid a track's boxes live on is PER TRACK, not global — the
+    # sidecar reports native pixels, the legacy in-process brain
+    # reported downscaled ones. Assuming the downscaled answer for a
+    # native track multiplied every box by native/sample_width, which
+    # slid the person mask off the person: measured 2026-08-07, ticks
+    # with `motion_mean_abs` 0.79 reported `sig_tracks` amount 0.0 and
+    # churn 0.0, because the mask covered furniture. `requires_motion`
+    # gates on exactly that number.
+    def _extracted_w(t: "TrackObservation") -> float:
+        return bbox_extracted_width(t, native_w, sample_width=sample_width)
+
     face_px_native = 0.0
-    if tracks and extracted_w > 0:
-        # Native face px: extracted-space px × (native / extracted).
-        face_px_native = (
-            max(t.face_px_max for t in tracks) * (native_w / extracted_w)
-        )
+    if tracks and native_w:
+        # Native face px: box-grid px × (native / that track's grid).
+        face_px_native = max(
+            t.face_px_max * (native_w / ew)
+            for t in tracks
+            if (ew := _extracted_w(t)) > 0
+        ) if any(_extracted_w(t) > 0 for t in tracks) else 0.0
 
     if len(planes) >= _MIN_FRAMES:
         counts = np.zeros(planes[0].shape, dtype=np.int32)
@@ -254,8 +267,8 @@ def compute_tick_signals(
 
         person_mask = np.zeros_like(active)
         if tracks:
-            factor = map_w / max(1, extracted_w)
             for t in tracks:
+                factor = map_w / max(1.0, _extracted_w(t))
                 union: tuple[int, int, int, int] | None = None
                 for _, bbox in t.bbox_series:
                     b = _scaled_box(bbox, factor, map_w, map_h)
@@ -285,7 +298,7 @@ def compute_tick_signals(
             env_motion = float(int((active & outside).sum()) / n_outside)
 
     face_valid: bool | None = None
-    if tracks and attribution_ran and extracted_w > 0:
+    if tracks and attribution_ran and native_w > 0:
         # Only meaningful when face checks could run, someone was
         # actually in frame, AND we can scale to native px. "Saw
         # people, no usable face" reads as False (the FACE bucket

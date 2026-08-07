@@ -37,6 +37,7 @@ from uuid import UUID
 import httpx
 
 from src.services.identity.observations import (
+    BBOX_SPACE_NATIVE,
     LABEL_PATIENT,
     LABEL_UNKNOWN,
     TrackObservation,
@@ -230,6 +231,12 @@ class IdentityClient:
                 label=LABEL_PATIENT if is_patient else LABEL_UNKNOWN,
                 confidence=seat_score if is_patient else 0.0,
                 bbox_series=((0, bb),),
+                # The sidecar pushes frames at native resolution
+                # (`INTAKE_MAX_W = 0`) and hands these boxes back on
+                # that same grid. Saying so is what stops the crop /
+                # motion-mask consumers rescaling them by
+                # native/reid_inference_sample_width.
+                bbox_space=BBOX_SPACE_NATIVE,
                 face_locked=face_locked,
                 pre_labeled=is_patient and not face_locked,
                 pre_label_source=(

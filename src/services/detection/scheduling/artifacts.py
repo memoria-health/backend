@@ -46,6 +46,7 @@ from src.services.detection.motion_overlay import overlay_motion
 from src.services.detection.mp4_remux import Mp4RemuxError, frames_to_mp4
 from src.services.detection.rapid_artifact import crop_i420, union_box
 from src.services.detection.rapid_call import scale_bbox_to_frame
+from src.services.identity.observations import bbox_extracted_width
 
 if TYPE_CHECKING:
     from src.services.identity.observations import TrackObservation
@@ -60,17 +61,26 @@ def person_crop_box(
     sample_width: int,
 ) -> tuple[int, int, int, int] | None:
     """The static native-pixel crop window for one track: every box in
-    its series scaled extracted→native, then union+pad+clamp. None when
-    the track has no usable boxes or the window is empty."""
+    its series scaled onto the native grid, then union+pad+clamp. None
+    when the track has no usable boxes or the window is empty.
+
+    `sample_width` is only a HINT — the real divisor comes from the
+    track's own `bbox_space` (see `bbox_extracted_width`). A sidecar
+    track is already native and must not be scaled; multiplying it
+    anyway is the 2026-08-07 bug that cropped the patient's legs and
+    1400px of empty room."""
     if not window or not track.bbox_series:
         return None
     # mp4_remux convention: the LAST frame's shape is the live publish
     # state; crop_i420 anchors on it too, so scale against the same.
     ref = window[-1]
+    extracted_w = bbox_extracted_width(
+        track, ref.width, sample_width=sample_width,
+    )
     scaled = []
     for _, bbox in track.bbox_series:
         b = scale_bbox_to_frame(
-            bbox, ref.width, ref.height, sample_width=sample_width,
+            bbox, ref.width, ref.height, sample_width=extracted_w,
         )
         if b is not None:
             scaled.append(b)
