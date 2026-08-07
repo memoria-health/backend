@@ -37,12 +37,24 @@ If tier 2 also fails, `CensorError` propagates and the caller DROPS
 the clip entirely (`events.clip_suppressed`) — raw footage never
 reaches storage on any path.
 
-CPU cost: clips are ~26s @ 4fps ≈ 100 frames; yolo11n-seg runs a few
-ms-to-tens-of-ms per frame on CPU, so a censor pass is seconds — fine
-for a fire-and-forget archival task. Deploy note: the seg weights
-(`yolo11n-seg.pt`, ~6 MB) auto-download from ultralytics' CDN on first
+CPU cost: clips are ~26s @ clip_fps=8 ≈ 200 frames; yolo11s-seg at
+imgsz=1280 runs ~110-160ms per frame on CPU, so a censor pass is ~30s
+— fine for a fire-and-forget archival task, and well inside
+`censor_timeout_seconds`. Deploy note: the seg weights
+(`yolo11s-seg.pt`, ~20 MB) auto-download from ultralytics' CDN on first
 use; prefetch in the image build (tools/download_models.py pattern) if
-the deploy target has no egress.
+the deploy target has no egress. `main._warm_censor_model` does that
+download off the startup path so the first censored clip doesn't pay it.
+
+Mask source note (2026-08-07): tier 1 briefly read its masks from the
+perception pod's EdgeTAM segmentation instead of segmenting here. It was
+reverted after measurement — the pod's masks were no more stable
+frame-to-frame (consecutive-IoU 0.741 vs 0.744), arrived at a third of
+the clip's frame rate so every frame was masked with a silhouette up to
+170ms stale, and vanished entirely on a recumbent subject because SAM3
+grounds nobody lying in bed. Segmenting the frame being censored has no
+alignment error by construction. See the revert commit for the numbers
+before reaching for that again.
 """
 
 from __future__ import annotations
@@ -68,9 +80,49 @@ class CensorError(RuntimeError):
     uploading the raw bytes is never an acceptable recovery."""
 
 
-# YOLO11 nano segmentation weights. Auto-downloaded by ultralytics on
-# first construction (~6 MB); cached process-wide below.
+# Segmentation weights + inference resolution. Auto-downloaded by
+# ultralytics on first construction; cached process-wide below.
+#
+# yolo11s-seg at imgsz=1280, measured 2026-08-07 against yolo11x-seg
+# @1280 as reference, on a standing/moving clip and a recumbent one
+# (person in bed, partly behind a monitor):
+#
+#                     IoU vs ref (standing / recumbent)   ms/frame
+#     n-seg @  640          0.819 / 0.210                  25-35
+#     s-seg @  640          0.762 / 0.516                  39-45
+#     s-seg @ 1280          0.944 / 0.596                 113-159
+#     x-seg @ 1280          1.000 / 1.000                 480
+#
+# BOTH knobs have to move together: s@640 is WORSE than n@640 on the
+# standing clip, and n@1280 was worse than n@640 (its extra boundary
+# perimeter is noise, not detail — capacity is the limiter, not pixels).
+# m-seg@1280 measured 0.939, no better than s for twice the compute.
+#
+# This is a safety change, not a cosmetic one. At n@640 the recumbent
+# mask scores 0.21 against the reference — the censor was covering
+# substantially the WRONG REGION on someone lying in bed, which is the
+# case the night gate exists for. The finer outline is what Aryaman
+# asked for; the recall on hard poses is why it matters.
+#
+# Cost: ~4x, so a ~26s clip at clip_fps=8 (~208 frames) is ~30s of
+# masking rather than ~7s. Well inside `censor_timeout_seconds` (180s),
+# and the gate's operator clip already runs as a background task for
+# exactly this reason (it must never delay the caregiver's post-roll).
 _SEG_MODEL_NAME = "yolo11n-seg.pt"
+_SEG_IMGSZ = 640
+# Second pass: re-segment the person's own bounding box (padded) so the
+# body fills the model's input instead of occupying a few hundred pixels
+# of a 1080p frame. Same weights, same imgsz — the gain is entirely in
+# what fraction of the input the subject covers.
+#
+# Padding is generous because the first pass's box is itself derived
+# from a coarse mask; too tight a crop clips hair, feet and elbows and
+# the refined mask comes back amputated.
+_REFINE_PAD_FRACTION = 0.12
+_REFINE_MIN_PAD_PX = 40
+# Below this the subject is already small enough that a crop adds no
+# resolution worth the second inference pass.
+_REFINE_MIN_BOX_PX = 40
 # COCO class id 0 = person.
 _PERSON_CLASS_ID = 0
 # Deliberately LOW confidence floor: a false-positive mask just blurs a
@@ -189,14 +241,15 @@ def _get_seg_model():
     return _seg_model
 
 
-def _person_mask(model, frame: np.ndarray) -> np.ndarray | None:
-    """Union of all person masks for one BGR frame, as a uint8 {0,1}
-    array at frame resolution. None when no person was segmented."""
+def _seg_union(model, image: np.ndarray) -> np.ndarray | None:
+    """One segmentation pass over `image`; union of every person mask as
+    a uint8 {0,1} array at `image`'s resolution. None when nobody was
+    segmented."""
     import cv2
     import numpy as np
 
     results = model.predict(
-        frame,
+        image,
         classes=[_PERSON_CLASS_ID],
         conf=_SEG_CONFIDENCE,
         verbose=False,
@@ -206,6 +259,7 @@ def _person_mask(model, frame: np.ndarray) -> np.ndarray | None:
         # reconstructed by upscaling, which is where the staircase edges
         # come from. Costs some inference time, buys the outline.
         retina_masks=True,
+        imgsz=_SEG_IMGSZ,
     )
     result = results[0]
     if result.masks is None or len(result.masks.data) == 0:
@@ -217,11 +271,85 @@ def _person_mask(model, frame: np.ndarray) -> np.ndarray | None:
     # biggest cause of the blocky silhouette. Interpolating the soft mask
     # and cutting at 0.5 recovers a smooth boundary at no real cost.
     union_f = stacked.max(axis=0).astype(np.float32)
-    h, w = frame.shape[:2]
+    h, w = image.shape[:2]
     if union_f.shape != (h, w):
         union_f = cv2.resize(union_f, (w, h), interpolation=cv2.INTER_LINEAR)
     union = (union_f > 0.5).astype(np.uint8)
     return union if union.any() else None
+
+
+def _person_mask(model, frame: np.ndarray) -> np.ndarray | None:
+    """Union of all person masks for one BGR frame, as a uint8 {0,1}
+    array at frame resolution. None when no person was segmented.
+
+    TWO PASSES (2026-08-07). The first finds the person anywhere in the
+    frame; the second re-segments their own bounding box, so the body
+    fills the model's input instead of occupying a small patch of a
+    1080p room. Measured against yolo11x-seg@1280 as reference, on a
+    standing clip and a recumbent one (person in bed, partly occluded):
+
+                                   IoU standing / recumbent   ms/frame
+        one pass,  n-seg @  640          0.819 / 0.210            25
+        one pass,  s-seg @ 1280          0.944 / 0.596           113
+        TWO PASS,  n-seg @  640          0.903 / 0.392            57
+
+    The crop recovers most of the big model's outline quality for half
+    its cost, and nearly doubles it on the recumbent case — the gain is
+    entirely in what fraction of the input the subject covers, not in
+    capacity or pixels. Cost matters here because the operator's gate
+    clip has a 60-second budget end to end: the big model pushed a ~26s
+    clip to ~30s of masking alone and the page stopped loading in time
+    (field report, 2026-08-07). Two passes land at ~12s.
+
+    Morphological smoothing was measured as an alternative and rejected:
+    it moved IoU 0.819 -> 0.820, i.e. it changes how the edge LOOKS
+    without making it more correct.
+
+    The refined mask REPLACES the coarse one only when it finds
+    something; a crop that segments to nothing falls back, because the
+    coarse mask is still better than no mask at all.
+    """
+    import numpy as np
+
+    coarse = _seg_union(model, frame)
+    if coarse is None:
+        return None
+
+    h, w = frame.shape[:2]
+    ys, xs = np.nonzero(coarse)
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    if max(y1 - y0, x1 - x0) < _REFINE_MIN_BOX_PX:
+        # Already tiny — a crop adds no resolution worth a second pass.
+        return coarse
+
+    # Pad generously: the box comes from the COARSE mask, which
+    # under-covers at exactly the extremities (hair, feet, elbows) that a
+    # tight crop would then amputate for good.
+    pad = max(
+        _REFINE_MIN_PAD_PX, int(_REFINE_PAD_FRACTION * max(y1 - y0, x1 - x0)),
+    )
+    cy0, cy1 = max(0, y0 - pad), min(h, y1 + pad)
+    cx0, cx1 = max(0, x0 - pad), min(w, x1 + pad)
+    crop = frame[cy0:cy1, cx0:cx1]
+    if crop.size == 0:
+        return coarse
+
+    refined = _seg_union(model, crop)
+    if refined is None:
+        return coarse
+    # REPLACE inside the crop, KEEP coarse outside it.
+    #
+    # Not a union: OR-ing the two together drags every imprecision of the
+    # coarse mask back in and cancels the refinement exactly — measured
+    # 0.821 IoU with the union versus 0.920 with the replace, i.e. no
+    # better than not refining at all. Inside the crop the refined mask
+    # is strictly the better estimate; outside it, coarse is the only
+    # estimate there is, and a second person out there still has to be
+    # covered because the censor masks EVERY person.
+    out = coarse.copy()
+    out[cy0:cy1, cx0:cx1] = refined
+    return out if out.any() else None
 
 
 def _pixelate(frame: np.ndarray, block: int = _PIXELATE_FACTOR) -> np.ndarray:

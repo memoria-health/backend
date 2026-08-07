@@ -400,3 +400,89 @@ class TestScratchSweep:
         import os as _os
 
         assert _os.listdir(scratch) == []  # unlinked in the finally
+
+
+# ── segmentation quality knobs (2026-08-07) ──────────────────────────
+
+
+def test_person_mask_refines_by_re_segmenting_the_person_crop() -> None:
+    """Two passes: find the person, then re-segment their own box.
+
+    Measured against yolo11x-seg@1280, standing clip / recumbent clip:
+
+        one pass,  n-seg @  640   IoU 0.819 / 0.210    25 ms
+        one pass,  s-seg @ 1280   IoU 0.944 / 0.596   113 ms
+        TWO PASS,  n-seg @  640   IoU 0.903 / 0.392    57 ms
+
+    The big single-pass model was tried and reverted the same day: it
+    pushed a ~26s gate clip to ~30s of masking and the operator's page
+    stopped loading inside its 60s budget. Two passes get most of the
+    quality for half the cost because the gain comes from the subject
+    filling the input, not from capacity or pixels.
+    """
+    calls: list = []
+
+    class _Res:
+        def __init__(self, m):
+            self.masks = m
+
+    class _Model:
+        def predict(self, image, **kw):
+            calls.append(image.shape[:2])
+            h, w = image.shape[:2]
+            arr = np.zeros((1, h, w), dtype=np.float32)
+            arr[0, h // 4: h // 2, w // 4: w // 2] = 1.0
+
+            class _M:
+                data = _Tensor(arr)
+            return [_Res(_M())]
+
+    class _Tensor:
+        def __init__(self, a): self._a = a
+        def cpu(self): return self
+        def numpy(self): return self._a
+        def __len__(self): return len(self._a)
+
+    out = censor._person_mask(_Model(), np.zeros((1080, 1920, 3), np.uint8))
+    assert out is not None
+    # Two passes, and the second saw a SMALLER image than the first.
+    assert len(calls) == 2, calls
+    assert calls[1] < calls[0], calls
+
+
+def test_refined_mask_replaces_coarse_inside_the_crop() -> None:
+    """Not a union.
+
+    OR-ing the refined mask with the coarse one drags every imprecision
+    of the coarse mask back in and cancels the refinement exactly —
+    measured 0.821 IoU with the union versus 0.903 with the replace,
+    i.e. no better than not refining at all. Caught by measuring the
+    shipped function rather than trusting the bench harness.
+    """
+    import inspect
+    src = inspect.getsource(censor._person_mask)
+    assert "out = coarse.copy()" in src
+    assert "out |= coarse" not in src
+
+
+def test_person_mask_asks_for_full_resolution_masks(monkeypatch) -> None:
+    """`retina_masks` and `imgsz` both reach ultralytics.
+
+    Without retina_masks the silhouette is reconstructed from a ~160px
+    prototype and staircases; without imgsz it is derived from a
+    640-wide view of a 1080p frame however large the model is."""
+    seen: dict = {}
+
+    class _Res:
+        masks = None
+
+    class _Model:
+        def predict(self, frame, **kw):
+            seen.update(kw)
+            return [_Res()]
+
+    censor._person_mask(_Model(), np.zeros((1080, 1920, 3), np.uint8))
+    assert seen["retina_masks"] is True
+    assert seen["imgsz"] == censor._SEG_IMGSZ
+    assert seen["conf"] == censor._SEG_CONFIDENCE
+    assert seen["classes"] == [censor._PERSON_CLASS_ID]
