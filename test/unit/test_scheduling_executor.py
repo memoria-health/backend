@@ -438,3 +438,122 @@ async def test_overlay_confirm_votes_carry_recipe(monkeypatch) -> None:
         assert "MOTION-OVERLAY" in vote["detectors"][0].prompt_fragment
     assert out.detector_fields["seizure_detected"] is True
     assert out.sched_fields["sched_confirm"]["seizure"]["passed"] is True
+
+
+# ── Concurrency (2026-08-07 regression) ──────────────────────────────
+# The provider calls used to run in one sequential `for` loop, so a
+# tick cost the SUM of its calls: ~7s each, three due, 21.7s against a
+# 10s cadence. camera_ingest allows 2 generations in flight plus one
+# 16s queue slot, so the pipeline shed 25.2% of ticks — and shedding
+# is blind to what a tick carries. A real fall on 2026-08-07 05:46
+# landed in a 19s hole left by two shed ticks and was never seen going
+# down, only lying still afterwards.
+#
+# These pin the two properties that fix depends on: the calls actually
+# overlap, and the merge is STILL in plan order regardless of which
+# one returns first.
+
+class _ConcurrencyProbeVLM:
+    """Records how many calls are in flight simultaneously."""
+
+    def __init__(self, delay: float = 0.05) -> None:
+        self.delay = delay
+        self.inflight = 0
+        self.peak = 0
+        self.order: list[str] = []
+
+    async def __call__(self, **kw):
+        import asyncio as _a
+        self.inflight += 1
+        self.peak = max(self.peak, self.inflight)
+        try:
+            await _a.sleep(self.delay)
+        finally:
+            self.inflight -= 1
+        ident = kw["detectors"][0].identifier
+        self.order.append(ident)
+        return "gemini", ProviderResult(
+            description=f"desc-{ident}",
+            detector_fields={f"{ident}_detected": False, "people_present": True},
+            people_present=True, people_count=1,
+            usage={"input": 10, "output": 1},
+        )
+
+
+@pytest.mark.asyncio
+async def test_provider_calls_run_concurrently(monkeypatch) -> None:
+    """Three due detectors on three plans must overlap, not queue."""
+    plans = _plans(
+        _due("fall", severity=95),
+        _due("medication", bucket="person", targets=(1,)),
+        _due("activity", bucket="person", targets=(2,)),
+    )
+    assert len(plans) >= 3, "test needs >=3 plans to prove overlap"
+    vlm = _ConcurrencyProbeVLM()
+    await _run(plans, vlm, identity=_identity((1, 2)), monkeypatch=monkeypatch)
+    # Sequential execution can never exceed 1 in flight.
+    assert vlm.peak >= 3, f"calls did not overlap (peak in-flight={vlm.peak})"
+
+
+@pytest.mark.asyncio
+async def test_merge_stays_in_plan_order_when_calls_finish_out_of_order(
+    monkeypatch,
+) -> None:
+    """`sched_calls` must follow PLAN order, not completion order.
+
+    The whole morning of 2026-08-07 was spent reading `sched_calls` to
+    work out which call produced which verdict. A ledger ordered by
+    whichever call happened to return first would have made that
+    impossible, so the ordering is a contract, not a coincidence.
+    """
+    import asyncio as _a
+
+    plans = _plans(
+        _due("fall", severity=95),
+        _due("medication", bucket="person", targets=(1,)),
+    )
+    delays = {"fall": 0.06, "medication": 0.0}   # scene call finishes LAST
+
+    async def vlm(**kw):
+        ident = kw["detectors"][0].identifier
+        await _a.sleep(delays.get(ident, 0.0))
+        return "gemini", ProviderResult(
+            description=f"desc-{ident}",
+            detector_fields={f"{ident}_detected": False, "people_present": True},
+            people_present=True, people_count=1,
+            usage={"input": 10, "output": 1},
+        )
+
+    out = await _run(plans, vlm, identity=_identity((1,)), monkeypatch=monkeypatch)
+    ledger_keys = [c["key"] for c in out.sched_fields["sched_calls"]]
+    assert ledger_keys == [p.plan_key for p in plans]
+    # And the scene call still anchors the shared block even though it
+    # returned last.
+    assert out.description == "desc-fall"
+
+
+@pytest.mark.asyncio
+async def test_ledger_carries_each_calls_own_evidence(monkeypatch) -> None:
+    """Each sched_calls entry rides ITS OWN call's `seen`, not the
+    scene call's. Without this, a crop verdict is only ever stored
+    beside the scene call's description of different pixels — the
+    2026-08-07 logging gap that invalidated a morning of FP analysis."""
+    plans = _plans(
+        _due("fall", severity=95),
+        _due("medication", bucket="person", targets=(1,)),
+    )
+    vlm = _ScriptedVLM([
+        ("gemini", {"fall_detected": False, "people_present": True,
+                    "seen": "wide: person at desk"},
+         {"input": 10, "output": 1}),
+        ("gemini", {"medication_detected": False, "people_present": True,
+                    "seen": "crop: hands holding phone"},
+         {"input": 10, "output": 1}),
+    ])
+    out = await _run(plans, vlm, identity=_identity((1,)), monkeypatch=monkeypatch)
+    calls = out.sched_fields["sched_calls"]
+    by_key = {tuple(c["detectors"]): c for c in calls}
+    assert by_key[("fall",)]["seen"] == "wide: person at desk"
+    assert by_key[("medication",)]["seen"] == "crop: hands holding phone"
+    # Row-level `seen` still the scene call's (caregiver-facing rule).
+    assert out.detector_fields["seen"] == "wide: person at desk"
