@@ -197,16 +197,32 @@ def _entry_confidence_for(
     Emergencies must not wait, so safety stakes cap corroboration lower
     than routine.
 
-    Only SUSTAINED detectors accumulate entry evidence — instant events fire
-    on-sight and absence fires on its schedule; cross-tick corroboration for
-    those would be the within-clip confirm (k-of-N), not entry M-of-N.
+    Only SUSTAINED detectors accumulate entry evidence — instant events
+    fire on a single tick, so their corroboration is the WITHIN-CLIP
+    confirm (k-of-N): on a fire, the same clip is re-judged by fresh
+    calls that never see the first call's answer, and the fire is
+    suppressed unless k of n agree. Independent re-judging is the
+    variant the verification literature actually validates — a checker
+    that can read the draft happily re-copies the draft's hallucination
+    (Chain-of-Verification, arXiv:2309.11495).
+
+    Derived 2026-08-08 from the drinking-water FP episode: an instant
+    routine custom fired 35×/day at confidence 0.9-1.0 on confabulated
+    drinks, and the confirm dial — named below since P4 but never set
+    by any code path — existed precisely for this. Safety instants stay
+    on-sight: a real fall must not risk being outvoted by two noisier
+    re-checks, the same stakes carve-out the sustained branch makes.
+    Cost is bounded by the fire rate, not the tick rate (~n-1 extra
+    calls per fire), so a well-behaved detector pays nothing.
 
     Windows satisfy `t_seconds >= m * scheduler_tick` (~60 s) so M is
     physically reachable. TODO(soak): the exact (m, t) per tier are
     placeholders to calibrate against golden soak data before prod.
     """
     if not is_sustained:
-        return None
+        if category == "safety":
+            return None
+        return {"confirm": {"k": 2, "n": 3}}
     if degradation == "distance_class":
         m, t = (2, 180) if category == "safety" else (3, 300)
     elif bucket in ("rapid", "fine_motion"):
