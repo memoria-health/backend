@@ -237,12 +237,6 @@ class StreamingMp4Writer:
             str(self._out_path),
         ]
 
-    def _build_env(self) -> "dict[str, str] | None":
-        """Environment for the encoder child. None = inherit ours, which
-        is what plain ffmpeg wants. The masking subclass overrides it to
-        hand down a credential that must not go on the command line."""
-        return None
-
     async def start(self) -> None:
         """Launch the encoder child and the CFR pacer task."""
         cmd = self._build_command()
@@ -251,7 +245,6 @@ class StreamingMp4Writer:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
-            env=self._build_env(),
         )
         self._pacer_task = asyncio.create_task(self._pace())
 
@@ -423,8 +416,9 @@ class StreamingMp4Writer:
 class MaskingMp4Writer(StreamingMp4Writer):
     """Same writer, but every frame is masked on the way out.
 
-    Frames go to an isolated child process that fills the people in them
-    flat, then encodes the result. Raw footage never reaches disk.
+    Frames go to an isolated child process that segments the people in
+    them and fills those regions flat, then encodes the result. Raw
+    footage never reaches disk.
 
     Doing it here rather than over the finished clip is what makes it
     affordable: the recorder already holds decoded frames, so masking
@@ -436,53 +430,25 @@ class MaskingMp4Writer(StreamingMp4Writer):
     already isolates tier 1: a native OpenMP deadlock in torch froze the
     whole backend on 2026-07-28, event loop included. That hang lives
     below Python, so a thread could not be recovered but a child can
-    always be killed. Torch left this path with the pod-mask switch
-    (2026-08-06), but a wedged HTTP read is worth the same containment.
-
-    The child needs to know WHICH camera's masks to ask the pod for, so
-    unlike the plain writer it cannot be built from a path alone.
+    always be killed.
 
     The child dying takes the session's video with it — the pacer sees a
     broken pipe and stops, and ``ok`` goes False so the clip is never
     uploaded.
     """
 
-    # Masking is real work, and at close the child still has whatever
+    # Segmenting is real work, and at close the child still has whatever
     # the pipe buffered to get through. Killing it at ffmpeg's 10s would
     # truncate the clip.
     _exit_timeout = 120.0
 
-    def __init__(
-        self,
-        out_path: Path | str,
-        *,
-        camera_id: str,
-        pod_url: str,
-        pod_token: str = "",
-        **kwargs: object,
-    ) -> None:
-        super().__init__(out_path, **kwargs)  # type: ignore[arg-type]
-        self._camera_id = camera_id
-        self._pod_url = pod_url
-        self._pod_token = pod_token
-
     def _build_command(self) -> list[str]:
         import sys
 
-        # The TOKEN is deliberately absent: argv shows up in `ps` for
-        # every local user. It reaches the child through the environment
-        # instead — see `_build_env` and `censor._censor_child_env`.
         return [
             sys.executable,
             "-m", "src.services.detection.censor",
             "-",  # in_path unused in stream mode
             str(self._out_path),
             "--stream-i420", f"{self._width}x{self._height}@{self._fps}",
-            "--camera-id", self._camera_id,
-            "--pod-url", self._pod_url,
         ]
-
-    def _build_env(self) -> "dict[str, str] | None":
-        from src.services.detection.censor import _censor_child_env
-
-        return _censor_child_env(self._pod_token)

@@ -24,7 +24,6 @@ import tempfile
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime, timezone
-from functools import partial
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -108,22 +107,10 @@ def _default_encoder_factory(path: Path) -> StreamingMp4Writer:
     return StreamingMp4Writer(path)
 
 
-def _masking_encoder_factory(
-    path: Path, *, camera_id: UUID, settings: Any,
-) -> MaskingMp4Writer:
+def _masking_encoder_factory(path: Path) -> MaskingMp4Writer:
     """Encoder for a session judged sensitive: identical timing, but
-    every frame is masked on the way out and raw never touches disk.
-
-    Takes the camera and settings the plain factory does not, because
-    the masks come from the perception pod (2026-08-06) and the child
-    has to know which camera to ask about and where to ask.
-    """
-    return MaskingMp4Writer(
-        path,
-        camera_id=str(camera_id),
-        pod_url=settings.perception_mask_url,
-        pod_token=settings.perception_mask_token,
-    )
+    every frame is masked on the way out and raw never touches disk."""
+    return MaskingMp4Writer(path)
 
 
 async def _never_private(_camera_id: UUID) -> bool:
@@ -374,11 +361,8 @@ class RecorderManager:
             ctx=ctx,
             temp_dir=self._temp_dir,
             encoder_factory=(
-                partial(
-                    self._masking_encoder_factory,
-                    camera_id=camera_id, settings=self._settings,
-                )
-                if masked else self._encoder_factory
+                self._masking_encoder_factory if masked
+                else self._encoder_factory
             ),
             on_finalized=self._handle_finalized,
             clock=self._clock,

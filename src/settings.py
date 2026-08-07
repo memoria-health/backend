@@ -249,43 +249,14 @@ class Settings(BaseSettings):
     # Env: NEMARA_CENSOR_TIMEOUT_SECONDS.
     censor_timeout_seconds: float = Field(gt=0, le=900, default=180.0)
 
-    # Inline recorder masking: how often the live masking child refreshes
-    # its rolling mask window from the pod. It used to be "segment every
-    # Nth frame" locally; masks now come off the wire, so the same knob
-    # now paces HTTP reads instead of inference. At 15fps, 5 → a read
-    # roughly 3x a second, each a few hundred KB over loopback.
-    # Env: NEMARA_CENSOR_STREAM_SEGMENT_EVERY.
+    # Inline recorder masking: run segmentation every Nth frame and carry
+    # the (extra-dilated) mask across the rest. At 15fps there is only
+    # ~66ms per frame and segmentation costs tens of ms, so segmenting
+    # every frame does not fit the budget. 5 → segment 3x a second; a
+    # person moves very little in 200ms and the wider dilation covers it.
+    # Lower is safer and more expensive. Env:
+    # NEMARA_CENSOR_STREAM_SEGMENT_EVERY.
     censor_stream_segment_every: int = Field(ge=1, le=60, default=5)
-
-    # ── event-gate / privacy censor mask source (2026-08-06) ─────
-    # The censor masks people using the SAME EdgeTAM segmentation that
-    # tracks them on the pod, fetched from GET /masks. It replaced
-    # yolo11n-seg outright: at seated distance yolo scored ~0.05, and
-    # since both censor failure paths treat "no mask" as "cover
-    # everything", the operator's 60s page was a solid green rectangle
-    # for its whole duration and every alert auto-released unjudged.
-    # A bigger YOLO was measured and is not the fix (censor.py).
-    #
-    # Base URL of the perception pod. Same service `reid_sam_service_url`
-    # names; kept as its own setting because the censor CHILD PROCESS
-    # takes it on argv and must not load the full Settings model (it has
-    # no DB, no app, and pays this per invocation).
-    # Env: NEMARA_PERCEPTION_MASK_URL.
-    perception_mask_url: str = Field(
-        default="http://host.docker.internal:8000"
-    )
-    # Bearer token for GET /masks. Empty = the pod's default open mode
-    # (it binds loopback behind an SSH tunnel today). Set this AND
-    # NEMARA_PERCEPTION_TOKEN on the pod to close it. Reaches the censor
-    # child through its ENVIRONMENT, never argv — argv is world-readable
-    # in the process table.
-    # Env: NEMARA_PERCEPTION_MASK_TOKEN.
-    perception_mask_token: str = Field(default="")
-    # HTTP deadline for one mask fetch. The censor's own deadline is
-    # censor_timeout_seconds (180s) and a clip needs exactly one fetch,
-    # so this only has to beat a black-holed pod, not a slow one.
-    # Env: NEMARA_PERCEPTION_MASK_TIMEOUT_S.
-    perception_mask_timeout_s: float = Field(gt=0, le=120, default=10.0)
 
     # How often a recording camera asks whether the moment is sensitive.
     # This is the ONLY thing that turns masking on — room class does not.

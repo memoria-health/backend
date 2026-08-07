@@ -133,12 +133,10 @@ class _FakeCensor:
     async def censor_clip(
         self, in_path: str, out_path: str, *, full_frame: bool = False,
         keep_audio: bool = True, mode: str = "pixelate",
-        camera_id: str = "", clip_start: float = 0.0,
     ) -> None:
         self.calls.append(
             {"in_path": in_path, "out_path": out_path,
-             "full_frame": full_frame, "keep_audio": keep_audio, "mode": mode,
-             "camera_id": camera_id, "clip_start": clip_start}
+             "full_frame": full_frame, "keep_audio": keep_audio, "mode": mode}
         )
         if self.raises:
             raise CensorError("boom")
@@ -146,15 +144,9 @@ class _FakeCensor:
             f.write(self.write)
 
 
-# Any epoch will do here — these tests exercise the fail-closed matrix,
-# not mask lookup; the censor itself is faked.
-CLIP_START = 1_786_000_000.0
-
-
 async def _resolve(mp4: bytes, settings: Settings) -> clip_archival.ClipResolution:
     return await clip_archival.resolve_clip_for_upload(
         mp4, event_id=EVENT_ID, camera_id=CAMERA_ID, settings=settings,
-        clip_start=CLIP_START,
     )
 
 

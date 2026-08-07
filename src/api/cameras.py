@@ -14,7 +14,6 @@ Cameras are CREATED in two steps by the pairing flow:
 import asyncio
 import logging
 import secrets
-import time
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
@@ -1090,30 +1089,13 @@ async def update_camera(
     return _to_response(cam)
 
 
-# How stale a still must be before the identity service's "nobody is in
-# this room" can vouch for it. /state describes what perception saw
-# `lag_s` ago — measured 1.2-2.6s live — so a verdict fetched now says
-# nothing about a frame captured now. 4s clears the observed range with
-# margin, and a 4-second-old picture of doors and walls is worth exactly
-# as much as a fresh one for picking exit doors.
-_PRESENCE_VERDICT_LAG_MARGIN_S = 4.0
-
-
-def _latest_frame_jpeg(
-    request: Request, identity: str, *, min_age_seconds: float = 0.0,
-) -> bytes | None:
+def _latest_frame_jpeg(request: Request, identity: str) -> bytes | None:
     """Newest buffered frame for `identity`, as JPEG.
 
     Straight from the detection worker's in-process frame buffers — the
     same source `home_report._live_frames` uses, and the same "zero extra
     capture cost". Returns None when the camera is not currently being
     ingested.
-
-    `min_age_seconds` asks instead for the newest frame at least that
-    OLD, and returns None when the buffer holds no such frame. Only the
-    private-camera path uses it, so that a presence verdict which lags
-    capture can actually cover the frame it is being used to clear (see
-    `_PRESENCE_VERDICT_LAG_MARGIN_S`). None is the fail-closed answer.
     """
     worker = getattr(request.app.state, "detector_worker", None)
     if worker is None:
@@ -1122,12 +1104,7 @@ def _latest_frame_jpeg(
         ingest = getattr(room_worker, "_ingests_by_identity", {}).get(identity)
         if ingest is None:
             continue
-        frames = ingest.frame_buffer.snapshot_last_seconds(
-            max(4.0, min_age_seconds * 2)
-        )
-        if min_age_seconds > 0:
-            cutoff = time.monotonic() - min_age_seconds
-            frames = [f for f in frames if f.captured_at <= cutoff]
+        frames = ingest.frame_buffer.snapshot_last_seconds(4.0)
         if not frames:
             return None
         data = frames[-1].data
@@ -1141,34 +1118,11 @@ def _latest_frame_jpeg(
     return None
 
 
-async def _tracked_people(request: Request, camera_id: UUID) -> int | None:
-    """How many people the identity sidecar is tracking on this camera,
-    or None when there is no verdict to be had.
-
-    Reuses the detection worker's identity client rather than opening a
-    second one: it already holds the connection pool and a 1s /state
-    cache, so a caregiver tapping through the door picker rides the
-    same read the detection tick just made. No worker (or no client) is
-    NOT "empty room" — it is no verdict, and the caller fails closed.
-    """
-    worker = getattr(request.app.state, "detector_worker", None)
-    client = getattr(worker, "_reid", None)
-    probe = getattr(client, "tracked_people", None)
-    if probe is None:
-        return None
-    try:
-        return await probe(camera_id)
-    except Exception:  # noqa: BLE001 — no verdict, never an empty room
-        log.exception("door_frame.presence_probe_failed camera_id=%s", camera_id)
-        return None
-
-
 @router.get("/cameras/{camera_id}/door-frame")
 async def door_frame(
     camera_id: UUID,
     auth: CaregiverAuth,
     session: SessionDep,
-    settings: SettingsDep,
     request: Request,
 ) -> Response:
     """One still for the exit-door picker.
@@ -1189,17 +1143,6 @@ async def door_frame(
     people are the thing being protected, and a re-fetchable still is a
     slideshow of the room. Masking failure serves NOTHING (503) rather
     than an unmasked private room.
-
-    WHO DECIDES THE ROOM IS EMPTY (2026-08-06). The censor used to
-    segment this still itself, so it could see for itself that nobody
-    was in shot and hand the frame back untouched. Its masks now come
-    from the perception pod, which records nothing at all for a tick
-    with no people — "no masks" is therefore ambiguous between "empty
-    room" (serve it, a bedroom with no one in it is architecture) and
-    "the sidecar stopped watching this camera" (serve nothing). The two
-    are told apart HERE, against the identity service's /state, before
-    the censor is asked for anything. No verdict from /state is not an
-    empty room; it is a 503.
     """
     cam = await camera_repo.find_by_id(session, camera_id, caregiver_id=auth.id)
     if cam is None:
@@ -1222,60 +1165,18 @@ async def door_frame(
         )
 
     if cam.privacy_enabled:
-        tracked = await _tracked_people(request, camera_id)
-        if tracked is None:
-            log.warning(
-                "door_frame.no_presence_verdict camera_id=%s — serving "
-                "nothing", camera_id,
+        try:
+            jpeg = await asyncio.to_thread(
+                censor.mask_people_in_still_sync, jpeg
+            )
+        except Exception:  # noqa: BLE001 — fail CLOSED, never serve raw
+            log.exception(
+                "door_frame.mask_failed camera_id=%s — serving nothing",
+                camera_id,
             )
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="privacy_mask_unavailable",
-            )
-        if tracked > 0:
-            try:
-                jpeg = await asyncio.to_thread(
-                    censor.mask_people_in_still_sync, jpeg,
-                    camera_id=str(camera_id),
-                    pod_url=settings.perception_mask_url,
-                    pod_token=settings.perception_mask_token,
-                )
-            except Exception:  # noqa: BLE001 — fail CLOSED, never serve raw
-                log.exception(
-                    "door_frame.mask_failed camera_id=%s — serving nothing",
-                    camera_id,
-                )
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="privacy_mask_unavailable",
-                ) from None
-        else:
-            # /state positively says nobody is in this room, so the still
-            # is architecture and may go out as-is — the SAME rule the
-            # old segmenter applied when it found no person; the only
-            # change is who establishes it.
-            #
-            # But the verdict describes what perception saw `lag_s` ago,
-            # and the still above is the NEWEST frame — so a person who
-            # walked in within the last second or two is in the picture
-            # and not yet in the verdict. The old segmenter looked at
-            # these very pixels and had no such gap; this one is the
-            # price of moving the masks off-box. Close it by answering
-            # with a frame OLD enough for the verdict to cover, rather
-            # than by trusting a verdict about a different moment.
-            jpeg = _latest_frame_jpeg(
-                request, cam.livekit_identity,
-                min_age_seconds=_PRESENCE_VERDICT_LAG_MARGIN_S,
-            )
-            if jpeg is None:
-                log.warning(
-                    "door_frame.no_settled_frame camera_id=%s — the buffer "
-                    "holds nothing old enough for the presence verdict to "
-                    "cover; serving nothing", camera_id,
-                )
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="privacy_mask_unavailable",
-                )
+            ) from None
 
     return Response(content=jpeg, media_type="image/jpeg")

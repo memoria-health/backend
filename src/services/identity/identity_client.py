@@ -121,36 +121,6 @@ class IdentityClient:
         self._cache = (now, j)
         return j
 
-    async def tracked_people(self, camera_id: "UUID | str") -> int | None:
-        """How many people the sidecar is currently tracking on this
-        camera, or None when it has NO VERDICT (service down, warming
-        up, wrong contract, or it has never heard of this camera).
-
-        Added for the private-camera door still (2026-08-06). That path
-        masks people out of a live frame using the pod's masks, and the
-        pod records nothing at all for a tick with no people — so "no
-        masks" reads identically whether the room is empty or the
-        sidecar has stopped watching. Serving an unmasked still is only
-        safe in the first case, and this is what tells them apart.
-
-        Deliberately NOT fail-open, unlike `label_clip`. There, no
-        verdict means "don't suppress detection". Here it means "we
-        cannot promise the room is empty", and the caller serves
-        nothing. Shares the 1s /state cache with the detection tick, so
-        a caregiver tapping through the door picker adds no real load.
-        """
-        state = await self._state()
-        if state is None:
-            return None
-        entry = self._cam_entry(state, camera_id)
-        if entry is None:
-            return None
-        tracks = entry.get("tracks") or {}
-        try:
-            return min(len(tracks), _MAX_TRACKS)
-        except TypeError:
-            return None
-
     def timing(self, camera_id: "UUID | str") -> "dict[str, float] | None":
         """REAL pipeline timings for this camera, as measured by the
         identity service on its last batch (not synthesized): e2e_ms =

@@ -9,15 +9,15 @@ happened" stay readable; identity and exposure do not.
 
 Two tiers, fail-closed:
 
-  1. Person-mask censor — the person masks EdgeTAM already computed on
-     the perception pod, read back from `GET /masks` (see
-     `pod_masks.py`), generously dilated, and the masked region
-     pixelated via OpenCV. A frame of a SENSITIVE clip for which no
-     mask exists is pixelated FULL-FRAME — the mask source must never
-     be the weak link (a missed body is exactly the failure mode we
-     cannot afford). Re-encoded via ffmpeg with `-an`.
+  1. Person-mask censor — YOLO11n-seg (ultralytics; already a repo
+     dependency via the identity stack) segments the `person` class per
+     frame, masks are generously dilated, and the masked region is
+     pixelated via OpenCV. A frame of a SENSITIVE clip in which
+     segmentation finds NO person is pixelated FULL-FRAME — the seg
+     model must never be the weak link (a missed body is exactly the
+     failure mode we cannot afford). Re-encoded via ffmpeg with `-an`.
      The pipeline STREAMS: decode one frame → mask → censor → write to
-     the piped encoder → drop it, so peak memory is O(1 frame)
+     the piped encoder → drop it, so peak memory is O(1 frame + model)
      — decoding a whole 1080p clip up front (~1.2 GB at 200 frames)
      got the child OOM-killed (SIGKILL -9) in the local Docker VM on
      2026-07-28. Runs in an ISOLATED CHILD PROCESS (`python -m
@@ -30,30 +30,19 @@ Two tiers, fail-closed:
   2. Full-frame blur — pure ffmpeg (boxblur + `-an`), no Python CV
      stack in the path. Used when the caller has no trustworthy verdict
      (VLM screen failed → we don't know WHAT is sensitive) and as the
-     fallback when tier 1 raises for any reason (pod unreachable,
-     decode error, ...).
+     fallback when tier 1 raises for any reason (ultralytics missing,
+     model load failure, decode error, ...).
 
 If tier 2 also fails, `CensorError` propagates and the caller DROPS
 the clip entirely (`events.clip_suppressed`) — raw footage never
 reaches storage on any path.
 
-WHY THE MASKS COME OFF THE POD (2026-08-06). Tier 1 used to run
-yolo11n-seg locally. At normal seated distance it scored ~0.05, and
-because every failure path here treats "no mask" as "cover everything",
-the operator's 60-second gate page arrived as a solid green rectangle
-for its whole duration: unjudgeable, so the alert auto-released
-unreviewed and the gate was not doing its job. A bigger model was
-measured and rejected — yolo11x-seg managed 7 of 21 frames on the
-incident clip for far more compute. Meanwhile EdgeTAM on the pod was
-already computing a full mask for every frame of every tick and tracking
-the same person reliably, then throwing the masks away. So the segmenter
-is GONE rather than demoted to a fallback: a weaker second segmenter
-would just preserve the failure being removed, one clip in N.
-
-Cost: one HTTP read per clip (a few hundred KB, run-length encoded) in
-place of per-frame inference, so tier 1 is now mask arithmetic only.
-The pod must be reachable for it to work at all; when it is not, tier 2
-covers the frame. No weights, no torch, no ultralytics in this path.
+CPU cost: clips are ~26s @ 4fps ≈ 100 frames; yolo11n-seg runs a few
+ms-to-tens-of-ms per frame on CPU, so a censor pass is seconds — fine
+for a fire-and-forget archival task. Deploy note: the seg weights
+(`yolo11n-seg.pt`, ~6 MB) auto-download from ultralytics' CDN on first
+use; prefetch in the image build (tools/download_models.py pattern) if
+the deploy target has no egress.
 """
 
 from __future__ import annotations
@@ -64,10 +53,8 @@ import os
 import subprocess
 import sys
 import tempfile
-import time
 from typing import TYPE_CHECKING, Any
 
-from src.services.detection import pod_masks
 from src.settings import get_settings
 
 if TYPE_CHECKING:
@@ -81,6 +68,40 @@ class CensorError(RuntimeError):
     uploading the raw bytes is never an acceptable recovery."""
 
 
+# YOLO11 nano segmentation weights. Auto-downloaded by ultralytics on
+# first construction (~6 MB); cached process-wide below.
+_SEG_MODEL_NAME = "yolo11n-seg.pt"
+# COCO class id 0 = person.
+_PERSON_CLASS_ID = 0
+# Deliberately LOW confidence floor: a false-positive mask just blurs a
+# bit more of the frame (harmless); a false negative leaves skin
+# visible (the failure we exist to prevent).
+#
+# 0.20 was not low enough. Measured 2026-08-05 against event 62250996,
+# a real evening clip where the subject stands by the wardrobe door in
+# white clothing, roughly 111/255 mean brightness:
+#
+#     conf=0.20   detected  3/21 frames      <- what shipped
+#     conf=0.15   detected  6/21 frames
+#     conf=0.10   detected 12/21 frames
+#     conf=0.07   detected 21/21 frames
+#     conf=0.05   detected 21/21 frames
+#
+# Both failure paths treat "no mask" as "cover everything", so 18 of
+# those 21 frames came out filled edge to edge: the operator's clip was
+# a solid green rectangle for its whole duration, useless for judging
+# anything, and the caregiver's censored clip would have been a
+# full-frame blur for the same reason. Neither is a rendering bug, both
+# are this number.
+#
+# A bigger model is NOT the fix. yolo11x-seg at 0.20 managed only 7/21
+# on the same frames, for far more compute than the gate's 60s window
+# can spare. The threshold dominates.
+#
+# 0.05 rather than 0.07 for margin: average mask coverage barely moves
+# between them (0.81% vs 0.63% of frame), so the cost of going lower is
+# close to nothing, while a miss is expensive in both directions.
+_SEG_CONFIDENCE = 0.05
 # Pixelation factor: the masked region is downsampled by this per axis
 # and re-upsampled with nearest-neighbour. 24 → a 720p body becomes a
 # handful of flat blocks — posture readable, identity/exposure not.
@@ -102,25 +123,6 @@ _FFMPEG_BLUR_FILTER = (
 # widened dilation. Longer gaps mean the person may genuinely be
 # elsewhere in frame → full-frame.
 _MASK_GAP_BRIDGE_FRAMES = 3
-
-# Upper bound on how much wall clock one censored clip can span, used to
-# size the pod-mask fetch window before the clip is decoded. Event clips
-# are ~26s and the pod retains 45s, so this is slack, not a limit — it
-# exists so a bad `clip_start` cannot ask the pod for an unbounded range.
-_MAX_CLIP_SECONDS = 120.0
-
-# How far back the door-frame still looks for a mask. The still is live,
-# so this only has to cover the pipeline lag between a frame being
-# captured and its mask being retained (`lag_s` ≈ 2.6s live) plus a
-# tick's worth of slack.
-_STILL_LOOKBACK_SECONDS = 10.0
-
-# Ceiling on the motion allowance in `_motion_margin_px`, in seconds.
-# Past this the margin would swallow the room and stop being a redaction
-# at all; the bounded gap bridge and the full-frame cover take over
-# instead. 0.5s at a body-height per second is already half a body of
-# slack in every direction.
-_MOTION_MARGIN_MAX_S = 0.5
 
 # ── research mask mode (2026-08-04) ─────────────────────────────────
 #
@@ -147,43 +149,79 @@ _MOTION_MARGIN_MAX_S = 0.5
 # Flat green: it is not a colour a room produces, so a masked region is
 # unambiguous to a human reviewer and trivially separable to a model.
 _RESEARCH_FILL_BGR = (0, 255, 0)
-# Margin around the masked person. 2% of the short side is ~21px on a
+# Margin around the segmented person. 2% of the short side is ~21px on a
 # 1080p frame, which rounds off fingers and closes the gaps between limbs
 # — the silhouette reads as a blob rather than a person. That size was
 # compensating for a mask that arrived at ~160x160 and was upscaled with
-# nearest-neighbour; `pod_masks` interpolates the soft mask before
-# thresholding, so the mask itself is accurate to a few pixels and the
-# margin no longer has to cover for it.
+# nearest-neighbour; `_person_mask` now computes at full resolution and
+# interpolates before thresholding, so the mask itself is accurate to a
+# few pixels and the margin no longer has to cover for it.
 #
-# 0.5% (~5px at 1080p) still covers the under-coverage the masks show
-# at body edges, especially loose clothing and hair. It is widened at
-# runtime by `_motion_margin_px` to cover the time gap between the
-# masked instant and the frame being censored (2026-08-06). Raise this
-# base if any real footage shows skin outside the fill; that is the
-# failure that matters, and it is the reason this is a named constant
-# rather than a literal.
+# 0.5% (~5px at 1080p) still covers the under-coverage segmentation shows
+# at body edges, especially loose clothing and hair. Raise it if any real
+# footage shows skin outside the fill; that is the failure that matters,
+# and it is the reason this is a named constant rather than a literal.
 _RESEARCH_DILATE_FRACTION = 0.005
 _RESEARCH_DILATE_MIN_PX = 3
 
 CENSOR_MODE_PIXELATE = "pixelate"  # event clips (default, unchanged)
 CENSOR_MODE_RESEARCH = "research"  # B2 corpus only
 
+_seg_model = None
 
-def _person_mask(
-    window: "pod_masks.MaskWindow",
-    frame_time: float,
-    shape: tuple[int, int],
-) -> np.ndarray | None:
-    """Union of every tracked person's pod mask at `frame_time`, as a
-    uint8 {0,1} array at `shape` (height, width). None when the pod
-    retained nothing near that time.
 
-    All the real work — decoding at the RECORDED dims, unioning in
-    float, upscaling before thresholding so the outline stays smooth —
-    lives in `pod_masks`, because the live recorder path needs exactly
-    the same arithmetic against a different lookup.
-    """
-    return window.mask_at(frame_time, shape)
+def _get_seg_model():
+    """Load + cache the YOLO seg model. Raises if ultralytics (or the
+    weights download) is unavailable — the caller falls back to the
+    full-frame ffmpeg tier."""
+    global _seg_model
+    if _seg_model is None:
+        import torch
+        from ultralytics import YOLO
+
+        # Deadlock guard (2026-07-28): a multi-threaded torch inference
+        # froze the entire process (event loop included) in the local
+        # Docker VM — classic libomp hang. Single-threaded inference is
+        # ~2-3x slower and immune. Belt to the compose-level
+        # OMP_NUM_THREADS=1 braces.
+        torch.set_num_threads(1)
+        _seg_model = YOLO(_SEG_MODEL_NAME)
+    return _seg_model
+
+
+def _person_mask(model, frame: np.ndarray) -> np.ndarray | None:
+    """Union of all person masks for one BGR frame, as a uint8 {0,1}
+    array at frame resolution. None when no person was segmented."""
+    import cv2
+    import numpy as np
+
+    results = model.predict(
+        frame,
+        classes=[_PERSON_CLASS_ID],
+        conf=_SEG_CONFIDENCE,
+        verbose=False,
+        # Compute masks at the input image's resolution rather than at the
+        # prototype resolution (~160x160). Without this the mask is
+        # produced ~12x smaller than a 1080p frame and every edge is
+        # reconstructed by upscaling, which is where the staircase edges
+        # come from. Costs some inference time, buys the outline.
+        retina_masks=True,
+    )
+    result = results[0]
+    if result.masks is None or len(result.masks.data) == 0:
+        return None
+    stacked = result.masks.data.cpu().numpy()  # (n, mh, mw) in [0,1]
+    # Union in FLOAT, resize in float, threshold last. The old order
+    # thresholded to {0,1} first and then resized with INTER_NEAREST, so
+    # each source pixel became a hard rectangular block — the single
+    # biggest cause of the blocky silhouette. Interpolating the soft mask
+    # and cutting at 0.5 recovers a smooth boundary at no real cost.
+    union_f = stacked.max(axis=0).astype(np.float32)
+    h, w = frame.shape[:2]
+    if union_f.shape != (h, w):
+        union_f = cv2.resize(union_f, (w, h), interpolation=cv2.INTER_LINEAR)
+    union = (union_f > 0.5).astype(np.uint8)
+    return union if union.any() else None
 
 
 def _pixelate(frame: np.ndarray, block: int = _PIXELATE_FACTOR) -> np.ndarray:
@@ -212,58 +250,25 @@ def _dilate_mask(mask: np.ndarray, *, extra: bool = False) -> np.ndarray:
     return (cv2.dilate(mask, kernel) > 0).astype(mask.dtype)
 
 
-def _motion_margin_px(gap_seconds: float | None, mask: np.ndarray) -> int:
-    """Extra dilation to cover how far the subject may have MOVED between
-    the masked instant and this frame.
-
-    Needed since 2026-08-06. The old segmenter ran on the frame being
-    censored, so its mask was exact and a few pixels of margin were
-    enough. Pod masks are retained at the identity service's tracking
-    cadence (~3fps) while clips encode at `clip_fps` (8), so a frame is
-    routinely covered by a silhouette from up to ~170ms away — about
-    63px of walking at 1080p, against a 5px research margin. That is
-    uncovered skin at the trailing edge, which is the one failure this
-    module exists to prevent.
-
-    Scaled by the subject's OWN height in pixels rather than the frame's,
-    so it tracks distance from the camera for free: someone across the
-    room is smaller in frame and also moves fewer pixels per second. A
-    fast indoor walk is roughly one body height per second, which is the
-    bound used here.
-    """
-    import numpy as np
-
-    if not gap_seconds:
-        return 0
-    ys = np.nonzero(mask.any(axis=1))[0]
-    if ys.size == 0:
-        return 0
-    body_px = int(ys[-1] - ys[0] + 1)
-    return int(min(gap_seconds, _MOTION_MARGIN_MAX_S) * body_px)
-
-
-def _research_dilate(mask: np.ndarray, *, extra_px: int = 0) -> np.ndarray:
-    """Tight dilation for the research mode — a real but small margin,
-    widened by `extra_px` to cover subject motion since the mask was
-    computed (see `_motion_margin_px`)."""
+def _research_dilate(mask: np.ndarray) -> np.ndarray:
+    """Tight dilation for the research mode — a real but small margin."""
     import cv2
 
     h, w = mask.shape[:2]
     k = max(
         _RESEARCH_DILATE_MIN_PX,
         int(min(h, w) * _RESEARCH_DILATE_FRACTION),
-    ) + max(0, int(extra_px))
-    k |= 1
+    ) | 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
     return (cv2.dilate(mask, kernel) > 0).astype(mask.dtype)
 
 
 def _research_frame(
-    frame: np.ndarray, mask: np.ndarray | None, *, motion_px: int = 0,
+    frame: np.ndarray, mask: np.ndarray | None,
 ) -> np.ndarray:
     """Fill the person with flat colour, keeping the room intact.
 
-    No mask means the pod retained none, not that the room is empty — the
+    No mask means segmentation missed, not that the room is empty — the
     gate upstream already established someone is present. So the frame
     is filled entirely rather than left as-is. One rule, no special
     cases: whether we mask at all is decided upstream by the sensitivity
@@ -274,7 +279,7 @@ def _research_frame(
     if mask is None or not mask.any():
         out[:] = _RESEARCH_FILL_BGR
         return out
-    out[_research_dilate(mask, extra_px=motion_px) > 0] = _RESEARCH_FILL_BGR
+    out[_research_dilate(mask) > 0] = _RESEARCH_FILL_BGR
     return out
 
 
@@ -283,8 +288,8 @@ def _censor_frame(
 ) -> np.ndarray:
     """Censor one frame, pure for unit tests. ``mask`` is the {0,1}
     person union (or None). No person → FULL-FRAME pixelation (the
-    sensitive verdict stands even where no mask exists).
-    With a mask: dilate generously — limbs, held items, and mask
+    sensitive verdict stands even where segmentation sees nothing).
+    With a mask: dilate generously — limbs, held items, and seg
     under-coverage at body edges must land inside the censored region —
     then pixelate only that region."""
     import cv2
@@ -411,22 +416,15 @@ class _FrameEncoder:
 
 def _censor_person_mask_sync(
     in_path: str, out_path: str, *, mode: str = CENSOR_MODE_PIXELATE,
-    camera_id: str, clip_start: float, pod_url: str, pod_token: str = "",
 ) -> None:
     """Tier 1, synchronous (runs inside the CLI child process — see
     `_cli_main`): STREAM one frame at a time — decode → person-mask
     pixelation → straight into the piped ffmpeg encoder — so peak
-    memory is O(1 frame), never O(clip). Audio never enters the path
-    (raw-video pipe).
-
-    `clip_start` is the EPOCH capture time of the clip's first frame and
-    `camera_id` the backend camera UUID. The pod's masks are fetched ONCE
-    for the whole window before the decode loop: this runs per frame, and
-    an HTTP read per frame would turn a seconds-long pass into a
-    minutes-long one against the gate's 60s budget.
-    """
+    memory is O(1 frame + model), never O(clip). Audio never enters
+    the path (raw-video pipe)."""
     import cv2
 
+    model = _get_seg_model()
     cap = cv2.VideoCapture(in_path)
     if not cap.isOpened():
         raise CensorError(f"censor: cannot decode {in_path}")
@@ -458,22 +456,6 @@ def _censor_person_mask_sync(
             raise CensorError("censor: clip decoded to 0 frames")
         h, w = frame.shape[:2]
         encoder = _FrameEncoder(w, h, float(fps), out_path)
-        # ONE fetch for the whole clip. `frames_to_vfr_mp4` materializes
-        # the window onto a uniform fps grid whose playback duration
-        # equals wall clock, so output frame i sits at
-        # clip_start + i/fps — which is what makes a time lookup legal
-        # here at all. A PodMaskError propagates: tier 2 covers the clip
-        # rather than tier 1 shipping it unmasked.
-        window = pod_masks.fetch_window(
-            camera_id, clip_start, clip_start + _MAX_CLIP_SECONDS,
-            base_url=pod_url, token=pod_token,
-            timeout=float(get_settings().perception_mask_timeout_s),
-        )
-        if window.empty:
-            log.warning(
-                "censor.no_pod_masks cam=%s start=%.3f — every frame will "
-                "be covered", camera_id, clip_start,
-            )
         # Gap bridging (2026-07-28 field feedback): a 1-2 frame detection
         # dropout mid-motion flashed the whole frame to pixelation, which
         # reads as flicker. For gaps up to _MASK_GAP_BRIDGE_FRAMES, reuse
@@ -482,31 +464,15 @@ def _censor_person_mask_sync(
         # still fail safe to full-frame.
         last_mask = None
         gap = 0
-        index = 0
         while ok:
-            frame_time = clip_start + index / fps
-            mask = _person_mask(window, frame_time, (h, w))
-            # How stale the mask we got actually is. Pod masks arrive at
-            # the tracking cadence (~3fps) and clips encode at clip_fps,
-            # so a matched mask is routinely up to ~170ms old; the margin
-            # below covers the movement in between. None → the bridge
-            # supplied the mask, which is already extra-dilated.
-            match_gap = window.match_gap(frame_time)
-            index += 1
+            mask = _person_mask(model, frame)
             if mask is not None:
                 last_mask, gap = mask, 0
             elif last_mask is not None and gap < _MASK_GAP_BRIDGE_FRAMES:
                 gap += 1
                 mask = _dilate_mask(last_mask, extra=True)
-                match_gap = None
             if mode == CENSOR_MODE_RESEARCH:
-                censored = _research_frame(
-                    frame, mask,
-                    motion_px=(
-                        _motion_margin_px(match_gap, mask)
-                        if mask is not None else 0
-                    ),
-                )
+                censored = _research_frame(frame, mask)
                 if censored is None:
                     # No subject found and the gap bridge is exhausted.
                     # Research mode has no safe fallback (see
@@ -528,10 +494,7 @@ def _censor_person_mask_sync(
     encoder.close()
 
 
-def mask_people_in_still_sync(
-    jpeg: bytes, *, camera_id: str, pod_url: str, pod_token: str = "",
-    frame_time: float | None = None,
-) -> bytes:
+def mask_people_in_still_sync(jpeg: bytes) -> bytes:
     """Pixelate PEOPLE in one still, leaving the room itself visible.
 
     For the exit-door picker on a PRIVATE camera. The caregiver has to
@@ -541,24 +504,15 @@ def mask_people_in_still_sync(
     architecture, people are the thing being protected.
 
     DIFFERENT FAIL RULE from `_censor_frame`, deliberately. There, a
-    frame with no mask is pixelated FULL-FRAME, because the clip already
-    carries a sensitive verdict and a missed body is the unaffordable
-    failure. Here the room IS the subject, so full-frame pixelation would
-    defeat the feature entirely. No person found → return the frame
-    unchanged, which is correct: an empty bedroom is architecture.
+    frame with no segmented person is pixelated FULL-FRAME, because the
+    clip already carries a sensitive verdict and a missed body is the
+    unaffordable failure. Here the room IS the subject, so full-frame
+    pixelation would defeat the feature entirely. No person found →
+    return the frame unchanged, which is correct: an empty bedroom is
+    architecture.
 
-    THE CALLER OWNS "is the room empty?" (2026-08-06). This function used
-    to segment the still itself, so it could answer that question from
-    the pixels. Pod masks cannot: the pod records nothing at all for a
-    tick with no people, so "no masks" reads identically whether the room
-    is empty or the sidecar has stopped watching this camera — and those
-    two must not produce the same picture. `api/cameras.door_frame`
-    settles it against the identity service's /state before calling here,
-    and only calls when someone is actually being tracked. Reaching this
-    function therefore means "mask a person who IS there", and failing to
-    find one raises so the caller serves nothing.
-
-    Being unable to reach the pod raises too, by design.
+    Segmentation being UNABLE to run still raises, so the caller fails
+    closed and serves nothing rather than an unmasked private room.
     """
     import cv2
     import numpy as np
@@ -567,21 +521,10 @@ def mask_people_in_still_sync(
     if arr is None:
         raise CensorError("door frame: could not decode JPEG")
 
-    # The still is whatever is in the ingest buffer right now, so "now"
-    # is its time. The tolerance is the fetch window's, not a frame
-    # match: the newest retained mask is the right one for a live still.
-    now = time.time() if frame_time is None else frame_time
-    window = pod_masks.fetch_window(
-        camera_id, now - _STILL_LOOKBACK_SECONDS, now,
-        base_url=pod_url, token=pod_token,
-        timeout=float(get_settings().perception_mask_timeout_s),
-    )
-    mask = window.newest(arr.shape[:2])
+    # Raises on a broken CV stack — that propagates, by design.
+    mask = _person_mask(_get_seg_model(), arr)
     if mask is None or not mask.any():
-        # The caller established someone is tracked here, so no mask
-        # means the pod's window is stale or the person left between the
-        # two reads — either way we cannot promise this still is masked.
-        raise CensorError("door frame: no pod mask for a tracked person")
+        return jpeg  # nobody in shot; the room alone is not private
 
     # Same treatment as the event path: generous dilation, person-relative
     # block size, block-quantised region so the silhouette does not leak.
@@ -594,8 +537,6 @@ def mask_people_in_still_sync(
 
 def mask_stream_sync(
     width: int, height: int, fps: float, out_path: str, stdin: Any = None,
-    *, camera_id: str, pod_url: str, pod_token: str = "",
-    feed: Any = None,
 ) -> None:
     """Mask raw I420 frames arriving on stdin, straight into an MP4.
 
@@ -604,50 +545,30 @@ def mask_stream_sync(
     re-encode a post-pass over a finished clip would need — and raw
     footage never reaches disk.
 
-    A ROLLING window, not one prefetch (2026-08-06). The file censor
-    knows its clip's bounds and reads the pod once; this does not. A
-    recorder session runs up to 900s, the pod retains 45s, and — the part
-    that decides the design — the mask for the frame being written right
-    now does not exist yet. It is computed on the pod a couple of seconds
-    after capture (`lag_s` ≈ 2.6s live). So `pod_masks.MaskFeed` re-reads
-    a short trailing window on a background thread and this loop masks
-    with the freshest mask available, EXTRA-DILATED because it is by
-    construction that much stale. Reading per frame is not an option:
-    this runs inline at 15fps.
+    Segmentation runs every `censor_stream_segment_every` frames and the
+    mask is carried (extra-dilated) across the ones between: at 15fps a
+    person moves very little in a few frames, and segmenting all of them
+    costs more than the budget allows.
 
-    `censor_stream_segment_every` now paces the feed's polling rather
-    than local inference — same knob, same meaning (how often the mask
-    is refreshed), one HTTP read instead of a segmentation pass.
-
-    When the feed has nothing, the SAME bounded bridge the file-based
-    censor uses applies (`_MASK_GAP_BRIDGE_FRAMES`): reuse the last mask,
-    widened, for a few frames, then cover the frame entirely. Carrying a
-    stale mask indefinitely would be worse than useless — a person who
-    moved would be uncovered while we masked where they used to be.
+    When segmentation finds nothing, the SAME bounded bridge the
+    file-based censor uses applies (`_MASK_GAP_BRIDGE_FRAMES`): reuse the
+    last mask, widened, for a few frames, then cover the frame entirely.
+    Carrying a stale mask indefinitely would be worse than useless — a
+    person who moved would be uncovered while we masked where they used
+    to be.
 
     Note this bites during the recorder's 45s linger, where the gate has
     already gone false and the room may genuinely be empty: those frames
     get covered rather than kept. Safe, and cheap in research value,
     since an empty room at the tail of a session carries little.
-
-    `feed` is a seam for tests — a stand-in with `.freshest(shape)`.
     """
     import cv2
     import numpy as np
 
     stream = stdin if stdin is not None else sys.stdin.buffer
+    model = _get_seg_model()
     frame_bytes = width * height * 3 // 2
     every = max(1, int(get_settings().censor_stream_segment_every))
-    owns_feed = feed is None
-    if owns_feed:
-        feed = pod_masks.MaskFeed(
-            camera_id,
-            base_url=pod_url,
-            token=pod_token,
-            timeout=float(get_settings().perception_mask_timeout_s),
-            interval_seconds=every / float(fps) if fps else 0.33,
-        )
-        feed.start()
 
     encoder = _FrameEncoder(width, height, float(fps), out_path)
     last_mask = None
@@ -663,87 +584,43 @@ def mask_stream_sync(
             )
             frame = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
             if index % every == 0:
-                fresh = feed.freshest((height, width))
+                fresh = _person_mask(model, frame)
                 if fresh is not None:
                     last_mask, gap = fresh, 0
                 else:
                     gap += 1
-            # Always extra-dilated, unlike the file path's gap==0 case.
-            # Even the freshest pod mask describes where the person was
-            # ~lag_s ago, so there is no such thing here as a mask that
-            # matches the frame exactly.
             mask = None
             if last_mask is not None and gap <= _MASK_GAP_BRIDGE_FRAMES:
-                mask = _dilate_mask(last_mask, extra=True)
+                mask = last_mask if gap == 0 else _dilate_mask(
+                    last_mask, extra=True
+                )
             encoder.write(_research_frame(frame, mask))
             index += 1
     except BaseException:
         encoder.abort()
         raise
-    finally:
-        if owns_feed:
-            feed.close()
     encoder.close()
 
 
 def _person_mask_subprocess_cmd(
     in_path: str, out_path: str, *, mode: str = CENSOR_MODE_PIXELATE,
-    camera_id: str, clip_start: float, pod_url: str,
 ) -> list[str]:
     """argv for the tier-1 child process. Split out as a seam so unit
     tests can substitute a scripted child (exit-code / sleep stand-ins)
-    and exercise the real spawn/kill/timeout mechanics.
-
-    NOTE WHAT IS NOT HERE: the pod token. argv is world-readable in the
-    process table (`ps` on the host shows every backend child's full
-    command line), so a credential passed this way is published to every
-    local user for the life of the process. It travels in the child's
-    ENVIRONMENT instead — see `_censor_child_env`. Everything on this
-    line is non-secret: a path, a camera UUID, a timestamp, an internal
-    URL.
-    """
+    and exercise the real spawn/kill/timeout mechanics without YOLO."""
     argv = [
         sys.executable,
         "-m", "src.services.detection.censor",
         in_path,
         out_path,
-        "--camera-id", str(camera_id),
-        "--clip-start", repr(float(clip_start)),
-        "--pod-url", pod_url,
     ]
     if mode != CENSOR_MODE_PIXELATE:
         argv += ["--mode", mode]
     return argv
 
 
-# Env name the censor child reads its pod credential from. Same name on
-# the pod (`NEMARA_PERCEPTION_TOKEN` in perception/server.py); the
-# backend's own setting is NEMARA_PERCEPTION_MASK_TOKEN, and this is the
-# hand-off between them.
-_POD_TOKEN_ENV = "NEMARA_PERCEPTION_TOKEN"
-
-
-def _censor_child_env(token: str) -> dict[str, str]:
-    """Environment for the tier-1 child: ours, plus the pod token.
-
-    Built explicitly rather than relying on plain inheritance, because
-    the backend's setting can come from a `.env` file that was never
-    exported into the process environment — inheritance would then hand
-    the child an empty token and every censor would 401 with nothing
-    obviously wrong. An empty token removes the variable rather than
-    setting it blank, so "unset" means the same thing on both sides.
-    """
-    env = dict(os.environ)
-    if token:
-        env[_POD_TOKEN_ENV] = token
-    else:
-        env.pop(_POD_TOKEN_ENV, None)
-    return env
-
-
 async def _censor_person_mask_subprocess(
     in_path: str, out_path: str, *, mode: str = CENSOR_MODE_PIXELATE,
-    camera_id: str, clip_start: float,
 ) -> None:
     """Tier 1: run the person-mask censor in an ISOLATED child process
     with a hard wall-clock deadline (`censor_timeout_seconds`).
@@ -752,29 +629,21 @@ async def _censor_person_mask_subprocess(
     a native OpenMP deadlock and froze the whole backend — the hang
     lives below Python (no bytecode runs), so `asyncio.to_thread` could
     not contain it and the event loop starved with it. A wedged child
-    process, by contrast, is always `kill()`-able. Torch is no longer in
-    this path at all now that masks come off the pod, but the isolation
-    stays: it also bounds a wedged HTTP read and a runaway ffmpeg, and
-    costs a fork we were already paying.
-
-    The child needs network and config it never needed before. Config
-    rides argv; the credential rides the environment (see
-    `_person_mask_subprocess_cmd`).
+    process, by contrast, is always `kill()`-able. The child inherits
+    our cwd, so it finds the seg weights the in-process warmup
+    (`main._warm_censor_model`) already downloaded there — but it pays
+    model load per invocation (~2-4s with cached weights), which is
+    acceptable for a fire-and-forget archival task.
 
     Raises `TimeoutError` on deadline (child killed + reaped first) and
     `CensorError` on nonzero exit; `censor_clip` maps both onto the
     tier-2 full-frame fallback.
     """
-    settings = get_settings()
-    timeout = settings.censor_timeout_seconds
+    timeout = get_settings().censor_timeout_seconds
     proc = await asyncio.create_subprocess_exec(
-        *_person_mask_subprocess_cmd(
-            in_path, out_path, mode=mode, camera_id=camera_id,
-            clip_start=clip_start, pod_url=settings.perception_mask_url,
-        ),
+        *_person_mask_subprocess_cmd(in_path, out_path, mode=mode),
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
-        env=_censor_child_env(settings.perception_mask_token),
     )
     try:
         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -879,18 +748,10 @@ async def _mux_source_audio(source_path: str, video_path: str) -> None:
 async def censor_clip(
     in_path: str, out_path: str, *, full_frame: bool = False,
     keep_audio: bool = True, mode: str = CENSOR_MODE_PIXELATE,
-    camera_id: str, clip_start: float,
 ) -> None:
     """Censor the clip at `in_path` into `out_path` (video pixelated/
     blurred; the SOURCE audio track is carried over — 2026-07-28
     product call: visuals are censored, sound stays).
-
-    `camera_id` (backend UUID) and `clip_start` (EPOCH capture time of
-    the clip's first frame) locate this clip's masks on the pod. They are
-    REQUIRED rather than defaulted: a wrong-but-plausible default here
-    would silently find no masks and cover every frame, which is exactly
-    the failure this path exists to remove, and it would look like a
-    rendering problem rather than a missing argument.
 
     ``keep_audio=False`` ships the clip SILENT. One caller uses it:
     an intimate-situation verdict, where the audio is itself the
@@ -916,20 +777,14 @@ async def censor_clip(
             raise CensorError(
                 "censor: research mode has no full-frame fallback"
             )
-        await _censor_person_mask_subprocess(
-            in_path, out_path, mode=mode,
-            camera_id=camera_id, clip_start=clip_start,
-        )
+        await _censor_person_mask_subprocess(in_path, out_path, mode=mode)
         if keep_audio:
             await _mux_source_audio(in_path, out_path)
         return
 
     if not full_frame:
         try:
-            await _censor_person_mask_subprocess(
-                in_path, out_path,
-                camera_id=camera_id, clip_start=clip_start,
-            )
+            await _censor_person_mask_subprocess(in_path, out_path)
             # Tier 1 writes video only, so silence is simply not muxing.
             if keep_audio:
                 await _mux_source_audio(in_path, out_path)
@@ -953,15 +808,10 @@ def _cli_main(argv: list[str] | None = None) -> int:
 
     Runs the synchronous censor pipeline and exits 0 on success,
     nonzero on any failure; the parent (`censor_clip`) maps nonzero /
-    timeout onto its tier-2 fallback. Heavy imports (cv2, httpx) are
-    lazy inside the pipeline functions, so importing this module
-    headless stays cheap and side-effect-free — no FastAPI app, no DB
-    engine.
-
-    The pod TOKEN is not an argument and must not become one: it is read
-    from `NEMARA_PERCEPTION_TOKEN` in the environment the parent built
-    (`_censor_child_env`), because argv is visible to every local user
-    via `ps`.
+    timeout onto its tier-2 fallback. Heavy imports (torch, cv2,
+    ultralytics) are already lazy inside the pipeline functions, so
+    importing this module headless stays cheap and side-effect-free —
+    no FastAPI app, no DB engine.
     """
     import argparse
 
@@ -980,7 +830,7 @@ def _cli_main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--full-frame",
         action="store_true",
-        help="skip person masking; blur the whole frame via ffmpeg",
+        help="skip person segmentation; blur the whole frame via ffmpeg",
     )
     parser.add_argument(
         "--mode",
@@ -988,40 +838,17 @@ def _cli_main(argv: list[str] | None = None) -> int:
         default=CENSOR_MODE_PIXELATE,
         help="pixelate (caregiver-facing clips) or research (B2 corpus)",
     )
-    parser.add_argument(
-        "--camera-id",
-        default="",
-        help="backend camera UUID — locates this camera's masks on the pod",
-    )
-    parser.add_argument(
-        "--clip-start",
-        type=float,
-        default=0.0,
-        help="epoch capture time of the clip's first frame",
-    )
-    parser.add_argument(
-        "--pod-url",
-        default="",
-        help="perception pod base URL (GET /masks)",
-    )
     args = parser.parse_args(argv)
-    pod_token = os.environ.get(_POD_TOKEN_ENV, "")
     try:
         if args.stream_i420:
             dims, _, rate = args.stream_i420.partition("@")
             w, _, h = dims.partition("x")
-            mask_stream_sync(
-                int(w), int(h), float(rate), args.out_path,
-                camera_id=args.camera_id, pod_url=args.pod_url,
-                pod_token=pod_token,
-            )
+            mask_stream_sync(int(w), int(h), float(rate), args.out_path)
         elif args.full_frame:
             asyncio.run(_censor_full_frame(args.in_path, args.out_path))
         else:
             _censor_person_mask_sync(
                 args.in_path, args.out_path, mode=args.mode,
-                camera_id=args.camera_id, clip_start=args.clip_start,
-                pod_url=args.pod_url, pod_token=pod_token,
             )
     except Exception:  # noqa: BLE001 — any failure = nonzero exit
         import traceback
