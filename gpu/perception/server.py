@@ -30,19 +30,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import hmac
-import json
 import logging
-import math
 import os
 import threading
 import time
 
 import cv2
 import numpy as np
-from fastapi import (
-    FastAPI, File, Form, Header, HTTPException, UploadFile, Request,
-)
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Request
 from fastapi.responses import JSONResponse
 
 from perception.face_worker import FaceWorker
@@ -59,26 +54,6 @@ _CKPT = os.environ.get(
     "NEMARA_SAM_CKPT", "/workspace/nemara/models/sam3.1_multiplex.pt",
 )
 _FACE_MODEL = os.environ.get("NEMARA_FACE_MODEL", "buffalo_l")
-# Bearer credential for GET /masks. Empty = open, which is what every
-# pod runs today and what the loopback-bound, tunnel-only deployment
-# already assumes. Deliberately NOT reusing the identity service's
-# contract module: `gpu/identity` is not shipped to the pod (pod.sh
-# deploy ships `perception/` only, and PYTHONPATH has no `identity`), so
-# importing it would be an ImportError at boot on the real host.
-_MASK_TOKEN = os.environ.get("NEMARA_PERCEPTION_TOKEN", "")
-
-
-def auth_ok(header_value: "str | None", configured_token: str) -> bool:
-    """True iff the caller may read masks. Empty configured token
-    disables auth; otherwise a constant-time compare of the Bearer
-    credential (no timing oracle)."""
-    if not configured_token:
-        return True
-    if not header_value or not header_value.startswith("Bearer "):
-        return False
-    return hmac.compare_digest(
-        header_value.removeprefix("Bearer "), configured_token,
-    )
 _face = FaceWorker(
     model_name=_FACE_MODEL,
     providers=os.environ.get(
@@ -268,7 +243,6 @@ def _observe_sync(
     detect_screens: bool = False,
     camera_id: str = "default",
     client_stamp: str = "UNSTAMPED",
-    capture_ts: "dict[int, float] | None" = None,
 ) -> dict:
     """The whole perception pass, run in a worker thread under
     `_perception_lock` so /health stays responsive while SAM grinds
@@ -343,48 +317,6 @@ def _observe_sync(
         session_out = session.observe(
             imgs, person_thr=person_thr, sam_pred=pred,
         )
-        # Retain this tick's per-frame masks for the event-gate censor
-        # (2026-08-06). They are already computed here and were dropped
-        # after the face pass; the backend then re-segmented the same
-        # pixels with a weaker model and, at seated distance, masked the
-        # whole frame green. Recorded before the loop mutates anything,
-        # and never allowed to break a tick.
-        #
-        # Stamped with the CALLER'S capture time (`capture_ts`, keyed by
-        # original frame index), not ours. The censor has to find the
-        # masks belonging to a clip window, and that window is timed on
-        # the backend's clock; stamping here would fold in both the
-        # capture→processing lag (seconds — `lag_s` ≈ 2.6 live) and the
-        # skew between two machines' clocks, and every frame would be
-        # matched to a mask from a couple of seconds earlier. A caller
-        # that sends no stamps still gets retention, on our clock, with
-        # exactly that sloppiness — degraded, not wrong.
-        try:
-            _t_tick = time.time()
-            _stamps = capture_ts or {}
-            for _pos, _dets in session_out.items():
-                if not _dets or _pos >= len(pos_to_orig):
-                    continue
-                _orig = pos_to_orig[_pos]
-                # Dimensions come off the mask arrays inside record_masks,
-                # NOT from `imgs[_pos]`. The masks are track-resolution
-                # (~640 wide) while the frame is full-res, and passing the
-                # frame's size here mislabelled every retained mask —
-                # see record_masks for what that looked like downstream.
-                continuous.record_masks(
-                    camera_id,
-                    _stamps.get(
-                        _orig,
-                        # Fallback: frames are ~evenly spaced within the
-                        # tick; the censor matches on a window, not on an
-                        # exact frame.
-                        _t_tick + (_pos / max(len(session_out), 1)),
-                    ),
-                    {tid: m for tid, (_bb, m) in _dets.items()},
-                )
-        except Exception:
-            log.warning("mask retention failed; censor falls back", exc_info=True)
-
         for pos in sorted(session_out):
             if pos >= len(pos_to_orig):
                 continue
@@ -656,32 +588,6 @@ async def faces(
     })
 
 
-def _parse_capture_ts(raw: str) -> "dict[int, float] | None":
-    """Parse the optional `capture_ts` form field ({"<idx>": epoch}).
-
-    Malformed input is DROPPED, never fatal: these stamps only sharpen
-    mask retention, and a perception tick must not fail over them. Size
-    is capped at the frame ceiling for the same reason /observe caps
-    frames — a hostile caller must not be able to grow a dict without
-    bound before we even decode a JPEG.
-    """
-    if not raw:
-        return None
-    try:
-        parsed = json.loads(raw)
-        if not isinstance(parsed, dict):
-            return None
-        out: dict[int, float] = {}
-        for k, v in list(parsed.items())[:_MAX_FRAMES]:
-            ts = float(v)
-            if math.isfinite(ts):
-                out[int(k)] = ts
-        return out or None
-    except (TypeError, ValueError):
-        log.warning("perception.capture_ts_unparseable — stamping locally")
-        return None
-
-
 @app.post("/observe")
 async def observe(
     request: Request,
@@ -691,7 +597,6 @@ async def observe(
     face_cap: int = Form(8),
     detect_screens: int = Form(0),
     camera_id: str = Form("default"),
-    capture_ts: str = Form(""),
 ) -> JSONResponse:
     """Run SAM perception on one tick's frames and return raw
     observations. Frame files MUST be named "<origidx>.jpg" — all
@@ -741,7 +646,6 @@ async def observe(
         payload = await asyncio.to_thread(
             _observe_sync, named_jpegs, person_thr, face_interval, face_cap,
             bool(detect_screens), camera_id, client_stamp,
-            _parse_capture_ts(capture_ts),
         )
     finally:
         global _last_request_ts
@@ -751,29 +655,3 @@ async def observe(
         code, msg = payload["_error"]
         raise HTTPException(code, msg)
     return JSONResponse(payload)
-
-
-@app.get("/masks/{camera_id}")
-def masks(
-    camera_id: str, t0: float, t1: float,
-    authorization: str | None = Header(default=None),
-) -> dict:
-    """Retained per-frame person masks in [t0, t1], RLE-encoded.
-
-    Serves the event-gate censor so it can mask a clip from the SAME
-    segmentation that tracks the person, instead of re-running a weaker
-    model on the same pixels. Empty list = nothing retained for that
-    window; the caller must treat that as "cannot censor" and fail closed.
-
-    Auth: `NEMARA_PERCEPTION_TOKEN` on both sides. Empty (the default,
-    and what every pod runs today) accepts every caller — which is what
-    the tunnel-only, loopback-bound deployment already assumes. This is
-    the one endpoint that hands out person SILHOUETTES rather than
-    consuming frames, so it is the one worth being able to close; set the
-    variable here and `NEMARA_PERCEPTION_MASK_TOKEN` on the backend and it
-    is closed, with no other change anywhere.
-    """
-    if not auth_ok(authorization, _MASK_TOKEN):
-        raise HTTPException(401, "bad or missing bearer token")
-    frames = continuous.masks_between(camera_id, t0, t1)
-    return {"camera_id": camera_id, "count": len(frames), "frames": frames}
