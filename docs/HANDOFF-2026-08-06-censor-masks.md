@@ -486,3 +486,56 @@ That is a gap, not a regression — before the change it alerted AND had no
 timeline. The natural follow-on is a generic summarizer for `record_only`
 customs (daily on/off spans per identifier), so "the caregiver sees it on the
 timeline" becomes true rather than aspirational.
+
+---
+
+## Environment detectors — a queued fix, currently MASKED (not done)
+
+No fix has been made. Recording it because the gate is inert today and will
+bite the moment anyone tunes it, and the failure is silent.
+
+### The mechanism
+`scheduler.py:219` gates every `subject_scope == "environment"` detector on
+whole-frame motion:
+```python
+if d.subject_scope == "environment":
+    if measurement_ok and signals.env_motion < settings.scheduler_env_motion_floor:
+        skipped.append((ident, "env_floor"))
+        continue
+```
+`scheduler_env_motion_floor` defaults to **0.0** and is NOT set in `.env`, so
+nothing is ever skipped. Parity. That is the only reason this has not shown up.
+
+### Why it breaks when the floor is raised
+Environment conditions are STATIC. `stove_left_on` (severity 74),
+`fire_smoke` (98), `env_hazard_water` (56), `env_hazard_glass` (62) are all
+`subject_scope=environment` and all describe a hazard that persists with ZERO
+motion.
+
+Raising the floor — which is the whole point of it as a cost lever — stops
+these detectors running exactly when the hazard is UNATTENDED. Nobody in the
+kitchen means no motion, which means the stove detector is skipped, which is
+precisely the case a caregiver needs. **Absence of motion is not absence of
+hazard; for environment detectors it is usually the opposite.**
+
+Person detectors do not have this problem: no person means nothing to detect.
+Environment detectors invert that, and the shared floor does not know the
+difference.
+
+### The queued fix (from the 2026-08-03 post-soak list)
+"env-detector latch & motion re-sample". Two halves:
+- **Latch**: once an environment condition is seen TRUE, keep it latched and
+  re-check on a TIMER rather than on motion, until it is seen false.
+- **Motion re-sample**: give environment detectors a periodic floor bypass so
+  a static hazard is re-examined every N ticks regardless of motion.
+
+The hard part noted at the time is the "trailing look" — deciding when a
+latched hazard has genuinely ended, when the evidence for its end is also
+static.
+
+### State right now
+Every environment detector on the test patient is `is_on = false`
+(`stove_left_on` among them), so none of this is live. If any is enabled for a
+pilot home, the floor must stay at 0.0 until the latch exists — otherwise the
+cost lever silently disables the highest-severity detectors in the catalogue
+(`fire_smoke` is severity 98).
