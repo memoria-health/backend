@@ -440,14 +440,27 @@ async def maybe_promote_analysis(
 
         # Criticality split (Aryaman 2026-07-28, from the soak's first
         # false fire — Watching TV attributed to a visiting aunt):
-        # NON-CRITICAL patient detectors (category=routine) FAIL-QUIET —
-        # they fire only when identity POSITIVELY confirms the patient in
-        # the clip, so a visitor's routine never lands on the patient's
-        # record. SAFETY detectors keep FAIL-LOUD semantics (fire unless
-        # the patient is confirmed elsewhere — the upstream skip): a fall
-        # must never be missed because a face wasn't visible.
+        # NON-CRITICAL patient detectors FAIL-QUIET — they fire only when
+        # identity POSITIVELY confirms the patient in the clip, so a
+        # visitor's routine never lands on the patient's record. SAFETY
+        # detectors keep FAIL-LOUD semantics (fire unless the patient is
+        # confirmed elsewhere — the upstream skip): a fall must never be
+        # missed because a face wasn't visible.
+        #
+        # Keyed on NOT-SAFETY, never on an enumeration of the quiet
+        # categories (2026-08-08). This read `category == "routine"`, and
+        # when 2026-08-05 added `behaviour` and `care` the gate silently
+        # stopped covering them — the compiler's identical
+        # stakes-vs-category conflation was fixed the SAME DAY, but this
+        # copy was missed. Found by soak: four "Laptop work" (behaviour)
+        # events fired with identity_patient_in_clip=false, one of them
+        # on a clip whose scene call read "the room is empty throughout"
+        # (people_count=0) while the crop call — cropped to a stale
+        # track — narrated a seated person into an empty room. A new
+        # category added tomorrow must default to fail-quiet, not to
+        # bypassing identity.
         if (det.subject_scope == "patient"
-                and det.category == "routine"
+                and det.category != "safety"
                 and not _is_truthy_bool(
                     detector_fields.get("identity_patient_in_clip"))):
             skipped.append(f"{ident}(patient_unconfirmed)")

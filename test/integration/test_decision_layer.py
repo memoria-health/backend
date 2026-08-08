@@ -319,3 +319,46 @@ async def test_safety_patient_custom_fails_loud_without_confirmation(
     )
     await session.commit()
     assert len(res.fired) == 1
+
+
+@pytest.mark.asyncio
+async def test_behaviour_and_care_patient_customs_fail_quiet_too(
+    client: AsyncClient, auth_user, session: AsyncSession,
+) -> None:
+    """The gate is keyed on NOT-safety, never on an enumerated list of
+    quiet categories (2026-08-08). It read `category == "routine"`, so
+    when 2026-08-05 added behaviour/care those bypassed identity
+    entirely — a behaviour custom ("Laptop work") evented four times
+    with identity_patient_in_clip=false, once on a clip whose scene
+    call read "the room is empty throughout". Any category that isn't
+    safety must fail quiet without a confirmed patient."""
+    patient_id, camera_id = await _setup_patient_with_camera(
+        client, auth_user, session,
+    )
+    now = datetime.now(timezone.utc)
+    for i, category in enumerate(("behaviour", "care")):
+        ident = f"custom_quiet_{category}"
+        await _add_detector(
+            session, patient_id, ident, is_sustained=False,
+            category=category, subject_scope="patient",
+        )
+        await session.commit()
+        res = await maybe_promote_analysis(
+            session, patient_id=patient_id, camera_id=camera_id,
+            occurred_at=now + timedelta(seconds=i * 40),
+            description="unconfirmed tick",
+            detector_fields=_fields(ident), settings=_V2,
+        )
+        await session.commit()
+        assert res.fired == [], f"{category} bypassed the identity gate"
+
+        f = _fields(ident)
+        f["identity_patient_in_clip"] = True
+        res2 = await maybe_promote_analysis(
+            session, patient_id=patient_id, camera_id=camera_id,
+            occurred_at=now + timedelta(seconds=i * 40 + 20),
+            description="confirmed tick",
+            detector_fields=f, settings=_V2,
+        )
+        await session.commit()
+        assert len(res2.fired) == 1, f"{category} blocked a confirmed patient"
