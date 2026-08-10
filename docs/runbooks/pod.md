@@ -16,22 +16,40 @@ mkdir -p .pod                     # holds the SSH key + pinned known_hosts
 `.pod.env` and `.pod/` are gitignored — never commit them. `.pod.env`
 holds the RunPod API key and the pod's direct-TCP endpoint.
 
-## 1. Daily cost control — stop when idle, start to use
-
-The pod has **no persistent network volume** (`volumeInGb=0`), so
-everything (models, venvs, code) lives on the 70 GB container disk. On
-RunPod Secure Cloud, **stop** retains that disk and **start** resumes it —
-so this is safe and reversible:
+## 1. Daily cost control — stop when idle, and the catch
 
 ```bash
-scripts/pod.sh stop      # billing off  (desiredStatus -> EXITED)
-scripts/pod.sh start     # billing on   (desiredStatus -> RUNNING)
+scripts/pod.sh up        # start + rediscover endpoint + re-pin + wait healthy
+scripts/pod.sh down      # billing off (desiredStatus -> EXITED)
 scripts/pod.sh status    # check desiredStatus + $/hr
 ```
 
-Give it ~60–90 s after `start` before the server answers. If the
-container disk is ever reclaimed while stopped (rare on Secure Cloud),
-rebuild with §3.
+Always use `up`, never bare `start`. Two traps it handles that manual
+bring-up does not:
+
+**⚠️ Stopping is NOT reliably reversible.** A stopped Secure Cloud pod
+holds **no GPU reservation**. The GPU goes back to the host machine, and
+if the host reallocates it, `podResume` fails with *"There are not enough
+free GPUs on the host machine to start this pod"* and the pod stays
+EXITED until one frees up **on that same physical host**. Hit for real on
+2026-08-10: the pod would not come back, with no ETA. `up` retries for
+~10 min (`RESUME_TRIES=90` for longer) and prints the real reason.
+If it stays stuck, rebuild on a different host with §3 (~40 min).
+So: stopping overnight to save $0.44/hr is a genuine gamble against
+needing the pod back on a schedule. Weigh ~$320/mo against that.
+
+**The endpoint moves.** RunPod assigns the direct-TCP `ip:port` only when
+the pod reaches RUNNING (`runtime` is `null` while stopped) and reassigns
+it across restarts. So `POD_HOST`/`POD_PORT` in `.pod.env` are stale the
+moment you stop, and the pinned host key no longer matches — ssh then
+refuses, correctly, because RunPod recycles those endpoints across
+tenants. `up` rediscovers the endpoint from the API, rewrites `.pod.env`
+(backing it up) and re-scans the host key, so nobody has to remember any
+of this.
+
+Storage: the pod now has a **20 GB network volume** (`volumeInGb=20`)
+alongside the 70 GB container disk; the volume survives independently.
+Give it ~60–90 s after `up` before the server answers.
 
 ## 2. Deploy code changes
 
