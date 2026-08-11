@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hmac
 import logging
 import os
 import threading
@@ -49,6 +50,55 @@ logging.basicConfig(
 )
 
 app = FastAPI(title="nemara-sam-perception-v2")
+
+# ── Bearer auth ────────────────────────────────────────────────────────
+# /observe takes patient frames and /faces returns face embeddings, and
+# until 2026-08-11 neither had ANY authentication. That was survivable only
+# because the server binds 127.0.0.1 and the sole route in was an ssh
+# tunnel — i.e. the security property lived in a deployment detail, not in
+# the service. Split the services, run anything else on the box, or set
+# PERCEPTION_HOST=0.0.0.0 for one debug session, and it was wide open with
+# nothing complaining.
+#
+# Deliberately NOT imported from identity.contract: perception is the lower
+# layer and must not depend on the brain. Eight lines of hmac is a better
+# trade than that coupling. Same semantics as contract.auth_ok, including
+# "empty token disables auth" — see the boot warning below.
+_AUTH_TOKEN = os.environ.get("NEMARA_PERCEPTION_TOKEN", "").strip()
+
+
+def _auth_ok(header_value: str | None) -> bool:
+    """True iff the caller may use the perception API.
+
+    Constant-time compare (hmac.compare_digest) — no timing oracle on the
+    token.
+    """
+    if not _AUTH_TOKEN:
+        return True
+    if not header_value or not header_value.startswith("Bearer "):
+        return False
+    return hmac.compare_digest(
+        header_value.removeprefix("Bearer "), _AUTH_TOKEN,
+    )
+
+
+def _require_auth(request: Request) -> None:
+    """Raise 401 unless the request carries the shared bearer.
+
+    /health is deliberately left open: it carries no patient data and is
+    what a supervisor and the container healthcheck poll.
+    """
+    if not _auth_ok(request.headers.get("authorization")):
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+
+if not _AUTH_TOKEN:
+    log.warning(
+        "perception.auth_disabled — NEMARA_PERCEPTION_TOKEN is unset, so "
+        "/observe and /faces accept EVERY caller. Safe only while bound to "
+        "loopback (host=%s). Set the token before exposing this port.",
+        os.environ.get("PERCEPTION_HOST", "127.0.0.1"),
+    )
 
 _CKPT = os.environ.get(
     "NEMARA_SAM_CKPT", "/workspace/nemara/models/sam3.1_multiplex.pt",
@@ -502,6 +552,7 @@ def _observe_sync(
 
 @app.post("/faces")
 async def faces(
+    request: Request,
     frame: UploadFile = File(...),
     boxes: str = Form(...),
     full: str = Form("0"),
@@ -525,6 +576,7 @@ async def faces(
     """
     import json as _json
 
+    _require_auth(request)
     if not _ready:
         raise HTTPException(503, "service warming up")
     raw = await frame.read()
@@ -605,6 +657,9 @@ async def observe(
     passes at a time (default 1); calls for the SAME camera serialise on
     that camera's session lock regardless, since a session's tick
     counter, id allocator and carried masks are read-modify-write."""
+    # Before the frame reads: an unauthorized caller should not be able to
+    # make us decode its uploads.
+    _require_auth(request)
     if not _ready:
         raise HTTPException(503, "service warming up")
     if len(frames) > _MAX_FRAMES:

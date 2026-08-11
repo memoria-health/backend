@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 
 import httpx
 import numpy as np
@@ -73,6 +74,14 @@ class SamServiceClient:
         self._client.headers["X-Nemara-Client"] = (
             f"identity-service@{socket.gethostname()}"
         )
+        # Perception grew bearer auth on 2026-08-11. Same shared-token shape
+        # as /state, and same "empty disables it" semantics on the server, so
+        # an unset token leaves dev exactly as it was. Sent on every request
+        # via the client's default headers rather than per-call, so a new
+        # endpoint cannot forget it.
+        _tok = os.environ.get("NEMARA_PERCEPTION_TOKEN", "").strip()
+        if _tok:
+            self._client.headers["Authorization"] = f"Bearer {_tok}"
         self._expected_face_model = expected_face_model
 
     async def aclose(self) -> None:
