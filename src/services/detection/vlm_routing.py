@@ -37,19 +37,30 @@ _VALID = ("gemini", "openai", "openrouter", "dashscope")
 _CHAINS: dict[str, tuple[str, ...]] = {
     # Gemini path: primary model (gemini_model, e.g. flash-lite) → fallback model
     # (gemini_fallback_model, e.g. flash) on the SAME native-video path → DashScope
-    # (Alibaba-direct Qwen3-VL, ALSO native video) → OpenRouter (frame-based Qwen)
+    # (Alibaba-direct Qwen3-VL, ALSO native video) → OpenAI (frame-based)
     # only as a last-resort net so detection never goes fully dark. Immediate
     # failover on first error, no retry. `gemini_fallback` is a chain-internal
     # token (NOT a user choice); run_vlm reports it as "gemini". A keyless
     # provider (e.g. DashScope) raises immediately, is caught, and the chain
-    # moves on — so keyless environments still fail through to openrouter.
-    "gemini": ("gemini", "gemini_fallback", "dashscope", "openrouter"),
-    "openai": ("openai", "openrouter"),
+    # moves on — so keyless environments still fail through to openai.
+    #
+    # OpenRouter was retired as the net (Aryaman 2026-08-11): its key was
+    # part of the f1c0564 leak, the routed Qwen was measured poor out of
+    # the box, and OpenAI already earns its keep here (compile path +
+    # opt-in accounts). It survives only as an explicit account CHOICE
+    # below. Two honest limits of the remaining net: gemini and
+    # gemini_fallback share ONE credential/account, so those two tiers
+    # are not independent against key/quota/billing failures — and the
+    # OpenAI tier is frame-sampling, so a failover tick loses native
+    # video pacing and audio (the executor already marks
+    # `sched_degraded_audio` when that happens).
+    "gemini": ("gemini", "gemini_fallback", "dashscope", "openai"),
+    "openai": ("openai", "gemini"),
     "openrouter": ("openrouter", "dashscope", "gemini"),
-    # SANDBOX: Alibaba-direct Qwen3-VL (native video + fps) primary, OpenRouter
+    # SANDBOX: Alibaba-direct Qwen3-VL (native video + fps) primary, OpenAI
     # fallback so detection never goes dark if DashScope errors or the model
     # isn't activated on the account yet.
-    "dashscope": ("dashscope", "openrouter"),
+    "dashscope": ("dashscope", "openai"),
 }
 
 # caregiver_id -> (provider, expiry_monotonic). Module-level so it survives

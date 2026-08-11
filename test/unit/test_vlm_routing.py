@@ -1,6 +1,8 @@
 """run_vlm fallback-chain order for the gemini path:
 
-    gemini(primary model) → gemini(fallback model) → dashscope → openrouter
+    gemini(primary model) → gemini(fallback model) → dashscope → openai
+(openrouter retired as the net 2026-08-11 — leaked key + measured-poor Qwen;
+OpenAI is the cross-vendor last resort now)
 
 with IMMEDIATE failover (no retry), and the flash tier reported as the existing
 ``"gemini"`` provider value (the analyses.provider CHECK constraint has no
@@ -67,7 +69,7 @@ async def test_gemini_chain_order_on_total_failure(monkeypatch) -> None:
         ("gemini", "flash-lite"),   # primary model
         ("gemini", "flash"),        # fallback model — SAME provider, immediate
         ("dashscope", None),        # native-video Qwen
-        ("openrouter", None),       # last-resort net
+        ("openai", None),           # last-resort net (openrouter retired)
     ]
 
 
