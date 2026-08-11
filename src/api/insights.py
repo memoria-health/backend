@@ -216,7 +216,7 @@ async def event_timeline(
     ids = await _scoped_ids(session, auth, patient_id)
     rows = (await session.execute(text(
         """
-        select to_char(occurred_at, 'YYYY-MM-DD HH24:MI') as ts,
+        select to_char(occurred_at, 'YYYY-MM-DD HH24\:MI') as ts,
                to_char(occurred_at::date, 'YYYY-MM-DD') as date,
                category as type,
                title,
@@ -320,9 +320,107 @@ async def offline_cameras(
     rows = (await session.execute(text(
         """
         select coalesce(c.room, 'Camera') as room, p.full_name as patient,
-               to_char(coalesce(c.last_seen_at, c.created_at), 'Mon DD HH24:MI') as last_seen
+               to_char(coalesce(c.last_seen_at, c.created_at), 'Mon DD HH24\:MI') as last_seen
         from cameras c join patients p on p.id = c.patient_id
         where not c.disabled and not c.online and c.patient_id = any(:ids)
         order by c.last_seen_at desc nulls last limit 40
         """), {"ids": ids})).mappings().all()
     return [dict(r) for r in rows]
+
+
+@router.get("/home-data")
+async def home_data(
+    auth: CaregiverAuth, session: SessionDep,
+    patient_id: str | None = None,
+) -> dict[str, Any]:
+    """Raw payload for the family home view — the web route keeps every
+    line of its composition (status verdict, streaks, wake math, the
+    LLM briefing) and only swaps where the rows come from. Serving raw
+    rows rather than the finished view is deliberate: the prose and
+    verdict logic is presentation, and presentation churn should never
+    need a backend deploy."""
+    ids = await _scoped_ids(session, auth, patient_id)
+    if not ids:
+        raise HTTPException(status_code=404, detail="no_patients")
+    if patient_id is None:
+        # Most recently active patient — a real family account has one.
+        row = (await session.execute(text(
+            """
+            select p.id from patients p
+            left join events e on e.patient_id = p.id
+            where p.id = any(:ids)
+            group by p.id order by max(e.occurred_at) desc nulls last limit 1
+            """), {"ids": ids})).first()
+        if row is None:
+            raise HTTPException(status_code=404, detail="no_patients")
+        ids = [row[0]]
+    pid = ids[0]
+
+    patient = (await session.execute(text(
+        "select id, full_name, preferred_name from patients where id = :pid"),
+        {"pid": pid})).mappings().one()
+    cams = (await session.execute(text(
+        """select count(*)::int as total, count(*) filter (where online)::int as online
+           from cameras where not disabled and patient_id = :pid"""),
+        {"pid": pid})).mappings().one()
+    serious = ("(title ilike '%fall%' or title ilike '%chok%' or "
+               "title ilike '%stroke%' or title ilike '%heart%' or "
+               "title ilike '%seizure%')")
+    recent = (await session.execute(text(
+        f"""select title, occurred_at, reviewed, {serious} as serious
+            from events where patient_id = :pid
+              and occurred_at >= now() - interval '24 hours'
+            order by occurred_at desc limit 20"""),
+        {"pid": pid})).mappings().all()
+    last_fall = (await session.execute(text(
+        "select max(occurred_at) as last from events "
+        "where patient_id = :pid and title ilike '%fall%'"),
+        {"pid": pid})).mappings().one()
+    night = ("(extract(hour from occurred_at) >= 22 or "
+             "extract(hour from occurred_at) < 6)")
+    nights = (await session.execute(text(
+        f"""select distinct (occurred_at - interval '6 hours')::date as night
+            from events where patient_id = :pid and {night}
+              and occurred_at >= now() - interval '60 days'"""),
+        {"pid": pid})).mappings().all()
+    feed = (await session.execute(text(
+        """select e.title, e.narrative, e.occurred_at, c.room
+           from events e left join cameras c on c.id = e.camera_id
+           where e.patient_id = :pid
+             and e.occurred_at >= now() - interval '30 days'
+           order by e.occurred_at desc limit 15"""),
+        {"pid": pid})).mappings().all()
+    wakes = (await session.execute(text(
+        """select a.captured_at::date as day,
+                  min(extract(hour from a.captured_at) + extract(minute from a.captured_at)/60.0)
+                    filter (where a.people_present and extract(hour from a.captured_at) >= 4) as wake
+           from analyses a join cameras c on c.id = a.camera_id
+           where c.patient_id = :pid
+             and a.captured_at >= now() - interval '14 days'
+           group by 1 order by 1 desc"""),
+        {"pid": pid})).mappings().all()
+
+    return {
+        "patient": {"id": str(patient["id"]),
+                    "full_name": patient["full_name"],
+                    "preferred_name": patient["preferred_name"]},
+        "cameras": {"total": cams["total"], "online": cams["online"]},
+        "recent": [
+            {"title": r["title"], "occurred_at": r["occurred_at"].isoformat(),
+             "reviewed": bool(r["reviewed"]), "serious": bool(r["serious"])}
+            for r in recent
+        ],
+        "last_fall_at": (last_fall["last"].isoformat()
+                         if last_fall["last"] else None),
+        "event_nights": [str(r["night"]) for r in nights],
+        "feed": [
+            {"title": r["title"], "narrative": r["narrative"],
+             "occurred_at": r["occurred_at"].isoformat(), "room": r["room"]}
+            for r in feed
+        ],
+        "wakes": [
+            {"day": str(r["day"]),
+             "wake": float(r["wake"]) if r["wake"] is not None else None}
+            for r in wakes
+        ],
+    }

@@ -107,3 +107,84 @@ async def test_shapes_match_web_data_layer(
     assert (await client.get(
         f"/v1/insights/activity-trend?patient_id={pid}&days=100000",
         headers=h)).status_code == 200
+
+
+# ── widget engine + home-data (the BYPASSRLS-retirement surface) ─────
+
+@pytest.mark.asyncio
+async def test_widget_data_scope_and_shapes(
+    client: AsyncClient, auth_user_factory,
+) -> None:
+    h_a, pid_a = await _caregiver_with_patient(client, auth_user_factory)
+    h_b, pid_b = await _caregiver_with_patient(client, auth_user_factory)
+
+    # Foreign patient in `source.patient` AND in `compareWith` → 404.
+    for source in (
+        {"metric": "activity", "patient": pid_b},
+        {"patient": pid_a, "compareWith": pid_b, "days": 7},
+    ):
+        r = await client.post("/v1/insights/widget-data",
+                              headers=h_a, json={"source": source})
+        assert r.status_code == 404, source
+
+    # Default events series: zero-filled to the full window.
+    r = (await client.post("/v1/insights/widget-data", headers=h_a,
+                           json={"source": {"days": 7}})).json()
+    assert r["kind"] == "series" and r["terms"] == ["events"]
+    assert len(r["rows"]) == 7
+    assert all(row["events"] == 0 for row in r["rows"])
+    assert r["statValue"] == "0"
+
+    # byHour: exactly 24 buckets.
+    r = (await client.post("/v1/insights/widget-data", headers=h_a,
+                           json={"source": {"byHour": True}})).json()
+    assert len(r["rows"]) == 24 and r["rows"][0]["bucket"] == "00:00"
+
+    # byDow: labeled Mon..Sun.
+    r = (await client.post("/v1/insights/widget-data", headers=h_a,
+                           json={"source": {"byDow": True}})).json()
+    assert [x["bucket"] for x in r["rows"]] == [
+        "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+    # daysSince with no matches: the honest unavailable answer.
+    r = (await client.post("/v1/insights/widget-data", headers=h_a,
+                           json={"source": {"metric": "daysSince",
+                                            "terms": ["fall"]}})).json()
+    assert r["statValue"] is None and "unavailable" in r
+
+    # activity byHour: 24 buckets, percent unit.
+    r = (await client.post("/v1/insights/widget-data", headers=h_a,
+                           json={"source": {"metric": "activity",
+                                            "byHour": True,
+                                            "patient": pid_a}})).json()
+    assert r["unit"] == "%" and len(r["rows"]) == 24
+
+    # Term sanitiser: quotes stripped, no SQL error, empty result.
+    r = await client.post(
+        "/v1/insights/widget-data", headers=h_a,
+        json={"source": {"terms": ["fall'; drop table events; --"],
+                         "days": 7}})
+    assert r.status_code == 200
+    assert r.json()["statValue"] == "0"
+
+
+@pytest.mark.asyncio
+async def test_home_data_scope_and_shape(
+    client: AsyncClient, auth_user_factory,
+) -> None:
+    h_a, pid_a = await _caregiver_with_patient(client, auth_user_factory)
+    h_b, pid_b = await _caregiver_with_patient(client, auth_user_factory)
+
+    r = await client.get(
+        f"/v1/insights/home-data?patient_id={pid_b}", headers=h_a)
+    assert r.status_code == 404
+
+    r = (await client.get("/v1/insights/home-data", headers=h_a))
+    assert r.status_code == 200
+    d = r.json()
+    assert d["patient"]["id"] == pid_a          # default pick = own patient
+    assert set(d) == {"patient", "cameras", "recent", "last_fall_at",
+                      "event_nights", "feed", "wakes"}
+    assert d["cameras"] == {"total": 0, "online": 0}
+    assert d["recent"] == [] and d["feed"] == [] and d["wakes"] == []
+    assert d["last_fall_at"] is None
