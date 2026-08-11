@@ -89,6 +89,69 @@ def is_configured(settings: "Settings") -> bool:
     return bool(settings.pagerduty_routing_key)
 
 
+async def trigger_keyed(
+    *,
+    settings: "Settings",
+    dedup_key: str,
+    source: str,
+    summary: str,
+    link_url: str | None = None,
+    details: dict[str, Any] | None = None,
+    severity: str = "critical",
+    link_text: str = "Review and decide",
+) -> bool:
+    """Open (or update) one PagerDuty incident, keyed by an arbitrary string.
+
+    The event gate keys on an event id, but it is not the only thing worth
+    paging about: a GPU node that stops heartbeating leaves homes with no
+    identity, and until this existed nothing told a human. Rather than a
+    second copy of the payload and retry handling, both go through here.
+
+    The dedup_key namespace is shared, so callers prefix it (`node:<id>`,
+    or a bare event uuid for the gate). Two different subsystems colliding
+    on one key would silently collapse two incidents into one, and settling
+    either would hide the other.
+    """
+    if not is_configured(settings):
+        log.warning(
+            "pager.skip reason=not_configured key=%s — NOBODY is being told",
+            dedup_key,
+        )
+        return False
+    if severity not in _VALID_SEVERITIES:
+        severity = "critical"
+
+    payload: dict[str, Any] = {
+        "routing_key": settings.pagerduty_routing_key,
+        "event_action": "trigger",
+        "dedup_key": dedup_key,
+        "payload": {
+            "summary": summary[:1024],
+            "source": source,
+            "severity": severity,
+            "custom_details": details or {},
+        },
+    }
+    if link_url:
+        payload["links"] = [{"href": link_url, "text": link_text}]
+    return await _post(payload, settings=settings, action="trigger", key=dedup_key)
+
+
+async def resolve_keyed(*, settings: "Settings", dedup_key: str) -> bool:
+    """Close an incident by key. A resolve for an unknown key is a no-op at
+    PagerDuty, so callers need not track whether the trigger ever landed."""
+    if not is_configured(settings):
+        return False
+    return await _post(
+        {
+            "routing_key": settings.pagerduty_routing_key,
+            "event_action": "resolve",
+            "dedup_key": dedup_key,
+        },
+        settings=settings, action="resolve", key=dedup_key,
+    )
+
+
 async def trigger(
     *,
     settings: "Settings",
@@ -114,24 +177,15 @@ async def trigger(
             event_id,
         )
         return False
-    if severity not in _VALID_SEVERITIES:
-        severity = "critical"
-
-    payload: dict[str, Any] = {
-        "routing_key": settings.pagerduty_routing_key,
-        "event_action": "trigger",
-        "dedup_key": str(event_id),
-        "payload": {
-            "summary": summary[:1024],
-            "source": "memoria-event-gate",
-            "severity": severity,
-            "custom_details": details or {},
-        },
-    }
-    if link_url:
-        payload["links"] = [{"href": link_url, "text": "Review and decide"}]
-
-    return await _post(payload, settings=settings, action="trigger", event_id=event_id)
+    return await trigger_keyed(
+        settings=settings,
+        dedup_key=str(event_id),
+        source="memoria-event-gate",
+        summary=summary,
+        link_url=link_url,
+        details=details,
+        severity=severity,
+    )
 
 
 async def resolve(*, settings: "Settings", event_id: UUID) -> bool:
@@ -140,14 +194,7 @@ async def resolve(*, settings: "Settings", event_id: UUID) -> bool:
     dedup_key as a no-op, so callers don't need to track whether the
     trigger landed.
     """
-    if not is_configured(settings):
-        return False
-    payload = {
-        "routing_key": settings.pagerduty_routing_key,
-        "event_action": "resolve",
-        "dedup_key": str(event_id),
-    }
-    return await _post(payload, settings=settings, action="resolve", event_id=event_id)
+    return await resolve_keyed(settings=settings, dedup_key=str(event_id))
 
 
 async def _post(
@@ -155,22 +202,22 @@ async def _post(
     *,
     settings: "Settings",
     action: str,
-    event_id: UUID,
+    key: str,
 ) -> bool:
     try:
         client = await _get_client()
         response = await client.post(settings.pagerduty_events_url, json=payload)
     except Exception:  # noqa: BLE001 — paging must never break the caller
-        log.exception("pager.transport_error action=%s event=%s", action, event_id)
+        log.exception("pager.transport_error action=%s key=%s", action, key)
         return False
 
     # 202 is the documented success. Anything else means the operator
     # is not being told, which matters enough to log at warning.
     if response.status_code != 202:
         log.warning(
-            "pager.rejected action=%s event=%s status=%d body=%s",
-            action, event_id, response.status_code, response.text[:300],
+            "pager.rejected action=%s key=%s status=%d body=%s",
+            action, key, response.status_code, response.text[:300],
         )
         return False
-    log.info("pager.%s event=%s", action, event_id)
+    log.info("pager.%s key=%s", action, key)
     return True

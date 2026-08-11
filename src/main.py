@@ -110,6 +110,7 @@ from src.services import clip_archival, email, event_gate, pager, push
 from src.services.data_collection import manager as recorder_manager
 from src.services.detection.presence_cache import PresenceCache
 from src.services.detection.presence_sweeper import PresenceSweeper
+from src.services.identity.fleet_watch import FleetWatch
 from src.services.detection.worker import DetectorWorker
 from src.services.scheduling.scheduler import ScheduledDetectorRunner
 from src.settings import get_settings
@@ -205,9 +206,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.gate_sweeper = gate_sweeper
     await gate_sweeper.start()
+    # Dead-man watch over the GPU nodes. Identity fails OPEN, so a node
+    # that dies costs its homes their routine detections while everything
+    # keeps looking healthy — that is how the 2026-07-26 OOM went unnoticed
+    # for hours. Nothing else notices, so this does.
+    fleet_watch = FleetWatch(
+        settings=get_settings(), sessionmaker=get_sessionmaker(),
+    )
+    app.state.fleet_watch = fleet_watch
+    await fleet_watch.start()
     try:
         yield
     finally:
+        await fleet_watch.stop()
         await gate_sweeper.stop()
         await presence_sweeper.stop()
         await scheduler.stop()

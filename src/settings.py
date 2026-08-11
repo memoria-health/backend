@@ -350,6 +350,10 @@ class Settings(BaseSettings):
     # other on a slow poll and every home pays a ~30-60s re-ground for
     # nothing. 90s against a 30s poll gives two misses of slack.
     identity_roster_stale_after_s: int = Field(ge=30, le=900, default=90)
+    # How often FleetWatch asks whether any home has no node. Cheap (four
+    # counting queries) and deliberately slower than the roster poll, so a
+    # normal failover completes between two checks and never pages.
+    identity_fleet_watch_seconds: int = Field(ge=15, le=3600, default=120)
     identity_state_url: str = Field(default="http://host.docker.internal:8012")
     # HTTP proxy used ONLY for calls to identity nodes. On Railway that is
     # tailscaled's --outbound-http-proxy-listen, which is how a container
