@@ -121,9 +121,14 @@ _gql() {  # $1 = graphql query/mutation string
 _rest() {  # $1=method $2=path $3=json-body-or-empty
   local m="$1" p="$2" b="${3:-}"
   if [[ -n "$b" ]]; then
-    curl -s --max-time 60 -X "$m" "https://rest.runpod.io/v1$p" \
+    # Body goes in on STDIN (`@-`), not as `-d "$b"`. The create body carries
+    # the node's whole environment — DB URL, LiveKit secret, HF token — and
+    # an argument is visible in `ps` to every other process on this machine
+    # for as long as the request runs. This is the same rule the release
+    # command follows for its own inputs a few lines below.
+    printf '%s' "$b" | curl -s --max-time 60 -X "$m" "https://rest.runpod.io/v1$p" \
       -H "Authorization: Bearer $RUNPOD_API_KEY" \
-      -H "Content-Type: application/json" -d "$b"
+      -H "Content-Type: application/json" --data-binary @-
   else
     curl -s --max-time 60 -X "$m" "https://rest.runpod.io/v1$p" \
       -H "Authorization: Bearer $RUNPOD_API_KEY"
@@ -152,9 +157,41 @@ case "${1:-}" in
     # that shows up in shell history or `ps`.
     for v in NEMARA_DB_URL NEMARA_LIVEKIT_URL NEMARA_LIVEKIT_API_KEY \
              NEMARA_LIVEKIT_API_SECRET NEMARA_IDENTITY_STATE_TOKEN \
-             NEMARA_IDENTITY_ROOMS HUGGINGFACE_TOKEN; do
+             HUGGINGFACE_TOKEN; do
       [[ -n "${!v:-}" ]] || { echo "pod.sh release: $v not set in $ENV_FILE" >&2; exit 2; }
     done
+
+    # ── roster mode is the only thing worth releasing ──────────────────
+    # The entrypoint falls back to a STATIC room list when NEMARA_BACKEND_URL
+    # is unset, and that fallback is for a local `docker run`, not for a node
+    # on real homes: a statically-pinned node cannot be scaled, cannot be
+    # failed over, and holds its rooms even after the backend has reassigned
+    # them elsewhere — two nodes serving one home, both writing seats.
+    #
+    # Releasing that by accident is easy and silent, so it is refused here.
+    # NEMARA_IDENTITY_ROOMS is no longer required (and is not forwarded):
+    # in roster mode the backend decides, and shipping a stale list alongside
+    # it only invites the two to disagree.
+    for v in NEMARA_BACKEND_URL NEMARA_INTERNAL_SERVICE_KEY; do
+      [[ -n "${!v:-}" ]] || {
+        echo "pod.sh release: $v not set in $ENV_FILE" >&2
+        echo "  a node released without it boots the STATIC fallback: it never polls" >&2
+        echo "  the roster, so it cannot be scaled or failed over." >&2
+        exit 2; }
+    done
+    # TS_AUTHKEY is not optional in roster mode either — the node derives the
+    # base_url the backend dials from its tailnet name, and without a tailnet
+    # it has no reachable address to register and refuses to start.
+    [[ -n "${TS_AUTHKEY:-}" ]] || {
+      echo "pod.sh release: TS_AUTHKEY not set in $ENV_FILE" >&2
+      echo "  the backend reaches identity over the tailnet; without it the node" >&2
+      echo "  has no address to register and will exit on boot." >&2
+      exit 2; }
+
+    # NEMARA_NODE_ID and NEMARA_NODE_BASE_URL are deliberately NOT sent: the
+    # pod id does not exist until the API call below returns, and the tailnet
+    # name is not assigned until tailscaled authenticates. The entrypoint
+    # derives both at boot, when they are actually knowable.
 
     # Exported so the heredoc's python can read them; they are shell locals
     # otherwise. Secrets go via the environment, never argv — argv is visible
@@ -167,10 +204,11 @@ import json, os
 env = {k: os.environ[k] for k in (
     "NEMARA_DB_URL", "NEMARA_LIVEKIT_URL", "NEMARA_LIVEKIT_API_KEY",
     "NEMARA_LIVEKIT_API_SECRET", "NEMARA_IDENTITY_STATE_TOKEN",
-    "NEMARA_IDENTITY_ROOMS", "HUGGINGFACE_TOKEN",
+    "NEMARA_BACKEND_URL", "NEMARA_INTERNAL_SERVICE_KEY", "TS_AUTHKEY",
+    "HUGGINGFACE_TOKEN",
 ) if os.environ.get(k)}
-for opt in ("TS_AUTHKEY", "NEMARA_PERCEPTION_TOKEN",
-            "NEMARA_PERCEPTION_CONCURRENCY"):
+for opt in ("NEMARA_PERCEPTION_TOKEN", "NEMARA_PERCEPTION_CONCURRENCY",
+            "NEMARA_NODE_CAPACITY", "NEMARA_ROSTER_POLL_S", "TS_HOSTNAME"):
     if os.environ.get(opt):
         env[opt] = os.environ[opt]
 print(json.dumps({

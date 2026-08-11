@@ -22,15 +22,22 @@
 # blind home, not all of them.
 #
 # REQUIRED ENV
-#   NEMARA_IDENTITY_ROOMS        static fallback only — comma-separated room
-#                                ids. Unused when NEMARA_BACKEND_URL is set,
-#                                which is how production runs.
 #   NEMARA_IDENTITY_STATE_TOKEN  bearer for /state — MUST be set
 #   NEMARA_DB_URL                face-enrollment gallery
 #   NEMARA_LIVEKIT_URL / _API_KEY / _API_SECRET
 #   HUGGINGFACE_TOKEN            first boot only, gated facebook/sam3.1
+# ROSTER MODE (production) — set NEMARA_BACKEND_URL to select it
+#   NEMARA_BACKEND_URL           e.g. https://api.memoria-health.com
+#   NEMARA_INTERNAL_SERVICE_KEY  shared secret for the roster poll
+#   TS_AUTHKEY                   required in practice: the tailnet name is
+#                                what the backend dials, and this node
+#                                DERIVES both its id and that name below
+# STATIC MODE (bring-up / local docker run) — used when the above is unset
+#   NEMARA_IDENTITY_ROOMS        comma-separated room ids
 # OPTIONAL
-#   TS_AUTHKEY                   tagged key; tailscale skipped when unset
+#   NEMARA_NODE_ID               overrides the RunPod pod id
+#   NEMARA_NODE_BASE_URL         overrides the derived tailnet address
+#   NEMARA_NODE_CAPACITY         homes this node accepts (default 4)
 #   NEMARA_PERCEPTION_CONCURRENCY  passes admitted at once (default 1)
 #   NEMARA_STATE_DIR             writable state, default /persist/state
 set -uo pipefail
@@ -110,7 +117,61 @@ curl -sf -m 2 -o /dev/null "http://127.0.0.1:${PERCEPTION_PORT:-8000}/health" \
 # The static list is the fallback for a node with no backend to talk to
 # (bring-up, a local docker run, debugging a single home).
 if [ -n "${NEMARA_BACKEND_URL:-}" ]; then
-  log "identity: roster mode (backend=$NEMARA_BACKEND_URL)"
+  # ── who am I, and where can the backend reach me? ────────────────────
+  # Both are DERIVED HERE rather than passed in, because neither exists at
+  # the moment the node is created: `pod.sh release` calls the RunPod API
+  # and only learns the pod id from the response, and the tailnet name is
+  # not assigned until tailscaled has authenticated. Anything passed in at
+  # create time would be a guess.
+
+  # RunPod injects RUNPOD_POD_ID into every container. It is the right node
+  # identity because it is stable across container restarts of the SAME pod
+  # — so a restarting node re-claims its own homes instead of appearing as
+  # a stranger and waiting out the staleness window while they sit blind.
+  export NEMARA_NODE_ID="${NEMARA_NODE_ID:-${RUNPOD_POD_ID:-}}"
+  if [ -z "$NEMARA_NODE_ID" ]; then
+    log "FATAL: roster mode needs NEMARA_NODE_ID and RUNPOD_POD_ID is unset"
+    log "       (not on RunPod? pass NEMARA_NODE_ID explicitly)"
+    exit 1
+  fi
+
+  # base_url is what the backend will dial. Ask tailscaled for the name it
+  # was actually GIVEN rather than assuming it matches TS_HOSTNAME —
+  # Tailscale appends a suffix (`-1`, `-2`) when the name is already taken,
+  # which happens routinely when a replaced node's old record is still
+  # present. Guessing there would register an address that resolves to the
+  # DEAD node, and every home on this one would look assigned and be blind.
+  if [ -z "${NEMARA_NODE_BASE_URL:-}" ] && [ -n "${TS_AUTHKEY:-}" ]; then
+    log "waiting for a tailnet name"
+    for _ in $(seq 1 60); do
+      TS_NAME="$(tailscale --socket=/var/run/tailscale/tailscaled.sock status --json 2>/dev/null \
+        | python3 -c 'import json,sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(0)
+# Only trust the name once the node is actually Online — DNSName is
+# populated during login, before the connection is usable.
+s = (d.get("Self") or {})
+if s.get("Online"):
+    print((s.get("DNSName") or "").rstrip("."))' 2>/dev/null)"
+      [ -n "$TS_NAME" ] && break
+      sleep 2
+    done
+    if [ -n "${TS_NAME:-}" ]; then
+      export NEMARA_NODE_BASE_URL="http://$TS_NAME"
+      log "tailnet name: $TS_NAME"
+    fi
+  fi
+  if [ -z "${NEMARA_NODE_BASE_URL:-}" ]; then
+    # Refuse rather than register an unreachable address. A node in the
+    # roster with a base_url nobody can dial is WORSE than an absent one:
+    # it claims homes up to its capacity and then serves none of them, and
+    # the backend fails open, so those homes lose identity silently.
+    log "FATAL: roster mode has no NEMARA_NODE_BASE_URL and could not derive one"
+    log "       set TS_AUTHKEY (production), or pass NEMARA_NODE_BASE_URL explicitly"
+    exit 1
+  fi
+
+  log "identity: roster mode (backend=$NEMARA_BACKEND_URL node=$NEMARA_NODE_ID at $NEMARA_NODE_BASE_URL)"
   exec /workspace/nemara/deploy/roster_agent.sh
 fi
 
