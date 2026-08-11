@@ -1,4 +1,12 @@
 #!/usr/bin/env bash
+# ⚠️ SUPERSEDED by gpu/deploy/entrypoint.sh (2026-08-11), which supervises
+# one identity process PER ROOM inside the node image. DELETE once the first
+# node has come up from a tag.
+#
+# This script's real problem was never the supervision — it was that it runs
+# identity wherever a human happens to start it, which in practice was a
+# laptop. Production identity now lives on the GPU node next to perception.
+#
 # Identity-service supervisor — restart-on-exit, same file-based
 # discipline as the perception pod's supervisor.
 #

@@ -1,4 +1,12 @@
 #!/usr/bin/env bash
+# ⚠️ SUPERSEDED by Tailscale + colocation (2026-08-11). DELETE once the first
+# node has come up from a tag.
+#
+# Its own comment below already predicted this: "Colocation deletes this
+# entire class in production." Identity now runs beside perception inside the
+# node image, so there is no Mac-to-pod forward left to supervise, and the
+# backend reaches /state over the tailnet instead.
+#
 # Pod-tunnel supervisor (2026-07-28): the ssh -N -L tunnel is the stack's
 # last unsupervised link and it zombies — process alive, forward dead
 # (ServerAlive catches a dead TCP link, NOT a broken forward). Same

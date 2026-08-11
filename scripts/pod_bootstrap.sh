@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
+# ⚠️ SUPERSEDED by gpu/Dockerfile (2026-08-11) — DELETE once the first node
+# has come up from an image tag. Everything below was ported into that
+# Dockerfile, including both upstream patches and the onnxruntime pin.
+#
+# Kept only because the image has not been built yet: until `pod.sh release`
+# has stood up a working node once, THIS is still the only way to build one,
+# and deleting it would leave no path at all. Do not extend it — any change
+# made here has to be made twice, and the two will drift.
+#
 # Full perception-pod rebuild from NOTHING (2026-07-25 — written the
 # night the original pod was terminated by RunPod when credits ran out
 # and its disk vanished with it; the old bootstrap lived only on that

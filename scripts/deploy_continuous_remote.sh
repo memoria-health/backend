@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
+# ⚠️ SUPERSEDED by gpu/Dockerfile + gpu/deploy/entrypoint.sh (2026-08-11) —
+# DELETE once the first node has come up from an image tag. Shipping six
+# files onto a hand-built box cannot recover from the two failures that have
+# actually happened to us (pod terminated with its disk; pod unable to resume
+# because the host took its GPU). The image can: a lost node is replaced by
+# creating another from the tag.
+#
+# Kept only until `pod.sh release` has worked once. Do not extend it.
+#
 # Runs ON THE POD — piped in by `scripts/pod.sh deploy`. Stops the old
 # supervisor + server, (re)writes the FILE-BASED supervisor, and
 # relaunches it via setsid. perception/ must already be shipped to
