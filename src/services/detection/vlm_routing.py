@@ -6,7 +6,7 @@ Two jobs:
      within a minute WITHOUT adding a DB query to every detection tick.
   2. `run_vlm` — run the chosen provider with a fallback chain so a single
      provider's outage / rate-limit / unsupported-feature can't blind a
-     family. Gemini gets the native-video path; openai / openrouter share
+     family. Gemini gets the native-video path; openai runs
      the frame-sampling path.
 """
 
@@ -24,13 +24,16 @@ from src.services.detection.prompt import DetectorSpec
 from src.services.detection.providers.dashscope import dashscope_provider
 from src.services.detection.providers.gemini import gemini_provider
 from src.services.detection.providers.openai import openai_provider
-from src.services.detection.providers.openrouter import openrouter_provider
 from src.services.detection.providers.types import ProviderResult
 from src.settings import Settings
 
 log = logging.getLogger(__name__)
 
-_VALID = ("gemini", "openai", "openrouter", "dashscope")
+# "openrouter" removed 2026-08-11 (leaked key deleted, provider retired).
+# Accounts whose stored vlm_provider still says "openrouter" fall through
+# the `raw in _VALID` check below onto the default provider — no
+# migration needed, no crash, just a quiet downgrade to the house chain.
+_VALID = ("gemini", "openai", "dashscope")
 
 # Chosen-first, then fallbacks — detection never goes dark if the primary
 # errors out.
@@ -56,7 +59,6 @@ _CHAINS: dict[str, tuple[str, ...]] = {
     # `sched_degraded_audio` when that happens).
     "gemini": ("gemini", "gemini_fallback", "dashscope", "openai"),
     "openai": ("openai", "gemini"),
-    "openrouter": ("openrouter", "dashscope", "gemini"),
     # SANDBOX: Alibaba-direct Qwen3-VL (native video + fps) primary, OpenAI
     # fallback so detection never goes dark if DashScope errors or the model
     # isn't activated on the account yet.
@@ -131,7 +133,6 @@ async def run_vlm(
                 return "gemini", _dc_replace(result, model=gmodel)
             fn = {
                 "openai": openai_provider,
-                "openrouter": openrouter_provider,
                 "dashscope": dashscope_provider,
             }[prov]
             # Frame reuse only when attribution ran: with always-on
@@ -152,7 +153,6 @@ async def run_vlm(
             )
             served_model = {
                 "openai": settings.openai_model,
-                "openrouter": settings.openrouter_model,
                 "dashscope": settings.dashscope_model,
             }[prov]
             return prov, _dc_replace(result, model=served_model)

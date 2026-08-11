@@ -192,12 +192,25 @@ async def test_a_brand_new_home_is_not_paged_immediately(
     cid, email = auth_user
     await _clear(session)
     await _mk_caregiver(session, cid, email)
-    await _mk_patient(session, cid, age_mins=0)
 
-    counts = await _watch(settings, get_sessionmaker()).check()
-    assert counts["blind"] == 1, "it IS blind right now"
-    assert counts["overdue"] == 0, "but not for long enough to be a page"
-    assert pages.triggered == {}
+    # DELTAS, not absolute counts. check() counts across the whole table, so
+    # asserting "blind == 1" silently depends on no other test having left an
+    # unassigned home behind — which makes the test order-dependent and its
+    # failure look like a product bug. Measure before and after instead; the
+    # claim is about what adding one fresh home does, and that is what is
+    # actually being tested.
+    before = await _watch(settings, get_sessionmaker()).check()
+    pages.triggered.clear()
+    pages.resolved.clear()
+
+    await _mk_patient(session, cid, age_mins=0)
+    after = await _watch(settings, get_sessionmaker()).check()
+
+    assert after["blind"] - before["blind"] == 1, "it IS blind right now"
+    assert after["overdue"] == before["overdue"], (
+        "a home seconds old is mid-failover, not an orphan"
+    )
+    assert "identity-fleet:unassigned-homes" not in pages.triggered
 
 
 async def test_dead_node_is_a_warning_not_a_critical(

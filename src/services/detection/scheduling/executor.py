@@ -14,7 +14,7 @@ Provider routing:
           to what they detect.
 
 Audio constraint: a needs_audio call that lands on a frame-sampling
-provider (openai/openrouter/dashscope receive frames, not video) loses
+provider (openai/dashscope receive frames, not video) loses
 its sound. The fallback is allowed (locked decision) but the tick is
 MARKED: `sched_degraded_audio=true`.
 
@@ -97,7 +97,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 # Providers that receive extracted frames, not native video — no audio.
-_FRAME_SAMPLING_PROVIDERS = frozenset({"openai", "openrouter", "dashscope"})
+_FRAME_SAMPLING_PROVIDERS = frozenset({"openai", "dashscope"})
 
 # Overlay-channel prompt swaps: a detector whose row prompt describes the
 # clean clip gets its validated overlay variant on RAPID calls (the P0

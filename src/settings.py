@@ -127,15 +127,6 @@ class Settings(BaseSettings):
     openai_compile_model: str = Field(default="gpt-5.4")
     openai_frames_fps: int = Field(ge=1, le=30, default=4)
 
-    # ── OpenRouter (brokers Qwen3-VL etc.) ───────────────────────────
-    # OpenAI-compatible endpoint, so the provider reuses the frame-based
-    # path (OpenRouter does NOT accept native video). Used when a caregiver
-    # is routed to a non-Gemini/OpenAI model. Model ids are namespaced
-    # slugs, e.g. "qwen/qwen3-vl-32b-instruct".
-    openrouter_api_key: str = Field(default="")
-    openrouter_model: str = Field(default="qwen/qwen3-vl-32b-instruct")
-    openrouter_base_url: str = Field(default="https://openrouter.ai/api/v1")
-
     # ── DashScope (Alibaba Model Studio — Qwen3-VL, NATIVE video+fps) ──
     # SANDBOX: go direct to Alibaba instead of OpenRouter. The OpenAI-
     # compatible endpoint accepts a real `video` content part with an `fps`
@@ -159,7 +150,7 @@ class Settings(BaseSettings):
     dashscope_max_frames: int = Field(ge=1, le=768, default=55)
 
     # Per-account VLM routing: a caregiver may carry a `vlm_provider`
-    # override ("gemini" | "openai" | "openrouter" | "dashscope"); when
+    # override ("gemini" | "openai" | "dashscope"); when
     # null/unset we fall back to this global default. So you can move
     # individual families onto a different model without a deploy (just flip
     # the caregivers column). See services/detection/vlm_routing.py.

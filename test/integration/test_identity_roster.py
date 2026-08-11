@@ -71,10 +71,26 @@ async def _mk_patient(session: AsyncSession, caregiver_id: UUID) -> UUID:
 
 
 async def _clear(session: AsyncSession) -> None:
-    """Detach every home and drop test nodes, so a case starts from a known
-    pool regardless of what other tests left behind."""
+    """Detach every home and drop THIS SUITE'S nodes, so a case starts from a
+    known pool regardless of what other tests left behind.
+
+    Deletes only rows matching the names these tests create. An unscoped
+    `DELETE FROM public.identity_nodes` would also remove any node a
+    developer had registered by hand, and the equivalent shortcut in the
+    fleet-watch tests — `DELETE FROM public.patients` — cascaded through
+    cameras, analyses, events and detectors and wiped the local rig
+    (2026-08-11). Never delete rows a test did not create.
+
+    Detaching the homes is a plain UPDATE and stays: it loses nothing, and
+    the roster reassigns on the next poll, which is the behaviour under test.
+    """
     await session.execute(text("UPDATE public.patients SET identity_node_id = NULL"))
-    await session.execute(text("DELETE FROM public.identity_nodes"))
+    await session.execute(
+        text(
+            "DELETE FROM public.identity_nodes "
+            " WHERE node_id LIKE 'node-%' OR node_id = 'sentinel'"
+        )
+    )
     await session.commit()
 
 

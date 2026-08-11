@@ -200,7 +200,7 @@ async def test_missing_crop_degrades_to_scene_artifact(monkeypatch) -> None:
 async def test_needs_audio_on_frame_sampling_provider_marks_degraded(monkeypatch) -> None:
     plans = _plans(_due("calling_for_help", needs_audio=True))
     vlm = _ScriptedVLM([
-        ("openrouter", {"calling_for_help_detected": False}, None),
+        ("openai", {"calling_for_help_detected": False}, None),
     ])
     out = await _run(plans, vlm, monkeypatch=monkeypatch)
     assert out.sched_fields["sched_degraded_audio"] is True

@@ -1600,7 +1600,7 @@ class CameraIngest:
             # per-tick query). `run_vlm` runs that provider and falls back
             # through the rest of the chain so a single provider's outage /
             # rate-limit can't blind the family. Gemini gets native video;
-            # openai / openrouter share the frame-sampling path. See
+            # openai / dashscope share the frame-sampling path. See
             # services/detection/vlm_routing.py.
             vlm_choice = await resolve_vlm_provider(
                 session, patient.caregiver_id, self._settings,

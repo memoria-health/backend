@@ -52,7 +52,6 @@ def _patch_all(monkeypatch, calls, *, gemini_ok_on=None) -> None:
 
     monkeypatch.setattr(vlm_routing, "gemini_provider", fake_gemini)
     monkeypatch.setattr(vlm_routing, "dashscope_provider", _make("dashscope"))
-    monkeypatch.setattr(vlm_routing, "openrouter_provider", _make("openrouter"))
     monkeypatch.setattr(vlm_routing, "openai_provider", _make("openai"))
 
 
