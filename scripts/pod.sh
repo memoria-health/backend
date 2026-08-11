@@ -9,6 +9,7 @@
 # in this script or in git.
 #
 # Usage:
+#   scripts/pod.sh release <tag>     # create a NEW node from a GHCR image tag
 #   scripts/pod.sh up                # start + rediscover endpoint + repin + wait healthy
 #   scripts/pod.sh down              # alias for stop (billing off)
 #   scripts/pod.sh status            # RunPod desiredStatus + $/hr
@@ -116,7 +117,110 @@ _gql() {  # $1 = graphql query/mutation string
     -d "{\"query\":\"$1\"}"
 }
 
+# REST (not GraphQL) — pod CREATION lives on rest.runpod.io/v1.
+_rest() {  # $1=method $2=path $3=json-body-or-empty
+  local m="$1" p="$2" b="${3:-}"
+  if [[ -n "$b" ]]; then
+    curl -s --max-time 60 -X "$m" "https://rest.runpod.io/v1$p" \
+      -H "Authorization: Bearer $RUNPOD_API_KEY" \
+      -H "Content-Type: application/json" -d "$b"
+  else
+    curl -s --max-time 60 -X "$m" "https://rest.runpod.io/v1$p" \
+      -H "Authorization: Bearer $RUNPOD_API_KEY"
+  fi
+}
+
 case "${1:-}" in
+  release)
+    # Create a NEW node from an image tag. This is the `railway up` of the
+    # GPU side: the artifact is the tag, and a lost node is replaced rather
+    # than repaired. It does NOT touch the existing pod — terminating that is
+    # a separate, deliberate act (see the note it prints at the end).
+    TAG="${2:?usage: pod.sh release <image-tag>   e.g. pod.sh release gpu-v1}"
+    : "${GHCR_IMAGE:?set GHCR_IMAGE in .pod.env, e.g. ghcr.io/<owner>/memoria-gpu}"
+    : "${RUNPOD_REGISTRY_AUTH_ID:?set RUNPOD_REGISTRY_AUTH_ID in .pod.env — the image is private; save GHCR creds in RunPod (Settings > Container Registry Auth) and put the id here}"
+    : "${RUNPOD_NETWORK_VOLUME_ID:?set RUNPOD_NETWORK_VOLUME_ID in .pod.env — without a network volume RunPod TERMINATES the pod (not stops it) at \$0 balance and the data is unrecoverable; this is how pod #1 died}"
+    : "${RUNPOD_DATACENTER_ID:?set RUNPOD_DATACENTER_ID in .pod.env — a network volume is pinned to its datacenter, so the node must be created there}"
+
+    IMAGE="$GHCR_IMAGE:$TAG"
+    NAME="${RUNPOD_POD_NAME:-nemara-gpu}-$TAG"
+    GPU_TYPES="${RUNPOD_GPU_TYPES:-\"NVIDIA A40\"}"
+
+    # Node env. Deliberately assembled here rather than baked: these are
+    # per-deployment secrets and per-node placement, and the image must stay
+    # free of both. Sourced from .pod.env so nothing lands on a command line
+    # that shows up in shell history or `ps`.
+    for v in NEMARA_DB_URL NEMARA_LIVEKIT_URL NEMARA_LIVEKIT_API_KEY \
+             NEMARA_LIVEKIT_API_SECRET NEMARA_IDENTITY_STATE_TOKEN \
+             NEMARA_IDENTITY_ROOMS HUGGINGFACE_TOKEN; do
+      [[ -n "${!v:-}" ]] || { echo "pod.sh release: $v not set in $ENV_FILE" >&2; exit 2; }
+    done
+
+    # Exported so the heredoc's python can read them; they are shell locals
+    # otherwise. Secrets go via the environment, never argv — argv is visible
+    # in `ps` to anything else on the machine.
+    export NAME IMAGE GPU_TYPES RUNPOD_NETWORK_VOLUME_ID \
+           RUNPOD_DATACENTER_ID RUNPOD_REGISTRY_AUTH_ID
+
+    BODY="$(python3 - <<'PY'
+import json, os
+env = {k: os.environ[k] for k in (
+    "NEMARA_DB_URL", "NEMARA_LIVEKIT_URL", "NEMARA_LIVEKIT_API_KEY",
+    "NEMARA_LIVEKIT_API_SECRET", "NEMARA_IDENTITY_STATE_TOKEN",
+    "NEMARA_IDENTITY_ROOMS", "HUGGINGFACE_TOKEN",
+) if os.environ.get(k)}
+for opt in ("TS_AUTHKEY", "NEMARA_PERCEPTION_TOKEN",
+            "NEMARA_PERCEPTION_CONCURRENCY"):
+    if os.environ.get(opt):
+        env[opt] = os.environ[opt]
+print(json.dumps({
+    "name": os.environ["NAME"],
+    "imageName": os.environ["IMAGE"],
+    "cloudType": "SECURE",          # Community/Spot can be reclaimed mid-soak
+    "computeType": "GPU",
+    "gpuTypeIds": json.loads("[" + os.environ["GPU_TYPES"] + "]"),
+    "gpuCount": 1,
+    "gpuTypePriority": "availability",
+    "containerDiskInGb": 70,
+    # Mounted at /persist, NOT /workspace — the image keeps sam3, edgetam and
+    # our code under /workspace and a volume there would shadow all of it.
+    "volumeMountPath": "/persist",
+    "networkVolumeId": os.environ["RUNPOD_NETWORK_VOLUME_ID"],
+    "dataCenterIds": [os.environ["RUNPOD_DATACENTER_ID"]],
+    "containerRegistryAuthId": os.environ["RUNPOD_REGISTRY_AUTH_ID"],
+    "ports": ["22/tcp"],
+    "interruptible": False,
+    "env": env,
+}))
+PY
+)" || { echo "pod.sh release: failed to build request body" >&2; exit 1; }
+
+    echo "creating node from $IMAGE ..."
+    RESP="$(_rest POST /pods "$BODY")"
+    NEW_ID="$(python3 -c '
+import json,sys
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(0)
+print(d.get("id") or "")
+' <<<"$RESP")"
+    if [[ -z "$NEW_ID" ]]; then
+      echo "pod.sh release: create failed" >&2
+      echo "$RESP" | head -c 800 >&2; echo >&2
+      exit 1
+    fi
+    echo "  new pod id: $NEW_ID"
+    echo
+    echo "next:"
+    echo "  1. set POD_ID=$NEW_ID in $ENV_FILE"
+    echo "  2. scripts/pod.sh up          # discovers the endpoint, re-pins the host key"
+    echo "  3. scripts/pod.sh health      # confirm ticks"
+    echo
+    echo "the OLD pod ($POD_ID) is untouched and still billing if RUNNING."
+    echo "terminate it deliberately once the new node is verified."
+    ;;
+
   status)
     _gql "query { pod(input:{podId:\\\"$POD_ID\\\"}) { id name desiredStatus volumeInGb containerDiskInGb costPerHr machine { gpuDisplayName } } }"
     echo ;;
@@ -258,6 +362,6 @@ except Exception: print("unknown error")' <<<"$resp")"
       2>&1 | grep -viE "Warning: Permanently added|post-quantum|store now" ;;
 
   *)
-    echo "usage: pod.sh {up|down|status|start|stop|ssh <cmd>|deploy|logs [N]|health}" >&2
+    echo "usage: pod.sh {release <tag>|up|down|status|start|stop|ssh <cmd>|deploy|logs [N]|health}" >&2
     exit 2 ;;
 esac

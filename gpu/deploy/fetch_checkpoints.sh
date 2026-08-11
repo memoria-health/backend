@@ -17,7 +17,7 @@
 # datacenter with no volume simply re-downloads — slower, still correct.
 set -uo pipefail
 
-MODEL_DIR="${NEMARA_MODEL_DIR:-/workspace/models}"
+MODEL_DIR="${NEMARA_MODEL_DIR:-/persist/models}"
 EDGETAM_CKPT_DIR=/workspace/edgetam/checkpoints
 mkdir -p "$MODEL_DIR" "$EDGETAM_CKPT_DIR"
 

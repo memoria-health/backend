@@ -31,10 +31,10 @@
 # OPTIONAL
 #   TS_AUTHKEY                   tagged key; tailscale skipped when unset
 #   NEMARA_PERCEPTION_CONCURRENCY  passes admitted at once (default 1)
-#   NEMARA_STATE_DIR             writable state, default /workspace/state
+#   NEMARA_STATE_DIR             writable state, default /persist/state
 set -uo pipefail
 
-STATE_DIR="${NEMARA_STATE_DIR:-/workspace/state}"
+STATE_DIR="${NEMARA_STATE_DIR:-/persist/state}"
 LOGDIR="$STATE_DIR/logs"
 mkdir -p "$LOGDIR"
 
@@ -59,7 +59,7 @@ export NEMARA_SUPABASE_JWT_SECRET="${NEMARA_SUPABASE_JWT_SECRET:-unused-on-gpu-n
 export NEMARA_SUPABASE_SERVICE_ROLE_KEY="${NEMARA_SUPABASE_SERVICE_ROLE_KEY:-unused-on-gpu-node}"
 
 # ── 1. Checkpoints (first boot only) ───────────────────────────────────
-log "checking model weights in ${NEMARA_MODEL_DIR:-/workspace/models}"
+log "checking model weights in ${NEMARA_MODEL_DIR:-/persist/models}"
 /workspace/nemara/deploy/fetch_checkpoints.sh 2>&1 | tee -a "$LOGDIR/checkpoints.log"
 if [ "${PIPESTATUS[0]}" -ne 0 ]; then
   log "FATAL: checkpoint fetch failed — see $LOGDIR/checkpoints.log"

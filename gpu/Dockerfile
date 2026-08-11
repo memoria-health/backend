@@ -154,11 +154,19 @@ WORKDIR /workspace/edgetam
 # This also makes service.py's own sys.path bootstrap correct rather than
 # merely harmless: it inserts Path(__file__).parents[2], which in-container is
 # /workspace — exactly where src/ lives.
+# Persistent state lives under /persist, NOT under /workspace. RunPod mounts
+# a network volume at volumeMountPath, and the obvious choice — /workspace —
+# would SHADOW everything the image put there (sam3, edgetam, our code), so
+# the node would boot with no application at all. /persist is empty in the
+# image and exists precisely to be mounted over.
+RUN mkdir -p /persist/models /persist/state
+
 ENV PYTHONPATH=/workspace/sam3:/workspace/nemara:/workspace/edgetam:/workspace \
-    NEMARA_SAM_CKPT=/workspace/models/sam3.1_multiplex.pt \
-    NEMARA_TRIGGER_WEIGHTS=/workspace/models/yolo26x-seg.pt \
+    NEMARA_MODEL_DIR=/persist/models \
+    NEMARA_STATE_DIR=/persist/state \
+    NEMARA_SAM_CKPT=/persist/models/sam3.1_multiplex.pt \
+    NEMARA_TRIGGER_WEIGHTS=/persist/models/yolo26x-seg.pt \
     NEMARA_GROUNDER=sam3 \
-    NEMARA_MODEL_DIR=/workspace/models \
     PERCEPTION_HOST=127.0.0.1 \
     PERCEPTION_PORT=8000
 
