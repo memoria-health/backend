@@ -91,6 +91,7 @@ from src.api.patient_members import router as patient_members_router
 from src.api.patients import router as patients_router
 from src.api.presence import router as presence_router
 from src.api.security_headers import SecurityHeadersMiddleware
+from src.api.identity_roster import router as identity_roster_router
 from src.api.support import router as support_router
 from src.api.talk import router as talk_router
 from src.db import analysis as _analysis  # noqa: F401
@@ -264,6 +265,9 @@ def create_app() -> FastAPI:
     app.include_router(face_embeddings_router)
     # Contact Support (Resend forwarding) from the iOS app's Settings.
     app.include_router(support_router)
+    # GPU node roster — nodes poll to be told which homes to run. This is
+    # also their heartbeat, so it is what makes failover and scale-out work.
+    app.include_router(identity_roster_router)
     # Product Feedback (persisted + best-effort Resend) from Settings.
     app.include_router(feedback_router)
     # Support-only /internal routes (room-privacy reclassify escape

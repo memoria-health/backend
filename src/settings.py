@@ -344,6 +344,12 @@ class Settings(BaseSettings):
     # Base URL of the identity service (the GPU-host sidecar that
     # synthesizes per-tick IdentityResults from /state — the ONLY
     # identity provider since the legacy brain's deletion 2026-07-26).
+    # How long a GPU node may go without polling /v1/identity/roster before
+    # its homes are released to whichever node polls next. MUST exceed the
+    # node's poll interval with margin, or nodes will steal homes from each
+    # other on a slow poll and every home pays a ~30-60s re-ground for
+    # nothing. 90s against a 30s poll gives two misses of slack.
+    identity_roster_stale_after_s: int = Field(ge=30, le=900, default=90)
     identity_state_url: str = Field(default="http://host.docker.internal:8012")
     # Bearer token for /state (gpu/identity/contract.py). Empty = no
     # auth (local dev, host-only traffic). ONE env name on BOTH sides:
