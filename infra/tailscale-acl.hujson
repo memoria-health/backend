@@ -1,0 +1,81 @@
+// Tailscale access policy — memoria tailnet.
+//
+// Committed so the network boundary is reviewable in a diff rather than
+// clicked in an admin console. Paste into Access Controls, or apply with
+// the Tailscale GitHub Action / API once an OAuth client exists.
+//
+// Shape: DENY BY DEFAULT. Tailscale allows nothing that is not listed
+// below, so every line here is a deliberate grant.
+//
+// Everything is TAGGED, never owned by a personal identity. A tagged node
+// keeps working when a person is removed from the tailnet — which is not
+// hypothetical here: a departed cofounder's accounts held production
+// access across GitHub, Vercel and Resend as recently as 2026-08-10.
+{
+  "tagOwners": {
+    // Only admins may mint nodes for these tags. `autogroup:admin` rather
+    // than a named user, again so no single person is load-bearing.
+    "tag:gpu":     ["autogroup:admin"],
+    "tag:backend": ["autogroup:admin"],
+    "tag:ci":      ["autogroup:admin"],
+    "tag:gateway": ["autogroup:admin"],
+  },
+
+  "acls": [
+    // ── Backend -> identity ────────────────────────────────────────
+    // The ONLY production data path. Railway reads /state from the
+    // identity service colocated with perception on the GPU host.
+    // Port-scoped: :8012 and nothing else, so a compromised backend
+    // cannot reach the pod's ssh or the perception port directly.
+    {
+      "action": "accept",
+      "src":    ["tag:backend"],
+      "dst":    ["tag:gpu:8012"],
+    },
+
+    // ── CI -> GPU host ─────────────────────────────────────────────
+    // Deploys ship code over ssh. CI joins as an EPHEMERAL node so the
+    // machine disappears from the tailnet when the run ends.
+    {
+      "action": "accept",
+      "src":    ["tag:ci"],
+      "dst":    ["tag:gpu:22"],
+    },
+
+    // ── Humans -> everything we operate ────────────────────────────
+    // Admin/ops access for debugging. Deliberately NOT autogroup:member
+    // — an invited teammate gets no infrastructure access until someone
+    // grants it.
+    {
+      "action": "accept",
+      "src":    ["autogroup:admin"],
+      "dst":    ["tag:gpu:22,8000,8012", "tag:gateway:22"],
+    },
+  ],
+
+  // Node attributes: nothing on the tailnet may reach the wider internet
+  // through us, and no node advertises routes it was not asked to.
+  "autoApprovers": {},
+
+  // ── ssh over tailscale ─────────────────────────────────────────────
+  // Replaces the pinned-host-key ssh dance for the GPU host. WireGuard
+  // authenticates the node cryptographically, so there is no host key to
+  // trust-on-first-use — which matters because RunPod reassigns direct-TCP
+  // endpoints across tenants, and CI cannot pre-pin a key for an endpoint
+  // that does not exist until the pod is RUNNING.
+  "ssh": [
+    {
+      "action": "accept",
+      "src":    ["autogroup:admin"],
+      "dst":    ["tag:gpu", "tag:gateway"],
+      "users":  ["root", "autogroup:nonroot"],
+    },
+    {
+      // CI gets ssh to the GPU host only, as root, for deploys.
+      "action": "accept",
+      "src":    ["tag:ci"],
+      "dst":    ["tag:gpu"],
+      "users":  ["root"],
+    },
+  ],
+}

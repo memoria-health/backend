@@ -1,0 +1,188 @@
+# GPU node image — perception + identity, the deployable form of
+# scripts/pod_bootstrap.sh.
+#
+# WHY THIS EXISTS. The pod has been a hand-built pet: bootstrap mutates a
+# running container over ssh (~40 min) and `pod.sh deploy` rsyncs six files
+# onto it. That has cost us a machine twice — RunPod terminated the original
+# when credits hit zero and the disk went with it, and on 2026-08-10 a stopped
+# pod could not resume because the host had reallocated its GPU. Neither is
+# recoverable by rsync.
+#
+# An image makes the node disposable: the artifact is a tag, a lost node is
+# replaced by creating another from it, and "what is running?" has an answer
+# that is not "whatever we last scp'd".
+#
+# BOTH SERVICES SHIP HERE. Identity sends ~13MB batches to perception every
+# cycle. Over a network that is ~2.2 TB/month/camera, and RunPod's inter-pod
+# link is 100 Mbps (~1s per batch). Colocated it is a localhost copy — and
+# perception never has to bind a network interface.
+#
+# BUILD — on an amd64 runner. Do NOT build on an Apple-silicon Mac: QEMU
+# emulation of the torch/CUDA layers takes hours.
+#
+#   docker build -f gpu/Dockerfile -t ghcr.io/<org>/memoria-gpu:<tag> .
+#
+# Build context is the REPO ROOT (we copy both gpu/ and src/).
+
+ARG BASE_IMAGE=runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
+FROM ${BASE_IMAGE}
+
+# PINNED, not `main`. Two builds a week apart off a branch get different Meta
+# code, which is how a working node becomes a broken one with no diff to
+# blame — and is exactly how the two patches below came to be needed. Bumping
+# either is a change that deserves a soak.
+# Captured 2026-08-11 from each repo's default branch.
+ARG SAM3_REF=96914d2425f90a64f45ca977c2b5165418099543
+ARG EDGETAM_REF=7711e012a30a2402c4eaab637bdb00a521302c91
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /workspace
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# ── Upstream model code ────────────────────────────────────────────────
+RUN git clone https://github.com/facebookresearch/sam3 sam3 \
+ && git -C sam3 checkout "${SAM3_REF}" \
+ && git clone https://github.com/facebookresearch/EdgeTAM edgetam \
+ && git -C edgetam checkout "${EDGETAM_REF}"
+
+# ── Patch 1: EdgeTAM Perceiver reshape ─────────────────────────────────
+# `.expand().view()` on a non-contiguous tensor throws the moment a SECOND
+# person is tracked — invisible to solo testing, 500s every /observe in a real
+# room. The grep asserts the patch applied: silently shipping the unpatched
+# file is how this bites again.
+RUN sed -i \
+      -e 's/\.expand(B, -1, -1)\.view(-1, 1, C)/.expand(B, -1, -1).reshape(-1, 1, C)/' \
+      -e 's/latents_2d\.view(B, num_window, num_window, C)/latents_2d.reshape(B, num_window, num_window, C)/' \
+      edgetam/sam2/modeling/perceiver.py \
+ && grep -q 'expand(B, -1, -1).reshape(-1, 1, C)' edgetam/sam2/modeling/perceiver.py \
+ && grep -q 'latents_2d.reshape(B, num_window, num_window, C)' edgetam/sam2/modeling/perceiver.py \
+ || (echo "EdgeTAM perceiver patch did not apply — upstream moved" && exit 1)
+
+# ── Patch 2: SAM3 bool argsort ─────────────────────────────────────────
+# torch 2.4 cannot sort a bool tensor on CUDA. The original pod ran a 2.8-dev
+# nightly where it works, which is why this only surfaced on rebuild.
+RUN sed -i \
+      's/pos_pred_mask_idx = pos_pred_mask.argsort(descending=True)/pos_pred_mask_idx = pos_pred_mask.int().argsort(descending=True)/' \
+      sam3/sam3/model/sam3_multiplex_base.py \
+ && grep -q "int().argsort" sam3/sam3/model/sam3_multiplex_base.py \
+ || (echo "SAM3 bool-argsort patch did not apply — upstream moved" && exit 1)
+
+# ── ML deps ────────────────────────────────────────────────────────────
+# --no-deps throughout this block: every one of these declares torch, and
+# letting pip resolve it will happily swap the base image's CUDA build for
+# something else. A mismatched torch/CUDA pair costs an evening.
+RUN pip install -q --no-deps ultralytics ultralytics-thop boxmot
+
+# onnxruntime-gpu pinned to the CUDA-12 line. 1.28+ needs CUDA 13, and the
+# failure mode is not an error but a silent fall back to CPUExecutionProvider
+# (~10x slower face probes). NOTE pyproject.toml declares plain
+# `onnxruntime>=1.16` for the backend — installing that here would shadow this
+# with the CPU build, which is why src/'s deps are curated below rather than
+# installed wholesale. Check /health's face_provider after any bump.
+RUN pip uninstall -q -y onnxruntime || true \
+ && pip install -q "onnxruntime-gpu==1.20.1"
+
+RUN pip install -q \
+      opencv-python-headless insightface \
+      hydra-core omegaconf iopath py-cpuinfo pandas polars matplotlib tqdm psutil \
+      einops timm pycocotools decord scikit-image ftfy regex \
+      gdown lap filterpy
+
+# ── Backend deps, curated ──────────────────────────────────────────────
+# identity imports src.settings / src.db.session / src.repos, which drag in
+# most of src/ (src/repos/__init__ eagerly imports nine repos;
+# src/services/__init__ pulls auth + onboarding). So the backend's runtime
+# deps are needed — MINUS everything ML, which is pinned above.
+#
+# Deliberately excluded from pyproject.toml's list: torch, torchvision,
+# onnxruntime, onnx, numpy, opencv-python-headless, ultralytics, boxmot,
+# insightface. Installing those here would fight the pins above.
+RUN pip install -q \
+      fastapi "uvicorn[standard]" python-multipart httpx \
+      "sqlalchemy[asyncio]" asyncpg \
+      pydantic pydantic-settings python-dotenv \
+      "pyjwt[crypto]" bcrypt typer \
+      google-genai openai \
+      livekit "livekit-api" \
+      h2 pillow aioboto3 webrtcvad-wheels
+
+# ── OSNet body-embedding weights, baked ────────────────────────────────
+# gpu/identity/body_embeddings.py lazy-loads `osnet_x0_25_msmt17.pt` through
+# boxmot, which downloads it to ~/.boxmot on first use. Baking it means the
+# first body embedding after a cold start does not depend on the network.
+# Runs on CPU — CI has no GPU, and the download is device-independent.
+# Uses the SAME import path and constructor as body_embeddings.py:_get_backend,
+# so if boxmot moves it the build breaks here rather than at the first body
+# embedding on a live node.
+RUN python3 -c "\
+from boxmot.reid.backends.pytorch_backend import PyTorchBackend;\
+import torch, pathlib;\
+PyTorchBackend(weights=pathlib.Path('osnet_x0_25_msmt17.pt'), device=torch.device('cpu'), half=False);\
+print('osnet weights cached')" \
+ || (echo "OSNet prefetch failed — body embeddings would hit the network on first use" && exit 1)
+
+# ── Our code ───────────────────────────────────────────────────────────
+# Last, so editing our code invalidates only these layers; everything above
+# stays cached.
+#
+# src/ is 7.3MB of source. It is here because gpu/identity/service.py imports
+# src.db.session, src.repos and src.settings, and gpu/identity/gallery.py
+# imports src.services.identity.trace. Vendoring those is not viable —
+# src/repos/__init__ alone pulls nine repos. The proper fix is a GPU-host
+# config surface (see gpu/identity/README.md); this is the documented
+# packaging exception until then.
+COPY src            /workspace/src
+COPY gpu/perception /workspace/nemara/perception
+COPY gpu/identity   /workspace/nemara/identity
+COPY gpu/deploy     /workspace/nemara/deploy
+RUN chmod +x /workspace/nemara/deploy/*.sh
+
+# ── Runtime env ────────────────────────────────────────────────────────
+# cwd must be /workspace/edgetam — it resolves configs/edgetam.yaml relatively.
+WORKDIR /workspace/edgetam
+
+# PYTHONPATH order matters. /workspace/sam3 must precede /workspace so
+# `import sam3` finds the inner package, not the clone directory. /workspace
+# is last and exists so `src.*` resolves.
+#
+# This also makes service.py's own sys.path bootstrap correct rather than
+# merely harmless: it inserts Path(__file__).parents[2], which in-container is
+# /workspace — exactly where src/ lives.
+ENV PYTHONPATH=/workspace/sam3:/workspace/nemara:/workspace/edgetam:/workspace \
+    NEMARA_SAM_CKPT=/workspace/models/sam3.1_multiplex.pt \
+    NEMARA_TRIGGER_WEIGHTS=/workspace/models/yolo26x-seg.pt \
+    NEMARA_GROUNDER=sam3 \
+    NEMARA_MODEL_DIR=/workspace/models \
+    PERCEPTION_HOST=127.0.0.1 \
+    PERCEPTION_PORT=8000
+
+# onnxruntime-gpu needs cuDNN 9, supplied by torch's bundled nvidia wheels.
+# Without this, faces silently run on CPU.
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.11/dist-packages/nvidia/cudnn/lib:/usr/local/lib/python3.11/dist-packages/nvidia/cublas/lib
+
+# Fail the BUILD on a broken environment rather than finding out on a node at
+# 3am. Covers both services: the perception model builders AND the src/ import
+# chain that identity needs (this is the one most likely to regress, since a
+# backend refactor can break it from a distance).
+RUN python3 -c "\
+import torch, cv2, numpy;\
+from sam3.model_builder import build_sam3_multiplex_video_predictor;\
+from sam2.build_sam import build_sam2_video_predictor;\
+import insightface, ultralytics, fastapi, boxmot;\
+import src.settings, src.db.session, src.repos;\
+import src.services.identity.trace;\
+print('smoke imports OK — perception + identity + src')"
+
+EXPOSE 8000
+
+# Checkpoints are NOT baked. They are fetched on first boot into the network
+# volume by deploy/fetch_checkpoints.sh — same as pod_bootstrap.sh does today,
+# it keeps the image ~9-10GB instead of ~14GB, and it avoids redistributing
+# the GATED facebook/sam3.1 weights inside an image.
+ENTRYPOINT ["/workspace/nemara/deploy/entrypoint.sh"]
