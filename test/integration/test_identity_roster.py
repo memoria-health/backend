@@ -85,11 +85,15 @@ def _names(body) -> list[str]:
 
 
 async def _poll(client: AsyncClient, node: str, cap: int, url: str | None = None):
+    # base_url is scheme://host, deliberately WITHOUT a port. Callers append
+    # the per-room port the roster hands out, so a port here would build
+    # `http://node:8012:8013`. These fixtures used to carry `:8012` and the
+    # validator that now rejects it caught them.
     return await client.post(
         ROSTER,
         json={
             "node_id": node,
-            "base_url": url or f"http://{node}:8012",
+            "base_url": url or f"http://{node}",
             "capacity": cap,
         },
     )
@@ -240,8 +244,8 @@ async def test_base_url_and_capacity_refresh_on_every_poll(
     for _ in range(3):
         await _mk_patient(session, caregiver_id)
 
-    await _poll(client, "node-move", cap=1, url="http://old-name:8012")
-    await _poll(client, "node-move", cap=3, url="http://new-name:8012")
+    await _poll(client, "node-move", cap=1, url="http://old-name")
+    await _poll(client, "node-move", cap=3, url="http://new-name")
 
     row = (
         await session.execute(
@@ -251,7 +255,7 @@ async def test_base_url_and_capacity_refresh_on_every_poll(
             )
         )
     ).first()
-    assert row[0] == "http://new-name:8012"
+    assert row[0] == "http://new-name"
     assert row[1] == 3
 
 
@@ -359,7 +363,7 @@ async def test_unassigned_claimed_oldest_first(
     await session.execute(
         text(
             "INSERT INTO public.identity_nodes (node_id, base_url, capacity) "
-            "VALUES ('sentinel','http://sentinel:8012',9999) "
+            "VALUES ('sentinel','http://sentinel',9999) "
             "ON CONFLICT (node_id) DO NOTHING"
         )
     )
@@ -386,3 +390,47 @@ async def test_unassigned_claimed_oldest_first(
 
     rooms = _names((await _poll(client, "node-order", cap=1)).json())
     assert rooms == [f"patient_{ids[0]}"], "did not take the longest-waiting home"
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "http://node:8012",      # a port — callers append the per-room one
+        "node-without-scheme",   # httpx cannot dial it
+        "ftp://node",            # not a scheme we speak
+        "http://node/state",     # a path — appending ":8012" mangles it
+        "http://",               # no host at all
+    ],
+)
+async def test_unaddressable_base_url_is_refused(
+    client: AsyncClient, session: AsyncSession, auth_user, bad: str
+) -> None:
+    """A node that cannot be dialled must not be allowed to claim homes.
+
+    base_url is SELF-REPORTED by the node and then handed to httpx with a
+    port appended. Every value here either fails to parse or silently builds
+    a wrong address — and the resulting failure is invisible, because the
+    backend fails open on identity: the node holds homes up to its capacity
+    and serves none of them. Rejecting the poll leaves those homes in the
+    unassigned pool where another node will take them.
+    """
+    caregiver_id, email = auth_user
+    await _clear(session)
+    await _mk_caregiver(session, caregiver_id, email)
+    await _mk_patient(session, caregiver_id)
+
+    r = await client.post(
+        ROSTER, json={"node_id": "node-bad", "base_url": bad, "capacity": 1},
+    )
+    assert r.status_code == 422, r.text
+
+    # And it is refused BEFORE the upsert, so a bad poll cannot register.
+    seen = (
+        await session.execute(
+            text(
+                "SELECT count(*) FROM public.identity_nodes "
+                " WHERE node_id = 'node-bad'"
+            )
+        )
+    ).scalar()
+    assert seen == 0

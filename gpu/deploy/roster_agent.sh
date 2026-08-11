@@ -109,11 +109,28 @@ _alive() {
 log "agent up node=$NEMARA_NODE_ID capacity=$CAPACITY poll=${POLL_S}s"
 
 while true; do
-  RESP="$(curl -sS -m 20 -X POST "$NEMARA_BACKEND_URL/v1/identity/roster" \
+  # Body to a file, status code to stdout. Keeping them apart is what lets
+  # the two failure shapes below be told apart at all.
+  CODE="$(curl -sS -m 20 -X POST "$NEMARA_BACKEND_URL/v1/identity/roster" \
       -H "Content-Type: application/json" \
       -H "X-Internal-Key: $NEMARA_INTERNAL_SERVICE_KEY" \
       -d "{\"node_id\":\"$NEMARA_NODE_ID\",\"base_url\":\"$NEMARA_NODE_BASE_URL\",\"capacity\":$CAPACITY}" \
-      2>>"$LOGDIR/roster.log")" || RESP=""
+      -o "$RUN/.roster.json" -w '%{http_code}' \
+      2>>"$LOGDIR/roster.log")" || CODE="000"
+  RESP="$(cat "$RUN/.roster.json" 2>/dev/null)"
+
+  # A 4xx is CONFIGURATION, and it will never fix itself: a rotated internal
+  # key (403), or a base_url the roster refuses as unaddressable (422). Both
+  # otherwise look identical to a network blip — the node keeps polling,
+  # keeps warning, and never claims a home. Say plainly that this one needs
+  # a human, and include the body, which names the offending field.
+  case "$CODE" in
+    4*)
+      log "ERROR roster REJECTED this node (HTTP $CODE) — this will NOT recover on its own"
+      log "      node=$NEMARA_NODE_ID base_url=$NEMARA_NODE_BASE_URL"
+      log "      $(printf '%s' "$RESP" | head -c 300)"
+      ;;
+  esac
 
   # Emits "<room> <port>" per line. Exits non-zero on anything that is not a
   # well-formed roster reply.

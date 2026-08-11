@@ -23,9 +23,10 @@ from __future__ import annotations
 
 import logging
 import secrets
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Header, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import text
 
 from src.api.deps import SessionDep, SettingsDep
@@ -40,10 +41,39 @@ class RosterRequest(BaseModel):
     # Where the backend should reach this node's identity processes. In
     # production a tailnet MagicDNS name, precisely so it survives RunPod
     # reassigning the pod's direct-TCP endpoint on every restart.
+    #
+    # SCHEME AND HOST ONLY — no port, no path. Callers append `:<port>`
+    # (IdentityRouter, and the /ready fleet probe), so a value carrying
+    # either produces `http://host:8100:8012` or `http://host/x:8012`. Both
+    # are silent: the row stores fine, and the breakage surfaces later as an
+    # unreachable node whose homes are quietly identity-less.
     base_url: str = Field(min_length=1, max_length=512)
     # How many rooms this node will accept. Node-local because it depends on
     # NEMARA_PERCEPTION_CONCURRENCY and the GPU.
     capacity: int = Field(ge=1, le=64)
+
+    @field_validator("base_url")
+    @classmethod
+    def _addressable(cls, v: str) -> str:
+        v = v.strip().rstrip("/")
+        parsed = urlparse(v)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError("base_url must start with http:// or https://")
+        if not parsed.hostname:
+            raise ValueError("base_url must include a host")
+        if parsed.path or parsed.query or parsed.fragment:
+            raise ValueError("base_url must be scheme://host with no path")
+        try:
+            # Accessing .port is what raises on a malformed one; the check is
+            # that it is ABSENT, since the per-room port is appended later.
+            if parsed.port is not None:
+                raise ValueError(
+                    "base_url must not include a port — the roster assigns "
+                    "one port per room and appends it"
+                )
+        except ValueError as exc:  # covers both the raise above and a bad port
+            raise ValueError(str(exc)) from exc
+        return v
 
 
 class RosterRoom(BaseModel):
