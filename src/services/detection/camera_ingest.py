@@ -80,7 +80,7 @@ from src.services.detection.registry import (
 from src.services.detection.state_machine import apply_tick_update
 from src.repos.face_embedding_repo import has_ready_enrollment
 from src.services.identity.result import IdentityResult
-from src.services.identity.identity_client import IdentityClient
+from src.services.identity.identity_client import IdentityProvider
 from src.services.data_collection.gate import should_collect
 from src.services.data_collection.session import RecorderCtx
 from src.services import room_classifier
@@ -214,7 +214,7 @@ class CameraIngest:
         motion_cache: MotionCache,
         patient_presence: "PatientPresence | None" = None,
         settings: "Settings",
-        reid: IdentityClient,
+        reid: IdentityProvider,
         livekit_identity: str | None = None,
         recorder: "RecorderManager | None" = None,
     ) -> None:
