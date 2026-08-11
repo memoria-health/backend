@@ -1,5 +1,36 @@
 # Identity service latency — measured facts
 
+> ## ⚠️ PARTLY OBSOLETE — read this first (2026-08-11)
+>
+> Two of this document's central claims were true when written and are
+> not true now. It misled a reader on 2026-08-11 who quoted it as current,
+> so the corrections are here rather than buried inline.
+>
+> **1. "The pod serialises all inference behind its own global lock"
+> (§ below, citing `_perception_lock = threading.Lock()`) is FIXED.**
+> Commit `86b88dd` (2026-08-01) replaced it with a bounded admission gate:
+>
+> ```python
+> _PERCEPTION_CONCURRENCY = int(os.environ.get("NEMARA_PERCEPTION_CONCURRENCY", "1"))
+> _perception_lock = _Gate(_PERCEPTION_CONCURRENCY)   # server.py:178-181
+> ```
+>
+> It still defaults to 1, so single-node behaviour is unchanged — but it
+> is now a **knob**, not a structural limit, and raising it is the lever
+> that sets how many homes fit on a node. Saturation returns 429 rather
+> than queueing, which is the per-node load signal.
+>
+> **2. The ~80% per-camera duty figure is stale and roughly 4x too high.**
+> It was measured before `86b88dd`. A pass now costs ~0.6-1.3s against a
+> ~5s cadence, i.e. **12-26% duty per OCCUPIED camera**. An empty room
+> makes zero calls, so the binding constraint is concurrent occupancy, not
+> home count.
+>
+> Everything else — the measurement method, the split fields, and
+> especially the disproven-hypotheses section — is still good. The
+> concurrency=2 A/B that `86b88dd` left "NOT VALIDATED FOR LATENCY" is
+> still not validated.
+
 > Written 2026-07-29 after an afternoon spent re-deriving the same
 > ground repeatedly and getting it wrong five times. Everything here is
 > MEASURED unless marked otherwise. The disproven-hypotheses section is

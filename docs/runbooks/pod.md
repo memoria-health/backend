@@ -1,168 +1,206 @@
-# Pod runbook — spin up / down / deploy the perception GPU
+# GPU node runbook — release, scale, recover
 
-The EdgeTAM-continuous `sam_service` runs on a single RunPod GPU (an A40
-is plenty; ~$0.44/hr). The backend reaches it over an SSH tunnel. This is
-how to operate it. All commands go through `scripts/pod.sh`, which reads
-secrets from a gitignored `.pod.env`.
+**Rewritten 2026-08-11.** The previous version described a hand-built pet:
+`pod_bootstrap.sh` mutated a running container over ssh for ~40 minutes, and
+`pod.sh deploy` rsynced perception onto it. That is gone — those scripts were
+deleted, and `pod.sh deploy` now refuses and prints the release steps. If you
+need what they did, they are in git history.
 
-## 0. One-time: credentials
+**A node is now an image.** The artifact is a tag, a lost node is replaced
+rather than repaired, and "what is running?" has an answer that is not
+"whatever we last scp'd".
 
-```bash
-cp .pod.env.example .pod.env      # then fill in (see the file's comments)
-mkdir -p .pod                     # holds the SSH key + pinned known_hosts
-# put your RunPod SSH private key at .pod/runpod_key  (chmod 600)
+> **NOTHING IN THIS FILE HAS BEEN RUN END TO END YET.** The image has never
+> been built and no node has been created from it. Every command below is
+> written from the source it drives. Treat the first run as the test, and
+> fix this file where it is wrong.
+
+---
+
+## What a node is
+
+One pod = **one perception + N identity processes**, serving up to K homes.
+
+Both services live in one container on purpose. Identity sends ~13MB batches
+to perception every cycle; over a network that is ~2.2 TB/month/camera, and
+RunPod's inter-pod link is 100 Mbps (~1s per batch). Colocated it is a
+localhost copy, and **perception never binds a network interface**.
+
+Nodes are interchangeable. All per-room state — EdgeTAM sessions, the seat,
+the track ledger — is rebuildable, so a home can move between nodes at the
+cost of a re-ground.
+
+```
+                    ┌─ perception :8000 (loopback ONLY, no auth by default)
+  RunPod pod ───────┤
+   (one cell)       ├─ identity :8012  room A ─┐
+                    ├─ identity :8013  room B ─┼─ published on the tailnet
+                    └─ roster agent ───────────┘
+                            │ POST /v1/identity/roster every 30s
+                            ▼
+                    Railway backend ── reads /state over the tailnet
 ```
 
-`.pod.env` and `.pod/` are gitignored — never commit them. `.pod.env`
-holds the RunPod API key and the pod's direct-TCP endpoint.
+## How a node finds its work
 
-## 1. Daily cost control — stop when idle, and the catch
+Nobody configures which homes a node serves. It polls
+`POST /v1/identity/roster` with its id, address and capacity, and is told
+which rooms to run and **on which ports**. The same call is its heartbeat.
 
-```bash
-scripts/pod.sh up        # start + rediscover endpoint + re-pin + wait healthy
-scripts/pod.sh down      # billing off (desiredStatus -> EXITED)
-scripts/pod.sh status    # check desiredStatus + $/hr
-```
+That one mechanism gives four things:
 
-Always use `up`, never bare `start`. Two traps it handles that manual
-bring-up does not:
+| | |
+|---|---|
+| discovery | backend joins `patients` → `identity_nodes.base_url` |
+| scale up | start another node; it drains the unassigned queue on first poll |
+| failover | a node that stops polling has its homes released to whoever polls next |
+| rebalance | null out `patients.identity_node_id` and it is re-placed |
 
-**⚠️ Stopping is NOT reliably reversible.** A stopped Secure Cloud pod
-holds **no GPU reservation**. The GPU goes back to the host machine, and
-if the host reallocates it, `podResume` fails with *"There are not enough
-free GPUs on the host machine to start this pod"* and the pod stays
-EXITED until one frees up **on that same physical host**. Hit for real on
-2026-08-10: the pod would not come back, with no ETA. `up` retries for
-~10 min (`RESUME_TRIES=90` for longer) and prints the real reason.
-If it stays stuck, rebuild on a different host with §3 (~40 min).
-So: stopping overnight to save $0.44/hr is a genuine gamble against
-needing the pod back on a schedule. Weigh ~$320/mo against that.
+The node **derives its own identity** at boot, because neither value exists
+at create time:
 
-**The endpoint moves.** RunPod assigns the direct-TCP `ip:port` only when
-the pod reaches RUNNING (`runtime` is `null` while stopped) and reassigns
-it across restarts. So `POD_HOST`/`POD_PORT` in `.pod.env` are stale the
-moment you stop, and the pinned host key no longer matches — ssh then
-refuses, correctly, because RunPod recycles those endpoints across
-tenants. `up` rediscovers the endpoint from the API, rewrites `.pod.env`
-(backing it up) and re-scans the host key, so nobody has to remember any
-of this.
+- `NEMARA_NODE_ID` ← `RUNPOD_POD_ID`, which RunPod injects. Stable across
+  restarts of the same pod, so a restarting node re-claims its own homes
+  instead of waiting out the staleness window while they sit blind.
+- `NEMARA_NODE_BASE_URL` ← the name **tailscaled reports**, not `TS_HOSTNAME`.
+  Tailscale suffixes a name already in use, which happens whenever a replaced
+  node's record lingers. Assuming the name would register an address pointing
+  at the dead node.
 
-Storage: the pod now has a **20 GB network volume** (`volumeInGb=20`)
-alongside the 70 GB container disk; the volume survives independently.
-Give it ~60–90 s after `up` before the server answers.
+A node that cannot derive a reachable address **exits** rather than
+registering. Registering an unreachable node is worse than being absent: it
+claims homes up to its capacity and serves none, and the backend fails open
+over it.
 
-## 2. Deploy code changes
+---
 
-The pod code lives in `gpu/perception/` (`continuous.py` / `server.py` /
-`sam_track.py` / `face_worker.py` / `person_trigger.py`; renamed from
-`sam_service/` on 2026-07-26). After editing:
+## 1. Release a new node
 
 ```bash
-scripts/pod.sh deploy    # ships gpu/perception/ + relaunches the supervisor
-scripts/pod.sh health    # confirm ticks resume (mode=ground/carry, drift=N)
-scripts/pod.sh logs 80   # tail the server log
+git tag gpu-v3 && git push origin gpu-v3      # CI builds + pushes to GHCR
+scripts/pod.sh release gpu-v3                 # create a node from that tag
+# → prints the new pod id
+# set POD_ID=<new id> in .pod.env, then:
+scripts/pod.sh up                             # discover endpoint, re-pin host key
+scripts/pod.sh health                         # confirm ticks
+curl -H "X-Internal-Key: $KEY" $BACKEND/ready  # confirm the fleet
 ```
 
-`deploy` runs `scripts/deploy_continuous_remote.sh` on the pod: it kills
-any old supervisor (including the disabled legacy `start_continuous.sh`),
-rewrites the file-based supervisor `/workspace/start_sam_supervisor.sh`,
-and launches `uvicorn perception.server:app` on the pod's **system
-python** (`/usr/bin/python3 -m uvicorn` — the old edgetam `.venv` no
-longer exists; one system env hosts sam2 + sam3 + insightface).
+The tag push is what triggers the build. Tag-triggered workflows run the
+workflow file **at that tag's commit**, so this does not require merging to
+`main` — which matters, because `main` is developmental and Railway
+deliberately does not auto-deploy from it.
 
-To watch the mask during a verification run, uncomment the
-`NEMARA_EDGE_DEBUG_DIR` line in `deploy_continuous_remote.sh`, deploy, do
-the walk-out, pull `/workspace/edge_debug/`, then **redeploy with it off**.
+`release` refuses unless `NEMARA_BACKEND_URL`, `NEMARA_INTERNAL_SERVICE_KEY`
+and `TS_AUTHKEY` are set. Without them the entrypoint falls through to a
+static room list, which is for a local `docker run`, not for real homes: a
+statically-pinned node cannot be scaled or failed over and keeps serving
+rooms the backend has since reassigned — two nodes writing seats for one home.
 
-## 3. Rebuild from scratch (new pod, or disk reclaimed)
+**The old pod is not touched.** Terminate it deliberately once the new one is
+verified.
 
-> Battle-tested for real on 2026-07-25, after RunPod TERMINATED the
-> original pod (credits hit zero → pod AND disk deleted, not stopped).
-> Total rebuild time ~40 min. Everything below is reproducible from
-> this repo — nothing may ever live only on the pod disk again.
+## 2. Add capacity
 
-1. Create an A40 (or better) **On-Demand** pod (Spot/Community can be
-   reclaimed mid-soak). Template "PyTorch 2.4 / CUDA 12.4", ~70 GB
-   container disk, port 22/tcp + public IP. Scriptable via the REST
-   API (`RUNPOD_API_KEY` in `.pod.env`; pass our SSH public key as the
-   `PUBLIC_KEY` env so access works from birth):
-   `POST https://rest.runpod.io/v1/pods` — see git history 2026-07-25
-   for the exact JSON body.
-2. Capture the endpoint into `.pod.env` (`POD_HOST`, `POD_PORT`,
-   `POD_ID`) and **pin the host key**:
-   ```bash
-   ssh-keyscan -p "$POD_PORT" "$POD_HOST" > .pod/pod_known_hosts
-   ```
-3. One-shot bootstrap — repos, pip layer, ALL source patches, ALL
-   checkpoints, smoke imports (idempotent, safe to re-run):
-   ```bash
-   scripts/pod.sh ssh "export HUGGINGFACE_TOKEN=<token>; bash -s" \
-     < scripts/pod_bootstrap.sh
-   ```
-   The token is needed for the **gated** `facebook/sam3.1` repo
-   (source of `sam3.1_multiplex.pt`); one lives as
-   `NEMARA_HF_ACCESS_TOKEN` in the backend `.env`. The script also
-   applies, with rationale inline:
-   - the **EdgeTAM Perceiver reshape patch** (multi-object crash —
-     `.expand().view()` on non-contiguous tensors 500s the instant a
-     2nd person is tracked; invisible to solo testing),
-   - the **SAM3 bool-argsort patch** (torch 2.4 cannot sort bool on
-     CUDA; the old pod ran torch 2.8-dev where it works),
-   - the **onnxruntime-gpu pin (1.20.1)** — 1.28+ wants CUDA 13; and
-     the supervisor must export `LD_LIBRARY_PATH` to torch's bundled
-     nvidia cudnn/cublas wheels or faces silently fall back to
-     `CPUExecutionProvider` (~10x slower probes; check `/health`).
-4. Ship + launch: `scripts/pod.sh deploy`. Mac-side services
-   (identity, dashboard) reconnect on their own — do not restart them.
-5. Retarget the Mac tunnel at the new endpoint and confirm
-   `scripts/pod.sh health` + new `identity.batch` lines.
+Release another node. It claims unassigned homes on its first poll. There is
+nothing else to do — no config, no restart of anything existing.
 
-**Operational traps learned 2026-07-24/25 (read before touching the pod):**
-- **Exactly ONE supervisor.** A legacy `start_continuous.sh` and the
-  deploy-script supervisor once raced for port 8000 for hours — every
-  deploy "worked" (new code) while env changes silently never applied
-  (old winner's env). The deploy script now disables the legacy file.
-- **`pkill -f` self-match.** Ad-hoc `pkill -f 'uvicorn sam_service'`
-  from an ssh one-liner matches the ssh session's OWN command line and
-  kills it (looks like a hang / empty output / phantom short-lived
-  processes). Always use the bracket trick (`sam_servic[e]`) and never
-  combine a pkill with a command containing the literal pattern.
-- **Launch supervisors as FILES, not inline heredocs** — two layers of
-  ssh quoting mangled inline scripts twice. Ship
-  `start_sam_supervisor.sh` via `ssh "cat > file" < localfile`
-  (md5-verify), then `setsid --fork` it in a session with NO kill
-  patterns.
-- **A backgrounded remote process holding the session's pipes makes
-  ssh "hang"** — that's the launch *succeeding* while sshd waits on
-  fds; redirect all three (`</dev/null >/dev/null 2>&1`).
-- `/proc/PID/environ` shows the INITIAL env only — exports made inside
-  a running script are invisible there; verify env via the *server's*
-  behavior (`/health` face_provider), not the supervisor's environ.
+**When?** The constraint is **concurrently occupied rooms, not home count** —
+an empty room makes zero perception calls. At ~0.6-1.3s per pass on a ~5s
+cadence, each *occupied* camera is 12-26% duty, so K ≈ 4 at
+`NEMARA_PERCEPTION_CONCURRENCY=1` and K ≈ 8 at 2 (the 1.6-1.8x is measured,
+the latency impact is **not** — see `docs/architecture/identity-latency.md`).
 
-## 4. Backend tunnel
+The signal already exists: perception returns **429** the moment its
+admission gate saturates, and `identity.batch` logs lag per batch. A rising
+429 rate on a node is the "add a node" trigger.
 
-The backend connects to the pod's `127.0.0.1:8000` over an autossh-style
-tunnel bound to host-loopback (so the rest of the LAN cannot reach patient
-frames). See the backend's tunnel helper; the security rationale is the
-same host-key pinning as above.
+## 3. Lose a node
+
+Nothing to do. A node that stops polling has its homes released after
+`identity_roster_stale_after_s` (90s), and the next node to poll claims them.
+
+You will be told: `FleetWatch` pages **warning** for the dead node, and
+**critical** only if the homes stay unplaced past a 300s grace period — that
+second page means no node had spare capacity, and the remedy is §2.
+
+Cost of a move: the receiving node starts with no seat, no EdgeTAM sessions
+and an empty ledger, and needs to re-ground. Safety detectors are unaffected
+(fail-loud and identity-agnostic), but patient-scoped **routine** detectors —
+medication, drinking, TV — fail quiet, and sleep/activity show a gap.
+
+> The ~30-60s re-ground figure is documented for a patient changing rooms,
+> **not** for a cold-start node with no prior seat. Measure it during the
+> first real failover; that number sets the right staleness threshold.
+
+## 4. Daily cost control
+
+`scripts/pod.sh stop` halts billing, `up` resumes. Two traps, both of which
+have cost us a machine:
+
+- **A stopped pod may not resume.** On 2026-08-10 the host had reallocated
+  its GPU. Savings plans are a **rate discount, not a capacity reservation**,
+  so no amount of money prevents this. The recovery is §1: release a new node.
+- **A pod without a network volume is TERMINATED, not stopped, at $0
+  balance,** and the disk goes with it. That is how the first pod died.
+  `release` refuses without `RUNPOD_NETWORK_VOLUME_ID` for this reason.
+
+The volume also carries the ~3.8GB of checkpoints across node recreation, so
+only the first boot pays the download.
 
 ## 5. Health signals
 
-- `scripts/pod.sh health` → recent `continuous.tick` lines. Healthy:
-  `mode` alternates ground/carry, `seeded` and `live` track occupancy,
-  `drift=0` most ticks (a nonzero `drift` is the guard doing its job).
-- `continuous.drift_dropped` lines → the drift guard fired (forced a
-  re-ground). A burst on every tick means the thresholds are too tight for
-  that install — raise `NEMARA_EDGE_DRIFT_BALLOON`.
-- Server not answering after `start` → give it 90 s; then
-  `scripts/pod.sh logs 100` for a stack trace.
+| check | what it tells you |
+|---|---|
+| `GET /ready` on the backend | one probe per registered node, through the tailnet. `degraded_1_of_3_nodes` names the count; failing nodes get their own line. |
+| `scripts/pod.sh health` | recent `continuous.tick` lines on that node. |
+| `identity.roster` in backend logs | logged only when a claim or a reclaim happens — the only two events that change which machine watches a home. |
+| perception 429 rate | admission gate saturated: this node is at capacity. |
+| `identity.node_down` / `identity.homes_blind` | FleetWatch. The second means families are receiving no identity right now. |
 
-## 6. Security invariants (do not regress)
+`/ready` returning `no_nodes_registered` in production means the fleet is
+absent, not misconfigured.
 
-- Host key is **pinned** (`StrictHostKeyChecking=yes` +
-  `UserKnownHostsFile`), because RunPod recycles direct-TCP endpoints
-  across tenants. A new pod = re-scan (`ssh-keyscan`).
-- Secrets stay in `.pod.env` / `.pod/` (gitignored). Rotate the RunPod API
-  key and SSH key if they were ever pasted into chat/logs.
-- `NEMARA_EDGE_DEBUG_DIR` writes raw patient frames to disk — keep it OFF
-  in production.
+## 6. Debugging a node
+
+```bash
+scripts/pod.sh ssh 'tail -50 /persist/state/logs/roster.log'      # what it was told
+scripts/pod.sh ssh 'tail -50 /persist/state/logs/identity-patient_<uuid>.log'
+scripts/pod.sh ssh 'tail -50 /persist/state/logs/perception.log'
+scripts/pod.sh ssh 'tail -50 /persist/state/logs/tailscale.log'
+scripts/pod.sh ssh 'ls /persist/state/run/'                       # pid + port per room
+```
+
+`roster.log` saying **"roster REJECTED this node (HTTP 4xx)"** is
+configuration, not a blip, and will not recover on its own — a rotated
+internal key (403) or a `base_url` the roster refuses (422). The body names
+the field.
+
+`roster.log` saying **"roster unreachable — keeping current rooms"** is the
+node deliberately NOT stopping anything on a failed poll. A backend blip must
+not blind every home on the node.
+
+To iterate without a release, ssh in and edit under `/workspace` — but the
+next node will not have your change. That is the whole point of §1.
+
+## 7. Security invariants (do not regress)
+
+- **Perception has no authentication by default and must stay on loopback.**
+  `PERCEPTION_HOST` exists only so exposing it is a deliberate, reviewable
+  act. `NEMARA_PERCEPTION_TOKEN` gates `/observe` and `/faces` if it ever
+  does leave.
+- **`NEMARA_IDENTITY_STATE_TOKEN` must be set.** An empty value disables the
+  check on `/state`, `/probes` and `/stream` — live annotated patient video.
+  The entrypoint refuses to start without it.
+- **The tailnet ACL grants a port RANGE** (`tag:gpu:8012-8111`), because a
+  node runs one process per room. Granting only `:8012` would let one home
+  through and deny the rest at the tailnet — which the backend cannot
+  distinguish from "the service is down", so it fails open and those homes
+  silently have no identity.
+- **Host key is pinned** (`StrictHostKeyChecking=yes` + `UserKnownHostsFile`),
+  because RunPod recycles direct-TCP endpoints across tenants. A new node
+  means a re-scan; `pod.sh up` does it.
+- **Secrets stay in `.pod.env` / `.pod/`** (gitignored, including the
+  `.pod.env.bak-*` files `up` writes). Nothing sensitive goes on a command
+  line — argv is visible in `ps`.
+- **`NEMARA_EDGE_DEBUG_DIR` writes raw patient frames to disk.** Keep it off.

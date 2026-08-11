@@ -27,16 +27,23 @@ Built + deployed overnight 2026-07-23. The lean rig is **live now on the SAM3 ar
 
 Two spots (pod + backend; the backend env is the arm *label* the trace records):
 
-> **Stale as of 2026-07-27:** the legacy `/workspace/start_continuous.sh` +
-> `restart_tracker.sh` supervisor is DISABLED — `scripts/pod.sh deploy` renames it
-> `.disabled` and launches a file-based supervisor (`/workspace/start_sam_supervisor.sh`,
-> written by `scripts/deploy_continuous_remote.sh`). The tracker arm is still selected by
-> `NEMARA_TRACKER` (`gpu/perception/continuous.py`, default `edgetam`).
+> **Rewritten 2026-08-11.** Everything this section used to describe is gone:
+> `scripts/pod.sh deploy`, `scripts/deploy_continuous_remote.sh` and the
+> supervisor heredoc it wrote were all deleted when the node became an image.
+> The tracker arm is still selected by `NEMARA_TRACKER`
+> (`gpu/perception/continuous.py`, default `edgetam`) — only the way it is
+> set has changed.
+>
+> `NEMARA_TRACKER` is now node ENV, set at create time. To flip the arm,
+> add it to `.pod.env`, forward it in `pod.sh release`'s optional-env list,
+> and release a node. For a one-off experiment it is faster to ssh in and
+> restart the perception loop with the var set — but that change dies with
+> the node, which is the point.
 
 ```bash
-# 1) Pod (functional — the actual tracker): add `export NEMARA_TRACKER=sam3`
-#    to the supervisor heredoc in scripts/deploy_continuous_remote.sh, then
-#    scripts/pod.sh deploy    (omit the export / redeploy to revert to edgetam)
+# 1) Node (functional — the actual tracker):
+#    NEMARA_TRACKER=sam3 in .pod.env, then scripts/pod.sh release <tag>
+#    (omit it to revert to edgetam)
 # 2) Backend (label only):
 sed -i '' 's/NEMARA_TRACKER=sam3/NEMARA_TRACKER=edgetam/' .env
 docker compose -f docker/docker-compose.local.yml up -d --force-recreate --no-deps backend
