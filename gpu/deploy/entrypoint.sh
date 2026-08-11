@@ -153,12 +153,18 @@ for room in "${ROOMS[@]}"; do
   ) &
 
   # In userspace mode tailscaled cannot reach a local listener by itself —
-  # `serve` is what publishes it onto the tailnet. Without this the backend
-  # can resolve the node but not connect.
+  # `serve` is what publishes it onto the tailnet.
+  #
+  # Run SYNCHRONOUSLY, not as a backgrounded `(sleep 15; ...) &`. That job
+  # would be a child of this shell, and the `wait -n` below returns as soon
+  # as ANY child exits — so the short-lived helper finished ~15s into every
+  # boot, `wait -n` returned, and the container exited 1 and crash-looped.
+  # `tailscale serve` is idempotent and cheap; there is nothing to defer.
   if [ -n "${TS_AUTHKEY:-}" ]; then
-    (sleep 15; tailscale --socket=/var/run/tailscale/tailscaled.sock \
-       serve --bg --tcp "$port" "tcp://127.0.0.1:$port" \
-       >>"$LOGDIR/tailscale.log" 2>&1) &
+    tailscale --socket=/var/run/tailscale/tailscaled.sock \
+      serve --bg --tcp "$port" "tcp://127.0.0.1:$port" \
+      >>"$LOGDIR/tailscale.log" 2>&1 \
+      || log "WARN could not publish port $port on the tailnet"
   fi
 
   i=$((i + 1))
@@ -166,8 +172,9 @@ done
 
 log "up: perception + $i identity room(s), state=$STATE_DIR"
 
-# If any supervised loop exits, fail the container so the platform restarts it
-# rather than leaving a healthy-looking empty shell.
+# If a SUPERVISED loop exits, fail the container so the platform restarts it
+# rather than leaving a healthy-looking empty shell. Every remaining child is
+# an infinite restart loop, so any exit here is genuinely abnormal.
 wait -n
 log "a supervised loop exited unexpectedly — failing the container"
 exit 1

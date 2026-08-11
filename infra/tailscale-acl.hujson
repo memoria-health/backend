@@ -23,14 +23,22 @@
 
   "acls": [
     // ── Backend -> identity ────────────────────────────────────────
-    // The ONLY production data path. Railway reads /state from the
-    // identity service colocated with perception on the GPU host.
-    // Port-scoped: :8012 and nothing else, so a compromised backend
-    // cannot reach the pod's ssh or the perception port directly.
+    // The ONLY production data path. Railway reads /state from the identity
+    // processes colocated with perception on the GPU host.
+    //
+    // A RANGE, not :8012. A node runs one identity process PER ROOM, each on
+    // its own port assigned by the roster from 8012-8111. Granting only 8012
+    // would let exactly one home per node through and deny the rest at the
+    // tailnet — which the backend cannot distinguish from "the service is
+    // down", so it would fail open and those homes would silently have no
+    // identity. That is the failure this whole design exists to prevent.
+    //
+    // Still tightly scoped: it does NOT include perception (:8000, which has
+    // no auth and must never leave loopback) or ssh (:22).
     {
       "action": "accept",
       "src":    ["tag:backend"],
-      "dst":    ["tag:gpu:8012"],
+      "dst":    ["tag:gpu:8012-8111"],
     },
 
     // ── CI -> GPU host ─────────────────────────────────────────────

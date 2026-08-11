@@ -93,26 +93,37 @@ class IdentityRouter:
         url: str | None = None
         try:
             async with self._sessionmaker() as session:
-                url = (
+                row = (
                     await session.execute(
                         text(
-                            "SELECT n.base_url FROM public.patients p "
+                            # base_url is the HOST; the port is per-room,
+                            # because the node runs one process per room. A
+                            # node-level URL alone reaches exactly one home
+                            # and silently starves the rest.
+                            "SELECT n.base_url, p.identity_port "
+                            "  FROM public.patients p "
                             "  JOIN public.identity_nodes n "
                             "    ON n.node_id = p.identity_node_id "
-                            " WHERE p.id = :pid"
+                            " WHERE p.id = :pid AND p.identity_port IS NOT NULL"
                         ),
                         {"pid": key},
                     )
-                ).scalar()
+                ).first()
+            if row is not None:
+                url = f"{row[0].rstrip('/')}:{row[1]}"
         except Exception:
             # Fail OPEN, like every other identity path: a database blip must
-            # not stop detection. Cache the miss briefly so a sustained
-            # outage does not add a query per camera per tick.
+            # not stop detection. Distinguished from "unassigned" below,
+            # because they mean very different things operationally.
             log.exception("identity.router route_lookup_failed patient=%s", key)
+            # Cache the miss briefly so a sustained outage does not add a
+            # query per camera per tick.
+            self._routes[key] = (now + _ROUTE_CACHE_S, None)
+            return None
 
         if url is None:
-            # Distinguishable in logs from "node is down": this patient is not
-            # assigned to any node, which means no node is watching them.
+            # Nobody is watching this home. Distinct from "the node is down",
+            # which surfaces as state_unreachable from the client.
             log.warning("identity.router unassigned patient=%s", key)
         self._routes[key] = (now + _ROUTE_CACHE_S, url)
         return url

@@ -44,21 +44,16 @@ mkdir -p "$LOGDIR" "$RUN"
 
 log() { echo "$(date -u +%FT%TZ) roster: $*" | tee -a "$LOGDIR/roster.log"; }
 
-# Ports are derived from the room id, not from arrival order. Order-based
-# assignment would move a room to a different port whenever the roster
-# changed, and a room that changed port looks to the backend like a brand new,
-# empty home. A hash is stable for the life of the room.
-_port_for() {
-  python3 - "$1" <<'PY'
-import hashlib, sys
-# 8012..8111 — 100 slots, far above any node's capacity.
-print(8012 + int(hashlib.sha256(sys.argv[1].encode()).hexdigest(), 16) % 100)
-PY
-}
-
+# The PORT COMES FROM THE ROSTER. It is not derived here.
+#
+# An earlier version hashed the room id to a port. That is wrong twice over:
+# the backend has to REACH this process, so it cannot be a number the node
+# picks unilaterally, and a hash into 100 slots collides (~6% at capacity 4)
+# with the loser wedged in an EADDRINUSE restart loop while looking healthy.
+# The backend allocates the lowest free port per node and tells us, the same
+# way it allocates gateways.tunnel_port.
 _start_room() {
-  local room="$1" port patient
-  port="$(_port_for "$room")"
+  local room="$1" port="$2" patient
   patient="${room#patient_}"
   mkdir -p "$STATE_DIR/$room"
   (
@@ -79,6 +74,9 @@ _start_room() {
     done
   ) &
   echo $! > "$RUN/$room.pid"
+  # The port is recorded too, so the next poll can tell "already running here"
+  # from "running on a port the backend has since moved".
+  echo "$port" > "$RUN/$room.port"
   log "started room=$room port=$port pid=$(cat "$RUN/$room.pid")"
 
   # Userspace tailscaled cannot reach a local listener on its own; `serve` is
@@ -99,7 +97,7 @@ _stop_room() {
   # respawns identity and the room never actually stops.
   pkill -P "$pid" 2>/dev/null
   kill "$pid" 2>/dev/null
-  rm -f "$RUN/$room.pid"
+  rm -f "$RUN/$room.pid" "$RUN/$room.port"
   log "stopped room=$room (reassigned or released)"
 }
 
@@ -117,14 +115,23 @@ while true; do
       -d "{\"node_id\":\"$NEMARA_NODE_ID\",\"base_url\":\"$NEMARA_NODE_BASE_URL\",\"capacity\":$CAPACITY}" \
       2>>"$LOGDIR/roster.log")" || RESP=""
 
+  # Emits "<room> <port>" per line. Exits non-zero on anything that is not a
+  # well-formed roster reply.
+  #
+  # An error BODY is still valid JSON — a 403 from a rotated key parses fine
+  # and has no "rooms" key, which an earlier version read as "you have been
+  # assigned nothing" and dutifully stopped every room on the node. The
+  # presence of the key, not the truthiness of its value, is the signal.
   WANT="$(printf '%s' "$RESP" | python3 -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
 except Exception:
-    sys.exit(1)          # non-JSON (5xx, proxy error) -> treat as unreachable
-for r in d.get("rooms", []):
-    print(r)
+    sys.exit(1)                 # non-JSON: 5xx, proxy error, empty body
+if not isinstance(d, dict) or "rooms" not in d:
+    sys.exit(1)                 # error body (403/422/500), NOT an empty roster
+for r in d["rooms"]:
+    print(r["room"], r["port"])
 ' 2>/dev/null)" || WANT="__UNREACHABLE__"
 
   if [ "$WANT" = "__UNREACHABLE__" ]; then
@@ -137,16 +144,27 @@ for r in d.get("rooms", []):
   fi
 
   # start what is newly assigned (or has died and lost its pid)
-  while IFS= read -r room; do
+  while IFS=' ' read -r room port; do
     [ -z "$room" ] && continue
-    _alive "$room" || _start_room "$room"
+    if _alive "$room"; then
+      # Already running — but if the backend moved it to a different port,
+      # restart it there. Otherwise the process keeps serving a port nobody
+      # is calling and the home looks alive while getting no traffic.
+      if [ "$(cat "$RUN/$room.port" 2>/dev/null)" != "$port" ]; then
+        log "room=$room port changed -> $port, restarting"
+        _stop_room "$room"
+        _start_room "$room" "$port"
+      fi
+    else
+      _start_room "$room" "$port"
+    fi
   done <<< "$WANT"
 
   # stop what is no longer ours
   for pidf in "$RUN"/*.pid; do
     [ -e "$pidf" ] || continue
     room="$(basename "$pidf" .pid)"
-    grep -qxF "$room" <<< "$WANT" || _stop_room "$room"
+    awk '{print $1}' <<< "$WANT" | grep -qxF "$room" || _stop_room "$room"
   done
 
   sleep "$POLL_S"

@@ -78,6 +78,12 @@ async def _clear(session: AsyncSession) -> None:
     await session.commit()
 
 
+def _names(body) -> list[str]:
+    """Room names only. The roster now returns {room, port} per entry —
+    the port is asserted separately, in the tests that care about it."""
+    return [r["room"] for r in body["rooms"]]
+
+
 async def _poll(client: AsyncClient, node: str, cap: int, url: str | None = None):
     return await client.post(
         ROSTER,
@@ -105,7 +111,7 @@ async def test_poll_registers_node_and_claims_up_to_capacity(
     # Capacity is a ceiling, not a target to overshoot.
     assert len(body["rooms"]) == 3
     assert body["node_id"] == "node-cap"
-    assert all(room.startswith("patient_") for room in body["rooms"])
+    assert all(r.startswith("patient_") for r in _names(body))
 
     # Polling IS the heartbeat — the row exists without a separate register.
     seen = (
@@ -130,8 +136,8 @@ async def test_second_poll_is_stable_not_cumulative(
     for _ in range(5):
         await _mk_patient(session, caregiver_id)
 
-    first = (await _poll(client, "node-stable", cap=2)).json()["rooms"]
-    second = (await _poll(client, "node-stable", cap=2)).json()["rooms"]
+    first = _names((await _poll(client, "node-stable", cap=2)).json())
+    second = _names((await _poll(client, "node-stable", cap=2)).json())
     assert first == second
     assert len(second) == 2
 
@@ -147,8 +153,8 @@ async def test_two_nodes_do_not_claim_the_same_home(
     for _ in range(4):
         await _mk_patient(session, caregiver_id)
 
-    a = set((await _poll(client, "node-a", cap=2)).json()["rooms"])
-    b = set((await _poll(client, "node-b", cap=2)).json()["rooms"])
+    a = set(_names((await _poll(client, "node-a", cap=2)).json()))
+    b = set(_names((await _poll(client, "node-b", cap=2)).json()))
 
     assert len(a) == 2 and len(b) == 2
     assert a.isdisjoint(b), "a home was handed to two nodes"
@@ -167,7 +173,7 @@ async def test_stale_node_homes_are_reclaimed(
     for _ in range(2):
         await _mk_patient(session, caregiver_id)
 
-    dead = (await _poll(client, "node-dead", cap=2)).json()["rooms"]
+    dead = _names((await _poll(client, "node-dead", cap=2)).json())
     assert len(dead) == 2
 
     # Age it past the staleness window without waiting for wall-clock.
@@ -183,7 +189,7 @@ async def test_stale_node_homes_are_reclaimed(
     live = await _poll(client, "node-live", cap=2)
     body = live.json()
     assert body["reclaimed"] == 2, "stale node's homes were not released"
-    assert set(body["rooms"]) == set(dead), "survivor did not pick them up"
+    assert set(_names(body)) == set(dead), "survivor did not pick them up"
 
 
 async def test_returning_node_keeps_identity_and_reclaims(
@@ -249,6 +255,94 @@ async def test_base_url_and_capacity_refresh_on_every_poll(
     assert row[1] == 3
 
 
+async def test_each_room_on_a_node_gets_its_own_port(
+    client: AsyncClient, session: AsyncSession, auth_user
+) -> None:
+    """THE bug this endpoint exists to prevent, in its second form.
+
+    A node runs one identity process per room, each on its own port. If the
+    roster hands back one address for the node, exactly one home is reachable
+    and every other one silently gets no identity — which is the same
+    end-state as having no roster at all.
+    """
+    caregiver_id, email = auth_user
+    await _clear(session)
+    await _mk_caregiver(session, caregiver_id, email)
+    for _ in range(3):
+        await _mk_patient(session, caregiver_id)
+
+    body = (await _poll(client, "node-ports", cap=3)).json()
+    ports = [r["port"] for r in body["rooms"]]
+
+    assert len(ports) == 3
+    assert len(set(ports)) == 3, f"ports collided: {ports}"
+    assert all(8012 <= p <= 8111 for p in ports), ports
+
+
+async def test_ports_are_stable_across_polls(
+    client: AsyncClient, session: AsyncSession, auth_user
+) -> None:
+    """A room that changed port would look to the backend like a brand new,
+    empty home, and would make the node restart it for nothing."""
+    caregiver_id, email = auth_user
+    await _clear(session)
+    await _mk_caregiver(session, caregiver_id, email)
+    for _ in range(2):
+        await _mk_patient(session, caregiver_id)
+
+    first = {r["room"]: r["port"] for r in (await _poll(client, "node-fix", cap=2)).json()["rooms"]}
+    second = {r["room"]: r["port"] for r in (await _poll(client, "node-fix", cap=2)).json()["rooms"]}
+    assert first == second
+
+
+async def test_released_port_is_reused(
+    client: AsyncClient, session: AsyncSession, auth_user
+) -> None:
+    """Ports return to the node's pool on release, or a node that churns
+    homes eventually exhausts its range."""
+    caregiver_id, email = auth_user
+    await _clear(session)
+    await _mk_caregiver(session, caregiver_id, email)
+    await _mk_patient(session, caregiver_id)
+
+    before = (await _poll(client, "node-reuse", cap=1)).json()["rooms"][0]["port"]
+
+    # Release it the way a failover does.
+    await session.execute(
+        text(
+            "UPDATE public.identity_nodes "
+            "   SET last_seen_at = now() - interval '1 hour' WHERE node_id='node-reuse'"
+        )
+    )
+    await session.commit()
+    await _poll(client, "node-sweeper", cap=0 + 1)
+
+    # Sweeper hands it back, then the original reclaims from a clean pool.
+    await session.execute(
+        text("UPDATE public.patients SET identity_node_id=NULL, identity_port=NULL")
+    )
+    await session.commit()
+    after = (await _poll(client, "node-reuse", cap=1)).json()["rooms"][0]["port"]
+
+    assert after == before, "lowest free port was not reused"
+
+
+async def test_lowering_capacity_sheds_load(
+    client: AsyncClient, session: AsyncSession, auth_user
+) -> None:
+    """Capacity is a live limit, not just a claim ceiling. A node resized
+    down (e.g. concurrency reverted) must stop being told to run the extra
+    homes, or it keeps serving beyond what it can handle."""
+    caregiver_id, email = auth_user
+    await _clear(session)
+    await _mk_caregiver(session, caregiver_id, email)
+    for _ in range(4):
+        await _mk_patient(session, caregiver_id)
+
+    assert len(_names((await _poll(client, "node-shrink", cap=4)).json())) == 4
+    assert len(_names((await _poll(client, "node-shrink", cap=2)).json())) == 2
+
+
 async def test_unassigned_claimed_oldest_first(
     client: AsyncClient, session: AsyncSession, auth_user
 ) -> None:
@@ -290,5 +384,5 @@ async def test_unassigned_claimed_oldest_first(
         )
     await session.commit()
 
-    rooms = (await _poll(client, "node-order", cap=1)).json()["rooms"]
+    rooms = _names((await _poll(client, "node-order", cap=1)).json())
     assert rooms == [f"patient_{ids[0]}"], "did not take the longest-waiting home"

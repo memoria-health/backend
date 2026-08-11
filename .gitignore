@@ -56,8 +56,16 @@ yolo11n.pt
 # clutter git status or get committed by accident.
 * [2-9].*
 
-# Pod lifecycle secrets (scripts/pod.sh) — never commit
-.pod.env
+# Pod lifecycle secrets (scripts/pod.sh) — never commit.
+#
+# GLOB, not the bare name: `pod.sh up` writes .pod.env.bak-<timestamp>
+# before rewriting the endpoint, and those backups hold the RunPod API key,
+# the database URL, the LiveKit secret, the identity bearer and the
+# HuggingFace token. `.pod.env` alone did not match them.
+#
+# This is the exact shape of the 2026-07-19 leak, where .env.bak.1783536884
+# was swept in by `git add -A` because the ignore rule only covered `.env`.
+.pod.env*
 .pod/
 
 # Accidental env backups (contain production keys) — never commit

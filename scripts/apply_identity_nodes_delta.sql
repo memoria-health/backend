@@ -37,10 +37,13 @@ create table if not exists public.identity_nodes (
   -- can paste into the RunPod console when something looks wrong.
   node_id      text primary key,
 
-  -- Where the backend reaches this node's identity processes. A tailnet
-  -- MagicDNS name in production (e.g. http://nemara-gpu-abc:8012) precisely
-  -- so it survives RunPod reassigning the pod's direct-TCP endpoint, which
-  -- happens on every restart.
+  -- Host only, NO PORT — e.g. http://nemara-gpu-abc. A tailnet MagicDNS name
+  -- in production, precisely so it survives RunPod reassigning the pod's
+  -- direct-TCP endpoint on every restart.
+  --
+  -- The port lives on the patient (see identity_port below) because the node
+  -- runs one process per room. base_url + patients.identity_port is the full
+  -- address; base_url alone would only ever reach one home per node.
   base_url     text not null,
 
   -- How many rooms this node will accept. Set per-node because it depends on
@@ -62,6 +65,29 @@ create table if not exists public.identity_nodes (
 alter table public.patients
   add column if not exists identity_node_id text
     references public.identity_nodes(node_id) on delete set null;
+
+-- WHICH PORT on that node. A node runs one identity process per room and each
+-- listens on its own port, so "which node" is only half an address — a single
+-- base_url reaches exactly one room and every other home on the node is
+-- unreachable. That is the failure this whole table exists to prevent, so the
+-- port is stored, not guessed.
+--
+-- Assigned BY THE BACKEND on claim (lowest free port for that node), the same
+-- way gateways.tunnel_port is assigned on a box's first roster poll. Deriving
+-- it from a hash on the node instead would mean two implementations of the
+-- same function in two languages, plus birthday collisions inside whatever
+-- range was chosen.
+--
+-- Cleared whenever the home is released, so the port returns to the pool.
+alter table public.patients
+  add column if not exists identity_port int
+    check (identity_port is null or identity_port between 8012 and 8111);
+
+-- One process cannot share a port with another on the SAME node. Across
+-- nodes the same port is fine — different machines.
+create unique index if not exists patients_identity_node_port_uidx
+  on public.patients (identity_node_id, identity_port)
+  where identity_node_id is not null and identity_port is not null;
 
 -- The roster's hot query is "unassigned patients, oldest first". Partial
 -- index: the assigned rows are the majority and are never scanned by it.

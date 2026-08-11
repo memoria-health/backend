@@ -46,16 +46,30 @@ class RosterRequest(BaseModel):
     capacity: int = Field(ge=1, le=64)
 
 
+class RosterRoom(BaseModel):
+    # `patient_<uuid>` — the LiveKit room the identity process joins.
+    room: str
+    # Which port to listen on. Assigned by the backend, not chosen by the
+    # node: the backend has to be able to REACH this process, and it cannot
+    # do that if the node picks unilaterally.
+    port: int
+
+
 class RosterResponse(BaseModel):
     node_id: str
-    # Rooms this node should be running, as `patient_<uuid>`. Authoritative:
-    # the node reconciles to exactly this list, starting what is new and
-    # stopping what is gone.
-    rooms: list[str]
+    # Rooms this node should be running. Authoritative: the node reconciles
+    # to exactly this list, starting what is new and stopping what is gone.
+    rooms: list[RosterRoom]
     capacity: int
     # How many homes this poll took off other (stale) nodes. Non-zero means a
     # failover just happened and is worth an alert.
     reclaimed: int
+
+
+# One identity process per room, one port each. 100 slots is far above any
+# node's plausible capacity (~4 at concurrency=1, ~8 at 2).
+PORT_MIN = 8012
+PORT_MAX = 8111
 
 
 @router.post("/roster", response_model=RosterResponse)
@@ -109,7 +123,10 @@ async def post_roster(
     reclaimed = (
         await session.execute(
             text(
-                "UPDATE public.patients SET identity_node_id = NULL "
+                # identity_port is cleared with the assignment — it belongs to
+                # a node, not to the home, and must return to that node's pool.
+                "UPDATE public.patients "
+                "   SET identity_node_id = NULL, identity_port = NULL "
                 "WHERE identity_node_id IS NOT NULL "
                 "  AND identity_node_id <> :self "
                 "  AND identity_node_id IN ("
@@ -134,39 +151,73 @@ async def post_roster(
     #    off a live node to even out load, because a move costs the new node a
     #    re-ground and ~30-60s where patient-scoped routine detectors are
     #    silently skipped. Failure is worth that; tidiness is not.
+    #    Each claimed home also gets a PORT — the lowest currently free one on
+    #    this node. row_number() over the free-port series pairs the Nth
+    #    claimed home with the Nth free port in a single statement, so two
+    #    concurrent pollers cannot both be handed the same one (the partial
+    #    unique index is the backstop if they somehow race).
     claimed = (
         await session.execute(
             text(
-                "WITH room AS ("
+                "WITH avail AS ("
                 "  SELECT :cap - count(*) AS n FROM public.patients "
                 "   WHERE identity_node_id = :node"
-                "), pick AS ("
-                "  SELECT id FROM public.patients "
+                # The lock and the numbering must be separate CTEs: Postgres
+                # rejects FOR UPDATE in a query that also has a window
+                # function ("FOR UPDATE is not allowed with window
+                # functions"). Lock first, number the locked set after.
+                "), locked AS ("
+                "  SELECT id, created_at FROM public.patients "
                 "   WHERE identity_node_id IS NULL "
                 "   ORDER BY created_at "
-                "   LIMIT GREATEST((SELECT n FROM room), 0) "
+                "   LIMIT GREATEST((SELECT n FROM avail), 0) "
                 "   FOR UPDATE SKIP LOCKED"
+                "), pick AS ("
+                "  SELECT id, row_number() OVER (ORDER BY created_at) AS rn "
+                "    FROM locked"
+                "), free_ports AS ("
+                # CAST(), not `::int`: the params must be typed because
+                # generate_series is overloaded (int/bigint/numeric/timestamp)
+                # and asyncpg sends binds untyped -> "function is not unique".
+                # `::` cannot be used here — SQLAlchemy's text() reads a colon
+                # as the start of a bind parameter.
+                "  SELECT gs AS port, row_number() OVER (ORDER BY gs) AS rn "
+                "    FROM generate_series(CAST(:pmin AS int), CAST(:pmax AS int)) gs "
+                "   WHERE gs NOT IN ("
+                "     SELECT identity_port FROM public.patients "
+                "      WHERE identity_node_id = :node AND identity_port IS NOT NULL"
+                "   )"
                 ") "
-                "UPDATE public.patients p SET identity_node_id = :node "
-                "  FROM pick WHERE p.id = pick.id"
+                "UPDATE public.patients p "
+                "   SET identity_node_id = :node, identity_port = f.port "
+                "  FROM pick JOIN free_ports f USING (rn) "
+                " WHERE p.id = pick.id"
             ),
-            {"node": body.node_id, "cap": body.capacity},
+            {
+                "node": body.node_id, "cap": body.capacity,
+                "pmin": PORT_MIN, "pmax": PORT_MAX,
+            },
         )
     ).rowcount or 0
 
+    # LIMIT by capacity: lowering a node's capacity must actually shed load,
+    # not just stop it claiming more. Oldest-held first, so the homes that
+    # keep their place are the ones that have been settled longest — the
+    # newest arrivals pay the re-ground.
     rows = (
         await session.execute(
             text(
-                "SELECT id FROM public.patients "
-                " WHERE identity_node_id = :node ORDER BY created_at"
+                "SELECT id, identity_port FROM public.patients "
+                " WHERE identity_node_id = :node AND identity_port IS NOT NULL "
+                " ORDER BY created_at LIMIT :cap"
             ),
-            {"node": body.node_id},
+            {"node": body.node_id, "cap": body.capacity},
         )
-    ).scalars().all()
+    ).all()
 
     await session.commit()
 
-    rooms = [f"patient_{pid}" for pid in rows]
+    rooms = [RosterRoom(room=f"patient_{pid}", port=port) for pid, port in rows]
     if reclaimed or claimed:
         # Worth a line at INFO: these are the only two events in the whole
         # scheme that change which machine is watching a home.
