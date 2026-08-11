@@ -22,8 +22,9 @@
 # blind home, not all of them.
 #
 # REQUIRED ENV
-#   NEMARA_IDENTITY_ROOMS        comma-separated room ids (patient_<uuid>,...)
-#                                (Phase 3 replaces this with a roster poll)
+#   NEMARA_IDENTITY_ROOMS        static fallback only — comma-separated room
+#                                ids. Unused when NEMARA_BACKEND_URL is set,
+#                                which is how production runs.
 #   NEMARA_IDENTITY_STATE_TOKEN  bearer for /state — MUST be set
 #   NEMARA_DB_URL                face-enrollment gallery
 #   NEMARA_LIVEKIT_URL / _API_KEY / _API_SECRET
@@ -44,7 +45,8 @@ log() { echo "$(date -u +%FT%TZ) entrypoint: $*"; }
 # An empty token is the dangerous one: contract.auth_ok() treats "" as
 # "accept every caller", so /state, /probes and /stream (live annotated
 # patient video) would be open to anything that reaches the port. Refuse.
-: "${NEMARA_IDENTITY_ROOMS:?set NEMARA_IDENTITY_ROOMS (comma-separated room ids)}"
+# Rooms come from the roster in production. Only required in the static
+# fallback, so the check moved down to where that path begins.
 : "${NEMARA_IDENTITY_STATE_TOKEN:?refusing to start: an empty token disables auth on /state and /stream}"
 : "${NEMARA_DB_URL:?set NEMARA_DB_URL — identity reads the face gallery from Postgres}"
 
@@ -100,7 +102,22 @@ done
 curl -sf -m 2 -o /dev/null "http://127.0.0.1:${PERCEPTION_PORT:-8000}/health" \
   || log "WARNING: perception not answering yet — identity will retry"
 
-# ── 4. identity, one process per room ──────────────────────────────────
+# ── 4. identity ────────────────────────────────────────────────────────
+# Two modes. ROSTER is production: the node asks the backend which homes it
+# should run and reconciles continuously, so adding capacity is "start
+# another node" and losing one is recovered by whoever polls next.
+#
+# The static list is the fallback for a node with no backend to talk to
+# (bring-up, a local docker run, debugging a single home).
+if [ -n "${NEMARA_BACKEND_URL:-}" ]; then
+  log "identity: roster mode (backend=$NEMARA_BACKEND_URL)"
+  exec /workspace/nemara/deploy/roster_agent.sh
+fi
+
+log "identity: static mode — NEMARA_BACKEND_URL unset, using NEMARA_IDENTITY_ROOMS"
+: "${NEMARA_IDENTITY_ROOMS:?static mode needs NEMARA_IDENTITY_ROOMS, or set NEMARA_BACKEND_URL for roster mode}"
+
+# ── 4b. static fallback: one process per room from the env list ────────
 # Ports are 8012, 8013, ... in ROOMS order. Order is stable across restarts
 # because it comes from the env string — a room that changed port would look
 # to the backend like a new, empty home.
