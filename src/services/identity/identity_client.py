@@ -107,8 +107,12 @@ class IdentityClient:
         self._auth_headers = (
             {"Authorization": f"Bearer {token}"} if token else {}
         )
+        # trust_env is left at its default, but the proxy is passed
+        # EXPLICITLY rather than picked up from ALL_PROXY: an env var would
+        # silently capture every other outbound call this process makes.
+        proxy = getattr(settings, "identity_proxy_url", "") or None
         self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(STATE_TIMEOUT_S),
+            timeout=httpx.Timeout(STATE_TIMEOUT_S), proxy=proxy,
         )
         self._cache: tuple[float, dict] | None = None
 

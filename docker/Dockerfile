@@ -8,7 +8,20 @@
 # Built and run by Railway. The CMD reads $PORT at runtime (Railway
 # injects it; defaults to 8002 for local docker runs).
 
+# Tailscale, for the OUTBOUND leg to the GPU nodes. Identity runs on
+# tailnet-only addresses, so without this the backend has no route to it and
+# every home fails open to "no identity" — silently, because that is the
+# designed behaviour when identity is unreachable.
+#
+# Same tag-pinned COPY as gpu/Dockerfile; keeping the two in step matters
+# because both ends have to speak the same tailnet.
+ARG TAILSCALE_TAG=stable
+FROM tailscale/tailscale:${TAILSCALE_TAG} AS tailscale
+
 FROM python:3.12-slim
+
+COPY --from=tailscale /usr/local/bin/tailscaled /usr/local/bin/tailscaled
+COPY --from=tailscale /usr/local/bin/tailscale  /usr/local/bin/tailscale
 
 # System deps:
 #   - ffmpeg: mp4_remux.py + frame_extraction.py (Re-ID inference and
@@ -74,5 +87,9 @@ RUN uv run python -c "import torch; \
 # Match the local-dev port for parity. Railway overrides via $PORT.
 EXPOSE 8002
 
-# `sh -c` form so $PORT is interpolated at container start.
-CMD ["sh", "-c", "uv run uvicorn src.main:app --host 0.0.0.0 --port ${PORT:-8002}"]
+# The entrypoint brings up the tailnet leg (only when TS_AUTHKEY is set) and
+# then execs the same uvicorn command this CMD used to run inline. Copied
+# last so editing it does not invalidate the dependency or model layers.
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+CMD ["/usr/local/bin/entrypoint.sh"]

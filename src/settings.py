@@ -351,6 +351,22 @@ class Settings(BaseSettings):
     # nothing. 90s against a 30s poll gives two misses of slack.
     identity_roster_stale_after_s: int = Field(ge=30, le=900, default=90)
     identity_state_url: str = Field(default="http://host.docker.internal:8012")
+    # HTTP proxy used ONLY for calls to identity nodes. On Railway that is
+    # tailscaled's --outbound-http-proxy-listen, which is how a container
+    # with no TUN device reaches a tailnet host.
+    #
+    # An HTTP proxy rather than tailscaled's SOCKS one: httpx needs the
+    # `socksio` package for socks5:// and we do not ship it, so an
+    # ALL_PROXY=socks5://... would raise ImportError on the first identity
+    # call — at runtime, in production, on a path that otherwise fails open.
+    #
+    # SCOPED to this client rather than set as a process-wide ALL_PROXY,
+    # because that would also route Gemini, OpenAI, LiveKit, Supabase and
+    # Resend through tailscaled. Only identity lives on the tailnet.
+    #
+    # It also fixes DNS: MagicDNS names do not resolve in the container's
+    # resolver, but a CONNECT carries the hostname and the proxy resolves it.
+    identity_proxy_url: str = Field(default="")
     # Bearer token for /state (gpu/identity/contract.py). Empty = no
     # auth (local dev, host-only traffic). ONE env name on BOTH sides:
     # NEMARA_IDENTITY_STATE_TOKEN. The service used to read

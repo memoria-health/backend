@@ -36,12 +36,17 @@ echo "$(date -u +%FT%TZ) tailscale supervisor: start host=$HOSTNAME_" >> "$LOG"
 
 while true; do
   # --tun=userspace-networking: no /dev/net/tun in a RunPod container.
-  # --socks5-server: only used if something on this host ever needs to
-  #   dial OUT over the tailnet; harmless otherwise and cheaper than
-  #   rebuilding the daemon later to add it.
+  # The two outbound proxies are only used if something on this host ever
+  # needs to dial OUT over the tailnet; harmless otherwise and cheaper than
+  # rebuilding the daemon later to add them.
+  #
+  # DIFFERENT PORTS. Both flags previously named localhost:1055, which is
+  # two listeners on one address — the second bind fails, and it fails
+  # inside a supervised restart loop where it reads as a daemon that will
+  # not stay up rather than as a flag conflict.
   tailscaled \
     --tun=userspace-networking \
-    --socks5-server=localhost:1055 \
+    --socks5-server=localhost:1056 \
     --outbound-http-proxy-listen=localhost:1055 \
     --state="$STATE" \
     --socket="$SOCK" >> "$LOG" 2>&1 &

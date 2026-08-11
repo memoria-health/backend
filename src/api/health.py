@@ -119,9 +119,17 @@ async def ready(
             detail={"status": "fail", "checks": {"db": "fail"}, "error": str(exc)},
         ) from exc
 
-    async def _probe(url: str, headers: dict[str, str] | None = None) -> str:
+    async def _probe(
+        url: str, headers: dict[str, str] | None = None,
+        proxy: str | None = None,
+    ) -> str:
+        # `proxy` matters for identity specifically: on Railway those nodes
+        # are only reachable through tailscaled's HTTP proxy. Probing them
+        # directly would report the whole fleet down while the real data
+        # path — which does use the proxy — was working fine. A readiness
+        # check must take the same route as the traffic it speaks for.
         try:
-            async with httpx.AsyncClient(timeout=1.5) as client:
+            async with httpx.AsyncClient(timeout=1.5, proxy=proxy) as client:
                 r = await client.get(url, headers=headers or {})
             # 401/403 is NOT reachability — it means our token is wrong
             # or missing, and `< 500` would have quietly called that
@@ -148,6 +156,7 @@ async def ready(
     )
     id_token = getattr(settings, "identity_state_token", "")
     id_headers = {"Authorization": f"Bearer {id_token}"} if id_token else None
+    id_proxy = getattr(settings, "identity_proxy_url", "") or None
 
     # Identity is a FLEET now, not one sidecar. Probing a single configured
     # URL was accurate when there was one process; with the roster it reports
@@ -170,7 +179,7 @@ async def ready(
         # poll interval starts reporting on the past.
         lk_result, *node_results = await asyncio.gather(
             _probe(lk_url) if lk_url else _noop_ok(),
-            *(_probe(f"{url}/state", id_headers) for _, url in nodes),
+            *(_probe(f"{url}/state", id_headers, id_proxy) for _, url in nodes),
         )
         live = sum(1 for r in node_results if r == "ok")
         if live == len(nodes):
@@ -197,7 +206,7 @@ async def ready(
         )
         lk_result, id_result = await asyncio.gather(
             _probe(lk_url) if lk_url else _noop_ok(),
-            _probe(f"{settings.identity_state_url}/state", id_headers)
+            _probe(f"{settings.identity_state_url}/state", id_headers, id_proxy)
             if id_configured else _noop_ok(),
         )
         if id_configured:

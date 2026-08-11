@@ -24,8 +24,33 @@
 #
 # Build context is the REPO ROOT (we copy both gpu/ and src/).
 
+# ── Tailscale binaries ─────────────────────────────────────────────────
+# Taken from the official image rather than installed from apt: it is one
+# COPY of two static binaries, it needs no apt repo/keyring dance, and the
+# version is a tag we control instead of whatever the repo serves today.
+#
+# NOT OPTIONAL on a production node. The backend reaches identity over the
+# tailnet, and the entrypoint derives the address it registers from the name
+# tailscaled reports — so without these binaries a roster-mode node cannot
+# name itself and refuses to boot. (Until now the image shipped without them
+# while the entrypoint called `tailscaled`, so tailscale silently never ran.)
+# Both ARGs are declared HERE, above the first FROM. An ARG used in a FROM
+# must be in the global scope; declared after one, it belongs to that stage
+# and the next FROM expands it to an empty string.
+ARG TAILSCALE_TAG=stable
 ARG BASE_IMAGE=runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
+
+FROM tailscale/tailscale:${TAILSCALE_TAG} AS tailscale
+
 FROM ${BASE_IMAGE}
+
+COPY --from=tailscale /usr/local/bin/tailscaled /usr/local/bin/tailscaled
+COPY --from=tailscale /usr/local/bin/tailscale  /usr/local/bin/tailscale
+# Fail the BUILD if they are not runnable, in keeping with the assertions
+# further down. The alternative is discovering it on a live node, where the
+# symptom is a node that boots, finds no tailnet name, and exits — twenty
+# minutes and one RunPod bill after the mistake was made.
+RUN tailscaled --version && tailscale --version
 
 # PINNED, not `main`. Two builds a week apart off a branch get different Meta
 # code, which is how a working node becomes a broken one with no diff to
