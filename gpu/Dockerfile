@@ -1,5 +1,6 @@
 # GPU node image — perception + identity, the deployable form of
-# scripts/pod_bootstrap.sh.
+# the hand-run bootstrap script this replaced (scripts/pod_bootstrap.sh,
+# deleted 2026-08-11 — see git history if you need what it did).
 #
 # WHY THIS EXISTS. The pod has been a hand-built pet: bootstrap mutates a
 # running container over ssh (~40 min) and `pod.sh deploy` rsyncs six files
@@ -215,7 +216,7 @@ print('smoke imports OK — perception + identity + src')"
 EXPOSE 8000
 
 # Checkpoints are NOT baked. They are fetched on first boot into the network
-# volume by deploy/fetch_checkpoints.sh — same as pod_bootstrap.sh does today,
+# volume by deploy/fetch_checkpoints.sh — same as the old bootstrap did,
 # it keeps the image ~9-10GB instead of ~14GB, and it avoids redistributing
 # the GATED facebook/sam3.1 weights inside an image.
 ENTRYPOINT ["/workspace/nemara/deploy/entrypoint.sh"]

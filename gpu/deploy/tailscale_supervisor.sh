@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Tailscale supervisor for the GPU host — restart-on-exit, same
-# file-based discipline as identity_supervisor.sh and the perception
+# file-based discipline as the roster agent and the perception
 # supervisor.
 #
 # WHY THIS EXISTS (2026-08-11): the backend reaches identity over the

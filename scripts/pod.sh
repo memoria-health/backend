@@ -16,7 +16,6 @@
 #   scripts/pod.sh start             # resume a STOPPED pod (billing on)
 #   scripts/pod.sh stop              # stop the pod (billing off, disk kept)
 #   scripts/pod.sh ssh "<cmd>"       # run a command on the pod
-#   scripts/pod.sh deploy            # ship perception/ + relaunch server
 #   scripts/pod.sh logs [N]          # tail N lines of the sam server log
 #   scripts/pod.sh health            # recent continuous.tick cadence
 #
@@ -356,15 +355,16 @@ except Exception: print("unknown error")' <<<"$resp")"
       echo "pod is UP and perception is answering on :8000"
     else
       echo "pod is reachable but perception did not answer /health in 180s."
-      echo "  the supervisor may still be loading checkpoints — 'pod.sh logs 100'."
-      echo "  if it never comes up, 'pod.sh deploy' relaunches the supervisor."
+      echo "  the node may still be fetching checkpoints — 'pod.sh logs 100'."
+      echo "  first boot pulls ~3.8GB onto the network volume and is slow."
     fi
     echo
     echo "  endpoint : $POD_HOST:$POD_PORT   (written to .pod.env, host key re-pinned)"
-    echo "  next     : gpu/deploy/tunnel_supervisor.sh        # backend -> pod :8000"
-    echo "             NEMARA_IDENTITY_ROOM=patient_<uuid> \\"
-    echo "               gpu/deploy/identity_supervisor.sh    # identity :8012"
+    echo "  next     : nothing to launch by hand. The node polls the backend"
+    echo "             for its homes and starts one identity process per room;"
+    echo "             the backend reaches them over the tailnet, not a tunnel."
     echo "             scripts/pod.sh health                  # confirm ticks"
+    echo "             curl \$NEMARA_BACKEND_URL/ready         # confirm the fleet"
     ;;
 
   stop|down)
@@ -380,16 +380,25 @@ except Exception: print("unknown error")' <<<"$resp")"
       | grep -viE "Warning: Permanently added|post-quantum|store now" ;;
 
   deploy)
-    # Ship the live perception code and relaunch the supervisor on the
-    # edgetam venv (one env hosts sam2 + sam3 + faces). Mirrors
-    # scripts/deploy_continuous_remote.sh, kept here so deploy is one cmd.
-    echo "shipping perception/ -> pod ..."
-    tar czf - -C "$HERE/gpu" perception 2>/dev/null \
-      | "${SSHC[@]}" "cd /workspace/nemara && tar xzf - && echo shipped" \
-      2>&1 | grep -viE "Warning: Permanently added|post-quantum|store now"
-    echo "relaunching continuous supervisor ..."
-    "${SSHC[@]}" 'bash -s' < "$HERE/scripts/deploy_continuous_remote.sh" \
-      2>&1 | grep -viE "Warning: Permanently added|post-quantum|store now" ;;
+    # REMOVED 2026-08-11 along with scripts/deploy_continuous_remote.sh.
+    #
+    # It rsynced perception/ onto a live pod and restarted the supervisor in
+    # place, which meant the running code was whatever the last person had
+    # pushed from their laptop — no tag, no record, and not reproducible on
+    # a replacement node. That is precisely how the pod became a pet that
+    # could not be rebuilt when its GPU was reallocated.
+    #
+    # The node is now an immutable image: build a tag, release a node from
+    # it, and replace rather than patch.
+    echo "pod.sh deploy: removed — the node is built from an image now." >&2
+    echo >&2
+    echo "  1. git tag gpu-vN && git push origin gpu-vN   # CI builds + pushes" >&2
+    echo "  2. scripts/pod.sh release gpu-vN              # new node from that tag" >&2
+    echo "  3. scripts/pod.sh up                          # endpoint + host key" >&2
+    echo >&2
+    echo "to iterate WITHOUT a release, ssh in and edit under /workspace —" >&2
+    echo "but know that the next node will not have your change." >&2
+    exit 2 ;;
 
   logs)
     "${SSHC[@]}" "tail -n ${2:-60} /workspace/sam_server.log" 2>&1 \
@@ -400,6 +409,6 @@ except Exception: print("unknown error")' <<<"$resp")"
       2>&1 | grep -viE "Warning: Permanently added|post-quantum|store now" ;;
 
   *)
-    echo "usage: pod.sh {release <tag>|up|down|status|start|stop|ssh <cmd>|deploy|logs [N]|health}" >&2
+    echo "usage: pod.sh {release <tag>|up|down|status|start|stop|ssh <cmd>|logs [N]|health}" >&2
     exit 2 ;;
 esac

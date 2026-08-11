@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# First-boot checkpoint fetch — the part of scripts/pod_bootstrap.sh that
+# First-boot checkpoint fetch — the part of the old hand-run bootstrap that
 # cannot live in the image.
 #
 # WHY NOT BAKED:
@@ -9,7 +9,8 @@
 #   * sam3.1_multiplex.pt alone is 3.34GB. Baking takes the image from ~9-10GB
 #     to ~14GB, and image size IS node cold-start time — the thing this whole
 #     design is buying.
-#   * It matches how the node works today: pod_bootstrap.sh downloads onto the
+#   * It matches how the node worked before the image: the bootstrap
+#     downloaded onto the
 #     pod's disk and they persist there.
 #
 # Idempotent. Writes into NEMARA_MODEL_DIR, which should be on the RunPod
