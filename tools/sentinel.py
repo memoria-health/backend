@@ -10,7 +10,7 @@ the one signal that can't lie about whether the product is working.
 
 Probes (every cycle, journaled to JSONL):
   backend   GET :8002/health
-  identity  GET :8012/state (ready flag)
+  identity  GET :8012/state (ready flag) — ONE process; not a fleet check
   tunnel    GET :8000/health (pod via ssh forward)
   dashboard GET :8010/
   frames    newest analyses row age via psql (THE product signal)
@@ -56,9 +56,21 @@ GVISOR_LOG = (
 JOURNAL = Path("/tmp/sentinel.jsonl")
 FORENSICS_ROOT = Path("/tmp/sentinel_forensics")
 
+# LOCAL RIG ONLY, and specifically ONE identity process.
+#
+# In production a GPU node runs one identity process per room, on ports the
+# roster assigns from 8012 upward, and there may be several nodes. This tool
+# would see 8012 and nothing else — reporting "identity: ok" while every
+# other room on every other node was dead. It is not a fleet monitor and
+# must not be read as one; that is /ready's job.
+#
+# The port is overridable so a local rig running two rooms can be pointed at
+# the second one, rather than silently reporting only the first.
+IDENTITY_PORT = int(os.environ.get("SENTINEL_IDENTITY_PORT", "8012"))
+
 PROBES = {
     "backend": "http://localhost:8002/health",
-    "identity": "http://localhost:8012/state",
+    "identity": f"http://localhost:{IDENTITY_PORT}/state",
     "tunnel": "http://localhost:8000/health",
     "dashboard": "http://localhost:8010/",
 }
@@ -83,7 +95,7 @@ def _identity_req(url: str) -> urllib.request.Request:
 
 def _http(url: str, timeout: float = 4.0) -> int:
     try:
-        req = _identity_req(url) if ":8012" in url else url
+        req = _identity_req(url) if f":{IDENTITY_PORT}" in url else url
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status
     except Exception:
@@ -131,7 +143,7 @@ def probe_identity_lag() -> float | None:
     nothing; today it served a frozen snapshot for 4 hours)."""
     try:
         with urllib.request.urlopen(
-            "http://localhost:8012/state", timeout=4
+            f"http://localhost:{IDENTITY_PORT}/state", timeout=4
         ) as r:
             d = json.load(r)
         lags = [
