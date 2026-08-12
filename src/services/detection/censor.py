@@ -200,7 +200,6 @@ _MASK_GAP_BRIDGE_FRAMES = 3
 #
 # Flat green: it is not a colour a room produces, so a masked region is
 # unambiguous to a human reviewer and trivially separable to a model.
-_RESEARCH_FILL_BGR = (0, 255, 0)
 # Margin around the segmented person. 2% of the short side is ~21px on a
 # 1080p frame, which rounds off fingers and closes the gaps between limbs
 # — the silhouette reads as a blob rather than a person. That size was
@@ -394,20 +393,26 @@ def _research_dilate(mask: np.ndarray) -> np.ndarray:
 def _research_frame(
     frame: np.ndarray, mask: np.ndarray | None,
 ) -> np.ndarray:
-    """Fill the person with flat colour, keeping the room intact.
+    """Pixelate the person, keeping the room intact.
+
+    Pixelation rather than the original flat-green fill (Aryaman
+    2026-08-12): identical look to the app's censored event clips, and
+    posture/motion stay readable through the mask — which is research
+    value; a green matte carries none. The research-specific parts
+    stay: the wider research dilation, and full coverage always.
 
     No mask means segmentation missed, not that the room is empty — the
     gate upstream already established someone is present. So the frame
-    is filled entirely rather than left as-is. One rule, no special
+    is pixelated entirely rather than left as-is. One rule, no special
     cases: whether we mask at all is decided upstream by the sensitivity
     verdict, and once we are masking, every frame gets covered one way or
     another.
     """
-    out = frame.copy()
     if mask is None or not mask.any():
-        out[:] = _RESEARCH_FILL_BGR
-        return out
-    out[_research_dilate(mask) > 0] = _RESEARCH_FILL_BGR
+        return _pixelate(frame)
+    out = frame.copy()
+    region = _research_dilate(mask) > 0
+    out[region] = _pixelate(frame)[region]
     return out
 
 
@@ -626,26 +631,9 @@ def _censor_person_mask_sync(
                 gap += 1
                 mask = _dilate_mask(last_mask, extra=True)
             if mode == CENSOR_MODE_RESEARCH:
+                # Always returns a fully-covered frame (person-region
+                # pixelation; full-frame on a seg miss) — no drop path.
                 censored = _research_frame(frame, mask)
-                if censored is None:
-                    if spans is not None:
-                        # Span-gated redaction: no subject inside a
-                        # sensitive span. Fail SAFE per-frame with
-                        # full-frame pixelation rather than dropping a
-                        # 15-minute research clip for one undetectable
-                        # frame — the span itself is already known
-                        # sensitive, so over-masking is the correct
-                        # direction.
-                        censored = _pixelate(frame)
-                    else:
-                        # No subject found and the gap bridge is
-                        # exhausted. Whole-clip research mode has no
-                        # safe fallback (see `_research_frame`), so the
-                        # whole clip goes.
-                        raise CensorError(
-                            "censor: research mode could not locate the "
-                            "subject; clip must be dropped"
-                        )
             else:
                 censored = _censor_frame(frame, mask)
             encoder.write(censored)

@@ -37,13 +37,18 @@ def _mask(h: int = 120, w: int = 160) -> np.ndarray:
     return m
 
 
-def test_person_is_filled_flat_not_pixelated() -> None:
+def test_person_is_pixelated_not_left_raw() -> None:
+    """Pixelation (Aryaman 2026-08-12) — same look as the app's censored
+    event clips; posture readable, identity not. Replaced flat green."""
     frame, mask = _frame(), _mask()
     out = censor._research_frame(frame, mask)
     assert out is not None
-    # Centre of the blob is exactly the fill colour, not a blurred
-    # average of the original pixels.
-    assert tuple(int(c) for c in out[65, 80]) == censor._RESEARCH_FILL_BGR
+    # The blob's region must differ from the original (it was censored)
+    # and must equal the full-frame pixelation of the same region (the
+    # exact treatment, not some other transform).
+    region = censor._research_dilate(mask) > 0
+    assert not np.array_equal(out[region], frame[region])
+    assert np.array_equal(out[region], censor._pixelate(frame)[region])
 
 
 def test_the_room_outside_the_person_is_untouched() -> None:
@@ -78,7 +83,7 @@ def test_no_subject_covers_the_whole_frame() -> None:
     for mask in (None, np.zeros((120, 160), np.uint8)):
         out = censor._research_frame(frame, mask)
         assert out is not None
-        assert (out == np.array(censor._RESEARCH_FILL_BGR, np.uint8)).all()
+        assert np.array_equal(out, censor._pixelate(frame))
 
 
 async def test_research_mode_never_falls_back_to_full_frame(monkeypatch) -> None:
