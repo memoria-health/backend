@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from fastapi import FastAPI
 from fastapi.responses import (
-    FileResponse, HTMLResponse, JSONResponse, StreamingResponse,
+    FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse,
 )
 from sqlalchemy import select, text
 
@@ -674,6 +674,48 @@ async def identity_stream(cam_id: str):
     )
 
 
+@app.get("/identity_live/{cam_id}")
+async def identity_live(cam_id: str):
+    """ONE current annotated frame, fetched on demand.
+
+    Continuous MJPEG over a slow path (tailnet to a remote node) queues
+    upstream of any client-side dropping — the writer pushes every frame
+    and the backlog lives in the node's socket/tailscale buffers, so the
+    view drifts behind wall clock without bound. A per-request grab has
+    no queue to drift: connect, take the first complete frame (the
+    stream always starts at NOW), disconnect. Latency = 1 frame + RTT,
+    by construction. The page polls this at ~1.5fps instead of holding
+    a stream open.
+    """
+    import httpx
+
+    BOUNDARY = b"--frame"
+    buf = b""
+    try:
+        async with httpx.AsyncClient(
+            timeout=8, headers=_ident_headers(),
+        ) as c:
+            async with c.stream(
+                "GET", f"{IDENTITY_BASE}/stream/{cam_id}",
+            ) as r:
+                if r.status_code != 200:
+                    return JSONResponse({"error": "upstream"}, status_code=502)
+                async for chunk in r.aiter_bytes():
+                    buf += chunk
+                    second = buf.find(BOUNDARY, len(BOUNDARY))
+                    if second > 0:
+                        part = buf[:second]
+                        head_end = part.find(b"\r\n\r\n")
+                        if head_end > 0:
+                            jpeg = part[head_end + 4:].rstrip(b"\r\n")
+                            return Response(jpeg, media_type="image/jpeg",
+                                            headers={"Cache-Control": "no-store"})
+                        break
+    except httpx.HTTPError:
+        pass
+    return JSONResponse({"error": "no frame"}, status_code=504)
+
+
 @app.get("/identity_snap/{name}")
 async def identity_snap(name: str):
     """Same reason as /identity_stream: journal snapshots are <img>
@@ -1198,7 +1240,21 @@ async function pollIdentity(){
     $("idsvc").innerHTML=h; window._idLastOk=Date.now();
     const cams=Object.keys(s.cameras||{});
     if(cams.length && idStreams!==cams.length){
-      $("idstreams").innerHTML=cams.map(c=>`<img src="/identity_stream/${c}" style="width:calc(50% - 4px);min-width:280px;border-radius:6px">`).join('');
+      // Snapshot polling, NOT a held-open MJPEG stream: over the tailnet
+      // to a remote node the stream queues upstream and drifts behind
+      // wall clock without bound; a per-request frame cannot lag more
+      // than 1 frame + RTT. Two buffers per cam, swapped on load, so
+      // the image never flickers white between polls.
+      $("idstreams").innerHTML=cams.map(c=>`<img id="live_${c}" src="/identity_live/${c}" style="width:calc(50% - 4px);min-width:280px;border-radius:6px">`).join('');
+      cams.forEach(c=>{
+        const el=document.getElementById("live_"+c);
+        if(!el || el._poll) return;
+        el._poll=setInterval(()=>{
+          const pre=new Image();
+          pre.onload=()=>{ el.src=pre.src; };
+          pre.src=`/identity_live/${c}?t=${Date.now()}`;
+        }, 700);
+      });
       idStreams=cams.length;
     }
   }catch(e){}
