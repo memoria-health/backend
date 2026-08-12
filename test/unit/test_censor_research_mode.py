@@ -84,7 +84,7 @@ def test_no_subject_covers_the_whole_frame() -> None:
 async def test_research_mode_never_falls_back_to_full_frame(monkeypatch) -> None:
     """A tier-1 failure must propagate, not quietly produce a blurred
     clip that then gets uploaded as though it were fine."""
-    async def boom(in_path, out_path, *, mode=censor.CENSOR_MODE_PIXELATE):
+    async def boom(in_path, out_path, *, mode=censor.CENSOR_MODE_PIXELATE, **kw):
         raise censor.CensorError("no subject")
 
     called = False
@@ -113,7 +113,7 @@ async def test_full_frame_request_in_research_mode_is_refused() -> None:
 
 async def test_default_mode_still_falls_back(monkeypatch) -> None:
     """The caregiver-facing path must be completely unchanged."""
-    async def boom(in_path, out_path, *, mode=censor.CENSOR_MODE_PIXELATE):
+    async def boom(in_path, out_path, *, mode=censor.CENSOR_MODE_PIXELATE, **kw):
         raise censor.CensorError("no subject")
 
     called = False

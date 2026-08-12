@@ -265,7 +265,10 @@ class RoomWorker:
             patient_id=fs.ctx.patient_id,
             camera_id=fs.ctx.camera_id,
             room=fs.ctx.room,
-            masked=bool(fs.masked),
+            # Span-level redaction (2026-08-12): "masked" now means "this
+            # clip carries pixelated spans" — the exact ranges ride the
+            # object metadata as `sensitive_spans`.
+            masked=clip_metadata.get("redacted") == "true",
             timeline_exact=clip_metadata.get("timeline_exact") != "false",
         )
         async with self._sessionmaker() as session:

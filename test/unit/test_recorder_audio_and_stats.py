@@ -1,10 +1,16 @@
-"""Sensitive-clip audio switch, and the counters that make collection
-observable.
+"""Clip audio, sensitive-verdict priors, and the counters that make
+collection observable.
 
-Audio: a masked clip is where sound carries most of what happened, so it
-is kept by default. The switch can only DISCARD audio — it can never
-cause any to be captured, because `patients.audio_capture_enabled`
-severs the track at the publisher.
+Audio: research clips carry their audio unconditionally (2026-07-28
+product call — visuals are censored, sound stays; redaction pixelates
+video spans and never touches the track). Capture itself is severed at
+the publisher by `patients.audio_capture_enabled` when audio is illegal
+to record.
+
+Sensitive verdicts (2026-08-12): a True verdict no longer switches
+encoders — it is NOTED as a clip-relative offset and rides
+FinalizedSession.sensitive_offsets into the finalize-time redaction
+pass as a span prior.
 
 Counters: without them, collection can stop completely (cap reached, B2
 unconfigured, every upload failing) and nothing anywhere says so.
@@ -69,18 +75,21 @@ def _settings(**over):
         b2_key_id="k", b2_app_key="s", b2_bucket="b",
         b2_endpoint_url="e", b2_region="r",
         data_collection_max_concurrent=8,
-        data_collection_keep_sensitive_audio=True,
+        data_collection_redaction_enabled=False,
     )
     base.update(over)
     return SimpleNamespace(**base)
 
 
-def _mgr(tmp_path, *, settings=None, muxer=None, uploader=None):
+def _mgr(tmp_path, *, settings=None, muxer=None, uploader=None,
+         span_detector=None):
+    kw = {}
+    if span_detector is not None:
+        kw["span_detector"] = span_detector
     return RecorderManager(
         settings=settings or _settings(),
         temp_dir=tmp_path,
         encoder_factory=_Enc,
-        masking_encoder_factory=_Enc,
         muxer=muxer or _Muxer(),
         uploader=uploader or _Uploader(),
         clock=lambda: 0.0,
@@ -88,7 +97,7 @@ def _mgr(tmp_path, *, settings=None, muxer=None, uploader=None):
         linger_seconds=0.0,
         retry_base_delay=0.0,
         sleep=lambda _s: _noop(),
-    )
+    **kw)
 
 
 async def _noop() -> None:
@@ -110,7 +119,7 @@ async def _run(mgr, cam, ctx, *, sensitive=None):
     await mgr.drain()
 
 
-async def test_masked_clip_keeps_audio_by_default(tmp_path) -> None:
+async def test_clip_audio_is_always_kept(tmp_path) -> None:
     muxer = _Muxer()
     mgr = _mgr(tmp_path, muxer=muxer)
     cam = uuid4()
@@ -118,29 +127,27 @@ async def test_masked_clip_keeps_audio_by_default(tmp_path) -> None:
     assert muxer.audio_args and muxer.audio_args[0] is not None
 
 
-async def test_switch_off_drops_audio_from_masked_clips(tmp_path) -> None:
-    muxer = _Muxer()
+async def test_sensitive_verdict_becomes_a_redaction_prior(tmp_path) -> None:
+    """A True verdict during a session must surface in the priors handed
+    to the span detector — that is the entire remaining effect of the
+    tick-time sensitivity screen on recording."""
+    seen: dict = {}
+
+    async def _detector(_path, *, duration, prior_offsets, settings):
+        seen["priors"] = list(prior_offsets)
+        return SimpleNamespace(
+            spans=[], chunk_hits=0, prior_hits=len(prior_offsets),
+            chunks_screened=0,
+        )
+
     mgr = _mgr(
         tmp_path,
-        settings=_settings(data_collection_keep_sensitive_audio=False),
-        muxer=muxer,
+        settings=_settings(data_collection_redaction_enabled=True),
+        span_detector=_detector,
     )
     cam = uuid4()
     await _run(mgr, cam, _ctx(cam), sensitive=True)
-    assert muxer.audio_args == [None]
-
-
-async def test_switch_off_leaves_unmasked_clips_alone(tmp_path) -> None:
-    """The switch is about sensitive footage, not all footage."""
-    muxer = _Muxer()
-    mgr = _mgr(
-        tmp_path,
-        settings=_settings(data_collection_keep_sensitive_audio=False),
-        muxer=muxer,
-    )
-    cam = uuid4()
-    await _run(mgr, cam, _ctx(cam))  # no verdict → unmasked
-    assert muxer.audio_args and muxer.audio_args[0] is not None
+    assert seen["priors"] == [0.0]  # frozen clock: verdict at t=0
 
 
 async def test_counters_track_a_healthy_upload(tmp_path) -> None:
@@ -168,10 +175,3 @@ async def test_counters_track_b2_not_configured(tmp_path) -> None:
     cam = uuid4()
     await _run(mgr, cam, _ctx(cam))
     assert mgr.stats["dropped_no_b2"] == 1
-
-
-async def test_counters_track_a_masked_session(tmp_path) -> None:
-    mgr = _mgr(tmp_path)
-    cam = uuid4()
-    await _run(mgr, cam, _ctx(cam), sensitive=True)
-    assert mgr.stats["sessions_masked"] == 1

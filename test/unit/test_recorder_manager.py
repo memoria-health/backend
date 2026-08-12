@@ -96,6 +96,7 @@ def _settings(max_concurrent: int = 8) -> SimpleNamespace:
         b2_app_key="a",
         b2_bucket="memoria-data",
         data_collection_max_concurrent=max_concurrent,
+        data_collection_redaction_enabled=False,
     )
 
 

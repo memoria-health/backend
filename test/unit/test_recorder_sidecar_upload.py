@@ -17,7 +17,6 @@ from src.services.data_collection.session import RecorderCtx
 
 _UTC = datetime(2026, 8, 5, 9, 0, 0, tzinfo=timezone.utc)
 
-
 class _Enc:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
@@ -36,12 +35,10 @@ class _Enc:
         self.path.write_bytes(b"video")
         return self.path
 
-
 class _Muxer:
     async def __call__(self, video, audio, out, **kw) -> Path:
         Path(out).write_bytes(b"final")
         return Path(out)
-
 
 class _Uploader:
     def __init__(self) -> None:
@@ -52,17 +49,17 @@ class _Uploader:
         self.calls.append((key, kw.get("content_type", ""), body))
         return key
 
-
 def _mgr(tmp_path, uploader, builder):
     return RecorderManager(
         settings=SimpleNamespace(
             b2_key_id="k", b2_app_key="s", b2_bucket="b",
             b2_endpoint_url="e", b2_region="r",
             data_collection_max_concurrent=8,
+            data_collection_redaction_enabled=False,
         ),
         temp_dir=tmp_path,
         encoder_factory=_Enc,
-        masking_encoder_factory=_Enc,
+
         muxer=_Muxer(),
         uploader=uploader,
         clock=lambda: 0.0,
@@ -71,20 +68,17 @@ def _mgr(tmp_path, uploader, builder):
         sidecar_builder=builder,
     )
 
-
 def _ctx(cam):
     return RecorderCtx(
         caregiver_id=uuid4(), patient_id=uuid4(), camera_id=cam,
         room="Bedroom", gate="person", confidence=0.9,
     )
 
-
 async def _run(mgr, cam, ctx):
     await mgr.on_tick(cam, True, ctx=ctx)
     await mgr.on_tick(cam, False, ctx=ctx)
     await mgr.on_tick(cam, False, ctx=ctx)
     await mgr.drain()
-
 
 async def test_sidecar_lands_beside_the_clip(tmp_path) -> None:
     async def builder(fs, key, meta):
@@ -105,7 +99,6 @@ async def test_sidecar_lands_beside_the_clip(tmp_path) -> None:
     assert json.loads(body)["clip"]["key"] == clip_key
     assert mgr.stats["sidecars_uploaded"] == 1
 
-
 async def test_the_clip_goes_up_first(tmp_path) -> None:
     """Order matters: a note about a clip that failed to upload is
     worse than no note."""
@@ -117,7 +110,6 @@ async def test_the_clip_goes_up_first(tmp_path) -> None:
     cam = uuid4()
     await _run(mgr, cam, _ctx(cam))
     assert up.calls[0][0].endswith(".mp4")
-
 
 async def test_a_failing_builder_never_costs_the_clip(tmp_path) -> None:
     async def builder(fs, key, meta):
@@ -133,7 +125,6 @@ async def test_a_failing_builder_never_costs_the_clip(tmp_path) -> None:
     assert mgr.stats["clips_uploaded"] == 1
     assert mgr.stats["sidecars_failed"] == 1
 
-
 async def test_no_builder_means_no_sidecar_not_a_failure(tmp_path) -> None:
     up = _Uploader()
     mgr = _mgr(tmp_path, up, None)
@@ -141,7 +132,6 @@ async def test_no_builder_means_no_sidecar_not_a_failure(tmp_path) -> None:
     await _run(mgr, cam, _ctx(cam))
     assert len(up.calls) == 1
     assert mgr.stats["sidecars_failed"] == 0
-
 
 async def test_no_sidecar_when_the_clip_never_uploaded(tmp_path) -> None:
     """A note with no clip is orphaned data in the bucket."""
@@ -162,10 +152,8 @@ async def test_no_sidecar_when_the_clip_never_uploaded(tmp_path) -> None:
     await _run(mgr, cam, _ctx(cam))
     assert calls == []
 
-
 async def _noop() -> None:
     return None
-
 
 async def test_temp_sidecar_file_is_cleaned_up(tmp_path) -> None:
     async def builder(fs, key, meta):

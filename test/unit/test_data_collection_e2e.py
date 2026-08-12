@@ -87,6 +87,7 @@ async def test_presence_session_produces_one_uploaded_av_clip(tmp_path) -> None:
         b2_app_key="a",
         b2_bucket="memoria-data",
         data_collection_max_concurrent=8,
+        data_collection_redaction_enabled=False,
     )
     mgr = RecorderManager(
         settings=settings,

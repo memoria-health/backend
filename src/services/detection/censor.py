@@ -544,12 +544,22 @@ class _FrameEncoder:
 
 def _censor_person_mask_sync(
     in_path: str, out_path: str, *, mode: str = CENSOR_MODE_PIXELATE,
+    spans: list[tuple[float, float]] | None = None,
+    fps_override: float | None = None,
 ) -> None:
     """Tier 1, synchronous (runs inside the CLI child process — see
     `_cli_main`): STREAM one frame at a time — decode → person-mask
     pixelation → straight into the piped ffmpeg encoder — so peak
     memory is O(1 frame + model), never O(clip). Audio never enters
-    the path (raw-video pipe)."""
+    the path (raw-video pipe).
+
+    ``spans`` (2026-08-12, finalize-time redaction): when given, ONLY
+    frames whose timestamp falls inside a span are censored; the rest
+    pass through untouched (and skip segmentation entirely, which is
+    what makes a 15-minute clip affordable). ``fps_override`` maps
+    frame index -> seconds for span gating; REQUIRED with spans when
+    the clip was not encoded at `clip_fps` (the data-collection
+    recorder runs 15fps, event clips run `clip_fps`)."""
     import cv2
 
     model = _get_seg_model()
@@ -572,7 +582,10 @@ def _censor_person_mask_sync(
         # sailed straight through (a variable-frame-rate file reports
         # 0.25 fps — measured), which would have written a clip 32x too
         # slow with nothing flagged anywhere.
-        fps = float(get_settings().clip_fps)
+        fps = (
+            float(fps_override) if fps_override
+            else float(get_settings().clip_fps)
+        )
         probed = cap.get(cv2.CAP_PROP_FPS)
         if probed and abs(probed - fps) > 0.5:
             log.warning(
@@ -592,7 +605,20 @@ def _censor_person_mask_sync(
         # still fail safe to full-frame.
         last_mask = None
         gap = 0
+        frame_idx = 0
         while ok:
+            if spans is not None:
+                t = frame_idx / fps
+                if not any(a <= t < b for a, b in spans):
+                    # Outside every sensitive span: pass through raw and
+                    # skip segmentation. Mask state resets so a span
+                    # entered later starts fresh instead of bridging a
+                    # minutes-old mask across clean footage.
+                    last_mask, gap = None, 0
+                    encoder.write(frame)
+                    frame_idx += 1
+                    ok, frame = cap.read()
+                    continue
             mask = _person_mask(model, frame)
             if mask is not None:
                 last_mask, gap = mask, 0
@@ -602,16 +628,28 @@ def _censor_person_mask_sync(
             if mode == CENSOR_MODE_RESEARCH:
                 censored = _research_frame(frame, mask)
                 if censored is None:
-                    # No subject found and the gap bridge is exhausted.
-                    # Research mode has no safe fallback (see
-                    # `_research_frame`), so the whole clip goes.
-                    raise CensorError(
-                        "censor: research mode could not locate the "
-                        "subject; clip must be dropped"
-                    )
+                    if spans is not None:
+                        # Span-gated redaction: no subject inside a
+                        # sensitive span. Fail SAFE per-frame with
+                        # full-frame pixelation rather than dropping a
+                        # 15-minute research clip for one undetectable
+                        # frame — the span itself is already known
+                        # sensitive, so over-masking is the correct
+                        # direction.
+                        censored = _pixelate(frame)
+                    else:
+                        # No subject found and the gap bridge is
+                        # exhausted. Whole-clip research mode has no
+                        # safe fallback (see `_research_frame`), so the
+                        # whole clip goes.
+                        raise CensorError(
+                            "censor: research mode could not locate the "
+                            "subject; clip must be dropped"
+                        )
             else:
                 censored = _censor_frame(frame, mask)
             encoder.write(censored)
+            frame_idx += 1
             ok, frame = cap.read()
     except BaseException:
         if encoder is not None:
@@ -663,75 +701,10 @@ def mask_people_in_still_sync(jpeg: bytes) -> bytes:
     return bytes(buf)
 
 
-def mask_stream_sync(
-    width: int, height: int, fps: float, out_path: str, stdin: Any = None,
-) -> None:
-    """Mask raw I420 frames arriving on stdin, straight into an MP4.
-
-    The inline half of the research censor. The recorder already holds
-    decoded frames, so piping them here skips the decode AND the
-    re-encode a post-pass over a finished clip would need — and raw
-    footage never reaches disk.
-
-    Segmentation runs every `censor_stream_segment_every` frames and the
-    mask is carried (extra-dilated) across the ones between: at 15fps a
-    person moves very little in a few frames, and segmenting all of them
-    costs more than the budget allows.
-
-    When segmentation finds nothing, the SAME bounded bridge the
-    file-based censor uses applies (`_MASK_GAP_BRIDGE_FRAMES`): reuse the
-    last mask, widened, for a few frames, then cover the frame entirely.
-    Carrying a stale mask indefinitely would be worse than useless — a
-    person who moved would be uncovered while we masked where they used
-    to be.
-
-    Note this bites during the recorder's 45s linger, where the gate has
-    already gone false and the room may genuinely be empty: those frames
-    get covered rather than kept. Safe, and cheap in research value,
-    since an empty room at the tail of a session carries little.
-    """
-    import cv2
-    import numpy as np
-
-    stream = stdin if stdin is not None else sys.stdin.buffer
-    model = _get_seg_model()
-    frame_bytes = width * height * 3 // 2
-    every = max(1, int(get_settings().censor_stream_segment_every))
-
-    encoder = _FrameEncoder(width, height, float(fps), out_path)
-    last_mask = None
-    gap = 0
-    index = 0
-    try:
-        while True:
-            buf = stream.read(frame_bytes)
-            if not buf or len(buf) < frame_bytes:
-                break  # clean EOF, or a torn final frame we won't trust
-            yuv = np.frombuffer(buf, dtype=np.uint8).reshape(
-                (height * 3 // 2, width)
-            )
-            frame = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
-            if index % every == 0:
-                fresh = _person_mask(model, frame)
-                if fresh is not None:
-                    last_mask, gap = fresh, 0
-                else:
-                    gap += 1
-            mask = None
-            if last_mask is not None and gap <= _MASK_GAP_BRIDGE_FRAMES:
-                mask = last_mask if gap == 0 else _dilate_mask(
-                    last_mask, extra=True
-                )
-            encoder.write(_research_frame(frame, mask))
-            index += 1
-    except BaseException:
-        encoder.abort()
-        raise
-    encoder.close()
-
-
 def _person_mask_subprocess_cmd(
     in_path: str, out_path: str, *, mode: str = CENSOR_MODE_PIXELATE,
+    spans: list[tuple[float, float]] | None = None,
+    fps: float | None = None,
 ) -> list[str]:
     """argv for the tier-1 child process. Split out as a seam so unit
     tests can substitute a scripted child (exit-code / sleep stand-ins)
@@ -744,14 +717,23 @@ def _person_mask_subprocess_cmd(
     ]
     if mode != CENSOR_MODE_PIXELATE:
         argv += ["--mode", mode]
+    if spans is not None:
+        argv += ["--spans", ",".join(f"{a:.3f}-{b:.3f}" for a, b in spans)]
+    if fps is not None:
+        argv += ["--fps", f"{fps:g}"]
     return argv
 
 
 async def _censor_person_mask_subprocess(
     in_path: str, out_path: str, *, mode: str = CENSOR_MODE_PIXELATE,
+    spans: list[tuple[float, float]] | None = None,
+    fps: float | None = None,
+    timeout_seconds: float | None = None,
 ) -> None:
     """Tier 1: run the person-mask censor in an ISOLATED child process
-    with a hard wall-clock deadline (`censor_timeout_seconds`).
+    with a hard wall-clock deadline (`censor_timeout_seconds`, or the
+    caller's ``timeout_seconds`` override — long research clips need a
+    duration-scaled budget the 15s-event default can't cover).
 
     Why a subprocess (2026-07-28): a multi-threaded torch inference hit
     a native OpenMP deadlock and froze the whole backend — the hang
@@ -767,9 +749,14 @@ async def _censor_person_mask_subprocess(
     `CensorError` on nonzero exit; `censor_clip` maps both onto the
     tier-2 full-frame fallback.
     """
-    timeout = get_settings().censor_timeout_seconds
+    timeout = (
+        timeout_seconds if timeout_seconds is not None
+        else get_settings().censor_timeout_seconds
+    )
     proc = await asyncio.create_subprocess_exec(
-        *_person_mask_subprocess_cmd(in_path, out_path, mode=mode),
+        *_person_mask_subprocess_cmd(
+            in_path, out_path, mode=mode, spans=spans, fps=fps,
+        ),
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -876,6 +863,9 @@ async def _mux_source_audio(source_path: str, video_path: str) -> None:
 async def censor_clip(
     in_path: str, out_path: str, *, full_frame: bool = False,
     keep_audio: bool = True, mode: str = CENSOR_MODE_PIXELATE,
+    spans: list[tuple[float, float]] | None = None,
+    fps: float | None = None,
+    timeout_seconds: float | None = None,
 ) -> None:
     """Censor the clip at `in_path` into `out_path` (video pixelated/
     blurred; the SOURCE audio track is carried over — 2026-07-28
@@ -905,14 +895,20 @@ async def censor_clip(
             raise CensorError(
                 "censor: research mode has no full-frame fallback"
             )
-        await _censor_person_mask_subprocess(in_path, out_path, mode=mode)
+        await _censor_person_mask_subprocess(
+            in_path, out_path, mode=mode, spans=spans, fps=fps,
+            timeout_seconds=timeout_seconds,
+        )
         if keep_audio:
             await _mux_source_audio(in_path, out_path)
         return
 
     if not full_frame:
         try:
-            await _censor_person_mask_subprocess(in_path, out_path)
+            await _censor_person_mask_subprocess(
+                in_path, out_path, spans=spans, fps=fps,
+                timeout_seconds=timeout_seconds,
+            )
             # Tier 1 writes video only, so silence is simply not muxing.
             if keep_audio:
                 await _mux_source_audio(in_path, out_path)
@@ -947,14 +943,8 @@ def _cli_main(argv: list[str] | None = None) -> int:
         prog="python -m src.services.detection.censor",
         description="Censor a sensitive clip (blur persons, strip audio).",
     )
-    parser.add_argument("in_path", help="source clip (mp4), or - to stream")
+    parser.add_argument("in_path", help="source clip (mp4)")
     parser.add_argument("out_path", help="censored output clip (mp4)")
-    parser.add_argument(
-        "--stream-i420",
-        metavar="WxH@FPS",
-        help="read raw I420 frames from stdin instead of decoding in_path "
-             "(inline recorder masking); in_path is ignored",
-    )
     parser.add_argument(
         "--full-frame",
         action="store_true",
@@ -966,17 +956,32 @@ def _cli_main(argv: list[str] | None = None) -> int:
         default=CENSOR_MODE_PIXELATE,
         help="pixelate (caregiver-facing clips) or research (B2 corpus)",
     )
+    parser.add_argument(
+        "--spans",
+        help="censor ONLY these second-ranges (e.g. '12.000-30.500,"
+             "300.000-321.000'); frames outside pass through raw "
+             "(finalize-time redaction, 2026-08-12)",
+    )
+    parser.add_argument(
+        "--fps",
+        type=float,
+        help="frame-index -> seconds rate for --spans gating (the "
+             "data-collection recorder encodes at 15fps, not clip_fps)",
+    )
     args = parser.parse_args(argv)
+    spans = None
+    if args.spans:
+        spans = []
+        for part in args.spans.split(","):
+            a, _, b = part.partition("-")
+            spans.append((float(a), float(b)))
     try:
-        if args.stream_i420:
-            dims, _, rate = args.stream_i420.partition("@")
-            w, _, h = dims.partition("x")
-            mask_stream_sync(int(w), int(h), float(rate), args.out_path)
-        elif args.full_frame:
+        if args.full_frame:
             asyncio.run(_censor_full_frame(args.in_path, args.out_path))
         else:
             _censor_person_mask_sync(
                 args.in_path, args.out_path, mode=args.mode,
+                spans=spans, fps_override=args.fps,
             )
     except Exception:  # noqa: BLE001 — any failure = nonzero exit
         import traceback

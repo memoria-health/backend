@@ -32,15 +32,19 @@ from src.services.data_collection import b2 as b2_module
 from src.services.annotations.sidecar import sidecar_key
 from src.services.data_collection.keys import build_clip_key
 from src.services.data_collection.mux import mux_av
+from src.services.data_collection.redaction import detect_spans
 from src.services.data_collection.session import (
     FinalizedSession,
     RecorderCtx,
     SessionRecorder,
 )
 from src.services.data_collection.streaming_encoder import (
-    MaskingMp4Writer,
+    _DEFAULT_FPS as RECORD_FPS,  # the recorder's encode rate (15fps)
+)
+from src.services.data_collection.streaming_encoder import (
     StreamingMp4Writer,
 )
+from src.services.detection.censor import CENSOR_MODE_RESEARCH, censor_clip
 
 logger = logging.getLogger(__name__)
 
@@ -104,12 +108,6 @@ def _default_encoder_factory(path: Path) -> StreamingMp4Writer:
     return StreamingMp4Writer(path)
 
 
-def _masking_encoder_factory(path: Path) -> MaskingMp4Writer:
-    """Encoder for a session judged sensitive: identical timing, but
-    every frame is masked on the way out and raw never touches disk."""
-    return MaskingMp4Writer(path)
-
-
 async def _always_us(_patient_id: UUID) -> str:
     """Default region lookup — used when no DB-backed resolver is injected
     (e.g. unit tests). Routes to the default (US) bucket."""
@@ -123,7 +121,6 @@ class RecorderManager:
         settings: Any,
         temp_dir: Path | str,
         encoder_factory: Callable[[Path], Any] = _default_encoder_factory,
-        masking_encoder_factory: Callable[[Path], Any] = _masking_encoder_factory,
         muxer: _Muxer = mux_av,
         uploader: _Uploader = b2_module.upload_file_to_b2,
         clock: Callable[[], float] = time.monotonic,
@@ -135,13 +132,15 @@ class RecorderManager:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         region_lookup: _RegionLookup = _always_us,
         sidecar_builder: _SidecarBuilder | None = None,
+        span_detector: Callable[..., Awaitable[Any]] = detect_spans,
+        redactor: Callable[..., Awaitable[None]] = censor_clip,
     ) -> None:
         self._settings = settings
-        self._masking_encoder_factory = masking_encoder_factory
-        # Cameras whose current session must be masked. Set by a
-        # sensitive verdict, cleared when the session ends.
-        self._masked: dict[UUID, bool] = {}
         self._region_lookup = region_lookup
+        # Finalize-time redaction seams (2026-08-12): span detection and
+        # the span-gated censor, injectable so unit tests use fakes.
+        self._span_detector = span_detector
+        self._redactor = redactor
         # Builds the note that travels with a clip. None (unit tests, a
         # box with no DB) simply means no sidecar — never a failed upload.
         self._sidecar_builder = sidecar_builder
@@ -163,8 +162,10 @@ class RecorderManager:
         # failing — and nothing anywhere says so. Read it via `stats`.
         self.stats: dict[str, int] = {
             "sessions_started": 0,
-            "sessions_masked": 0,
             "clips_uploaded": 0,
+            "clips_redacted": 0,
+            "redaction_spans_total": 0,
+            "dropped_redaction": 0,
             "dropped_cap": 0,
             "dropped_encoder": 0,
             "dropped_mux": 0,
@@ -206,13 +207,14 @@ class RecorderManager:
         lead_in_audio: bytes | None = None,
         sensitive: bool | None = None,
     ) -> None:
-        """``sensitive`` is the tick's verdict on whether this moment
-        needs masking, or None when the tick didn't ask (it runs on a
-        cadence). A True verdict is the ONLY thing that turns masking on.
+        """``sensitive`` is the tick's verdict on whether this moment is
+        sensitive, or None when the tick didn't ask (it runs on a
+        cadence). A True verdict no longer touches the encoder
+        (2026-08-12): it is NOTED as a clip-relative offset and becomes
+        a span prior for the finalize-time redaction pass. Recording
+        stays raw-to-local-disk throughout.
         """
         async with self._lock_for(camera_id):
-            if sensitive:
-                await self._go_masked(camera_id)
             rec = self._sessions.get(camera_id)
             if rec is None:
                 if not collect:
@@ -226,59 +228,22 @@ class RecorderManager:
                     )
                     self.stats["dropped_cap"] += 1
                     return
-                rec = self._make_recorder(
-                    camera_id, ctx, masked=self._masked.get(camera_id, False)
-                )
+                rec = self._make_recorder(camera_id, ctx)
                 self._sessions[camera_id] = rec
                 self.stats["sessions_started"] += 1
-                if self._masked.get(camera_id):
-                    self.stats["sessions_masked"] += 1
 
             await rec.on_tick(
                 collect, lead_in_frames=lead_in_frames, lead_in_audio=lead_in_audio
             )
+            if sensitive:
+                # AFTER on_tick so the verdict on the session-STARTING
+                # tick lands too (before it, the recorder is IDLE and
+                # the note would no-op).
+                rec.note_sensitive()
             # Drop fully-idle recorders so the dict (and the cap math)
             # stays tight — a session that just finalized is back to IDLE.
             if not rec.is_active:
                 self._sessions.pop(camera_id, None)
-                # Session over. The next one starts unmasked again — a
-                # verdict applies to the moment it judged, not forever.
-                self._masked.pop(camera_id, None)
-
-    async def _go_masked(self, camera_id: UUID) -> None:
-        """Switch this camera to masked recording, discarding what the
-        current session has captured so far.
-
-        A verdict describes footage that is already on disk — the tick
-        judges a window that has passed. Masking forward would leave that
-        prefix sitting there unmasked, so it is thrown away instead. We
-        lose the seconds before the verdict; nothing sensitive survives
-        unmasked. Discarding is also far cheaper than going back and
-        masking it.
-
-        Sticky for the rest of the session: once a moment has been judged
-        sensitive, the session stays masked rather than flapping back and
-        forth on each verdict, which would chop it into fragments.
-
-        Caller holds the camera's lock.
-        """
-        if self._masked.get(camera_id):
-            return  # already masked, nothing to switch
-        self._masked[camera_id] = True
-        rec = self._sessions.pop(camera_id, None)
-        if rec is None or not rec.is_active:
-            return  # nothing captured yet; the next session starts masked
-        logger.info(
-            "data_collection: sensitive verdict for camera %s — discarding "
-            "the unmasked session and restarting masked", camera_id,
-        )
-        try:
-            await rec.abort()
-        except Exception:
-            logger.exception(
-                "data_collection: abort while going masked failed for %s",
-                camera_id,
-            )
 
     async def finalize_camera(self, camera_id: UUID) -> None:
         """Force-finalize a single camera's in-flight session (called when
@@ -342,22 +307,18 @@ class RecorderManager:
     # ── session wiring ──────────────────────────────────────────────
 
     def _make_recorder(
-        self, camera_id: UUID, ctx: RecorderCtx, *, masked: bool = False,
+        self, camera_id: UUID, ctx: RecorderCtx,
     ) -> SessionRecorder:
         return SessionRecorder(
             camera_id=camera_id,
             ctx=ctx,
             temp_dir=self._temp_dir,
-            encoder_factory=(
-                self._masking_encoder_factory if masked
-                else self._encoder_factory
-            ),
+            encoder_factory=self._encoder_factory,
             on_finalized=self._handle_finalized,
             clock=self._clock,
             utcnow=self._utcnow,
             roll_seconds=self._roll_seconds,
             linger_seconds=self._linger_seconds,
-            masked=masked,
         )
 
     async def _handle_finalized(self, fs: FinalizedSession) -> None:
@@ -368,19 +329,7 @@ class RecorderManager:
         never blocks the tick.
         """
         final_path = fs.video_path.with_suffix(".final.mp4")
-        # A masked clip is where sound carries most of what happened, so
-        # it is kept by default. This switch is ours to flip; it can only
-        # DISCARD audio, never cause any to be captured (that is severed
-        # at the publisher by `patients.audio_capture_enabled`).
         audio_path = fs.audio_path
-        if fs.masked and not getattr(
-            self._settings, "data_collection_keep_sensitive_audio", True
-        ):
-            logger.info(
-                "data_collection: dropping audio from a masked clip "
-                "(keep_sensitive_audio is off) camera=%s", fs.ctx.camera_id,
-            )
-            audio_path = None
         if not fs.encoder_ok:
             # The encoder child died. Its file is truncated at best, and
             # for a masked session there is no telling how much of it got
@@ -405,6 +354,57 @@ class RecorderManager:
             logger.exception("data_collection: mux failed; dropping session")
             self._cleanup(fs.video_path, fs.audio_path, final_path)
             return
+
+        # ── finalize-time redaction (2026-08-12) ────────────────────
+        # Find the sensitive seconds (tick priors ∪ chunked re-screen)
+        # and pixelate exactly those via the event-clip censor in
+        # span-gated research mode. The invariant: never UPLOAD an
+        # unredacted clip — ANY failure in this stage drops the clip
+        # (fail closed; raw never leaves the box on an error path).
+        spans: list[tuple[float, float]] = []
+        upload_path = final_path
+        redacted_path = fs.video_path.with_suffix(".redacted.mp4")
+        duration = float(fs.video_duration_seconds or 0.0)
+        if (
+            getattr(self._settings, "data_collection_redaction_enabled", True)
+            and duration > 0
+        ):
+            try:
+                plan = await self._span_detector(
+                    final_path,
+                    duration=duration,
+                    prior_offsets=fs.sensitive_offsets,
+                    settings=self._settings,
+                )
+                spans = plan.spans
+                if spans:
+                    await self._redactor(
+                        str(final_path),
+                        str(redacted_path),
+                        spans=spans,
+                        fps=float(RECORD_FPS),
+                        mode=CENSOR_MODE_RESEARCH,
+                        # Span seconds pay segmentation (~10x realtime
+                        # budget); passthrough decode/encode is cheap.
+                        timeout_seconds=(
+                            120.0
+                            + 10.0 * sum(b - a for a, b in spans)
+                            + 0.5 * duration
+                        ),
+                    )
+                    upload_path = redacted_path
+                    self.stats["clips_redacted"] += 1
+                    self.stats["redaction_spans_total"] += len(spans)
+            except Exception:
+                self.stats["dropped_redaction"] += 1
+                logger.exception(
+                    "data_collection: redaction failed; dropping clip "
+                    "(raw never leaves the box on an error path)"
+                )
+                self._cleanup(
+                    fs.video_path, fs.audio_path, final_path, redacted_path,
+                )
+                return
 
         key = build_clip_key(
             caregiver_id=fs.ctx.caregiver_id,
@@ -439,11 +439,19 @@ class RecorderManager:
             # is still represented; the intermediate picture is not.
             # A sharpness signal for whoever trains on this.
             "dropped_frames": str(fs.dropped_frames),
+            # Redaction record: which second-ranges of THIS clip are
+            # pixelated ("[]" = clean clip, verified by two nets). Rides
+            # the object so a corpus consumer can filter or audit
+            # without opening the file; the sidecar carries it too.
+            "sensitive_spans": json.dumps(
+                [[round(a, 3), round(b, 3)] for a, b in spans]
+            ),
+            "redacted": "true" if spans else "false",
         }
 
         task = asyncio.create_task(
             self._upload_and_cleanup(
-                final_path,
+                upload_path,
                 key,
                 metadata,
                 fs.video_path,
@@ -451,6 +459,12 @@ class RecorderManager:
                 camera_id=fs.ctx.camera_id,
                 patient_id=fs.ctx.patient_id,
                 fs=fs,
+                # When the redacted file uploads, the raw mux still needs
+                # cleaning (and vice versa — the unused sibling).
+                extra_cleanup=(
+                    final_path if upload_path is not final_path
+                    else redacted_path
+                ),
             )
         )
         self._pending_uploads.add(task)
@@ -467,6 +481,7 @@ class RecorderManager:
         camera_id: UUID,
         patient_id: UUID,
         fs: FinalizedSession | None = None,
+        extra_cleanup: Path | None = None,
     ) -> None:
         try:
             # Room-derived privacy no longer gates collection or upload
@@ -495,7 +510,7 @@ class RecorderManager:
             if await self._upload_with_retry(final_path, key, metadata, region):
                 await self._upload_sidecar(fs, key, metadata, region)
         finally:
-            self._cleanup(video_path, audio_path, final_path)
+            self._cleanup(video_path, audio_path, final_path, extra_cleanup)
 
     async def _upload_with_retry(
         self, final_path: Path, key: str, metadata: dict[str, str], region: str,

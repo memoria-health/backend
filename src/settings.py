@@ -259,17 +259,32 @@ class Settings(BaseSettings):
         ge=1, le=60, default=3
     )
 
-    # Whether a research clip whose video was masked keeps its audio.
-    # ON by default: a masked clip is exactly where sound carries the most
-    # of what happened, and the corpus is opt-in. This is OURS to flip,
-    # not a per-family setting — hence a setting and not a column.
-    #
-    # It only decides whether we KEEP the audio. It can never cause any to
-    # be captured: `patients.audio_capture_enabled` severs the track at
-    # the publisher for facilities where recording audio is illegal, so
-    # when that is false no audio reaches us to keep.
-    # Env: NEMARA_DATA_COLLECTION_KEEP_SENSITIVE_AUDIO.
-    data_collection_keep_sensitive_audio: bool = True
+    # ── Finalize-time redaction (2026-08-12) ────────────────────
+    # (Replaces the per-clip masked-audio switch: audio is now kept
+    # unconditionally per the 2026-07-28 product call — redaction
+    # pixelates video spans and never touches the track. Capture is
+    # still severed at the publisher by patients.audio_capture_enabled.)
+    # Recording is raw-to-local-disk; between mux and upload the clip is
+    # re-screened in chunks and the sensitive spans pixelated via the
+    # event-clip censor (research mode, span-gated). ANY redaction
+    # failure drops the clip — raw never leaves the box on an error
+    # path. Disabling this uploads clips with only the tick-verdict
+    # priors unexamined — LOCAL RIGS ONLY, never a consented family.
+    # Env: NEMARA_DATA_COLLECTION_REDACTION_ENABLED etc.
+    data_collection_redaction_enabled: bool = True
+    # Chunk length for the finalize re-screen. Spans resolve to chunk
+    # granularity before padding; smaller = finer spans, more calls.
+    data_collection_redaction_chunk_seconds: float = Field(
+        ge=5.0, le=120.0, default=30.0
+    )
+    # Padding added to each side of every detected span before merging.
+    data_collection_redaction_pad_seconds: float = Field(
+        ge=0.0, le=30.0, default=3.0
+    )
+    # Concurrent chunk-screen calls per clip.
+    data_collection_redaction_concurrency: int = Field(
+        ge=1, le=16, default=4
+    )
 
     # ── Detector subscriber-bot (Phase 2) ───────────────────────
     # The bot lives inside the FastAPI process as an asyncio task tree
