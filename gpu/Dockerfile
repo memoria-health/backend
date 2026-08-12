@@ -104,6 +104,11 @@ RUN sed -i \
 # letting pip resolve it will happily swap the base image's CUDA build for
 # something else. A mismatched torch/CUDA pair costs an evening.
 RUN pip install -q --no-deps ultralytics ultralytics-thop boxmot
+# gdown is boxmot's weight downloader. --no-deps above means it never
+# installed, and the base image ships one too old for the fuzzy= kwarg
+# boxmot passes (OSNet prefetch died on it, first CI build 2026-08-12).
+# torch-free, so installing it WITH deps is safe.
+RUN pip install -q "gdown>=5"
 
 # onnxruntime-gpu pinned to the CUDA-12 line. 1.28+ needs CUDA 13, and the
 # failure mode is not an error but a silent fall back to CPUExecutionProvider
