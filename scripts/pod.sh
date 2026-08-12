@@ -45,8 +45,16 @@ if [[ ! -f "$ENV_FILE" ]]; then
   echo "pod.sh: missing $ENV_FILE — copy .pod.env.example and fill it in." >&2
   exit 2
 fi
+# set -a: source EXPORTS everything, because release's request body is
+# built by a python3 child that reads os.environ — plain `source` leaves
+# the vars shell-local and the child silently sees none of them. The
+# first real release (2026-08-12) shipped a pod whose only env var was
+# RunPod's own PUBLIC_KEY this way; the shell-side guards all passed
+# because the shell could see what the child could not.
+set -a
 # shellcheck disable=SC1090
 source "$ENV_FILE"
+set +a
 
 : "${RUNPOD_API_KEY:?set in .pod.env}"
 : "${POD_ID:?set in .pod.env}"
