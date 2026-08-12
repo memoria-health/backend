@@ -59,6 +59,12 @@ jobs:
       - name: Install locked deps
         run: uv sync --frozen
 
+      - name: Install ffmpeg
+        # The censor / mp4-remux / frame-codec tests shell out to the real
+        # ffmpeg binary — a genuine runtime dependency, present in the GPU
+        # image and on every dev machine.
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+
       - name: Unit tests
         # The unit suite never touches a database or Supabase, but
         # src/main.py builds the app at import time and Settings carries
@@ -72,7 +78,20 @@ jobs:
           NEMARA_SUPABASE_PUBLISHABLE_KEY: ci-publishable-placeholder
           NEMARA_SUPABASE_JWT_SECRET: ci-jwt-secret-placeholder-at-least-32-chars
           NEMARA_SUPABASE_SERVICE_ROLE_KEY: ci-service-role-placeholder
-        run: uv run pytest test/unit -q
+        # Five test/unit files are integration tests wearing a unit label:
+        # they open real connections to the local Supabase Postgres. CI has
+        # no database, so they are excluded HERE ONLY — `make test` still
+        # runs them against real infra on every dev machine. If a new
+        # DB-backed test lands in test/unit it will fail this gate loudly,
+        # which is the correct pressure to either mock it or move it to
+        # test/integration.
+        run: >
+          uv run pytest test/unit -q
+          --ignore test/unit/test_face_embedding_repo.py
+          --ignore test/unit/test_state_machine.py
+          --ignore test/unit/test_state_machine_no_online_write.py
+          --ignore test/unit/test_active_camera.py
+          --ignore test/unit/test_event_gate.py
 
   build:
     needs: test
