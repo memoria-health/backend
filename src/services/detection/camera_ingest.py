@@ -151,12 +151,6 @@ class _RecorderDecision:
     ctx: "RecorderCtx | None" = None
     lead_frames: list | None = None
     lead_audio: bytes | None = None
-    # Room-derived privacy for THIS camera (cameras.privacy_enabled, read
-    # off the camera row once it loads — per-camera model, 2026-07-27).
-    # When True the drive ABORTS any in-flight session instead of taking
-    # the linger→finalize→upload route, so pre-privacy footage is dropped
-    # on the device rather than uploaded.
-    privacy: bool = False
     # Whether this moment needs masking. None means the tick didn't ask
     # (the screen runs on a cadence, not every tick). A True verdict is
     # the ONLY thing that turns masking on — room class does not.
@@ -801,11 +795,6 @@ class CameraIngest:
         if self._recorder is None or decision.ctx is None:
             return
         try:
-            if decision.privacy:
-                # Privacy on → drop any in-flight clip immediately, no
-                # mux/upload. Idempotent no-op when nothing is recording.
-                await self._recorder.abort_camera(self.camera_id)
-                return
             await self._recorder.on_tick(
                 self.camera_id,
                 decision.collect,
@@ -901,11 +890,6 @@ class CameraIngest:
                 gate="person",
                 confidence=None,
             )
-            # Privacy is known the moment the camera row loads — set it
-            # now so EVERY tick path (including early returns) aborts an
-            # open session rather than letting it linger toward upload.
-            # Per-camera (cameras.privacy_enabled) since 2026-07-27.
-            decision.privacy = cam.privacy_enabled
 
             # Room classifier trigger (room-derived privacy, 2026-07-27):
             # a camera that has frames flowing but no room verdict yet is
@@ -1922,7 +1906,6 @@ class CameraIngest:
             # above as the session lead-in. Never alters detection; the
             # actual recording happens in the RoomWorker-owned recorder.
             collect = should_collect(
-                camera_privacy_enabled=cam.privacy_enabled,
                 data_collection_enabled=patient.data_collection_enabled,
                 motion_in_clip=motion_in_clip,
                 gate_people_present=gate_people_present,

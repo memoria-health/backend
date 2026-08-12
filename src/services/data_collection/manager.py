@@ -47,9 +47,6 @@ logger = logging.getLogger(__name__)
 # Type aliases for the injectable collaborators.
 _Muxer = Callable[..., Awaitable[Path]]
 _Uploader = Callable[..., Awaitable[str]]
-# Called with the CAMERA id (per-camera room-derived privacy, 2026-07-27
-# — the retired patient-level check took a patient id).
-_PrivacyCheck = Callable[[UUID], Awaitable[bool]]
 _RegionLookup = Callable[[UUID], Awaitable[str]]
 # (FinalizedSession, clip key, clip metadata) -> the sidecar dict.
 _SidecarBuilder = Callable[..., Awaitable[dict]]
@@ -113,12 +110,6 @@ def _masking_encoder_factory(path: Path) -> MaskingMp4Writer:
     return MaskingMp4Writer(path)
 
 
-async def _never_private(_camera_id: UUID) -> bool:
-    """Default privacy check — used when no DB-backed check is injected
-    (e.g. unit tests). Always permits the upload."""
-    return False
-
-
 async def _always_us(_patient_id: UUID) -> str:
     """Default region lookup — used when no DB-backed resolver is injected
     (e.g. unit tests). Routes to the default (US) bucket."""
@@ -142,7 +133,6 @@ class RecorderManager:
         upload_retries: int = 3,
         retry_base_delay: float = 1.0,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-        privacy_check: _PrivacyCheck = _never_private,
         region_lookup: _RegionLookup = _always_us,
         sidecar_builder: _SidecarBuilder | None = None,
     ) -> None:
@@ -151,7 +141,6 @@ class RecorderManager:
         # Cameras whose current session must be masked. Set by a
         # sensitive verdict, cleared when the session ends.
         self._masked: dict[UUID, bool] = {}
-        self._privacy_check = privacy_check
         self._region_lookup = region_lookup
         # Builds the note that travels with a clip. None (unit tests, a
         # box with no DB) simply means no sidecar — never a failed upload.
@@ -177,7 +166,6 @@ class RecorderManager:
             "sessions_masked": 0,
             "clips_uploaded": 0,
             "dropped_cap": 0,
-            "dropped_privacy": 0,
             "dropped_encoder": 0,
             "dropped_mux": 0,
             "dropped_no_b2": 0,
@@ -310,11 +298,11 @@ class RecorderManager:
         """Force-ABORT a camera's in-flight session, discarding temp files
         WITHOUT muxing or uploading.
 
-        This is the privacy path: when the camera's ``privacy_enabled``
-        turns on mid-session (room classifier finalizing, support
-        override), the per-tick drive calls this instead of the normal
-        gate-off route so the already-captured footage never reaches B2.
-        No-op if the camera has no active session.
+        The discard-don't-upload primitive. Its per-tick caller was the
+        room-privacy path, retired 2026-08-12 when consent became the
+        only recording boundary; the primitive stays for operational
+        kill-switches and the abort/restart machinery's tests. No-op if
+        the camera has no active session.
         """
         async with self._lock_for(camera_id):
             rec = self._sessions.pop(camera_id, None)
@@ -481,30 +469,11 @@ class RecorderManager:
         fs: FinalizedSession | None = None,
     ) -> None:
         try:
-            # Defense-in-depth: the CAMERA's privacy can flip on (room
-            # classifier finalizing bathroom/bedroom, support override)
-            # AFTER a session finalized but BEFORE its bytes leave the
-            # box. Re-check per-camera at the upload boundary and drop
-            # the clip if so — nothing private ever reaches B2 even on
-            # that race. Fail-safe: if the check itself errors, do NOT
-            # upload.
-            try:
-                if await self._privacy_check(camera_id):
-                    logger.info(
-                        "data_collection: camera privacy on at upload; "
-                        "discarding clip %s",
-                        key,
-                    )
-                    self.stats["dropped_privacy"] += 1
-                    return
-            except Exception:
-                logger.exception(
-                    "data_collection: privacy check failed for camera %s; "
-                    "discarding clip %s (fail-safe)",
-                    camera_id,
-                    key,
-                )
-                return
+            # Room-derived privacy no longer gates collection or upload
+            # (Aryaman 2026-08-12): consent is the recording boundary and
+            # sensitive verdicts switch the session to the masked
+            # encoder, so privacy rooms record like any other. Privacy
+            # still severs LIVE VIEW subscriptions — unchanged.
             if not b2_module.b2_configured(self._settings):
                 logger.warning(
                     "data_collection: B2 not configured; discarding clip %s", key

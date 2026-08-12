@@ -354,37 +354,6 @@ async def test_aclose_finalizes_in_flight_sessions_on_shutdown(tmp_path) -> None
 
 
 @pytest.mark.asyncio
-async def test_privacy_check_at_upload_boundary_drops_clip(tmp_path) -> None:
-    """Defense-in-depth: if privacy flips on between session-finalize and
-    the upload, the upload-boundary re-check drops the clip — uploader is
-    never called, temps still cleaned."""
-    clock = _Clock()
-    uploader = _FakeUploader()
-
-    async def _privacy_on(_camera_id) -> bool:
-        return True
-
-    mgr = RecorderManager(
-        settings=_settings(),
-        temp_dir=tmp_path,
-        encoder_factory=_Factory(),
-        muxer=_FakeMuxer(),
-        uploader=uploader,
-        clock=clock,
-        utcnow=lambda: _UTC,
-        roll_seconds=900.0,
-        linger_seconds=45.0,
-        retry_base_delay=0.0,
-        sleep=_noop_sleep,
-        privacy_check=_privacy_on,
-    )
-    await _run_one_session(mgr, clock)
-
-    assert uploader.calls == []  # privacy guard blocked the upload
-    assert list(tmp_path.iterdir()) == []  # temps still cleaned
-
-
-@pytest.mark.asyncio
 async def test_b2_not_configured_skips_upload_but_cleans_up(tmp_path) -> None:
     clock = _Clock()
     uploader = _FakeUploader()

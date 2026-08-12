@@ -240,23 +240,9 @@ class RoomWorker:
         self._recorder = RecorderManager(
             settings=settings,
             temp_dir=recorder_temp_root(),
-            privacy_check=self._camera_privacy_check,
             region_lookup=self._patient_region,
             sidecar_builder=self._build_sidecar,
         )
-
-    async def _camera_privacy_check(self, camera_id) -> bool:
-        """Upload-boundary guard for the recorder: re-read the CAMERA's
-        room-derived privacy flag at the moment a clip is about to leave
-        the box, so a privacy flip (classifier finalizing, support
-        override) during the finalize→upload window still drops it."""
-        async with self._sessionmaker() as session:
-            cam = await session.get(Camera, camera_id)
-        if cam is None:
-            # Row vanished mid-session — fail CLOSED: never upload a clip
-            # we can't positively confirm is allowed to leave the box.
-            return True
-        return cam.privacy_enabled
 
     async def _build_sidecar(self, fs, clip_key: str, clip_metadata: dict):
         """The note that travels with a clip: what the pipeline already
