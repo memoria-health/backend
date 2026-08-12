@@ -355,57 +355,6 @@ class RecorderManager:
             self._cleanup(fs.video_path, fs.audio_path, final_path)
             return
 
-        # ── finalize-time redaction (2026-08-12) ────────────────────
-        # Find the sensitive seconds (tick priors ∪ chunked re-screen)
-        # and pixelate exactly those via the event-clip censor in
-        # span-gated research mode. The invariant: never UPLOAD an
-        # unredacted clip — ANY failure in this stage drops the clip
-        # (fail closed; raw never leaves the box on an error path).
-        spans: list[tuple[float, float]] = []
-        upload_path = final_path
-        redacted_path = fs.video_path.with_suffix(".redacted.mp4")
-        duration = float(fs.video_duration_seconds or 0.0)
-        if (
-            getattr(self._settings, "data_collection_redaction_enabled", True)
-            and duration > 0
-        ):
-            try:
-                plan = await self._span_detector(
-                    final_path,
-                    duration=duration,
-                    prior_offsets=fs.sensitive_offsets,
-                    settings=self._settings,
-                )
-                spans = plan.spans
-                if spans:
-                    await self._redactor(
-                        str(final_path),
-                        str(redacted_path),
-                        spans=spans,
-                        fps=float(RECORD_FPS),
-                        mode=CENSOR_MODE_RESEARCH,
-                        # Span seconds pay segmentation (~10x realtime
-                        # budget); passthrough decode/encode is cheap.
-                        timeout_seconds=(
-                            120.0
-                            + 10.0 * sum(b - a for a, b in spans)
-                            + 0.5 * duration
-                        ),
-                    )
-                    upload_path = redacted_path
-                    self.stats["clips_redacted"] += 1
-                    self.stats["redaction_spans_total"] += len(spans)
-            except Exception:
-                self.stats["dropped_redaction"] += 1
-                logger.exception(
-                    "data_collection: redaction failed; dropping clip "
-                    "(raw never leaves the box on an error path)"
-                )
-                self._cleanup(
-                    fs.video_path, fs.audio_path, final_path, redacted_path,
-                )
-                return
-
         key = build_clip_key(
             caregiver_id=fs.ctx.caregiver_id,
             patient_id=fs.ctx.patient_id,
@@ -439,19 +388,18 @@ class RecorderManager:
             # is still represented; the intermediate picture is not.
             # A sharpness signal for whoever trains on this.
             "dropped_frames": str(fs.dropped_frames),
-            # Redaction record: which second-ranges of THIS clip are
-            # pixelated ("[]" = clean clip, verified by two nets). Rides
-            # the object so a corpus consumer can filter or audit
-            # without opening the file; the sidecar carries it too.
-            "sensitive_spans": json.dumps(
-                [[round(a, 3), round(b, 3)] for a, b in spans]
-            ),
-            "redacted": "true" if spans else "false",
+            # `sensitive_spans` / `redacted` are filled by the redaction
+            # stage inside the upload task (below) — redaction takes
+            # ~clip-length and MUST NOT run inline here: this path holds
+            # the camera's recorder lock, and running it inline opened a
+            # 5-minute recording hole after every roll (observed live
+            # 2026-08-12: clip rolled 13:44:37, next could not start
+            # until redaction finished at 13:49:35).
         }
 
         task = asyncio.create_task(
             self._upload_and_cleanup(
-                upload_path,
+                final_path,
                 key,
                 metadata,
                 fs.video_path,
@@ -459,12 +407,6 @@ class RecorderManager:
                 camera_id=fs.ctx.camera_id,
                 patient_id=fs.ctx.patient_id,
                 fs=fs,
-                # When the redacted file uploads, the raw mux still needs
-                # cleaning (and vice versa — the unused sibling).
-                extra_cleanup=(
-                    final_path if upload_path is not final_path
-                    else redacted_path
-                ),
             )
         )
         self._pending_uploads.add(task)
@@ -481,14 +423,67 @@ class RecorderManager:
         camera_id: UUID,
         patient_id: UUID,
         fs: FinalizedSession | None = None,
-        extra_cleanup: Path | None = None,
     ) -> None:
+        upload_path = final_path
+        redacted_path = final_path.with_suffix(".redacted.mp4")
         try:
-            # Room-derived privacy no longer gates collection or upload
-            # (Aryaman 2026-08-12): consent is the recording boundary and
-            # sensitive verdicts switch the session to the masked
-            # encoder, so privacy rooms record like any other. Privacy
-            # still severs LIVE VIEW subscriptions — unchanged.
+            # ── finalize-time redaction (2026-08-12) ────────────────
+            # Runs HERE, in the fire-and-forget task, never in the
+            # recorder-lock path (see the metadata note in
+            # _handle_finalized). Find the sensitive seconds (tick
+            # priors ∪ chunked re-screen), pixelate exactly those via
+            # the event-clip censor in span-gated research mode. The
+            # invariant: never UPLOAD an unredacted clip — ANY failure
+            # in this stage drops the clip (fail closed).
+            spans: list[tuple[float, float]] = []
+            duration = float(
+                (fs.video_duration_seconds if fs else None) or 0.0
+            )
+            if (
+                fs is not None
+                and duration > 0
+                and getattr(
+                    self._settings, "data_collection_redaction_enabled", True
+                )
+            ):
+                try:
+                    plan = await self._span_detector(
+                        final_path,
+                        duration=duration,
+                        prior_offsets=fs.sensitive_offsets,
+                        settings=self._settings,
+                    )
+                    spans = plan.spans
+                    if spans:
+                        await self._redactor(
+                            str(final_path),
+                            str(redacted_path),
+                            spans=spans,
+                            fps=float(RECORD_FPS),
+                            mode=CENSOR_MODE_RESEARCH,
+                            # Span seconds pay segmentation (~10x
+                            # realtime); passthrough re-encode is cheap.
+                            timeout_seconds=(
+                                120.0
+                                + 10.0 * sum(b - a for a, b in spans)
+                                + 0.5 * duration
+                            ),
+                        )
+                        upload_path = redacted_path
+                        self.stats["clips_redacted"] += 1
+                        self.stats["redaction_spans_total"] += len(spans)
+                except Exception:
+                    self.stats["dropped_redaction"] += 1
+                    logger.exception(
+                        "data_collection: redaction failed; dropping clip "
+                        "(raw never leaves the box on an error path)"
+                    )
+                    return
+            metadata["sensitive_spans"] = json.dumps(
+                [[round(a, 3), round(b, 3)] for a, b in spans]
+            )
+            metadata["redacted"] = "true" if spans else "false"
+
             if not b2_module.b2_configured(self._settings):
                 logger.warning(
                     "data_collection: B2 not configured; discarding clip %s", key
@@ -507,10 +502,10 @@ class RecorderManager:
                     patient_id, key,
                 )
                 region = "US"
-            if await self._upload_with_retry(final_path, key, metadata, region):
+            if await self._upload_with_retry(upload_path, key, metadata, region):
                 await self._upload_sidecar(fs, key, metadata, region)
         finally:
-            self._cleanup(video_path, audio_path, final_path, extra_cleanup)
+            self._cleanup(video_path, audio_path, final_path, redacted_path)
 
     async def _upload_with_retry(
         self, final_path: Path, key: str, metadata: dict[str, str], region: str,
