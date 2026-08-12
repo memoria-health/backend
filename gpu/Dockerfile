@@ -111,8 +111,10 @@ RUN pip install -q --no-deps ultralytics ultralytics-thop boxmot
 # `onnxruntime>=1.16` for the backend — installing that here would shadow this
 # with the CPU build, which is why src/'s deps are curated below rather than
 # installed wholesale. Check /health's face_provider after any bump.
+# 1.20.1 was never published for -gpu (PyPI jumps 1.20.0 -> 1.20.2);
+# found by the first real CI build 2026-08-12.
 RUN pip uninstall -q -y onnxruntime || true \
- && pip install -q "onnxruntime-gpu==1.20.1"
+ && pip install -q "onnxruntime-gpu==1.20.2"
 
 RUN pip install -q \
       opencv-python-headless insightface \
