@@ -103,7 +103,12 @@ RUN sed -i \
 # --no-deps throughout this block: every one of these declares torch, and
 # letting pip resolve it will happily swap the base image's CUDA build for
 # something else. A mismatched torch/CUDA pair costs an evening.
-RUN pip install -q --no-deps ultralytics ultralytics-thop boxmot
+# Pinned to the versions the LOCAL suite proves daily (2026-08-12) —
+# unpinned latest broke at import inside the container the first time a
+# node actually booted. NOTE local proves these against torch 2.13; the
+# image runs the base's CUDA torch 2.4 — if import still fails here,
+# suspect the torch gap before anything else.
+RUN pip install -q --no-deps ultralytics==8.4.55 ultralytics-thop==2.0.19 boxmot==19.0.0
 # gdown is boxmot's weight downloader. --no-deps above means it never
 # installed, and the base image ships one too old for the fuzzy= kwarg
 # boxmot passes (OSNet prefetch died on it, first CI build 2026-08-12).
@@ -111,6 +116,12 @@ RUN pip install -q --no-deps ultralytics ultralytics-thop boxmot
 # (2026) removed the fuzzy= kwarg again — 5.x is the only line whose
 # download() signature matches what boxmot calls.
 RUN pip install -q "gdown>=5,<6"
+# filelock: the base image's copy predates AsyncFileLock; --no-deps
+# blocks the upgrade ultralytics would have requested, and the newest
+# ultralytics dies importing it (first node boot, 2026-08-12). The pin
+# above avoids that import today; upgrading anyway costs nothing and
+# removes the tripwire. torch-free.
+RUN pip install -q -U filelock
 
 # onnxruntime-gpu pinned to the CUDA-12 line. 1.28+ needs CUDA 13, and the
 # failure mode is not an error but a silent fall back to CPUExecutionProvider
