@@ -60,6 +60,18 @@ jobs:
         run: uv sync --frozen
 
       - name: Unit tests
+        # The unit suite never touches a database or Supabase, but
+        # src/main.py builds the app at import time and Settings carries
+        # five required fields that local dev reads from the gitignored
+        # .env. Obviously-fake values — anything real here would be a
+        # credential leak into the repo.
+        env:
+          NEMARA_ENV: test
+          NEMARA_DB_URL: postgresql+asyncpg://ci:ci@localhost:5432/ci
+          NEMARA_SUPABASE_URL: http://localhost:54321
+          NEMARA_SUPABASE_PUBLISHABLE_KEY: ci-publishable-placeholder
+          NEMARA_SUPABASE_JWT_SECRET: ci-jwt-secret-placeholder-at-least-32-chars
+          NEMARA_SUPABASE_SERVICE_ROLE_KEY: ci-service-role-placeholder
         run: uv run pytest test/unit -q
 
   build:
