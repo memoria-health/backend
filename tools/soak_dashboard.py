@@ -618,19 +618,56 @@ async def identity_stream(cam_id: str):
     is raw camera video with no room-privacy gating, and prod has no
     live-feed path that bypasses the privacy rules.
     """
+    import asyncio
+
     import httpx
 
+    # FRAME-DROPPING pump (2026-08-12). The identity service moved from
+    # localhost onto a GPU node reached over the tailnet; MJPEG has no
+    # frame dropping of its own, so when the node produces frames faster
+    # than the transocean path carries them, the backlog queues and the
+    # view trails wall clock by an ever-growing margin (~30s observed).
+    # Fix: drain the upstream as fast as the pipe allows, keep ONLY the
+    # newest complete part, forward at a fixed ~6fps. Latency becomes
+    # one frame + RTT regardless of upstream fps or path bandwidth.
     async def _pump():
-        async with httpx.AsyncClient(
-            timeout=None, headers=_ident_headers(),
-        ) as c:
-            async with c.stream(
-                "GET", f"{IDENTITY_BASE}/stream/{cam_id}",
-            ) as r:
-                if r.status_code != 200:
-                    return
-                async for chunk in r.aiter_bytes():
-                    yield chunk
+        BOUNDARY = b"--frame"
+        state: dict = {}
+
+        async def _reader():
+            buf = b""
+            try:
+                async with httpx.AsyncClient(
+                    timeout=None, headers=_ident_headers(),
+                ) as c:
+                    async with c.stream(
+                        "GET", f"{IDENTITY_BASE}/stream/{cam_id}",
+                    ) as r:
+                        if r.status_code != 200:
+                            return
+                        async for chunk in r.aiter_bytes():
+                            buf += chunk
+                            while True:
+                                nxt = buf.find(BOUNDARY, len(BOUNDARY))
+                                if nxt < 0:
+                                    break
+                                part, buf = buf[:nxt], buf[nxt:]
+                                if part.strip():
+                                    state["part"] = part
+            finally:
+                state["done"] = True
+
+        task = asyncio.create_task(_reader())
+        last = None
+        try:
+            while not state.get("done"):
+                part = state.get("part")
+                if part is not None and part is not last:
+                    last = part
+                    yield part
+                await asyncio.sleep(0.15)
+        finally:
+            task.cancel()
 
     return StreamingResponse(
         _pump(), media_type="multipart/x-mixed-replace; boundary=frame",
