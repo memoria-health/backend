@@ -107,8 +107,10 @@ RUN pip install -q --no-deps ultralytics ultralytics-thop boxmot
 # gdown is boxmot's weight downloader. --no-deps above means it never
 # installed, and the base image ships one too old for the fuzzy= kwarg
 # boxmot passes (OSNet prefetch died on it, first CI build 2026-08-12).
-# torch-free, so installing it WITH deps is safe.
-RUN pip install -q "gdown>=5"
+# torch-free, so installing it WITH deps is safe. <6 because gdown 6.0
+# (2026) removed the fuzzy= kwarg again — 5.x is the only line whose
+# download() signature matches what boxmot calls.
+RUN pip install -q "gdown>=5,<6"
 
 # onnxruntime-gpu pinned to the CUDA-12 line. 1.28+ needs CUDA 13, and the
 # failure mode is not an error but a silent fall back to CPUExecutionProvider
