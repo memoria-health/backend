@@ -108,10 +108,21 @@ _alive() {
 
 log "agent up node=$NEMARA_NODE_ID capacity=$CAPACITY poll=${POLL_S}s"
 
+# Userspace tailscale routes NOTHING outbound by itself — a tailnet
+# (100.64.0.0/10) backend is reachable only through tailscaled's HTTP
+# proxy on :1055. Production backends are public and go direct; adding
+# the proxy there would make roster liveness depend on tailscaled for
+# no reason. Found on the first real node boot (2026-08-12): every
+# poll to the local rig's tailnet backend died with "unreachable".
+case "$NEMARA_BACKEND_URL" in
+  http://100.*|https://100.*) CURL_PROXY=(--proxy "http://127.0.0.1:1055") ;;
+  *)                          CURL_PROXY=() ;;
+esac
+
 while true; do
   # Body to a file, status code to stdout. Keeping them apart is what lets
   # the two failure shapes below be told apart at all.
-  CODE="$(curl -sS -m 20 -X POST "$NEMARA_BACKEND_URL/v1/identity/roster" \
+  CODE="$(curl -sS -m 20 "${CURL_PROXY[@]}" -X POST "$NEMARA_BACKEND_URL/v1/identity/roster" \
       -H "Content-Type: application/json" \
       -H "X-Internal-Key: $NEMARA_INTERNAL_SERVICE_KEY" \
       -d "{\"node_id\":\"$NEMARA_NODE_ID\",\"base_url\":\"$NEMARA_NODE_BASE_URL\",\"capacity\":$CAPACITY}" \

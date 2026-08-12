@@ -68,8 +68,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
 WORKDIR /workspace
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git curl ca-certificates \
+ && apt-get install -y --no-install-recommends git curl ca-certificates socat \
  && rm -rf /var/lib/apt/lists/*
+# socat: the local-rig tailnet DB bridge (entrypoint §3.5) — asyncpg
+# cannot ride a proxy, so a tailnet DB URL gets a TCP bridge through
+# tailscaled's HTTP CONNECT proxy. Unused in prod (public DB).
 
 # ── Upstream model code ────────────────────────────────────────────────
 RUN git clone https://github.com/facebookresearch/sam3 sam3 \

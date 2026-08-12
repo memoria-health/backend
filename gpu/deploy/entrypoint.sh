@@ -109,6 +109,34 @@ done
 curl -sf -m 2 -o /dev/null "http://127.0.0.1:${PERCEPTION_PORT:-8000}/health" \
   || log "WARNING: perception not answering yet — identity will retry"
 
+# ── 3.5 local-rig tailnet DB bridge ────────────────────────────────────
+# Userspace tailscale (no /dev/net/tun) does NOT route outbound dials
+# into the tailnet by itself — every dialer must go through tailscaled's
+# local proxies. Production never notices: backend, DB and LiveKit are
+# all public there, and the tailnet is only used INBOUND (backend→node).
+# The LOCAL rig is the exception — its DB URL points at the dev Mac's
+# tailnet IP (100.64.0.0/10), and asyncpg cannot use a proxy at all. So:
+# a socat TCP bridge on loopback, through the HTTP CONNECT proxy on
+# :1055, and the URL the identity processes see is rewritten to the
+# bridge. Found on the first real node boot (2026-08-12): the gallery
+# load dialed the tailnet raw and could never connect.
+DB_TAILNET_HOST="$(printf '%s' "$NEMARA_DB_URL" | sed -nE 's|.*@(100\.[0-9.]+):([0-9]+)/.*|\1|p')"
+DB_TAILNET_PORT="$(printf '%s' "$NEMARA_DB_URL" | sed -nE 's|.*@(100\.[0-9.]+):([0-9]+)/.*|\2|p')"
+if [ -n "$DB_TAILNET_HOST" ]; then
+  log "tailnet DB bridge: 127.0.0.1:15432 -> $DB_TAILNET_HOST:$DB_TAILNET_PORT via proxy :1055"
+  (
+    while true; do
+      socat TCP-LISTEN:15432,fork,reuseaddr,bind=127.0.0.1 \
+            "PROXY:127.0.0.1:$DB_TAILNET_HOST:$DB_TAILNET_PORT,proxyport=1055" \
+            >>"$LOGDIR/dbbridge.log" 2>&1
+      echo "$(date -u +%FT%TZ) db bridge exited rc=$? — restart in 3s" >>"$LOGDIR/dbbridge.log"
+      sleep 3
+    done
+  ) &
+  export NEMARA_DB_URL="$(printf '%s' "$NEMARA_DB_URL" \
+    | sed -E "s|@$DB_TAILNET_HOST:$DB_TAILNET_PORT/|@127.0.0.1:15432/|")"
+fi
+
 # ── 4. identity ────────────────────────────────────────────────────────
 # Two modes. ROSTER is production: the node asks the backend which homes it
 # should run and reconciles continuously, so adding capacity is "start
@@ -160,6 +188,23 @@ if s.get("Online"):
       export NEMARA_NODE_BASE_URL="http://$TS_NAME"
       log "tailnet name: $TS_NAME"
     fi
+    # LOCAL RIG: when the backend itself is a tailnet IP, it is a dev
+    # Mac running the backend in Docker — a context where MagicDNS
+    # (*.ts.net) resolution inside the container is unreliable. Register
+    # our tailnet IP instead of the name: routing works (the Docker VM
+    # egresses through the host, which routes 100.64.0.0/10 into
+    # tailscale) even where name resolution does not. Prod keeps the
+    # name — a replaced node's IP is reassigned, the name logic above
+    # exists for good reasons.
+    case "$NEMARA_BACKEND_URL" in
+      http://100.*|https://100.*)
+        TS_IP="$(tailscale --socket=/var/run/tailscale/tailscaled.sock ip -4 2>/dev/null | head -1)"
+        if [ -n "$TS_IP" ]; then
+          export NEMARA_NODE_BASE_URL="http://$TS_IP"
+          log "local rig: registering tailnet IP $TS_IP instead of the name"
+        fi
+        ;;
+    esac
   fi
   if [ -z "${NEMARA_NODE_BASE_URL:-}" ]; then
     # Refuse rather than register an unreachable address. A node in the
