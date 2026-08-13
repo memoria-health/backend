@@ -255,6 +255,16 @@ and the camera kept batching until the shared halt).
 
 ## 7. Open items
 
+- **/health is too shallow (found 2026-08-13 evening).** After the L5
+  OOM, perception restarted, could not load SAM (orphaned CUDA
+  children still held VRAM), tolerated it ("will warm lazily"), and
+  reported `status: ok` for ~5 hours while every /observe returned
+  500. Health must exercise the tracker (fail when get_sam fails) so
+  the roster/FleetWatch can see a node that cannot actually serve.
+- **Supervisor must reap orphaned CUDA children before relaunching
+  perception** — the guard-path reap (post-mortem #2) does not cover
+  an OOM/abort death; the orphans blocked the successor's SAM load.
+  Interim recovery: container restart.
 - FleetWatch alarm on sustained lag_s > tick length (ledger).
 - Confirm the L5 perception death was VRAM OOM (node G console log)
   and add the VRAM guards: per-session budget, prime-cache off above 4
