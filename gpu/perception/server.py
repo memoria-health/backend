@@ -475,11 +475,7 @@ def _observe_sync(
         # subject across ticks and stranded the backend binding into a
         # ghost. Masks are held in `session_out` for this tick; frame
         # pixels (`imgs[pos]`) are still released after the face pass.
-        try:
-            session = continuous.get_session(camera_id)
-        except continuous.SessionCapacityError as exc:
-            log.warning("perception.session_capacity %s", exc)
-            return {"_error": (429, str(exc))}
+        session = continuous.get_session(camera_id)
         session_out = session.observe(
             imgs, person_thr=person_thr, sam_pred=pred,
         )

@@ -30,13 +30,6 @@ import numpy as np
 
 log = logging.getLogger("perception.continuous")
 
-
-class SessionCapacityError(RuntimeError):
-    """Raised when a NEW camera session would exceed the node's cap and
-    no idle session can be evicted. The server maps this to a 429 so
-    identity fails open on that camera — bounded degradation, never the
-    unbounded VRAM growth that killed perception on 2026-08-13."""
-
 _EDGE = None
 _edge_lock = threading.Lock()
 _SESSIONS: "dict[str, CameraSession]" = {}
@@ -567,19 +560,12 @@ class CameraSession:
         return out
 
 
-# Concurrent-session ceiling. Each live session holds an EdgeTAM memory
-# bank; 10 measured survivable (thrashing but alive, 2026-08-13 ladder),
-# and the SLA is already gone by 10 — the cap is a backstop against
-# unbounded growth, not a performance rating (that is 4, surge 6-8; see
-# docs/IDENTITY-GPU-ARCHITECTURE.md).
+# Session-count REPORTING threshold (Aryaman 2026-08-13: no hard cap —
+# the VRAM-aware prime skip is the OOM guard; refusing cameras is a
+# policy call we are not making in code). Above this we log loudly so
+# FleetWatch/operators see a node past its rated envelope (rated 4,
+# surge 6-8, SLA gone by 10 — docs/IDENTITY-GPU-ARCHITECTURE.md).
 _MAX_SESSIONS = int(os.environ.get("NEMARA_MAX_SESSIONS", "10"))
-# REPORT-ONLY by default (Aryaman 2026-08-13): above the cap we log
-# loudly and serve anyway — the VRAM-aware prime skip is the actual
-# OOM guard, and refusing cameras is a policy call we are not ready to
-# hard-code. Set NEMARA_MAX_SESSIONS_ENFORCE=1 to refuse instead.
-_ENFORCE_CAP = os.environ.get(
-    "NEMARA_MAX_SESSIONS_ENFORCE", "0",
-).strip() in ("1", "true")
 # A session idle this long belongs to a camera that stopped (nothing
 # calls drop_session in the normal flow) — evict it before refusing a
 # newcomer, so churn in camera fleets self-heals.
@@ -600,15 +586,9 @@ def get_session(camera_id: str, *, reground_every: int = _REGROUND_EVERY) -> Cam
                     _SESSIONS.pop(cid, None)
                     log.info("continuous.session_evicted_idle cam=%s", cid)
             if len(_SESSIONS) >= _MAX_SESSIONS:
-                if _ENFORCE_CAP:
-                    raise SessionCapacityError(
-                        f"{len(_SESSIONS)} live sessions at cap "
-                        f"{_MAX_SESSIONS} — refusing new camera {camera_id}",
-                    )
                 log.warning(
-                    "continuous.sessions_above_cap n=%d cap=%d cam=%s — "
-                    "serving anyway (report-only; "
-                    "NEMARA_MAX_SESSIONS_ENFORCE=1 to refuse)",
+                    "continuous.sessions_above_threshold n=%d "
+                    "threshold=%d cam=%s — serving anyway",
                     len(_SESSIONS), _MAX_SESSIONS, camera_id,
                 )
             s = CameraSession(camera_id, reground_every=reground_every)
