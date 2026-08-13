@@ -38,7 +38,13 @@ CAPACITY="${NEMARA_NODE_CAPACITY:-4}"
 POLL_S="${NEMARA_ROSTER_POLL_S:-30}"
 STATE_DIR="${NEMARA_STATE_DIR:-/persist/state}"
 LOGDIR="$STATE_DIR/logs"
-RUN="$STATE_DIR/run"
+# RUN is CONTAINER-LOCAL, never on /persist (node F melt, 2026-08-13).
+# Pid/port files on the shared network volume outlive the container that
+# wrote them — and are visible to OTHER nodes mounting the same volume —
+# so a fresh boot reconciled against dead containers' pids, and PID reuse
+# made `kill -0` vouch for unrelated processes. Run-state must die with
+# the container that owns it.
+RUN="${NEMARA_RUN_DIR:-/run/nemara}"
 PERCEPTION_PORT="${PERCEPTION_PORT:-8000}"
 mkdir -p "$LOGDIR" "$RUN"
 
@@ -56,9 +62,17 @@ _start_room() {
   local room="$1" port="$2" patient
   patient="${room#patient_}"
   mkdir -p "$STATE_DIR/$room"
+  # Singleton per room, enforced, not assumed (node F melt, 2026-08-13):
+  # a stop/kill race once orphaned a live identity process, and the
+  # duplicate pair kicked each other off LiveKit (same participant
+  # identity) in an endless churn. Before starting, kill any straggler
+  # serving this room — match on the exact --room argument.
+  pkill -f -- "identity.service --room $room " 2>/dev/null && sleep 1
   (
+    backoff=3
     while true; do
       cd "$STATE_DIR/$room" || exit 1
+      t0=$(date +%s)
       # --patient explicitly: its argparse default is a hardcoded pilot UUID,
       # which on any other home silently binds the wrong patient.
       python3 -m identity.service \
@@ -66,18 +80,25 @@ _start_room() {
         --pod-url "http://127.0.0.1:${PERCEPTION_PORT}" \
         >>"$LOGDIR/identity-$room.log" 2>&1
       rc=$?
+      dt=$(( $(date +%s) - t0 ))
       # 4 = pod wedged, 5 = camera walk exhausted; both are deliberate
-      # self-exits asking to be restarted.
-      echo "$(date -u +%FT%TZ) identity room=$room exited rc=$rc — restart in 3s" \
+      # self-exits asking to be restarted. Backoff doubles to 60s on
+      # rapid deaths and resets after a 300s healthy run — a service
+      # dying at import must never become a fork storm again.
+      [ "$dt" -gt 300 ] && backoff=3
+      echo "$(date -u +%FT%TZ) identity room=$room exited rc=$rc after ${dt}s — restart in ${backoff}s" \
         >>"$LOGDIR/identity-$room.log"
-      sleep 3
+      sleep "$backoff"
+      backoff=$(( backoff * 2 ))
+      [ "$backoff" -gt 60 ] && backoff=60
     done
   ) &
-  echo $! > "$RUN/$room.pid"
+  local sup=$!
+  echo "$sup" > "$RUN/$room.pid"
   # The port is recorded too, so the next poll can tell "already running here"
   # from "running on a port the backend has since moved".
   echo "$port" > "$RUN/$room.port"
-  log "started room=$room port=$port pid=$(cat "$RUN/$room.pid")"
+  log "started room=$room port=$port pid=$sup"
 
   # Userspace tailscaled cannot reach a local listener on its own; `serve` is
   # what publishes it onto the tailnet.
@@ -93,12 +114,28 @@ _stop_room() {
   local room="$1" pid
   pid="$(cat "$RUN/$room.pid" 2>/dev/null)"
   [ -n "$pid" ] || return 0
-  # Kill the supervising subshell AND its current child, or the loop simply
-  # respawns identity and the room never actually stops.
-  pkill -P "$pid" 2>/dev/null
+  # ORDER MATTERS (node F melt, 2026-08-13). The old sequence killed the
+  # child first, then the supervisor — if the supervisor was between
+  # `sleep` and respawn, the fresh python it spawned in that window was
+  # orphaned alive, and the next _start_room made a duplicate. Kill the
+  # supervisor FIRST so nothing can respawn, then pattern-kill any
+  # identity process still serving this room (matches the exact --room
+  # argument), then verify the pid is actually gone before declaring
+  # the room stopped.
   kill "$pid" 2>/dev/null
+  pkill -f -- "identity.service --room $room " 2>/dev/null
+  for _ in 1 2 3 4 5; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 1
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" 2>/dev/null
+    pkill -9 -f -- "identity.service --room $room " 2>/dev/null
+    log "stopped room=$room (FORCED — did not exit on TERM)"
+  else
+    log "stopped room=$room (reassigned or released)"
+  fi
   rm -f "$RUN/$room.pid" "$RUN/$room.port"
-  log "stopped room=$room (reassigned or released)"
 }
 
 _alive() {
