@@ -275,3 +275,36 @@ and the camera kept batching until the shared halt).
 - identity_nodes dead rows accumulate — reaper or cleanup in the M3
   deploy batch.
 - RunPod account: SSH key in Settings; balance top-up cadence.
+
+## Addendum — 6-10 camera synthetic run (2026-08-13 evening)
+
+All-synthetic (real room empty): 10 cameras across the 5 synthetic
+homes, two publishers per room at full load — one CameraLoop per
+camera, per-home pod admission, i.e. the multi-camera-house shape.
+Run AFTER a clean container restart (the earlier attempt found the
+shallow-/health outage, §7). ~3 min holds at 6, 8, 10.
+
+| | 6 cams | 8 cams | 10 cams |
+|---|---|---|---|
+| lag_s p50 / p95 | 2.09 / 6.59 | 4.04 / 6.84 | 7.38 / 13.24 |
+| pod round-trip p50 | 2.0s | 4.0s | 7.2s |
+| pod_compute p50 | 788ms | 1,001ms | 1,127ms |
+| wire (≈ queueing) p50 | 1.1s | 2.8s | 5.7s |
+| CPU / GPU | 48-98% / 91-92% | 53-85% / sat. | 66-69% / thrash |
+| batches | 163 | 206 | 34 (stalled) |
+
+Reading: past GPU saturation (~5 cams) added cameras stretch QUEUEING
+(wire ≈ waiting for the busy pod), not compute — pod_compute grows
+gently while wire explodes. 6-8 cameras stay INSIDE the 7-10s SLA
+(p95 <7s) — a legitimate degraded surge envelope. At 10, lag p50
+breaches the SLA and throughput collapses into admission-timeout
+thrash — but the node survives: no crash, health honest, fail-open
+shedding as designed (contrast the L5 OOM death, which the pending
+VRAM/orphan/health guards address). Per-camera balance held at every
+level.
+
+**Operating guidance**: rate 4 concurrently-occupied cameras
+(comfort, ~14× margin) · tolerate 6-8 as a surge envelope (SLA holds,
+no headroom) · never plan for 10 (broken). Caveat: this run used 2
+cameras/home across 5 homes; 10 single-camera homes would contend
+slightly differently at the same perception gate.
