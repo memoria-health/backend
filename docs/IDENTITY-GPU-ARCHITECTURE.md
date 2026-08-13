@@ -308,3 +308,33 @@ level.
 no headroom) · never plan for 10 (broken). Caveat: this run used 2
 cameras/home across 5 homes; 10 single-camera homes would contend
 slightly differently at the same perception gate.
+
+## Addendum 2 — GPU class comparison (L4 ladder, 2026-08-13 night)
+
+Same 1-10 ladder on an NVIDIA L4 ($0.49/hr, 24GB, ~300GB/s) under
+gpu-v2.3.1, synthetic homes moved to the test node via their DB
+assignment (real home undisturbed on the 4090), node terminated after.
+
+| | 4090 (1008 GB/s, $0.74) | L4 (300 GB/s, $0.49) |
+|---|---|---|
+| lag p50 @1/2/3 cams | 0.19 / 0.25 / 0.34s | 0.53 / 0.77 / 0.77s |
+| collapse point | 10 cams | 4 cams |
+| rated (comfort) | 4 | 2 |
+| $/occupied camera | $0.185 | $0.245 |
+
+The ~3× throughput gap matches the memory-bandwidth ratio almost
+exactly — bandwidth (with FP16 tensor rate) is the workload's scaling
+predictor, so consumer flagships beat cut-down datacenter inference
+cards for dense video tracking. v2.3.1 hardening validated under
+saturation on the weak card: prime-skip fired at 81% VRAM, zero
+perception deaths, deep health honest, collapse was graceful shed.
+
+GPU procurement guidance: 4090 stays the fleet default; RTX 3090
+(936 GB/s at ~⅓-½ the price → est. $0.07-0.14/cam) and RTX A5000
+(768 GB/s → est. $0.10-0.14/cam) are the two candidates worth one
+ladder each when EU-RO-1 stock appears; skip L-series small cards.
+Community-cloud 4090s (~half price) are a deliberate experiment for
+non-anchor nodes — replace-don't-repair + 82s failover makes
+interruptible capacity tolerable by design. None of this changes the
+cost curve's SHAPE — that is the detector-cascade epic (SAM demoted
+to episodic) — GPU choice is the coefficient.
