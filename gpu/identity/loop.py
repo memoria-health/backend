@@ -113,6 +113,12 @@ MAX_BATCH = 40                 # ceiling only — batches self-pace to
                                # load stride stretches instead of lag
                                # compounding (graceful degradation)
 JPEG_QUALITY = 80
+# Frame wire to perception (2026-08-13). "raw" ships BGR pixels as-is —
+# identity and perception share the box, and the JPEG encode/decode pair
+# on that loopback hop was a top CPU stage under multi-camera load
+# (encode p50 391ms at 3 cams, plus the pod's decode out of the same
+# starved cores). "jpeg" is the one-env revert: NEMARA_FRAME_WIRE=jpeg.
+FRAME_WIRE = os.environ.get("NEMARA_FRAME_WIRE", "raw").strip().lower()
 SCREEN_REFRESH_S = 120.0       # screens are furniture
 SEAT_FLOOR = 0.4               # combined-score floor to take an empty seat
                                # (calibrated with scoring.py 2026-07-24 so
@@ -618,7 +624,7 @@ class CameraLoop:
         # identity again (face batches inside /observe were 3-5x the
         # cost and strangled the carry).
         t_e = time.time()
-        jpegs, inv_scale = await asyncio.to_thread(
+        send_frames, inv_scale = await asyncio.to_thread(
             self._encode, batch, TRACK_SEND_W,
         )
         encode_ms = (time.time() - t_e) * 1000.0
@@ -626,7 +632,7 @@ class CameraLoop:
         async with self.home.pod_lock:       # bounded pod admission
             t0 = time.time()                 # queue wait ends here
             obs = await self.home.sam_for(self.camera_id).observe(
-                jpegs,
+                send_frames,
                 camera_id=f"identity_{self.camera_id}",
                 person_thr=0.4,
                 face_interval=999,
@@ -743,8 +749,8 @@ class CameraLoop:
             "identity.batch cam=%s frames=%d span=%.1fs stride=%.0fms | "
             "encode=%.0f queue=%.0f pod=%.0f (compute=%.0f sam=%.0f "
             "decode=%.0f wire=%.0f) publish=%.0f (ms)",
-            self.camera_id, len(jpegs), span,
-            span * 1000.0 / max(1, len(jpegs) - 1),
+            self.camera_id, len(send_frames), span,
+            span * 1000.0 / max(1, len(send_frames) - 1),
             encode_ms, self.queue_ms, self.pod_ms,
             pod_total, pt.get("sam", 0.0), pt.get("decode", 0.0),
             self.pod_ms - pod_total,
@@ -756,10 +762,13 @@ class CameraLoop:
 
     def _encode(
         self, batch: list, send_w: Optional[int],
-    ) -> tuple[list[tuple[int, bytes]], float]:
-        """JPEG-encode a batch, optionally downscaled to send_w wide.
+    ) -> tuple[list[tuple[int, "bytes | np.ndarray"]], float]:
+        """Prepare a batch for the pod, optionally downscaled to send_w
+        wide. Raw wire (default): the frames themselves, untouched
+        pixels — pod_client ships them codec-free. JPEG wire: encoded
+        bytes as before.
 
-        Returns (jpegs, inv_scale) — multiply pod bbox coords by
+        Returns (frames, inv_scale) — multiply pod bbox coords by
         inv_scale to get back to ring-frame space.
         """
         out = []
@@ -770,6 +779,9 @@ class CameraLoop:
                 s = send_w / bgr.shape[1]
                 inv = 1.0 / s
                 img = cv2.resize(bgr, (send_w, int(bgr.shape[0] * s)))
+            if FRAME_WIRE == "raw":
+                out.append((idx, img))
+                continue
             ok, jpg = cv2.imencode(
                 ".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY],
             )
@@ -841,12 +853,21 @@ class CameraLoop:
                             for tid, x1, y1, x2, y2 in boxes
                         ]
                 self._probed_at = now
+                # Raw wire: ship pixels as-is — probing encoded NATIVE
+                # frames to JPEG every 1.5s while searching, for a
+                # loopback hop (see FRAME_WIRE). t_e/t_w bracket the
+                # payload prep so the probe stage timings below survive
+                # (encode ≈ 0 on the raw wire, by design).
                 t_e = time.time()
-                jpeg = await asyncio.to_thread(
-                    lambda: cv2.imencode(
-                        ".jpg", probe_frame, [cv2.IMWRITE_JPEG_QUALITY, 88],
-                    )[1].tobytes(),
-                )
+                if FRAME_WIRE == "raw":
+                    payload = probe_frame
+                else:
+                    payload = await asyncio.to_thread(
+                        lambda: cv2.imencode(
+                            ".jpg", probe_frame,
+                            [cv2.IMWRITE_JPEG_QUALITY, 88],
+                        )[1].tobytes(),
+                    )
                 t_w = time.time()
                 # While SEARCHING, also detect faces on the WHOLE frame:
                 # crop boxes ride the tracking pipeline and lag the world
@@ -854,7 +875,7 @@ class CameraLoop:
                 # WAS (live 2026-07-24, seat stayed empty through a
                 # clear pass). Full-frame is lag-immune for close faces.
                 hits = await self.home.sam_for(self.camera_id).faces(
-                    jpeg, face_boxes, full=(seat is None),
+                    payload, face_boxes, full=(seat is None),
                 )
                 # COVERAGE scan (searching only): every ring frame since
                 # the last probe, ≥PROBE_SCAN_GAP_S apart, full-frame in
@@ -874,12 +895,15 @@ class CameraLoop:
                         if len(extra) >= PROBE_SCAN_MAX:
                             break
                     if extra:
-                        jpegs = await asyncio.to_thread(lambda: [
-                            cv2.imencode(
-                                ".jpg", fr,
-                                [cv2.IMWRITE_JPEG_QUALITY, 88],
-                            )[1].tobytes() for fr in extra
-                        ])
+                        if FRAME_WIRE == "raw":
+                            payloads = extra
+                        else:
+                            payloads = await asyncio.to_thread(lambda: [
+                                cv2.imencode(
+                                    ".jpg", fr,
+                                    [cv2.IMWRITE_JPEG_QUALITY, 88],
+                                )[1].tobytes() for fr in extra
+                            ])
                         # Politeness cap: 2 concurrent scans, never a
                         # burst — a 5-wide burst landing on a SAM3
                         # reground ground the shared A40 to a 35s pod
@@ -887,14 +911,14 @@ class CameraLoop:
                         # unchanged; the burst is flattened.
                         sem = asyncio.Semaphore(2)
 
-                        async def _scan(j: bytes):
+                        async def _scan(j):
                             async with sem:
                                 return await self.home.sam_for(self.camera_id).faces(
                                     j, [], full=True,
                                 )
 
                         for more in await asyncio.gather(
-                            *[_scan(j) for j in jpegs],
+                            *[_scan(j) for j in payloads],
                             return_exceptions=True,
                         ):
                             if isinstance(more, list):

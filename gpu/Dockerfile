@@ -137,6 +137,31 @@ RUN pip install -q -U filelock
 RUN pip uninstall -q -y onnxruntime || true \
  && pip install -q "onnxruntime-gpu==1.20.2"
 
+# ORT 1.20.x dlopens libcudnn.so.9 when creating the CUDA EP, and this base
+# tag ships no cuDNN 9 — the failure mode is the same silent CPU fallback as
+# above (found live 2026-08-13: /health face_provider=CPUExecutionProvider,
+# every face probe on CPU, GPU idle under load). The previous fix — an ENV
+# LD_LIBRARY_PATH pointing at a dist-packages path — failed silently because
+# the path never existed here. So: install the exact cuDNN torch 2.4+cu124
+# was built against (--no-deps: its cublas dep comes from the CUDA toolkit
+# already in the image), register it with the SYSTEM loader via ldconfig
+# (not LD_LIBRARY_PATH — see face_worker.py's history with env-var lib
+# surgery), and prove at build time that (a) cuDNN 9 actually loads and
+# (b) every library the ORT CUDA provider links resolves. Only libcuda.so.1
+# (the driver, absent on a GPU-less builder) is allowed to be missing.
+RUN pip install -q --no-deps "nvidia-cudnn-cu12==9.1.0.70" \
+ && python3 -c "import nvidia.cudnn, pathlib; \
+lib = pathlib.Path(nvidia.cudnn.__file__).parent / 'lib'; \
+assert list(lib.glob('libcudnn.so.9*')), f'no libcudnn.so.9 under {lib}'; \
+pathlib.Path('/etc/ld.so.conf.d/nemara-cudnn.conf').write_text(str(lib) + '\n')" \
+ && ldconfig \
+ && python3 -c "import ctypes; ctypes.CDLL('libcudnn.so.9'); print('cudnn9 loads')"
+RUN ORT_CUDA=$(python3 -c "import onnxruntime, pathlib; \
+print(pathlib.Path(onnxruntime.__file__).parent / 'capi' / 'libonnxruntime_providers_cuda.so')") \
+ && MISSING=$(ldd "$ORT_CUDA" | grep 'not found' | grep -v libcuda.so.1 || true) \
+ && { [ -z "$MISSING" ] || { echo "ORT CUDA EP unresolved:"; echo "$MISSING"; exit 1; }; } \
+ && echo "ORT CUDA provider fully resolved"
+
 RUN pip install -q \
       opencv-python-headless insightface \
       hydra-core omegaconf iopath py-cpuinfo pandas polars matplotlib tqdm psutil \
@@ -218,10 +243,6 @@ ENV PYTHONPATH=/workspace/sam3:/workspace/nemara:/workspace/edgetam:/workspace \
     NEMARA_GROUNDER=sam3 \
     PERCEPTION_HOST=127.0.0.1 \
     PERCEPTION_PORT=8000
-
-# onnxruntime-gpu needs cuDNN 9, supplied by torch's bundled nvidia wheels.
-# Without this, faces silently run on CPU.
-ENV LD_LIBRARY_PATH=/usr/local/lib/python3.11/dist-packages/nvidia/cudnn/lib:/usr/local/lib/python3.11/dist-packages/nvidia/cublas/lib
 
 # Fail the BUILD on a broken environment rather than finding out on a node at
 # 3am. Covers both services: the perception model builders AND the src/ import
