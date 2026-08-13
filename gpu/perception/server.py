@@ -301,9 +301,15 @@ def _startup() -> None:
         log.critical(
             "perception.face_on_cpu_with_gpu_present provider=%s — "
             "refusing to serve (NEMARA_FACE_REQUIRE_GPU=0 to override). "
-            "Fix the image: onnxruntime-gpu could not create its CUDA "
-            "provider, usually a missing/mismatched cuDNN.", provider,
+            "Fix the image: the onnxruntime module lacks or cannot load "
+            "its CUDA provider (CPU-wheel shadowing or missing cuDNN).",
+            provider,
         )
+        # Reap the face child FIRST: os._exit skips multiprocessing
+        # cleanup, and on node E (2026-08-13) ~120 supervisor restarts
+        # of this exact path orphaned ~90 CUDA processes until the GPU
+        # itself OOMed. A loud refusal must not leak.
+        _face.stop()
         os._exit(1)
     try:
         pred = sam_track.get_sam(_CKPT)

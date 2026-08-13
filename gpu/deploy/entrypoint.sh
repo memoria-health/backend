@@ -48,6 +48,28 @@ mkdir -p "$LOGDIR"
 
 log() { echo "$(date -u +%FT%TZ) entrypoint: $*"; }
 
+# ── 0. sshd ────────────────────────────────────────────────────────────
+# RunPod's "SSH over exposed TCP" rides an sshd INSIDE the container. The
+# base image's /start.sh used to launch it; this entrypoint replaced that
+# script, which left every image-based node with port 22 mapped but
+# nothing listening — undebuggable exactly when debugging mattered
+# (nodes D and E, 2026-08-13). RunPod injects PUBLIC_KEY when the
+# account has an ssh key; no key, no sshd, same as the base behaved.
+SSHD_BIN="$(command -v sshd || echo /usr/sbin/sshd)"
+if [ -n "${PUBLIC_KEY:-}" ] && [ -x "$SSHD_BIN" ]; then
+  mkdir -p /root/.ssh /run/sshd
+  chmod 700 /root/.ssh
+  echo "$PUBLIC_KEY" >> /root/.ssh/authorized_keys
+  chmod 600 /root/.ssh/authorized_keys
+  if "$SSHD_BIN"; then
+    log "sshd up (PUBLIC_KEY present)"
+  else
+    log "WARNING: sshd failed to start — node runs, but no shell access"
+  fi
+else
+  log "sshd not started (no PUBLIC_KEY or no sshd binary)"
+fi
+
 # ── Config guards, before anything expensive ───────────────────────────
 # An empty token is the dangerous one: contract.auth_ok() treats "" as
 # "accept every caller", so /state, /probes and /stream (live annotated
@@ -89,15 +111,34 @@ fi
 # ── 3. perception ──────────────────────────────────────────────────────
 # Loopback by default. PERCEPTION_HOST exists only so exposing it is a
 # deliberate, reviewable act rather than a default nobody noticed.
+#
+# Log routing (2026-08-13, node E post-mortem): perception output goes to
+# the CONSOLE as well as the file — a file-only log on a node with no
+# shell is a black box, and diagnosing E took a human pasting a web
+# terminal. The file is per-container (hostname suffix): /persist is a
+# SHARED network volume, and two nodes appending to one perception.log
+# interleave into an unreadable braid.
+#
+# Restart backoff: a hot 3s loop turned one refusing-to-serve config into
+# ~120 restarts that orphaned ~90 CUDA processes and OOMed the GPU on E.
+# Exponential to 120s, reset after any run that survived 300s.
+PLOG="$LOGDIR/perception-$(hostname).log"
 (
+  backoff=3
   while true; do
     cd /workspace/edgetam || exit 1
+    t0=$(date +%s)
     python3 -m uvicorn perception.server:app \
       --host "${PERCEPTION_HOST:-127.0.0.1}" \
       --port "${PERCEPTION_PORT:-8000}" \
-      --timeout-keep-alive 75 >>"$LOGDIR/perception.log" 2>&1
-    echo "$(date -u +%FT%TZ) perception exited rc=$? — restart in 3s" >>"$LOGDIR/perception.log"
-    sleep 3
+      --timeout-keep-alive 75 2>&1 | tee -a "$PLOG"
+    rc=$?
+    dt=$(( $(date +%s) - t0 ))
+    [ "$dt" -gt 300 ] && backoff=3
+    echo "$(date -u +%FT%TZ) perception exited rc=$rc after ${dt}s — restart in ${backoff}s" | tee -a "$PLOG"
+    sleep "$backoff"
+    backoff=$(( backoff * 2 ))
+    [ "$backoff" -gt 120 ] && backoff=120
   done
 ) &
 

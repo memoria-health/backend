@@ -126,42 +126,6 @@ RUN pip install -q "gdown>=5,<6"
 # removes the tripwire. torch-free.
 RUN pip install -q -U filelock
 
-# onnxruntime-gpu pinned to the CUDA-12 line. 1.28+ needs CUDA 13, and the
-# failure mode is not an error but a silent fall back to CPUExecutionProvider
-# (~10x slower face probes). NOTE pyproject.toml declares plain
-# `onnxruntime>=1.16` for the backend — installing that here would shadow this
-# with the CPU build, which is why src/'s deps are curated below rather than
-# installed wholesale. Check /health's face_provider after any bump.
-# 1.20.1 was never published for -gpu (PyPI jumps 1.20.0 -> 1.20.2);
-# found by the first real CI build 2026-08-12.
-RUN pip uninstall -q -y onnxruntime || true \
- && pip install -q "onnxruntime-gpu==1.20.2"
-
-# ORT 1.20.x dlopens libcudnn.so.9 when creating the CUDA EP, and this base
-# tag ships no cuDNN 9 — the failure mode is the same silent CPU fallback as
-# above (found live 2026-08-13: /health face_provider=CPUExecutionProvider,
-# every face probe on CPU, GPU idle under load). The previous fix — an ENV
-# LD_LIBRARY_PATH pointing at a dist-packages path — failed silently because
-# the path never existed here. So: install the exact cuDNN torch 2.4+cu124
-# was built against (--no-deps: its cublas dep comes from the CUDA toolkit
-# already in the image), register it with the SYSTEM loader via ldconfig
-# (not LD_LIBRARY_PATH — see face_worker.py's history with env-var lib
-# surgery), and prove at build time that (a) cuDNN 9 actually loads and
-# (b) every library the ORT CUDA provider links resolves. Only libcuda.so.1
-# (the driver, absent on a GPU-less builder) is allowed to be missing.
-RUN pip install -q --no-deps "nvidia-cudnn-cu12==9.1.0.70" \
- && python3 -c "import nvidia.cudnn, pathlib; \
-lib = pathlib.Path(nvidia.cudnn.__file__).parent / 'lib'; \
-assert list(lib.glob('libcudnn.so.9*')), f'no libcudnn.so.9 under {lib}'; \
-pathlib.Path('/etc/ld.so.conf.d/nemara-cudnn.conf').write_text(str(lib) + '\n')" \
- && ldconfig \
- && python3 -c "import ctypes; ctypes.CDLL('libcudnn.so.9'); print('cudnn9 loads')"
-RUN ORT_CUDA=$(python3 -c "import onnxruntime, pathlib; \
-print(pathlib.Path(onnxruntime.__file__).parent / 'capi' / 'libonnxruntime_providers_cuda.so')") \
- && MISSING=$(ldd "$ORT_CUDA" | grep 'not found' | grep -v libcuda.so.1 || true) \
- && { [ -z "$MISSING" ] || { echo "ORT CUDA EP unresolved:"; echo "$MISSING"; exit 1; }; } \
- && echo "ORT CUDA provider fully resolved"
-
 RUN pip install -q \
       opencv-python-headless insightface \
       hydra-core omegaconf iopath py-cpuinfo pandas polars matplotlib tqdm psutil \
@@ -185,6 +149,52 @@ RUN pip install -q \
       google-genai openai \
       livekit "livekit-api" \
       h2 pillow aioboto3 webrtcvad-wheels
+
+# ── onnxruntime-gpu, AFTER every other pip layer ───────────────────────
+# Ordering is the whole fix. insightface (and pyproject.toml) declare plain
+# `onnxruntime`; pip does not treat installed onnxruntime-gpu as satisfying
+# that, so any later layer that resolves it OVERWRITES the module with the
+# CPU wheel. That is exactly what shipped in gpu-v1 AND gpu-v2: onnxruntime
+# reported "Available providers: AzureExecutionProvider, CPUExecutionProvider"
+# on a 4090 (node E console, 2026-08-13) — the CUDA provider was never
+# installed, and every face probe ran on CPU. So the GPU build installs LAST,
+# where nothing can shadow it.
+#
+# Pinned to the CUDA-12 line: 1.28+ needs CUDA 13. 1.20.1 was never published
+# for -gpu (PyPI jumps 1.20.0 -> 1.20.2); found by the first CI build.
+RUN pip uninstall -q -y onnxruntime || true \
+ && pip install -q --force-reinstall --no-deps "onnxruntime-gpu==1.20.2"
+
+# ORT 1.20.x also dlopens libcudnn.so.9 when creating the CUDA EP, and this
+# base tag ships no cuDNN 9 — that failure is a silent CPU fallback too.
+# Install the exact cuDNN torch 2.4+cu124 was built against (--no-deps: its
+# cublas comes from the CUDA toolkit already here), register it with the
+# SYSTEM loader via ldconfig (not LD_LIBRARY_PATH — see face_worker.py's
+# history with env-var lib surgery).
+RUN pip install -q --no-deps "nvidia-cudnn-cu12==9.1.0.70" \
+ && python3 -c "import nvidia.cudnn, pathlib; \
+lib = pathlib.Path(nvidia.cudnn.__file__).parent / 'lib'; \
+assert list(lib.glob('libcudnn.so.9*')), f'no libcudnn.so.9 under {lib}'; \
+pathlib.Path('/etc/ld.so.conf.d/nemara-cudnn.conf').write_text(str(lib) + '\n')" \
+ && ldconfig
+
+# Prove the whole chain at BUILD time, in order of what can break it:
+# (1) the installed onnxruntime module actually carries the CUDA provider
+#     (catches the CPU-wheel shadowing above — listing works on a GPU-less
+#     builder, only session creation needs a device);
+# (2) cuDNN 9 loads;
+# (3) every library the CUDA provider links resolves — only libcuda.so.1
+#     (the driver, absent on a GPU-less builder) may be missing.
+RUN python3 -c "import onnxruntime as ort; \
+provs = ort.get_available_providers(); \
+assert 'CUDAExecutionProvider' in provs, f'CUDA EP missing: {provs}'; \
+print('onnxruntime providers:', provs)" \
+ && python3 -c "import ctypes; ctypes.CDLL('libcudnn.so.9'); print('cudnn9 loads')" \
+ && ORT_CUDA=$(python3 -c "import onnxruntime, pathlib; \
+print(pathlib.Path(onnxruntime.__file__).parent / 'capi' / 'libonnxruntime_providers_cuda.so')") \
+ && MISSING=$(ldd "$ORT_CUDA" | grep 'not found' | grep -v libcuda.so.1 || true) \
+ && { [ -z "$MISSING" ] || { echo "ORT CUDA EP unresolved:"; echo "$MISSING"; exit 1; }; } \
+ && echo "ORT CUDA provider fully resolved"
 
 # ── OSNet body-embedding weights, baked ────────────────────────────────
 # gpu/identity/body_embeddings.py lazy-loads `osnet_x0_25_msmt17.pt` through
