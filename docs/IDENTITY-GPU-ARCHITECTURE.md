@@ -329,6 +329,25 @@ cards for dense video tracking. v2.3.1 hardening validated under
 saturation on the weak card: prime-skip fired at 81% VRAM, zero
 perception deaths, deep health honest, collapse was graceful shed.
 
+**3090 ladder (community cloud, $0.22/hr, gpu-v2.3.1, overnight
+2026-08-14):** levels 1-3 valid — lag p50 0.51/0.87/1.14s, pod_compute
+~2.6× the 4090 (community-host caveat: mining-rig PCIe/CPU can cripple
+transfer; a secure-cloud 3090 may do better). Read: rated ~2-3 cams →
+**$0.07-0.11/occupied camera — value winner confirmed** despite the
+slow host.
+
+**OPEN REGRESSION — v2.3.1 level-4 stall.** On BOTH v2.3.1 test nodes
+(L4 and 3090 — different GPUs), all cameras stopped batching the
+moment the 4th concurrent camera joined: publishers verified still
+streaming (their ~33-min clips outlived the cliff), health "ok"
+throughout, no perception death. v2.2 never showed this to 10 cameras.
+Signature fits in-flight observes hanging and starving the admission
+gate. Both nodes were terminated by test cleanup before logs could be
+read (lesson: capture log tails BEFORE terminate — added to the chain
+checklist). **Do not roll v2.3.1 to fleet nodes until root-caused**;
+node G stays on v2.2, whose known stall mode (session accumulation)
+is restart-recoverable and watchdog-monitored.
+
 GPU procurement guidance: 4090 stays the fleet default; RTX 3090
 (936 GB/s at ~⅓-½ the price → est. $0.07-0.14/cam) and RTX A5000
 (768 GB/s → est. $0.10-0.14/cam) are the two candidates worth one
