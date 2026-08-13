@@ -216,11 +216,12 @@ env = {k: os.environ[k] for k in (
 ) if os.environ.get(k)}
 for opt in ("NEMARA_PERCEPTION_TOKEN", "NEMARA_PERCEPTION_CONCURRENCY",
             "NEMARA_NODE_CAPACITY", "NEMARA_ROSTER_POLL_S", "TS_HOSTNAME",
-            # BLAS/OMP thread caps, forwardable for experiments. A/B'd
-            # 2026-08-13 (=2, 16 vCPUs, ~1260 threads): NOT the CPU
-            # wall — no change at 1-2 cams, worse at 3. Leave unset in
-            # normal operation; the wall was codec+CPU-face work, fixed
-            # in gpu-v2 (raw wire + cuDNN).
+            # BLAS/OMP thread caps, forwardable for experiments. A/B
+            # tested 2026-08-13 (=2, 16 vCPUs, ~1260 threads): NOT the
+            # CPU wall — no change at 1-2 cams, worse at 3. Leave unset
+            # normally; the wall was codec+CPU-face work, fixed in
+            # gpu-v2 (raw wire + cuDNN). NO apostrophes in this file:
+            # macOS bash 3.2 breaks on them inside $(heredoc) blocks.
             "OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
             # gpu-v2 revert knobs: frame wire back to JPEG, and the
             # faces-must-be-on-GPU boot guard override.
