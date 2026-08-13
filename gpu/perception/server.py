@@ -112,6 +112,11 @@ _face = FaceWorker(
     ),
 )
 _ready = False
+# Deep-health state: repr of the last SAM load failure, None when the
+# tracker is known-good. Set at startup warm and on every observe's
+# get_sam; /health returns 503 while set. Shallow health (process up,
+# models unchecked) hid a 5-hour total outage on 2026-08-13.
+_sam_error: "str | None" = None
 
 # Single-flight admission control (reviews E1/S1/C7): SAM perception is
 # ~10-20s of GPU work per request and the predictor is a process
@@ -311,6 +316,7 @@ def _startup() -> None:
         # itself OOMed. A loud refusal must not leak.
         _face.stop()
         os._exit(1)
+    global _sam_error
     try:
         pred = sam_track.get_sam(_CKPT)
         # Warm the full path (CUDA kernel compile + temp-clip round
@@ -320,8 +326,13 @@ def _startup() -> None:
             concept="person", thr=0.4,
         ):
             pass
-    except Exception:  # noqa: BLE001
-        log.exception("perception.sam_warm_failed (will warm lazily)")
+        _sam_error = None
+    except Exception as exc:  # noqa: BLE001
+        _sam_error = repr(exc)
+        log.exception(
+            "perception.sam_warm_failed — /health reports 503 until a "
+            "load succeeds (a tracker-less perception must look sick)",
+        )
     threading.Thread(target=_recycle_watchdog, daemon=True).start()
     _ready = True
     log.info(
@@ -331,11 +342,13 @@ def _startup() -> None:
 
 
 @app.get("/health")
-def health() -> dict:
+def health():
     import torch
 
-    return {
-        "status": "ok" if _ready else "warming",
+    body = {
+        "status": (
+            "degraded" if _sam_error else ("ok" if _ready else "warming")
+        ),
         "contract": "observe-v2",
         "cuda": torch.cuda.is_available(),
         "gpu": (
@@ -348,6 +361,13 @@ def health() -> dict:
         # gallery's (review G4) — expose the name so it can check.
         "face_model": _FACE_MODEL,
     }
+    if _sam_error:
+        # 503, not 200-with-a-sad-body: every existing consumer (boot
+        # wait, gates, dashboards) checks with `curl -f` or status
+        # string — both must fail when the tracker cannot load.
+        body["sam_error"] = _sam_error
+        return JSONResponse(body, status_code=503)
+    return body
 
 
 # Display-veto concept (2026-07-21, screen-face incident): measured on
@@ -435,7 +455,18 @@ def _observe_sync(
         face_attempts = 0
         faces_found = 0
 
-        pred = sam_track.get_sam(_CKPT)
+        global _sam_error
+        try:
+            pred = sam_track.get_sam(_CKPT)
+        except Exception as exc:  # noqa: BLE001
+            # Surfaced on /health as 503 (see below): a perception that
+            # cannot load its tracker must look SICK, not "ok" — after
+            # the 2026-08-13 L5 OOM this exact state served 500s for ~5
+            # hours behind a green health check.
+            _sam_error = repr(exc)
+            log.exception("perception.sam_unavailable")
+            return {"_error": (503, "tracker unavailable")}
+        _sam_error = None
         t_loop = time.time()
         # CONTINUOUS SESSION (EdgeTAM-continuous arch): one persistent
         # per-camera session yields STABLE track ids across ticks (SAM3
@@ -444,7 +475,11 @@ def _observe_sync(
         # subject across ticks and stranded the backend binding into a
         # ghost. Masks are held in `session_out` for this tick; frame
         # pixels (`imgs[pos]`) are still released after the face pass.
-        session = continuous.get_session(camera_id)
+        try:
+            session = continuous.get_session(camera_id)
+        except continuous.SessionCapacityError as exc:
+            log.warning("perception.session_capacity %s", exc)
+            return {"_error": (429, str(exc))}
         session_out = session.observe(
             imgs, person_thr=person_thr, sam_pred=pred,
         )

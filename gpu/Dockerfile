@@ -245,7 +245,12 @@ WORKDIR /workspace/edgetam
 # image and exists precisely to be mounted over.
 RUN mkdir -p /persist/models /persist/state
 
-ENV PYTHONPATH=/workspace/sam3:/workspace/nemara:/workspace/edgetam:/workspace \
+# expandable_segments: the CUDA caching allocator grows in resizable
+# segments instead of fixed blocks — fragmentation insurance for the
+# session-churn workload (the 2026-07-21 leak incident was allocator
+# fragmentation; the self-recycle remains the backstop).
+ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    PYTHONPATH=/workspace/sam3:/workspace/nemara:/workspace/edgetam:/workspace \
     NEMARA_MODEL_DIR=/persist/models \
     NEMARA_STATE_DIR=/persist/state \
     NEMARA_SAM_CKPT=/persist/models/sam3.1_multiplex.pt \

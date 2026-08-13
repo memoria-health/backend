@@ -127,6 +127,14 @@ PLOG="$LOGDIR/perception-$(hostname).log"
   backoff=3
   while true; do
     cd /workspace/edgetam || exit 1
+    # Reap ORPHANED CUDA children before every (re)launch. When
+    # perception dies hard (the L5 OOM, 2026-08-13), its face-worker
+    # child — a multiprocessing spawn — outlives it holding VRAM, and
+    # the successor then cannot load SAM while REPORTING healthy. Only
+    # perception uses multiprocessing in this container, so the
+    # pattern is safe to kill globally here.
+    pkill -9 -f "multiprocessing.spawn" 2>/dev/null
+    pkill -9 -f "multiprocessing.resource_tracker" 2>/dev/null
     t0=$(date +%s)
     python3 -m uvicorn perception.server:app \
       --host "${PERCEPTION_HOST:-127.0.0.1}" \

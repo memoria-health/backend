@@ -63,6 +63,15 @@ _STAGED: contextvars.ContextVar = contextvars.ContextVar(
 # roughly 2.5 GB; the loop's own MAX_BATCH is 40, which measured 4.1 GB.
 _PRIME_MAX_FRAMES = int(os.environ.get("NEMARA_PRIME_MAX_FRAMES", "24"))
 
+# VRAM floor for priming (GB free). The cache is a ~14% speed-up and
+# nothing more; staging it when the card is nearly full is how the
+# 2026-08-13 level-5 run killed perception outright (5 sessions + two
+# in-flight prime caches crossed 24GB — an OOM at peak concurrent
+# demand, which no amount of between-pass purging can prevent). Below
+# the floor we simply skip the cache: under pressure the node gets a
+# few percent slower, never dead. 0 disables the check.
+_PRIME_MIN_FREE_GB = float(os.environ.get("NEMARA_PRIME_MIN_FREE_GB", "6"))
+
 _installed = False
 
 
@@ -181,6 +190,22 @@ def prime_feature_cache(predictor, state, chunk=16):
     # prime and upstream encodes per frame as it always did.
     if int(imgs.shape[0]) > _PRIME_MAX_FRAMES:
         return False
+    # Look before you leap: skip the optional cache when free VRAM is
+    # below the floor (see _PRIME_MIN_FREE_GB). mem_get_info is one
+    # driver call (~µs) and reports DEVICE-wide free memory — other
+    # processes' allocations included, which is exactly what matters.
+    if _PRIME_MIN_FREE_GB > 0 and torch.cuda.is_available():
+        try:
+            free_b, _total = torch.cuda.mem_get_info()
+            if free_b < _PRIME_MIN_FREE_GB * (1024 ** 3):
+                log.info(
+                    "frame_tensor.prime_skipped_low_vram free=%.1fGB "
+                    "floor=%.1fGB", free_b / 1024 ** 3, _PRIME_MIN_FREE_GB,
+                )
+                state["cached_features"] = {}
+                return False
+        except Exception:  # noqa: BLE001 — a failed probe must not
+            pass           # block the fail-safe path below
     try:
         cache = {}
         device = state.get("device", imgs.device)
