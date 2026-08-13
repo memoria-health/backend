@@ -225,7 +225,12 @@ for opt in ("NEMARA_PERCEPTION_TOKEN", "NEMARA_PERCEPTION_CONCURRENCY",
             "OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
             # gpu-v2 revert knobs: frame wire back to JPEG, and the
             # faces-must-be-on-GPU boot guard override.
-            "NEMARA_FRAME_WIRE", "NEMARA_FACE_REQUIRE_GPU"):
+            "NEMARA_FRAME_WIRE", "NEMARA_FACE_REQUIRE_GPU",
+            # SSH pubkey for the entrypoint sshd. RunPod injects
+            # PUBLIC_KEY only into console-created pods; API-created
+            # pods must carry it themselves (learned on node G,
+            # 2026-08-13 - no key, no sshd, no shell when it mattered).
+            "PUBLIC_KEY"):
     if os.environ.get(opt):
         env[opt] = os.environ[opt]
 print(json.dumps({
