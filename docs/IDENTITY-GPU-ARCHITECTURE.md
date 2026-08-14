@@ -272,6 +272,13 @@ and the camera kept batching until the shared halt).
 - Soak dashboard must follow the roster for the current node (was left
   aimed at a dead node today).
 - Backend liveness alarm (post-mortem #6).
+- **Tentative-lock tier** (live incident 2026-08-14: fiancée took the
+  seat at 0.578 in low light and held it minutes at the relaxed 20s
+  probe cadence): a seat taken below ~0.6 should keep probing at the
+  1.5s SEARCH cadence until it clears real confidence (~13× faster
+  self-correction), plus a low-light face-quality floor (min face px /
+  det score) for seat ELIGIBILITY. Gallery held: harvest gates refused
+  the 0.578 lock — zero contamination.
 - identity_nodes dead rows accumulate — reaper or cleanup in the M3
   deploy batch.
 - RunPod account: SSH key in Settings; balance top-up cadence.
