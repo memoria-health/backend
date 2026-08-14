@@ -245,12 +245,14 @@ WORKDIR /workspace/edgetam
 # image and exists precisely to be mounted over.
 RUN mkdir -p /persist/models /persist/state
 
-# expandable_segments: the CUDA caching allocator grows in resizable
-# segments instead of fixed blocks — fragmentation insurance for the
-# session-churn workload (the 2026-07-21 leak incident was allocator
-# fragmentation; the self-recycle remains the backstop).
-ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-    PYTHONPATH=/workspace/sam3:/workspace/nemara:/workspace/edgetam:/workspace \
+# Do NOT set PYTORCH_CUDA_ALLOC_CONF=expandable_segments here. It went
+# in with v2.3 as fragmentation insurance and MEASURED as a 6x
+# multi-camera throughput collapse (2026-08-14 A/B/C on identical
+# hosts: rung-4 batches 86 without it, 13 with it, 79 with v2.3 code
+# and the setting blanked). Torch 2.4 + our concurrent multi-stream
+# EdgeTAM sessions is exactly the workload its known slow paths bite.
+# Fragmentation stays covered by empty_cache-per-pass + self-recycle.
+ENV PYTHONPATH=/workspace/sam3:/workspace/nemara:/workspace/edgetam:/workspace \
     NEMARA_MODEL_DIR=/persist/models \
     NEMARA_STATE_DIR=/persist/state \
     NEMARA_SAM_CKPT=/persist/models/sam3.1_multiplex.pt \

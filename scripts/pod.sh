@@ -241,6 +241,11 @@ print(json.dumps({
     "gpuTypeIds": json.loads("[" + os.environ["GPU_TYPES"] + "]"),
     "gpuCount": 1,
     "gpuTypePriority": "availability",
+    # Hosts must run a driver for our CUDA 12.4 base. Two community
+    # 3090s placed without this filter came up cuda:false (torch saw no
+    # GPU at all, 2026-08-14) - old-driver hosts. Harmless on secure
+    # cloud, essential on community.
+    "allowedCudaVersions": ["12.4", "12.5", "12.6", "12.7", "12.8"],
     "containerDiskInGb": 70,
     # Mounted at /persist, NOT /workspace — the image keeps sam3, edgetam and
     # our code under /workspace and a volume there would shadow all of it.
