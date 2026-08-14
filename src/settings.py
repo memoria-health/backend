@@ -250,16 +250,10 @@ class Settings(BaseSettings):
     censor_stream_segment_every: int = Field(ge=1, le=60, default=5)
 
     # How often a recording camera asks whether the moment is sensitive.
-    # This is the ONLY thing that turns masking on — room class does not.
-    # It reuses the MP4 the tick already built for the detector, so the
-    # cost is one extra VLM call, not another encode. 3 → roughly every
-    # 30s of a recording session. Lower reacts sooner and costs more.
-    # Env: NEMARA_DATA_COLLECTION_SENSITIVITY_EVERY_N_TICKS.
-    data_collection_sensitivity_every_n_ticks: int = Field(
-        ge=1, le=60, default=3
-    )
-
     # ── Finalize-time redaction (2026-08-12) ────────────────────
+    # (The tick-time sensitivity screen and its cadence knob were
+    # retired 2026-08-14: the chunked finalize re-screen below is the
+    # sole redaction net — ~30% tick-cost saving on recording cameras.)
     # (Replaces the per-clip masked-audio switch: audio is now kept
     # unconditionally per the 2026-07-28 product call — redaction
     # pixelates video spans and never touches the track. Capture is

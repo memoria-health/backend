@@ -78,7 +78,6 @@ class RedactionPlan:
 
     spans: list[Span]
     chunk_hits: int
-    prior_hits: int
     chunks_screened: int
 
 
@@ -111,11 +110,11 @@ async def detect_spans(
     final_path: Path,
     *,
     duration: float,
-    prior_offsets: Sequence[float],
     settings: Any,
     screen: Callable[..., Awaitable[Any]] | None = None,
 ) -> RedactionPlan:
-    """Union of tick-verdict priors and a chunked re-screen of the clip.
+    """Chunked re-screen of the whole clip — the sole redaction net
+    (tick-verdict priors retired 2026-08-14 with the tick-time screen).
 
     Raises on screening/cut failure — the caller treats ANY exception
     as "drop the clip" (fail closed). A screen call that itself judges
@@ -127,8 +126,6 @@ async def detect_spans(
     pad = float(settings.data_collection_redaction_pad_seconds)
     chunk_s = float(settings.data_collection_redaction_chunk_seconds)
     concurrency = int(settings.data_collection_redaction_concurrency)
-
-    prior_spans: list[Span] = [(t, t) for t in prior_offsets]
 
     starts = []
     t = 0.0
@@ -155,19 +152,15 @@ async def detect_spans(
     with tempfile.TemporaryDirectory(prefix="memoria-redact-") as tmpdir:
         await asyncio.gather(*(_screen_one(s, tmpdir) for s in starts))
 
-    spans = merge_spans(
-        [*prior_spans, *hits], pad_seconds=pad, duration=duration,
-    )
+    spans = merge_spans(hits, pad_seconds=pad, duration=duration)
     plan = RedactionPlan(
         spans=spans,
         chunk_hits=len(hits),
-        prior_hits=len(prior_spans),
         chunks_screened=len(starts),
     )
     log.info(
-        "redaction: %s -> %d span(s) (%d chunk hits / %d chunks, "
-        "%d tick priors)",
+        "redaction: %s -> %d span(s) (%d chunk hits / %d chunks)",
         final_path.name, len(spans), plan.chunk_hits,
-        plan.chunks_screened, plan.prior_hits,
+        plan.chunks_screened,
     )
     return plan

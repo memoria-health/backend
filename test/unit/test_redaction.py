@@ -97,7 +97,7 @@ def _settings():
 
 def _plan(spans):
     return SimpleNamespace(
-        spans=spans, chunk_hits=len(spans), prior_hits=0,
+        spans=spans, chunk_hits=len(spans),
         chunks_screened=1,
     )
 

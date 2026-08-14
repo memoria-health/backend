@@ -205,15 +205,7 @@ class RecorderManager:
         ctx: RecorderCtx,
         lead_in_frames: Sequence[Any] | None = None,
         lead_in_audio: bytes | None = None,
-        sensitive: bool | None = None,
     ) -> None:
-        """``sensitive`` is the tick's verdict on whether this moment is
-        sensitive, or None when the tick didn't ask (it runs on a
-        cadence). A True verdict no longer touches the encoder
-        (2026-08-12): it is NOTED as a clip-relative offset and becomes
-        a span prior for the finalize-time redaction pass. Recording
-        stays raw-to-local-disk throughout.
-        """
         async with self._lock_for(camera_id):
             rec = self._sessions.get(camera_id)
             if rec is None:
@@ -235,11 +227,6 @@ class RecorderManager:
             await rec.on_tick(
                 collect, lead_in_frames=lead_in_frames, lead_in_audio=lead_in_audio
             )
-            if sensitive:
-                # AFTER on_tick so the verdict on the session-STARTING
-                # tick lands too (before it, the recorder is IDLE and
-                # the note would no-op).
-                rec.note_sensitive()
             # Drop fully-idle recorders so the dict (and the cap math)
             # stays tight — a session that just finalized is back to IDLE.
             if not rec.is_active:
@@ -450,7 +437,6 @@ class RecorderManager:
                     plan = await self._span_detector(
                         final_path,
                         duration=duration,
-                        prior_offsets=fs.sensitive_offsets,
                         settings=self._settings,
                     )
                     spans = plan.spans

@@ -7,10 +7,9 @@ video spans and never touches the track). Capture itself is severed at
 the publisher by `patients.audio_capture_enabled` when audio is illegal
 to record.
 
-Sensitive verdicts (2026-08-12): a True verdict no longer switches
-encoders — it is NOTED as a clip-relative offset and rides
-FinalizedSession.sensitive_offsets into the finalize-time redaction
-pass as a span prior.
+Sensitivity (2026-08-14): recording is verdict-free — the finalize-time
+chunked re-screen is the sole redaction net (tick-time screening and
+its priors were retired with it).
 
 Counters: without them, collection can stop completely (cap reached, B2
 unconfigured, every upload failing) and nothing anywhere says so.
@@ -111,8 +110,8 @@ def _ctx(cam):
     )
 
 
-async def _run(mgr, cam, ctx, *, sensitive=None):
-    await mgr.on_tick(cam, True, ctx=ctx, sensitive=sensitive)
+async def _run(mgr, cam, ctx):
+    await mgr.on_tick(cam, True, ctx=ctx)
     mgr.feed_audio(cam, b"\x01\x02" * 100, captured_at=0.0)
     await mgr.on_tick(cam, False, ctx=ctx)
     await mgr.on_tick(cam, False, ctx=ctx)
@@ -123,31 +122,8 @@ async def test_clip_audio_is_always_kept(tmp_path) -> None:
     muxer = _Muxer()
     mgr = _mgr(tmp_path, muxer=muxer)
     cam = uuid4()
-    await _run(mgr, cam, _ctx(cam), sensitive=True)
+    await _run(mgr, cam, _ctx(cam))
     assert muxer.audio_args and muxer.audio_args[0] is not None
-
-
-async def test_sensitive_verdict_becomes_a_redaction_prior(tmp_path) -> None:
-    """A True verdict during a session must surface in the priors handed
-    to the span detector — that is the entire remaining effect of the
-    tick-time sensitivity screen on recording."""
-    seen: dict = {}
-
-    async def _detector(_path, *, duration, prior_offsets, settings):
-        seen["priors"] = list(prior_offsets)
-        return SimpleNamespace(
-            spans=[], chunk_hits=0, prior_hits=len(prior_offsets),
-            chunks_screened=0,
-        )
-
-    mgr = _mgr(
-        tmp_path,
-        settings=_settings(data_collection_redaction_enabled=True),
-        span_detector=_detector,
-    )
-    cam = uuid4()
-    await _run(mgr, cam, _ctx(cam), sensitive=True)
-    assert seen["priors"] == [0.0]  # frozen clock: verdict at t=0
 
 
 async def test_counters_track_a_healthy_upload(tmp_path) -> None:

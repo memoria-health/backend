@@ -23,7 +23,6 @@ class _FakeRecorder:
 
     async def on_tick(
         self, camera_id, collect, *, ctx, lead_in_frames, lead_in_audio,
-        sensitive=None,
     ) -> None:
         self.calls.append((camera_id, collect, ctx, lead_in_frames, lead_in_audio))
 

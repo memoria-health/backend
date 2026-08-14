@@ -94,12 +94,6 @@ class FinalizedSession:
     # frame is written twice to cover it) but the intermediate picture is
     # gone. A quality signal, not a fault.
     dropped_frames: int = 0
-    # Clip-relative seconds of every tick whose sensitivity screen said
-    # SENSITIVE during this clip. Free span priors for the finalize-time
-    # redaction pass (2026-08-12) — the union of these and the clip
-    # re-screen decides what gets pixelated. Replaces the retired
-    # `masked` flag: a verdict now marks a MOMENT, not the session.
-    sensitive_offsets: list[float] = field(default_factory=list)
 
 
 class _Encoder(Protocol):
@@ -140,10 +134,6 @@ class SessionRecorder:
         linger_seconds: float = 45.0,
     ) -> None:
         self.camera_id = camera_id
-        # Clip-relative offsets of sensitive tick verdicts — reset every
-        # time a clip starts (incl. rolls); ride out on FinalizedSession
-        # as redaction priors.
-        self._sensitive_marks: list[float] = []
         self._ctx = ctx
         self._temp_dir = Path(temp_dir)
         self._encoder_factory = encoder_factory
@@ -202,15 +192,6 @@ class SessionRecorder:
                 self.state = SessionState.RECORDING  # presence resumed
             elif now - self._linger_start_mono >= self._linger_seconds:
                 await self._finalize()
-
-    def note_sensitive(self) -> None:
-        """Record 'this moment was judged sensitive' as a clip-relative
-        offset. Cheap bookkeeping; the finalize-time redaction pass uses
-        these as span priors. No-op when nothing is recording."""
-        if self.state in (SessionState.RECORDING, SessionState.LINGERING):
-            self._sensitive_marks.append(
-                max(0.0, self._clock() - self._session_start_mono)
-            )
 
     # ── per-frame intake (sync, non-blocking) ───────────────────────
 
@@ -282,8 +263,6 @@ class SessionRecorder:
         self._audio_path = self._temp_dir / f"{sid}.audio.pcm"
         self._session_start_mono = self._clock()
         self._session_start_utc = self._utcnow()
-        # Fresh clip, fresh redaction priors.
-        self._sensitive_marks = []
         # Fresh session, fresh audio timeline.
         self._audio_start_mono = None
         self._audio_bytes = 0
@@ -367,7 +346,6 @@ class SessionRecorder:
                         getattr(encoder, "deficit_seconds", 0.0)
                     ),
                     dropped_frames=int(getattr(encoder, "dropped", 0)),
-                    sensitive_offsets=list(self._sensitive_marks),
                 )
             )
         except Exception:
