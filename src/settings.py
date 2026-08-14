@@ -749,7 +749,6 @@ class Settings(BaseSettings):
     # held a departed patient present for 890s over an empty room. A still
     # patient in bed is re-grounded by SAM3 within this window. 0 = old
     # unbounded behaviour.
-    reid_scene_extension_max_s: float = Field(ge=0, default=150.0)
     # W5 — face-lock quality floors: dim faces may VOTE, only quality
     # faces may LOCK (the lunch green-box fix: 15-30px guest faces
     # cleared the quality-ADAPTIVE match bar and locked PATIENT).

@@ -5,7 +5,8 @@ ticks, so the ledger keys entries by the pod id and never stitches. Two
 labels only: PATIENT or UNKNOWN. Tests drive fabricated IdentityResults
 through multi-tick scenarios: stable-id hold, hold-through-distance (the
 northstar), re-entry rebind, the single-patient FP guard, cross-camera
-single-holder, retirement + bounded scene-extension.
+single-holder, retirement on grace. (Scene-extension and the blackout
+carry were DELETED 2026-08-14 — extinct payoffs; see track_ledger.py.)
 """
 
 from __future__ import annotations
@@ -222,15 +223,14 @@ def test_face_still_establishes_when_confirmed_elsewhere(registry):
     assert label_of(r, 1) == LABEL_PATIENT   # face crosses the boundary
 
 
-def test_face_reentry_beats_stale_scene_extended_phantom(ledger):
-    # Patient face-binds, leaves; a lingering scene keeps the OLD id
-    # scene-extended (a phantom holding the seat at its peak 0.62). The
-    # patient returns as a NEW pod id and face-locks LOWER (0.55). The
+def test_face_reentry_beats_stale_held_phantom(ledger):
+    # Patient face-binds, vanishes; the OLD id is still inside the 45s
+    # retire grace (a stale holder at its peak 0.62). The patient
+    # returns as a NEW pod id and face-locks LOWER (0.55). The
     # physically-present, face-verified return must win over the stale
-    # phantom (review Finding 3).
+    # holder (review Finding 3).
     ledger.apply(result([face(1, BOX_A, conf=0.62)]), tick_mono=10.0)
-    ledger.note_scene_presence(True)
-    ledger.apply(result([]), tick_mono=20.0)          # id1 scene-extends
+    ledger.apply(result([]), tick_mono=20.0)          # unseen, within grace
     assert ledger.is_active
     r = ledger.apply(result([face(2, BOX_A, conf=0.55)]), tick_mono=30.0)
     assert label_of(r, 2) == LABEL_PATIENT
@@ -242,8 +242,7 @@ def test_pool_challenger_cannot_steal_from_stale_phantom(ledger):
     # (weaker outfit evidence) can't take a held seat just because the
     # holder wasn't seen this tick.
     ledger.apply(result([face(1, BOX_A, conf=0.62)]), tick_mono=10.0)
-    ledger.note_scene_presence(True)
-    ledger.apply(result([]), tick_mono=20.0)          # id1 scene-extends
+    ledger.apply(result([]), tick_mono=20.0)          # unseen, within grace
     r = ledger.apply(result([pool(2, BOX_A, conf=0.90)]), tick_mono=30.0)
     assert label_of(r, 2) == LABEL_UNKNOWN            # face-held seat stands
     assert ledger._entries[1].binding == LABEL_PATIENT
@@ -278,23 +277,6 @@ def test_reentry_new_pod_id_rebinds_patient(ledger):
     r = ledger.apply(result([face(2, BOX_A)]), tick_mono=110.0)
     assert label_of(r, 2) == LABEL_PATIENT
     assert 1 not in ledger._entries
-
-
-def test_scene_presence_extends_within_bound(ledger):
-    ledger.apply(result([face(1, BOX_A)]), tick_mono=10.0)
-    ledger.note_scene_presence(True)
-    ledger.apply(result([]), tick_mono=100.0)         # 90s unseen, within 150s
-    assert ledger.is_active                            # held within the bound
-
-
-def test_scene_extension_bounded_phantom_ages_out(ledger):
-    ledger.apply(result([face(1, BOX_A)]), tick_mono=10.0)
-    ledger.note_scene_presence(True)
-    # Scene keeps saying "present" long past the 150s bound (drift phantom).
-    ledger.apply(result([]), tick_mono=180.0)
-    ledger.apply(result([]), tick_mono=250.0)          # > 150s since body seen
-    ledger.apply(result([]), tick_mono=320.0)          # + grace
-    assert not ledger.is_active                         # Fix B: it ages out
 
 
 # ── registry / cross-camera single holder ───────────────────────────────

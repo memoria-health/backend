@@ -1854,9 +1854,6 @@ class CameraIngest:
             # present (live 2026-07-26). The union above is the value
             # the tick actually gates on — record that, always.
             result.detector_fields["people_present"] = gate_people_present
-            # W3: feed the LLM's presence verdict back to the lock (one
-            # tick of lag vs a 45 s grace — fine) and stash lock state.
-            self._identity_lock.note_scene_presence(bool(result.people_present))
             result.detector_fields.update(self._identity_lock.stash_fields())
 
             # Data-collection recorder decision — READ-ONLY over the
