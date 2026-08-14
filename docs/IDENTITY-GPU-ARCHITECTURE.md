@@ -322,10 +322,13 @@ assignment (real home undisturbed on the 4090), node terminated after.
 | rated (comfort) | 4 | 2 |
 | $/occupied camera | $0.185 | $0.245 |
 
-The ~3× throughput gap matches the memory-bandwidth ratio almost
-exactly — bandwidth (with FP16 tensor rate) is the workload's scaling
-predictor, so consumer flagships beat cut-down datacenter inference
-cards for dense video tracking. v2.3.1 hardening validated under
+CORRECTED 2026-08-14 by the 3090 datapoint: the predictor is
+FP16 TENSOR COMPUTE, not bandwidth. The 3090 has ~93% of the 4090's
+bandwidth yet measured ~2.5× slower per batch — matching its ~2.3×
+compute deficit; the L4 fit both ratios and could not distinguish.
+Consequence: the A5000's projected rating drops below the 3090's, and
+per compute-dollar the secure-tier 4090 is already the best deal —
+cheap-card procurement is not the cost lever; the cascade is. v2.3.1 hardening validated under
 saturation on the weak card: prime-skip fired at 81% VRAM, zero
 perception deaths, deep health honest, collapse was graceful shed.
 
