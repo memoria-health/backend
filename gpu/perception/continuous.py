@@ -107,6 +107,18 @@ def _track_dims(w: int, h: int) -> tuple[int, int, float]:
     return _TRACK_W, max(1, round(h * s)), s
 
 
+# torch.compile on the EdgeTAM heavy modules (2026-08-14, capacity
+# program item #3). Compilation fuses the per-frame kernel storm into
+# fewer, larger launches — same math, same outputs (mask parity is the
+# empirical check on the live feed). Scope is DELIBERATELY EdgeTAM-only:
+# it is the continuous per-frame cost; SAM3 runs only on re-grounds and
+# its multiplex graph is a riskier compile target. dynamic=True because
+# batch shape varies per tick. One env kills it: NEMARA_TORCH_COMPILE=0.
+_COMPILE = os.environ.get(
+    "NEMARA_TORCH_COMPILE", "1",
+).strip() not in ("0", "false")
+
+
 def _get_edge():
     """Process-singleton EdgeTAM (sam2) video predictor."""
     global _EDGE
@@ -120,6 +132,27 @@ def _get_edge():
                 _EDGE = build_sam2_video_predictor(
                     _EDGE_CFG, _EDGE_CKPT, device="cuda",
                 )
+                if _COMPILE:
+                    import torch
+
+                    try:
+                        _EDGE.image_encoder = torch.compile(
+                            _EDGE.image_encoder, dynamic=True,
+                        )
+                        _EDGE.memory_attention = torch.compile(
+                            _EDGE.memory_attention, dynamic=True,
+                        )
+                        log.info(
+                            "continuous.edgetam_compiled "
+                            "(image_encoder + memory_attention)",
+                        )
+                    except Exception:  # noqa: BLE001 — compile is an
+                        # optimisation, never a dependency: any failure
+                        # leaves the eager modules in place.
+                        log.warning(
+                            "continuous.edgetam_compile_failed — "
+                            "running eager", exc_info=True,
+                        )
                 log.info("continuous.edgetam_loaded ckpt=%s", _EDGE_CKPT)
     return _EDGE
 

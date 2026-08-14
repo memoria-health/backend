@@ -252,7 +252,11 @@ RUN mkdir -p /persist/models /persist/state
 # and the setting blanked). Torch 2.4 + our concurrent multi-stream
 # EdgeTAM sessions is exactly the workload its known slow paths bite.
 # Fragmentation stays covered by empty_cache-per-pass + self-recycle.
-ENV PYTHONPATH=/workspace/sam3:/workspace/nemara:/workspace/edgetam:/workspace \
+# torch.compile artifact cache on the PERSISTENT volume: the first node
+# of a GPU class pays the compile once; every later boot (and the
+# self-recycle restarts) hits the cache and warms in seconds.
+ENV TORCHINDUCTOR_CACHE_DIR=/persist/state/inductor-cache \
+    PYTHONPATH=/workspace/sam3:/workspace/nemara:/workspace/edgetam:/workspace \
     NEMARA_MODEL_DIR=/persist/models \
     NEMARA_STATE_DIR=/persist/state \
     NEMARA_SAM_CKPT=/persist/models/sam3.1_multiplex.pt \
