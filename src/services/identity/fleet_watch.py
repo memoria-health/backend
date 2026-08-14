@@ -347,6 +347,18 @@ class FleetWatch:
     async def _page_nodes_down(self, down: list) -> None:
         seen: set[str] = set()
         for node_id, homes, age_s in down:
+            # A stale node holding NO homes is a corpse, not an incident
+            # — replaced test/fleet nodes leave rows behind until the
+            # reaper runs, and paging each one buried real alerts in
+            # noise (2026-08-14: 11 corpse pages in an afternoon of
+            # node replacement, node_id different every time). Not
+            # added to `seen`, so any open page for it auto-resolves.
+            if not homes:
+                log.info(
+                    "identity.node_gone node=%s (0 homes) — no page",
+                    node_id,
+                )
+                continue
             key = f"{_KEY_NODE_DOWN}{node_id}"
             seen.add(key)
             log.warning(
