@@ -329,24 +329,42 @@ cards for dense video tracking. v2.3.1 hardening validated under
 saturation on the weak card: prime-skip fired at 81% VRAM, zero
 perception deaths, deep health honest, collapse was graceful shed.
 
-**3090 ladder (community cloud, $0.22/hr, gpu-v2.3.1, overnight
-2026-08-14):** levels 1-3 valid — lag p50 0.51/0.87/1.14s, pod_compute
-~2.6× the 4090 (community-host caveat: mining-rig PCIe/CPU can cripple
-transfer; a secure-cloud 3090 may do better). Read: rated ~2-3 cams →
-**$0.07-0.11/occupied camera — value winner confirmed** despite the
-slow host.
+**3090 ladders (community cloud, $0.22/hr, 2026-08-14).** After two
+infra lemons (EU-CZ-1 corrupt image cache — `exec entrypoint.sh: No
+such file or directory` from an image that runs everywhere else; and
+two old-driver community hosts exposing NO GPU — fixed permanently by
+the `allowedCudaVersions` filter in pod.sh), a healthy CUDA-filtered
+host ran the full ladder on v2.2:
 
-**OPEN REGRESSION — v2.3.1 level-4 stall.** On BOTH v2.3.1 test nodes
-(L4 and 3090 — different GPUs), all cameras stopped batching the
-moment the 4th concurrent camera joined: publishers verified still
-streaming (their ~33-min clips outlived the cliff), health "ok"
-throughout, no perception death. v2.2 never showed this to 10 cameras.
-Signature fits in-flight observes hanging and starving the admission
-gate. Both nodes were terminated by test cleanup before logs could be
-read (lesson: capture log tails BEFORE terminate — added to the chain
-checklist). **Do not roll v2.3.1 to fleet nodes until root-caused**;
-node G stays on v2.2, whose known stall mode (session accumulation)
-is restart-recoverable and watchdog-monitored.
+| 3090 (healthy, v2.2) | 1 | 2 | 4 | 6+ |
+|---|---|---|---|---|
+| lag p50 / p95 | 0.39/1.22s | 0.53/1.67s | 2.21/3.51s | hard stall |
+| batches | 34 | 66 | 86 | 2 |
+
+Rated **3 comfortable / 4 strained-in-SLA**, collapse at 6. At $0.22 →
+**$0.055-0.073/occupied camera** — but even healthy community 3090s ran
+~2.5× slower per batch than the 4090 (systematic community throttling
+suspected; secure-3090 unmeasured), and community tier is non-prod for
+patient data (custody). Fleet stays on the secure 4090.
+
+**The collapse model (replaces the earlier "v2.3.1 level-4 stall
+regression" framing, which was confounded).** Every card hard-stalls —
+throughput collapses into admission-timeout thrash, health honest, no
+crash — at roughly **2-2.5× its rated capacity**: L4 rated 2 → stalled
+at 4; 3090 rated 3 → stalled at 6; 4090 rated 4 → stalled at 10. The
+production guard is the FleetWatch lag alarm, which fires at 1× (lag >
+tick), far below the cliff.
+
+**The real v2.3 regression, convicted and fixed (gpu-v2.3.2).**
+Same-host A/B/C, one variable per run, rung-4 batches:
+v2.2 → **86** · v2.3.1 → **13** · v2.3.1 with
+`PYTORCH_CUDA_ALLOC_CONF` blanked → **79**. The expandable_segments
+allocator conf (added in v2.3 as fragmentation insurance) collapses
+concurrent multi-session throughput ~6× under torch 2.4 and had pulled
+the thrash cliff down to the rated capacity itself. v2.3.2 deletes the
+ENV line; every other guard in the hardening bundle is exonerated, and
+the C run doubles as v2.3.2's load validation (identical code path).
+Fragmentation stays covered by empty_cache-per-pass + self-recycle.
 
 GPU procurement guidance: 4090 stays the fleet default; RTX 3090
 (936 GB/s at ~⅓-½ the price → est. $0.07-0.14/cam) and RTX A5000
