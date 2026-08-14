@@ -233,7 +233,7 @@ for opt in ("NEMARA_PERCEPTION_TOKEN", "NEMARA_PERCEPTION_CONCURRENCY",
             "PUBLIC_KEY",
             # Capacity-experiment knobs (2026-08-14): SAM3 re-ground
             # cadence and tracking fps. Unset = proven defaults (5, 3.0).
-            "NEMARA_EDGE_REGROUND", "NEMARA_TARGET_FPS"):
+            "NEMARA_EDGE_REGROUND", "NEMARA_EDGE_REGROUND_S", "NEMARA_TARGET_FPS"):
     if os.environ.get(opt):
         env[opt] = os.environ[opt]
 print(json.dumps({
