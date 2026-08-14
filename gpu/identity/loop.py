@@ -100,7 +100,12 @@ EMPTY_INTERVAL_S = 20.0        # poll cadence for an empty room. Each
 # STABILITY IS THE PRODUCT; LATENCY IS SACRIFICIAL (Aryaman,
 # 2026-07-24): identity is ASYNC — detection ticks ride the published
 # Patient State, so tracking lag costs nothing downstream.
-TARGET_FPS = 3.0               # THE GPU-duty lever (measured
+# Env-overridable (2026-08-14) for the capacity experiments — the
+# 15-cams-per-node program A/Bs 2.0 against the proven 3.0. Default
+# unchanged; a lower value trades state-freshness for capacity and
+# needs an accuracy soak before it becomes the fleet default.
+TARGET_FPS = float(os.environ.get("NEMARA_TARGET_FPS", "3.0"))
+_TARGET_FPS_PROVEN = 3.0       # THE GPU-duty lever (measured
                                # 2026-07-26: pod cost ≈ 200-250ms x
                                # FRAMES, near-independent of
                                # resolution). 3fps → 10-19 frame

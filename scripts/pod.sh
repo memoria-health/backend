@@ -230,7 +230,10 @@ for opt in ("NEMARA_PERCEPTION_TOKEN", "NEMARA_PERCEPTION_CONCURRENCY",
             # PUBLIC_KEY only into console-created pods; API-created
             # pods must carry it themselves (learned on node G,
             # 2026-08-13 - no key, no sshd, no shell when it mattered).
-            "PUBLIC_KEY"):
+            "PUBLIC_KEY",
+            # Capacity-experiment knobs (2026-08-14): SAM3 re-ground
+            # cadence and tracking fps. Unset = proven defaults (5, 3.0).
+            "NEMARA_EDGE_REGROUND", "NEMARA_TARGET_FPS"):
     if os.environ.get(opt):
         env[opt] = os.environ[opt]
 print(json.dumps({
