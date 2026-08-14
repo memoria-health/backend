@@ -269,17 +269,28 @@ def _meta_prompt(
         detected_guidance = (
             "FIRST weigh the stakes: this is a ROUTINE, non-emergency behaviour, "
             "so a false alarm is just noise the caregiver must dismiss. Be "
-            "CONSERVATIVE — set TRUE only on a CLEAR, SUSTAINED, deliberate "
-            "occurrence; a fleeting glance, an incidental or momentary instance, "
-            "or anything ambiguous → FALSE. Use your judgment to calibrate how "
-            "strict to be: the more disruptive a false alarm would be, the "
-            "higher the bar."
+            "CONSERVATIVE about EVIDENCE, never about duration. Decide the "
+            "behaviour's natural time-scale first. If it is inherently "
+            "MOMENTARY (an action over in seconds — a sip, a pill, a doorway "
+            "pass), ONE clearly-visible occurrence anywhere in the clip is "
+            "TRUE; brevity alone is NEVER grounds for FALSE — the bar is that "
+            "the physical evidence is unambiguously on film. (Live lesson "
+            "2026-08-14: criteria that demanded 'sustained' made the model "
+            "describe a person drinking from a glass at confidence 0.9 and "
+            "still answer false.) If it is inherently a SUSTAINED state, "
+            "require clear, deliberate engagement for most of the clip; a "
+            "fleeting glance or incidental instant of it → FALSE. In both "
+            "cases anything ambiguous, occluded, or unclear → FALSE, and "
+            "calibrate strictness to how disruptive a false alarm would be."
         )
         example = _FEW_SHOT_EXAMPLE_ROUTINE_REACTIVE
 
     return (
         "You are configuring a computer-vision detector that runs on "
-        "short (~11s) clips from a wall-mounted home security camera.\n\n"
+        "short (~11s) clips from a wall-mounted home security camera. "
+        "Clips are analyzed roughly every 10 seconds, so a brief action "
+        "typically appears in exactly ONE clip and may start or end "
+        "mid-clip.\n\n"
         f"{_HARD_RULES}\n"
         "The caregiver wants a new detector with this description:\n"
         f"  Name:        {name!r}\n"
@@ -300,6 +311,14 @@ def _meta_prompt(
         f"not happening; 0.3–0.6 = ambiguous; 0.7+ = clearly happening.>\n\n"
         f"  {identifier}_reasoning: 1 short sentence explaining your "
         f"judgment, citing what you specifically saw.\n\n"
+        f"  {identifier}_confirm_need: high or low. <COMPILE-TIME metadata, "
+        f"NOT part of the runtime instructions — it configures server-side "
+        f"double-checking. Answer 'high' when this detector's visual "
+        f"evidence is error-prone: subtle or small-scale motion, interaction "
+        f"with a small handheld object (cup, pill, utensil, phone), or a "
+        f"visually busy context where similar-looking actions are common. "
+        f"Answer 'low' when the action is large-scale and unmistakable. Add "
+        f"one short reason after the word.>\n\n"
         + (
             # The detection/state split for sustained behaviours
             # (Aryaman 2026-08-07). `_detected` above is ENTRY evidence
@@ -327,12 +346,15 @@ def _meta_prompt(
         + f"Match the rigor of this example:\n\n"
         f"{example}\n\n"
         + (
-            "Total length under ~1800 characters. Return ONLY the "
-            "four-field instruction block — no preamble, no markdown, "
-            "no quotes around it."
+            "Total length under ~1900 characters. Return ONLY the "
+            "instruction block (the four runtime fields plus the "
+            "confirm_need line) — no preamble, no markdown, no quotes "
+            "around it."
             if is_sustained else
-            "Total length under ~1500 characters. Return ONLY the three-field "
-            "instruction block — no preamble, no markdown, no quotes around it."
+            "Total length under ~1600 characters. Return ONLY the "
+            "instruction block (the three runtime fields plus the "
+            "confirm_need line) — no preamble, no markdown, no quotes "
+            "around it."
         )
     )
 
@@ -349,6 +371,34 @@ class CompiledDetector:
     identifier: str
     prompt_fragment: str
     schema_json: dict[str, dict[str, str]]
+    # Compiler's evidence-risk verdict ("high" | "low" | None): does this
+    # detector's evidence warrant the within-clip confirm re-votes?
+    # Consumed by compiler_v2.apply_confirm_need; never shipped in the
+    # runtime fragment. None = the model omitted/garbled the line → the
+    # caller keeps today's default eventing (Aryaman 2026-08-14:
+    # confirmation should follow evidence risk — small-object interaction,
+    # subtle motion, confounding context — not be a blanket default).
+    confirm_need: str | None = None
+
+
+def _split_confirm_need(fragment: str, identifier: str) -> tuple[str, str | None]:
+    """Peel the compile-time confirm_need line off a cleaned fragment.
+
+    The line is eventing metadata and must never reach the runtime
+    prompt. Absent or garbled → (fragment unchanged, None): a parse miss
+    can only land on today's default behavior, never on a silently
+    unguarded detector.
+    """
+    pat = re.compile(
+        rf"^[ \t]*\**{re.escape(identifier)}_confirm_need\**:\s*[\"'`]?"
+        rf"(high|low)\b.*$",
+        re.M | re.I,
+    )
+    m = pat.search(fragment)
+    if not m:
+        return fragment, None
+    stripped = (fragment[: m.start()] + fragment[m.end():]).strip()
+    return stripped, m.group(1).lower()
 
 
 def _gen_identifier() -> str:
@@ -539,14 +589,17 @@ async def compile_custom_detector(
             user_text=user_text, absence=absence, category=category,
             settings=settings, is_sustained=is_sustained,
         )
+        fragment, confirm_need = _split_confirm_need(fragment, identifier)
         log.info(
-            "detector_compiler.openai_ok identifier=%s name=%r fragment_chars=%d",
-            identifier, name, len(fragment),
+            "detector_compiler.openai_ok identifier=%s name=%r "
+            "fragment_chars=%d confirm_need=%s",
+            identifier, name, len(fragment), confirm_need,
         )
         return CompiledDetector(
             identifier=identifier,
             prompt_fragment=fragment,
             schema_json=_schema_for(identifier, is_sustained=is_sustained),
+            confirm_need=confirm_need,
         )
     except Exception as openai_err:
         log.warning(
@@ -560,14 +613,17 @@ async def compile_custom_detector(
             user_text=user_text, absence=absence, category=category,
             settings=settings, is_sustained=is_sustained,
         )
+        fragment, confirm_need = _split_confirm_need(fragment, identifier)
         log.info(
-            "detector_compiler.gemini_ok identifier=%s name=%r fragment_chars=%d",
-            identifier, name, len(fragment),
+            "detector_compiler.gemini_ok identifier=%s name=%r "
+            "fragment_chars=%d confirm_need=%s",
+            identifier, name, len(fragment), confirm_need,
         )
         return CompiledDetector(
             identifier=identifier,
             prompt_fragment=fragment,
             schema_json=_schema_for(identifier, is_sustained=is_sustained),
+            confirm_need=confirm_need,
         )
     except Exception as gemini_err:
         log.error(

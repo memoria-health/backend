@@ -775,6 +775,13 @@ async def _compile_and_update_detector(
             name=name, user_text=user_text, is_sustained=is_sustained,
             category=category,
         )
+        # Confirm gate by evidence risk, not by default: the compile
+        # call judged this detector's confusability; "low" lifts the
+        # instant-custom re-vote default (and ONLY that — see
+        # apply_confirm_need).
+        dims["eventing"] = compiler_v2.apply_confirm_need(
+            dims.get("eventing"), compiled.confirm_need,
+        )
     except compiler_v2.DetectorRejected as e:
         log.error(
             "detector_compile_background.rejected detector_id=%s reason=%s",

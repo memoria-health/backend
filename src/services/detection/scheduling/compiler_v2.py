@@ -232,6 +232,26 @@ def _entry_confidence_for(
     return {"entry": {"m": m, "t_seconds": t}}
 
 
+def apply_confirm_need(eventing: dict | None, confirm_need: str | None) -> dict | None:
+    """Relax the instant-custom confirm gate when the COMPILER judged the
+    evidence low-risk (Aryaman 2026-08-14: confirmation should follow
+    evidence risk — subtle motion, small-object interaction, confounding
+    context — not be a blanket default).
+
+    Deliberately narrow: it can ONLY turn the exact instant-non-safety
+    default `{"confirm": {"k": 2, "n": 3}}` into None (fire on sight).
+    Sustained entry windows, safety instants (already None), and any
+    hand-tuned eventing pass through untouched. confirm_need None or
+    anything but "low" → unchanged, so a missing/garbled compiler line
+    lands on today's behavior — the 2026-08-08 confabulation storm
+    (35 fires/day on imagined drinks) is why the gate must never be
+    dropped by accident.
+    """
+    if confirm_need == "low" and eventing == {"confirm": {"k": 2, "n": 3}}:
+        return None
+    return eventing
+
+
 def classify_custom_dims(
     *, name: str, user_text: str, is_sustained: bool, category: str,
 ) -> dict:
