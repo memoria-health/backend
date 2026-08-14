@@ -56,11 +56,6 @@ _TRACK_W = int(os.environ.get("NEMARA_EDGE_TRACK_W", "640"))
 # slower to catch a NEW person → keep modest until occupancy-triggered
 # re-ground lands.
 _REGROUND_EVERY = int(os.environ.get("NEMARA_EDGE_REGROUND", "5"))
-# Wall-clock ceiling between grounds (seconds). Backstop for the tick
-# rule above, whose real-time meaning stretches with load (see
-# CameraSession.last_ground_at). 25s ≈ the proven solo cadence
-# (5 ticks x ~4-5s), so this only changes behavior when loaded.
-_REGROUND_MAX_S = float(os.environ.get("NEMARA_EDGE_REGROUND_S", "25"))
 # Debug: if set, dump per-frame mask overlays for each tick to this dir so we
 # can SEE what EdgeTAM's mask does (follow the person, or drift to the sofa).
 _DEBUG_DIR = os.environ.get("NEMARA_EDGE_DEBUG_DIR", "")
@@ -228,23 +223,6 @@ class CameraSession:
         self.reground_every = reground_every
         self.tick = 0
         self.last_ground = -(10 ** 9)
-        # Wall-clock of the last ground. The tick rule alone is
-        # denominated in the WRONG UNIT under load (2026-08-14, live):
-        # queueing stretches each tick from ~4s to ~11s, so "every 5
-        # ticks" silently became ~55s of un-anchored mask carry while
-        # the person kept moving — accumulated drift then broke the
-        # IoU re-map and churned track ids. Whichever rule fires first
-        # wins; solo behavior is unchanged (ticks bind), loaded
-        # behavior re-anchors on schedule (seconds bind).
-        self.last_ground_at = 0.0
-        # Set when a CARRIED track vanished during propagation: the
-        # next tick re-grounds immediately instead of waiting out the
-        # cadence, so a lost person is re-acquired in one tick. This is
-        # NOT the purged 2026-07-24 drift guard: that one KILLED tracks
-        # on a mask-area heuristic (and killed real walkers); this one
-        # only ADDS a ground pass after an actual loss — it cannot end
-        # a live track.
-        self.force_reground = False
         self.next_id = 1
         # Session epoch: track ids are only meaningful WITHIN one
         # session lifetime — a server restart resets next_id and
@@ -503,7 +481,6 @@ class CameraSession:
         else:
             self.last_masks = {}
         self.last_ground = self.tick  # every clip is authoritative on existence
-        self.last_ground_at = time.time()
         if _DEBUG_DIR:
             try:
                 _dump_overlay(frames, out, self.camera_id, self.tick, _DEBUG_DIR)
@@ -531,8 +508,6 @@ class CameraSession:
         reground = (
             self.tick == 0
             or (self.tick - self.last_ground) >= self.reground_every
-            or (time.time() - self.last_ground_at) >= _REGROUND_MAX_S
-            or self.force_reground
             or not self.last_masks
         )
         if reground:
@@ -550,28 +525,11 @@ class CameraSession:
             if seed is None:
                 seed = self._ground(frames, person_thr, sam_pred)
             self.last_ground = self.tick
-            self.last_ground_at = time.time()
-            self.force_reground = False
         else:
             seed = dict(self.last_masks)
             mode = "carry"
 
         out = self._propagate(frames, seed)
-
-        # Loss-triggered re-anchor (2026-08-14): a track we SEEDED that
-        # is absent from the final propagated frame was lost mid-carry —
-        # arm an immediate re-ground so re-acquisition takes one tick,
-        # not up to a full cadence. Additive only (see force_reground
-        # note in __init__): never ends a live track.
-        if mode == "carry" and out:
-            final = out[max(out)]
-            lost = [tid for tid in seed if tid not in final]
-            if lost:
-                self.force_reground = True
-                log.info(
-                    "continuous.carry_lost cam=%s tick=%d lost=%s — "
-                    "re-ground armed", self.camera_id, self.tick, lost,
-                )
 
         # NO drift guard (purged 2026-07-24, Aryaman's call): its area
         # heuristic could not tell a person approaching the camera from a
