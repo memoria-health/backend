@@ -140,7 +140,17 @@ async def _assign(
 
 
 def _watch(settings, sessionmaker) -> FleetWatch:
-    return FleetWatch(settings=settings, sessionmaker=sessionmaker)
+    w = FleetWatch(settings=settings, sessionmaker=sessionmaker)
+
+    # These tests exercise the roster-table logic against fake node
+    # names; the serving poll (lag alarm + occupancy, 2026-08-14) would
+    # only burn HTTP timeouts against them. Its own coverage lives in
+    # test_fleet_watch_serving.py.
+    async def _no_state(url):  # noqa: ANN001
+        return None
+
+    w._fetch_state = _no_state
+    return w
 
 
 async def test_healthy_fleet_pages_nothing(
@@ -156,7 +166,9 @@ async def test_healthy_fleet_pages_nothing(
 
     counts = await _watch(settings, get_sessionmaker()).check()
     assert counts == {"blind": 0, "overdue": 0, "nodes_down": 0,
-                      "nodes_live": 1 + SENTINEL_LIVE}
+                      "nodes_live": 1 + SENTINEL_LIVE,
+                      "cameras_polled": 0, "cameras_occupied": 0,
+                      "cameras_lagging": 0}
     assert pages.triggered == {}
 
 
@@ -265,7 +277,9 @@ async def test_recovery_resolves_the_incident(
     counts = await watch.check()
 
     assert counts == {"blind": 0, "overdue": 0, "nodes_down": 0,
-                      "nodes_live": 1 + SENTINEL_LIVE}
+                      "nodes_live": 1 + SENTINEL_LIVE,
+                      "cameras_polled": 0, "cameras_occupied": 0,
+                      "cameras_lagging": 0}
     assert "identity-fleet:node-down:node-flap" in pages.resolved
     assert "identity-fleet:unassigned-homes" in pages.resolved
 

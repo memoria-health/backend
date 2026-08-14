@@ -63,6 +63,15 @@ UNASSIGNED_GRACE_S = 300
 # and settling either would hide the other.
 _KEY_UNASSIGNED = "identity-fleet:unassigned-homes"
 _KEY_NODE_DOWN = "identity-fleet:node-down:"
+_KEY_LAG = "identity-fleet:lag:"
+
+# Consecutive cycles a camera must exceed the tick length before the lag
+# page fires. One bad cycle is a re-ground or a batch spike; three in a
+# row (~1.5-3 min at the default watch interval) is a node past its
+# rated envelope — the exact production tripwire the capacity rating
+# leans on (docs/IDENTITY-GPU-ARCHITECTURE.md: SLA = lag under the tick,
+# rated 4 occupied cams/4090, surge 6-8, gone by 10).
+LAG_ALARM_CYCLES = 3
 
 
 class FleetWatch:
@@ -79,6 +88,12 @@ class FleetWatch:
         # PagerDuty dedups on the key anyway, so being wrong here costs a
         # redundant request, never a missed or duplicated page.
         self._open: set[str] = set()
+        # Per-camera consecutive over-tick-lag cycle counts (lag alarm).
+        self._lag_streak: dict[str, int] = {}
+        # Set False after the first missing-table error so a not-yet-
+        # applied occupancy delta costs one log line, not one per cycle.
+        self._occupancy_ok = True
+        self._http: "object | None" = None
 
     async def start(self) -> None:
         self._task = asyncio.create_task(self._run(), name="identity-fleet-watch")
@@ -159,10 +174,144 @@ class FleetWatch:
 
         await self._page_unassigned(overdue, blind, live_nodes)
         await self._page_nodes_down(down)
+        serving = await self._check_serving()
         return {
             "blind": blind, "overdue": overdue,
             "nodes_down": len(down), "nodes_live": live_nodes,
+            **serving,
         }
+
+    # ── serving quality: lag alarm + occupancy sampling ──────────────
+    # The roster tables say a home HAS a node; only the node's own
+    # /state says it is being SERVED — and how well. One poll per home
+    # per cycle yields both the SLA tripwire (lag_s vs the tick length)
+    # and the occupancy duty-cycle samples that turn homes-per-node
+    # capacity planning into measurement (2026-08-14).
+
+    async def _fetch_state(self, url: str) -> "dict | None":
+        """GET one identity /state. Separate method so tests stub it."""
+        import httpx
+
+        if self._http is None:
+            token = getattr(self._settings, "identity_state_token", "")
+            self._http = httpx.AsyncClient(
+                timeout=5.0,
+                headers=(
+                    {"Authorization": f"Bearer {token}"} if token else {}
+                ),
+            )
+        try:
+            resp = await self._http.get(url)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception:  # noqa: BLE001 — an unreachable node is the
+            return None    # node-down page's job, not an exception here
+
+    async def _check_serving(self) -> dict[str, int]:
+        stale_s = self._settings.identity_roster_stale_after_s
+        tick_s = float(self._settings.livekit_worker_tick_seconds)
+        async with self._sessionmaker() as session:
+            served = (await session.execute(text(
+                "SELECT p.id::text, n.node_id, n.base_url, p.identity_port "
+                "  FROM public.patients p "
+                "  JOIN public.identity_nodes n "
+                "    ON n.node_id = p.identity_node_id "
+                " WHERE p.identity_port IS NOT NULL "
+                "   AND n.last_seen_at > now() - make_interval(secs => :stale)"
+            ), {"stale": stale_s})).all()
+
+        lagging = 0
+        per_node: dict[str, list[int]] = {}
+        seen_cams: set[str] = set()
+        for _pid, node_id, base_url, port in served:
+            state = await self._fetch_state(f"{base_url}:{port}/state")
+            if state is None:
+                # Unreachable is the node-down page's territory; a zero
+                # sample here would read as "empty node", which is a
+                # different fact than "no data".
+                continue
+            cameras = state.get("cameras") or {}
+            totals = per_node.setdefault(node_id, [0, 0])
+            for cam_id, cam in cameras.items():
+                totals[0] += 1
+                if cam.get("tracks"):
+                    totals[1] += 1
+                seen_cams.add(cam_id)
+                lag = cam.get("lag_s")
+                over = isinstance(lag, (int, float)) and lag > tick_s
+                # Only count lag against OCCUPIED cameras: an empty
+                # room legitimately stops batching and its last lag_s
+                # is a frozen snapshot, not a serving measurement
+                # (2026-08-13 watchdog false-alarm lesson).
+                if over and cam.get("tracks"):
+                    self._lag_streak[cam_id] = (
+                        self._lag_streak.get(cam_id, 0) + 1
+                    )
+                    if self._lag_streak[cam_id] == LAG_ALARM_CYCLES:
+                        lagging += 1
+                        log.error(
+                            "identity.lag_over_tick cam=%s lag=%.1fs "
+                            "tick=%.0fs node=%s — SLA breach sustained "
+                            "%d cycles", cam_id, lag, tick_s, node_id,
+                            LAG_ALARM_CYCLES,
+                        )
+                        await self._trigger(
+                            f"{_KEY_LAG}{cam_id}",
+                            summary=(
+                                f"identity lag {lag:.1f}s > tick "
+                                f"{tick_s:.0f}s on camera {cam_id} "
+                                f"(node {node_id})"
+                            ),
+                            severity="warning",
+                            details={
+                                "camera": cam_id, "node": node_id,
+                                "lag_s": lag, "tick_s": tick_s,
+                                "remedy": (
+                                    "node past its rated occupied-camera "
+                                    "envelope — add a node or move homes "
+                                    "(docs/IDENTITY-GPU-ARCHITECTURE.md)"
+                                ),
+                            },
+                        )
+                else:
+                    if self._lag_streak.pop(cam_id, None):
+                        await self._resolve(f"{_KEY_LAG}{cam_id}")
+        # Cameras that vanished entirely drop their streaks + pages.
+        for cam_id in [c for c in self._lag_streak if c not in seen_cams]:
+            self._lag_streak.pop(cam_id, None)
+            await self._resolve(f"{_KEY_LAG}{cam_id}")
+
+        await self._record_occupancy(per_node)
+        return {
+            "cameras_polled": sum(v[0] for v in per_node.values()),
+            "cameras_occupied": sum(v[1] for v in per_node.values()),
+            "cameras_lagging": lagging,
+        }
+
+    async def _record_occupancy(
+        self, per_node: "dict[str, list[int]]",
+    ) -> None:
+        if not self._occupancy_ok or not per_node:
+            return
+        try:
+            async with self._sessionmaker() as session:
+                for node_id, (total, occupied) in per_node.items():
+                    await session.execute(text(
+                        "INSERT INTO public.identity_occupancy_samples "
+                        "  (node_id, total_cameras, occupied_cameras) "
+                        "VALUES (:n, :t, :o)"
+                    ), {"n": node_id, "t": total, "o": occupied})
+                await session.commit()
+        except Exception:  # noqa: BLE001
+            # Most likely the delta is not applied yet (prepared-only in
+            # prod by decision, 2026-08-14). Sampling is an observability
+            # nicety — disable quietly rather than log-spam every cycle.
+            self._occupancy_ok = False
+            log.warning(
+                "identity.occupancy_sampling_disabled — table missing? "
+                "apply scripts/apply_identity_fleet_ops_delta.sql",
+                exc_info=True,
+            )
 
     async def _page_unassigned(
         self, overdue: int, blind: int, live_nodes: int,

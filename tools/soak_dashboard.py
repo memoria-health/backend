@@ -70,18 +70,45 @@ _SINCE: datetime = datetime.now(timezone.utc)
 _FRAMES_DIR = Path("out/id_frames")
 _TRACE_PATH = Path("out/track_trace.jsonl")
 
-# ONE identity process — the local rig's first room.
+# ONE identity process — the home under observation.
 #
 # In production a node runs one process per room on roster-assigned ports
-# from 8012 up, across several nodes. This dashboard reads a single address,
-# so pointed at a fleet it shows one home and gives no hint that the others
-# exist. It is a local soak tool, not an operations console.
+# from 8012 up, across several nodes. This dashboard follows ONE home; it
+# is a local soak tool, not an operations console.
 #
-# Overridable so a rig running two rooms can look at the second one instead
-# of silently only ever showing the first.
-IDENTITY_BASE = os.environ.get(
-    "SOAK_IDENTITY_BASE", "http://localhost:8012",
-).rstrip("/")
+# The address is resolved from the ROSTER (patients.identity_node_id ->
+# identity_nodes.base_url + patients.identity_port), cached 30s, so the
+# dashboard follows fleet swaps instead of pointing at dead nodes — on
+# 2026-08-13 it sat aimed at a terminated node until restarted by hand.
+# SOAK_IDENTITY_BASE remains as an explicit override (rigs with no DB);
+# SOAK_PATIENT_NAME picks the home.
+IDENTITY_BASE = os.environ.get("SOAK_IDENTITY_BASE", "").rstrip("/")
+_PATIENT_NAME = os.environ.get("SOAK_PATIENT_NAME", "Aryaman Darda")
+_ib_cache: dict = {"t": 0.0, "v": None}
+
+
+async def IB() -> str:
+    """Current identity-service base URL for the observed home."""
+    if IDENTITY_BASE:
+        return IDENTITY_BASE
+    now = time.time()
+    if _ib_cache["v"] and now - _ib_cache["t"] < 30:
+        return _ib_cache["v"]
+    try:
+        sm = get_sessionmaker()
+        async with sm() as session:
+            row = (await session.execute(text(
+                "SELECT n.base_url, p.identity_port "
+                "  FROM public.patients p "
+                "  JOIN public.identity_nodes n "
+                "    ON n.node_id = p.identity_node_id "
+                " WHERE p.preferred_name = :name"
+            ), {"name": _PATIENT_NAME})).first()
+        if row and row[0] and row[1]:
+            _ib_cache.update(t=now, v=f"{row[0].rstrip('/')}:{row[1]}")
+    except Exception:  # noqa: BLE001 — keep serving the last-known node
+        pass
+    return _ib_cache["v"] or "http://localhost:8012"
 
 # All displayed times are LAPTOP-LOCAL (Aryaman 2026-07-19 — the UTC
 # everywhere made cross-referencing painful; evidence-frame filenames
@@ -641,7 +668,7 @@ async def identity_stream(cam_id: str):
                     timeout=None, headers=_ident_headers(),
                 ) as c:
                     async with c.stream(
-                        "GET", f"{IDENTITY_BASE}/stream/{cam_id}",
+                        "GET", f"{await IB()}/stream/{cam_id}",
                     ) as r:
                         if r.status_code != 200:
                             return
@@ -696,7 +723,7 @@ async def identity_live(cam_id: str):
             timeout=8, headers=_ident_headers(),
         ) as c:
             async with c.stream(
-                "GET", f"{IDENTITY_BASE}/stream/{cam_id}",
+                "GET", f"{await IB()}/stream/{cam_id}",
             ) as r:
                 if r.status_code != 200:
                     return JSONResponse({"error": "upstream"}, status_code=502)
@@ -728,7 +755,7 @@ async def identity_snap(name: str):
         async with httpx.AsyncClient(
             timeout=4.0, headers=_ident_headers(),
         ) as c:
-            r = await c.get(f"{IDENTITY_BASE}/snap/{name}")
+            r = await c.get(f"{await IB()}/snap/{name}")
         if r.status_code != 200:
             return Response(status_code=r.status_code)
         return Response(content=r.content, media_type="image/jpeg")
@@ -743,7 +770,7 @@ async def identity_timeline():
     import httpx
     try:
         async with httpx.AsyncClient(timeout=2.0, headers=_ident_headers()) as c:
-            r = await c.get(f"{IDENTITY_BASE}/timeline?n=720")
+            r = await c.get(f"{await IB()}/timeline?n=720")
             return JSONResponse(r.json())
     except Exception:                        # noqa: BLE001 — service down
         return JSONResponse({"samples": []})
@@ -756,7 +783,7 @@ async def identity_probes():
     import httpx
     try:
         async with httpx.AsyncClient(timeout=2.0, headers=_ident_headers()) as c:
-            r = await c.get(f"{IDENTITY_BASE}/probes?n=1600")
+            r = await c.get(f"{await IB()}/probes?n=1600")
             return JSONResponse(r.json())
     except Exception:                        # noqa: BLE001 — service down
         return JSONResponse({"probes": {}})
@@ -769,7 +796,7 @@ async def identity_events():
     import httpx
     try:
         async with httpx.AsyncClient(timeout=2.0, headers=_ident_headers()) as c:
-            r = await c.get(f"{IDENTITY_BASE}/events?n=250")
+            r = await c.get(f"{await IB()}/events?n=250")
             return JSONResponse(r.json())
     except Exception:                        # noqa: BLE001 — service down
         return JSONResponse({"events": [], "confirm_stats": []})
@@ -783,7 +810,7 @@ async def identity_state():
     import httpx
     try:
         async with httpx.AsyncClient(timeout=2.0, headers=_ident_headers()) as c:
-            r = await c.get(f"{IDENTITY_BASE}/state")
+            r = await c.get(f"{await IB()}/state")
             j = r.json()
             j["on"] = True
             return JSONResponse(j)
