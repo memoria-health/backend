@@ -660,9 +660,15 @@ def _observe_sync(
         # Return cached blocks to the driver after every pass (leak
         # incident 2026-07-21): costs ~0.1-0.3s of re-allocation on the
         # next tick; 19GB of allocator drift cost the whole service.
-        import torch
+        # E2b-1 (2026-08-15 concurrency matrix): skippable via env — a
+        # mid-pass empty_cache from camera A while camera B is inside a
+        # forward is one of the shared-simultaneity suspects.
+        if os.environ.get("NEMARA_EXP_NO_EMPTY_CACHE", "").strip() not in (
+            "1", "true",
+        ):
+            import torch
 
-        torch.cuda.empty_cache()
+            torch.cuda.empty_cache()
         return payload
 
 

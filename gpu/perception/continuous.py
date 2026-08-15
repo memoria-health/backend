@@ -32,6 +32,19 @@ log = logging.getLogger("perception.continuous")
 
 _EDGE = None
 _edge_lock = threading.Lock()
+# E2b-3 (2026-08-15 concurrency matrix): serialize ALL EdgeTAM
+# propagation behind one lock while SAM3 stays concurrent — isolates
+# whether the mid-carry dropout lives in the follower's internals.
+# Env-gated, off by default.
+_EDGE_SERIALIZE = os.environ.get(
+    "NEMARA_EXP_LOCK_EDGE", "",
+).strip() in ("1", "true")
+_EDGE_CALL_LOCK = threading.Lock()
+import contextlib as _contextlib
+
+
+def _edge_gate():
+    return _EDGE_CALL_LOCK if _EDGE_SERIALIZE else _contextlib.nullcontext()
 _SESSIONS: "dict[str, CameraSession]" = {}
 _sessions_lock = threading.Lock()
 
@@ -370,7 +383,7 @@ class CameraSession:
             for fr in frames
         ]
         out: "dict[int, dict]" = {}
-        with torch.inference_mode(), torch.autocast(
+        with _edge_gate(), torch.inference_mode(), torch.autocast(
             "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available(),
         ), frame_tensor.staged_frames(
             tracked, edge, "cuda" if torch.cuda.is_available() else "cpu",

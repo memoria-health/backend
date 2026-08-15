@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+import threading
 from typing import Iterator
 
 import numpy as np
@@ -27,6 +28,21 @@ import numpy as np
 log = logging.getLogger("perception.track")
 
 _SAM = None
+
+# E2b-2 (2026-08-15 concurrency matrix): serialize ALL SAM3 passes
+# behind one lock while EdgeTAM stays concurrent — isolates whether the
+# corruption lives in SAM3's session machinery. Env-gated, off by
+# default; the whole-stream lock is deliberately coarse (held across a
+# track_stream's consumption) — an upper bound on SAM3 serialization.
+_SAM3_SERIALIZE = os.environ.get(
+    "NEMARA_EXP_LOCK_SAM3", "",
+).strip() in ("1", "true")
+_SAM3_LOCK = threading.Lock()
+import contextlib as _contextlib
+
+
+def _sam3_gate():
+    return _SAM3_LOCK if _SAM3_SERIALIZE else _contextlib.nullcontext()
 
 
 def _np(x):
@@ -124,7 +140,8 @@ def ground_frame0(
         return []
     path = _write_clip(frames_bgr)
     session_id = None
-    try:
+    with _sam3_gate():
+      try:
         with torch.autocast(
             "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available(),
         ):
@@ -138,7 +155,7 @@ def ground_frame0(
             ))
         outputs = seeded.get("outputs")
         return parse_frame(outputs, thr) if outputs is not None else []
-    finally:
+      finally:
         if session_id is not None:
             try:
                 pred.handle_request(request=dict(
@@ -188,6 +205,15 @@ def track_stream(
     `frames_bgr`, in order. Position indexes into frames_bgr; the
     caller owns any orig-index mapping. Masks are valid only during
     the yield (dropped by GC as the caller releases them)."""
+    with _sam3_gate():
+        yield from _track_stream_impl(
+            pred, frames_bgr, concept=concept, thr=thr,
+        )
+
+
+def _track_stream_impl(
+    pred, frames_bgr: list[np.ndarray], *, concept: str, thr: float,
+) -> Iterator[tuple[int, list]]:
     import cv2
 
     if not frames_bgr:
