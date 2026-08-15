@@ -179,6 +179,49 @@ async def _term_series(session, patient, term, days, gran, night, offset=0,
     return [dict(r) for r in rows]
 
 
+async def _ratio_stats(session, patient, terms, days, ratio, detector=None):
+    """nightsWith/daysWith caption stats — shared by the bare ratio_tile
+    response and the merged chart+ratio responses."""
+    is_night = ratio == "nightsWith"
+    tf = _terms_filter(terms, detector=detector)
+
+    async def qn(offset: int) -> int:
+        row = (await session.execute(text(f"""
+            select count(distinct occurred_at::date)::int as n from events
+            where patient_id = any(:ids)
+              and occurred_at >= now() - (((:days)::int + (:off)::int) * interval '1 day')
+              and occurred_at <  now() - (:off * interval '1 day')
+              and {tf} {f'and {NIGHT}' if is_night else ''}
+            """), {"ids": patient, "days": days, "off": offset},
+        )).mappings().one()
+        return int(row["n"])
+    cur_n, prev_n = await qn(0), await qn(days)
+
+    def pct(n: int) -> int:
+        return round(100 * n / days)
+    return {
+        "statValue": f"{pct(cur_n)}%", "prevValue": pct(prev_n),
+        "subtitle": (
+            f"{'nights' if is_night else 'days'} with a matching event "
+            f"({cur_n} of {days})"
+        ),
+    }
+
+
+async def _event_total(session, patient, terms, days, night, detector=None,
+                       offset=0):
+    tf = _terms_filter(terms, detector=detector)
+    row = (await session.execute(text(f"""
+        select count(*)::int as n from events
+        where patient_id = any(:ids)
+          and occurred_at >= now() - (((:days)::int + (:off)::int) * interval '1 day')
+          and occurred_at <  now() - (:off * interval '1 day')
+          and {tf} {f'and {NIGHT}' if night else ''}
+        """), {"ids": patient, "days": days, "off": offset},
+    )).mappings().one()
+    return int(row["n"])
+
+
 async def _categorical(session, patient, terms, days, night, bucket_expr,
                        join_cameras=False, detector=None):
     tf = _terms_filter(terms, "e", detector=detector)
@@ -235,6 +278,19 @@ async def widget_data(
             raise HTTPException(status_code=404, detail="detector_not_found")
         patient = [drow[0]]
         det = str(det_uuid)
+
+    # ── summary-table metrics are NOT served here ───────────────
+    # sleep_bands / summary widgets read the dedicated endpoints in
+    # src/api/summaries.py. Dead-end explicitly: falling through would
+    # return an unfiltered events series silently mislabeled as sleep.
+    if metric in ("sleepNights", "activityDays"):
+        return {
+            "kind": "series", "rows": [], "statValue": None,
+            "unavailable": (
+                "served by /v1/patients/{id}/sleep-nights and "
+                "/activity-days, not widget-data"
+            ),
+        }
 
     # ── activity ────────────────────────────────────────────────
     if metric == "activity":
@@ -348,6 +404,7 @@ async def widget_data(
             from patients p left join events e on e.patient_id = p.id
               and e.occurred_at >= now() - (:days * interval '1 day')
               {f'and {NIGHT}' if night else ''}
+              {f"and e.detector_id = '{det}'" if det else ''}
             where p.id = any(:ids)
             group by p.id order by events desc limit 10
             """), {"ids": patient, "days": d})).mappings().all()
@@ -453,6 +510,7 @@ async def widget_data(
             from events e join patients p on p.id = e.patient_id
             where occurred_at >= now() - (:days * interval '1 day')
               and p.id = any(:ids)
+              {f"and e.detector_id = '{det}'" if det else ''}
             group by 1, 2
             """), {"ids": patient, "days": d})).mappings().all()
         rows = [dict(r) for r in rows]
@@ -492,33 +550,19 @@ async def widget_data(
         return {"kind": "clips", "items": [dict(r) for r in rows]}
 
     # ── events (workhorse) ──────────────────────────────────────
+    # A request may carry BOTH a chart shape and a caption stat
+    # (hour_clock: byHour+ratio; dot_calendar: daily rows+daysWith;
+    # week_heatmap: heatmap+comparePrev). Chart shapes win the response
+    # body; the stat merges in on top — first-match-wins here used to
+    # blank the chart (Phase A review, 2026-08-15).
     ratio = source.get("ratio")
-    if ratio in ("nightsWith", "daysWith"):
-        is_night = ratio == "nightsWith"
-        tf = _terms_filter(terms, detector=det)
-
-        async def qn(offset: int) -> int:
-            row = (await session.execute(text(f"""
-                select count(distinct occurred_at::date)::int as n from events
-                where patient_id = any(:ids)
-                  and occurred_at >= now() - (((:days)::int + (:off)::int) * interval '1 day')
-                  and occurred_at <  now() - (:off * interval '1 day')
-                  and {tf} {f'and {NIGHT}' if is_night else ''}
-                """), {"ids": patient, "days": d, "off": offset},
-            )).mappings().one()
-            return int(row["n"])
-        cur_n, prev_n = await qn(0), await qn(d)
-
-        def pct(n: int) -> int:
-            return round(100 * n / d)
-        return {
-            "kind": "series", "rows": [],
-            "statValue": f"{pct(cur_n)}%", "prevValue": pct(prev_n),
-            "subtitle": (
-                f"{'nights' if is_night else 'days'} with a matching event "
-                f"({cur_n} of {d})"
-            ),
-        }
+    chart_intent = any(source.get(k) for k in (
+        "breakdown", "byRoom", "byHour", "byDow", "heatmap", "mode",
+        "compareWith", "comparePrev",
+    ))
+    if ratio in ("nightsWith", "daysWith") and not chart_intent:
+        stats = await _ratio_stats(session, patient, terms, d, ratio, det)
+        return {"kind": "series", "rows": [], **stats}
 
     if source.get("breakdown"):
         rows = await _categorical(session, patient, terms, d, night, KIND,
@@ -539,12 +583,15 @@ async def widget_data(
             session, patient, terms, d, night,
             r"""to_char(occurred_at, 'HH24"\:00"')""", detector=det)
         by = {r["t"]: r["n"] for r in rows}
-        return {
+        out = {
             "kind": "series", "categorical": True, "terms": ["events"],
             "rows": [{"bucket": f"{h:02d}:00", "events": by.get(f"{h:02d}:00", 0)}
                      for h in range(24)],
             "statValue": str(sum(r["n"] for r in rows)),
         }
+        if ratio in ("nightsWith", "daysWith"):
+            out.update(await _ratio_stats(session, patient, terms, d, ratio, det))
+        return out
     if source.get("byDow"):
         rows = await _categorical(
             session, patient, terms, d, night,
@@ -568,8 +615,12 @@ async def widget_data(
             group by 1, 2
             """), {"ids": patient, "days": d})).mappings().all()
         cells = [dict(r) for r in rows]
-        return {"kind": "heatmap", "dows": DOWS, "cells": cells,
-                "statValue": str(sum(r["n"] for r in cells))}
+        out = {"kind": "heatmap", "dows": DOWS, "cells": cells,
+               "statValue": str(sum(r["n"] for r in cells))}
+        if source.get("comparePrev"):
+            out["prevValue"] = await _event_total(
+                session, patient, terms, d, night, det, offset=d)
+        return out
 
     if source.get("compareWith"):
         other = _narrow(allowed, source["compareWith"])
@@ -673,4 +724,6 @@ async def widget_data(
             [float(r["n"]) for s in prev_all for r in s])
     if source.get("threshold") is not None:
         out["threshold"] = float(source["threshold"])
+    if ratio in ("nightsWith", "daysWith"):
+        out.update(await _ratio_stats(session, patient, terms, d, ratio, det))
     return out
