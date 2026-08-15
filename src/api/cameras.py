@@ -28,6 +28,8 @@ from src.services import room_classifier
 from src.services.detection import censor, frame_codec
 from src.services.ingest.pi.auth import mint_ingest_token
 from src.db.camera import Camera
+from src.db.detector import Detector
+from src.services.dashboard.widget_compiler import apply_widget
 from src.repos import (
     camera_detector_repo,
     camera_repo,
@@ -984,6 +986,14 @@ async def set_camera_detectors(
             await camera_detector_repo.sync_links_for_patient(
                 session, cam.patient_id,
             )
+            # The rewrite above just changed where_rooms — a widget-
+            # compiler input — outside the detectors API, so fold the
+            # edit into each affected dashboard spec here too or the
+            # Home tab goes stale until an unrelated shape edit.
+            for det in (await session.execute(
+                select(Detector).where(Detector.id.in_(changed))
+            )).scalars():
+                apply_widget(det)
     await session.commit()
     return CameraDetectorsResponse(detector_ids=list(final))
 

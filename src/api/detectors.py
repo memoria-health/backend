@@ -39,7 +39,7 @@ from src.schemas.detector import (
     ScheduleConfig,
     UpdateDetectorRequest,
 )
-from src.services.dashboard.widget_compiler import compile_widget, should_recompile
+from src.services.dashboard.widget_compiler import apply_widget, should_recompile
 from src.services.detection import catalog, catalog_v2
 from src.services.detection.door_detection import detect_doors
 from src.services.detection.scheduling import compiler_v2
@@ -436,7 +436,7 @@ async def add_detectors_from_library(
             schedule_config=None,
             **catalog_v2.row_kwargs(e.key),
         )
-        det.dashboard_widget = compile_widget(det)
+        apply_widget(det)
         await detector_repo.insert(session, det)
         log.info(
             "[detectors] from-library add key=%s detector=%s patient=%s",
@@ -815,10 +815,12 @@ async def _compile_and_update_detector(
         )
         # Widget spec from the FINAL row state (identifier + v2 dims
         # just landed above, same transaction) — the one-time dashboard
-        # visualization determiner for this custom detector.
+        # visualization determiner for this custom detector. apply_widget
+        # is guarded: a widget bug must not roll back the compile that
+        # just succeeded.
         row = await session.get(Detector, detector_id)
         if row is not None:
-            row.dashboard_widget = compile_widget(row)
+            apply_widget(row)
         await session.commit()
     log.info(
         "detector_compile_background.ok detector_id=%s identifier=%s criteria=%s",
@@ -929,7 +931,7 @@ async def patch_detector(
     # edits leave the spec untouched, so the Home tab never reshuffles
     # under the caregiver on a toggle.
     if should_recompile(fields):
-        det.dashboard_widget = compile_widget(det)
+        apply_widget(det)
     await session.commit()
     # Recompile-on-edit (bug fix 2026-07-18): an edited custom_prompt
     # used to update the stored TEXT while the detector kept running on

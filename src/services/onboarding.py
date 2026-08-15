@@ -34,7 +34,7 @@ from src.schemas.caregiver import (
 )
 from src.schemas.patient import Region
 from src.services import region as region_routing
-from src.services.dashboard.widget_compiler import compile_widget
+from src.services.dashboard.widget_compiler import apply_widget
 from src.services.detection import catalog, catalog_v2
 
 _log = logging.getLogger(__name__)
@@ -184,7 +184,7 @@ async def seed_detectors_for_patient(
             always_on=False,
             **catalog_v2.row_kwargs(e.key),
         )
-        det.dashboard_widget = compile_widget(det)
+        apply_widget(det)
         inserted.append(await detector_repo.insert(session, det))
     _log.info(
         "[onboarding] seeded %d preset detectors for patient %s (minor=%s): %s",

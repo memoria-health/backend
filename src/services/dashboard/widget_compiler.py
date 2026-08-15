@@ -55,6 +55,23 @@ def should_recompile(patched_fields) -> bool:
     return bool(SHAPE_FIELDS & set(patched_fields))
 
 
+def apply_widget(det) -> None:
+    """Best-effort `det.dashboard_widget = compile_widget(det)`.
+
+    The guard exists because every call site is a write path that
+    matters more than the dashboard: a compiler bug must never 500 a
+    caregiver's detector edit, roll back a successful custom compile,
+    or abort onboarding seeding. On failure the old spec (or NULL)
+    stays and the Home tab renders what it already had."""
+    try:
+        det.dashboard_widget = compile_widget(det)
+    except Exception:
+        log.warning(
+            "[dashboard] widget compile failed for detector %s — keeping "
+            "previous spec", getattr(det, "id", None), exc_info=True,
+        )
+
+
 class _DetectorLike(Protocol):
     id: Any
     name: str
