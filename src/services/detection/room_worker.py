@@ -21,12 +21,14 @@ from __future__ import annotations
 
 import array
 import asyncio
+import functools
 import json
 import logging
 import math
 import secrets
 import time
 from collections.abc import Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -118,6 +120,37 @@ _STORM_ALERT_CYCLES = 3
 _CONSUMER_RETRY_BACKOFF_INITIAL = 1.0
 _CONSUMER_RETRY_BACKOFF_MAX = 16.0
 _CONSUMER_MAX_RETRIES = 5
+
+# Capacity for the SDK-side frame queues. LiveKit's VideoStream /
+# AudioStream default to capacity=0 == UNBOUNDED (RingQueue only
+# drops when capacity > 0), and each queued video event pins a full
+# native-resolution frame copy (~5.5 MB at 2K). Any sustained
+# delivery-minus-drain deficit therefore grows RSS without limit: a
+# 0.1 fps shortfall at 2K is ~2 GB/hour — the exact shape of the
+# 2026-08-14 production OOMs (linear climb while streaming, flat when
+# idle). With a bound, the ring drops the OLDEST frame, which is the
+# semantic the pipeline already has: FrameBuffer.push re-applies its
+# min-gap rule and discards most delivered frames anyway.
+#
+# Video: 8 frames ≈ half a second at the 15 fps publish rate — enough
+# to absorb a compress hop or a brief event-loop stall, small enough
+# that a stalled consumer costs ~44 MB/camera, not gigabytes.
+# Audio: 200 chunks (10 ms each at 16 kHz) ≈ 2 s ≈ 64 kB — audio
+# gaps degrade clips, so it gets a deeper buffer; it is cheap.
+_VIDEO_STREAM_QUEUE_CAPACITY = 8
+_AUDIO_STREAM_QUEUE_CAPACITY = 200
+
+# Dedicated pool for per-frame JPEG compression. `asyncio.to_thread`
+# uses the loop's DEFAULT executor, which the tick path saturates with
+# multi-hundred-ms numpy/ffmpeg jobs (compute_tick_signals,
+# sample_stats, mp4 materialize). Frame compression queued behind
+# those stalls the video consumer, which is what lets the SDK-side
+# stream queue above grow in the first place. Ingress work gets its
+# own lane so tick load can never throttle the drain. Two workers
+# cover ~12 cameras at 4 fps × ~20 ms/frame with headroom.
+_FRAME_COMPRESS_POOL = ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix="frame-compress",
+)
 
 # Idle-room auto-teardown window. After this many seconds connected
 # to a room with zero `cam_*` ingests, the RoomWorker asks its
@@ -991,6 +1024,7 @@ class RoomWorker:
             ingest=ingest,
             open_stream=lambda: rtc.AudioStream(
                 track,
+                capacity=_AUDIO_STREAM_QUEUE_CAPACITY,
                 sample_rate=ingest.audio_buffer.sample_rate,
                 num_channels=ingest.audio_buffer.num_channels,
             ),
@@ -1047,10 +1081,13 @@ class RoomWorker:
                     )
                 if will_buffer:
                     try:
-                        jpeg, luma = await asyncio.to_thread(
-                            frame_codec.compress_for_buffer,
-                            frame.width, frame.height, frame_bytes,
-                            quality=self._settings.frame_jpeg_quality,
+                        jpeg, luma = await asyncio.get_running_loop().run_in_executor(
+                            _FRAME_COMPRESS_POOL,
+                            functools.partial(
+                                frame_codec.compress_for_buffer,
+                                frame.width, frame.height, frame_bytes,
+                                quality=self._settings.frame_jpeg_quality,
+                            ),
                         )
                     except Exception:  # noqa: BLE001 — never kill the reader
                         log.exception(
@@ -1093,7 +1130,9 @@ class RoomWorker:
         await self._consume_with_retry(
             label="video",
             ingest=ingest,
-            open_stream=lambda: rtc.VideoStream(track),
+            open_stream=lambda: rtc.VideoStream(
+                track, capacity=_VIDEO_STREAM_QUEUE_CAPACITY,
+            ),
             consume_one=_push_video,
         )
 
