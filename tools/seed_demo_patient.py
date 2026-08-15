@@ -1,6 +1,7 @@
-"""Demo seed: Jane Patel + historical data for every widget shape.
+"""Demo seed: Margaret Ellis + historical data for every widget shape.
 
-Local/dev only — creates a patient under the FIRST caregiver in the db,
+Local/dev only — creates a SYNTHETIC patient on the caregiver account that owns
+'Aryaman Darda' (falls back to the first caregiver),
 detectors across all four categories (presets + two customs, incl. a
 Care custom since Care has no built-ins), compiled widget specs, and
 ~60 days of history shaped so each chart has something honest to show:
@@ -12,8 +13,8 @@ Care custom since Care has no built-ins), compiled widget specs, and
   vs prior week) · "Company at meals" care custom (ratio) ·
   "TV after 11 PM" behaviour custom (duration bars)
 
-    uv run python tools/seed_jane_patel.py            # refuses if Jane exists
-    uv run python tools/seed_jane_patel.py --wipe     # delete + reseed
+    uv run python tools/seed_demo_patient.py            # refuses if Jane exists
+    uv run python tools/seed_demo_patient.py --wipe     # delete + reseed
 """
 
 from __future__ import annotations
@@ -100,21 +101,21 @@ async def run(wipe: bool) -> None:
     sm = get_sessionmaker()
     async with sm() as s:
         caregiver_id = (await s.execute(
-            text("select id from caregivers order by created_at limit 1"),
+            text("select coalesce((select caregiver_id from patients where full_name like 'Aryaman%' limit 1), (select id from caregivers order by created_at limit 1))"),
         )).scalar_one()
         existing = (await s.execute(text(
-            "select id from patients where full_name = 'Jane Patel'"),
+            "select id from patients where full_name in ('Jane Patel', 'Margaret Ellis')"),
         )).scalars().all()
         if existing and not wipe:
-            print("Jane Patel already exists — pass --wipe to reseed.")
+            print("Margaret Ellis already exists — pass --wipe to reseed.")
             return
         for pid in existing:
             await s.execute(text("delete from patients where id = :p"), {"p": pid})
 
         pid = uuid4()
         s.add(Patient(
-            id=pid, caregiver_id=caregiver_id, full_name="Jane Patel",
-            preferred_name="Jane", relation="parent", state="calm",
+            id=pid, caregiver_id=caregiver_id, full_name="Margaret Ellis",
+            preferred_name="Margaret", relation="parent", state="calm",
             status_line="All quiet", cameras_paused=False,
             created_at=NOW - timedelta(days=60), updated_at=NOW,
         ))
@@ -150,7 +151,7 @@ async def run(wipe: bool) -> None:
         events: list[Event] = []
         # Falls: one 47 days ago, one 61 days before that → streak + gap.
         events.append(_event(pid, dets["fall"], NOW - timedelta(days=47),
-                             living, "Jane lowered herself to the floor."))
+                             living, "Margaret lowered herself to the floor."))
         # Night exits: 2 of the last 14 nights, small hours.
         for day, hour in ((3, 2), (3, 3), (9, 23), (9, 2)):
             events.append(_event(
@@ -185,13 +186,13 @@ async def run(wipe: bool) -> None:
             events.append(_event(
                 pid, dets["meal_eaten"],
                 (NOW - timedelta(days=day)).replace(hour=13, minute=10),
-                kitchen, "Jane ate lunch at the table."))
+                kitchen, "Margaret ate lunch at the table."))
         # Care custom: company at meals, 4 of last 7 days.
         for day in (1, 2, 4, 6):
             events.append(_event(
                 pid, company,
                 (NOW - timedelta(days=day)).replace(hour=13, minute=20),
-                kitchen, "Someone sat with Jane through lunch."))
+                kitchen, "Someone sat with Margaret through lunch."))
         # TV after 11 PM: 5 of last 7 nights, 1-3 instances each.
         for day in (1, 2, 3, 5, 6):
             for _ in range(rng.randint(1, 3)):
@@ -243,7 +244,7 @@ async def run(wipe: bool) -> None:
         s.add_all(analyses)
 
         await s.commit()
-        print(f"Seeded Jane Patel ({pid}) — {len(events)} events, "
+        print(f"Seeded Margaret Ellis ({pid}) — {len(events)} events, "
               f"7 sleep nights, {len(analyses)} analyses, "
               f"{2 + len(dets)} detectors.")
 
