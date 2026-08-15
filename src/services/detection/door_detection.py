@@ -10,6 +10,8 @@ import asyncio
 import json
 
 from google import genai
+
+from src.services.genai_client import get_client
 from google.genai import errors as genai_errors
 from google.genai import types as genai_types
 
@@ -147,7 +149,7 @@ async def detect_doors(image_jpeg: bytes, *, settings: Settings) -> list[dict]:
     in `image_jpeg`. Runs `_N_CALLS` concurrent Gemini calls and unions the
     results (IoU-dedup) so a single unlucky empty response doesn't blank the
     picker. Raises only if EVERY call fails."""
-    client = genai.Client(api_key=settings.gemini_api_key)
+    client = get_client(settings.gemini_api_key)
     media_res = _media_resolution(settings.gemini_media_resolution)
     results = await asyncio.gather(
         *(_detect_once(client, image_jpeg, media_res) for _ in range(_N_CALLS)),

@@ -41,6 +41,8 @@ from dataclasses import dataclass, field
 from uuid import uuid4
 
 from google import genai
+
+from src.services.genai_client import get_client
 from google.genai import types as genai_types
 from openai import AsyncOpenAI
 
@@ -479,7 +481,7 @@ async def _compile_with_gemini(
     """One Gemini call. Returns the cleaned prompt_fragment string."""
     if not settings.gemini_api_key:
         raise RuntimeError("NEMARA_GEMINI_API_KEY not configured")
-    client = genai.Client(api_key=settings.gemini_api_key)
+    client = get_client(settings.gemini_api_key)
     response = await client.aio.models.generate_content(
         model=settings.gemini_model,
         contents=[
@@ -897,7 +899,7 @@ def _parse_json_lenient(raw: str) -> dict:
 async def _infer_with_gemini(*, name: str | None, prompt: str, settings: Settings) -> dict:
     if not settings.gemini_api_key:
         raise RuntimeError("NEMARA_GEMINI_API_KEY not configured")
-    client = genai.Client(api_key=settings.gemini_api_key)
+    client = get_client(settings.gemini_api_key)
     response = await client.aio.models.generate_content(
         model=settings.gemini_model,
         contents=[genai_types.Content(
@@ -982,7 +984,7 @@ async def summarize_detector_prompt(
     the fragment it describes. Returns None on ANY failure — the UI
     hides the card; a summary must never block or break a compile."""
     try:
-        client = genai.Client(api_key=settings.gemini_api_key)
+        client = get_client(settings.gemini_api_key)
         response = await client.aio.models.generate_content(
             model=settings.gemini_model,
             contents=[genai_types.Content(

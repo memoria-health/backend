@@ -48,6 +48,8 @@ from typing import TYPE_CHECKING
 from uuid import UUID
 
 from google import genai
+
+from src.services.genai_client import get_client
 from google.genai import types as genai_types
 
 from src.db.camera import Camera
@@ -419,7 +421,7 @@ async def classify_frame(jpeg: bytes, settings: Settings) -> Answer:
             "confidence": genai_types.Schema(type=genai_types.Type.NUMBER),
         },
     )
-    client = genai.Client(api_key=settings.gemini_api_key)
+    client = get_client(settings.gemini_api_key)
     response = await client.aio.models.generate_content(
         model=settings.gemini_model,
         contents=[

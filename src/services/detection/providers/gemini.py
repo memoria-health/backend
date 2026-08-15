@@ -11,6 +11,8 @@ fields (`speech_heard` + `speech_transcript`) to the prompt + schema
 from collections.abc import Sequence
 
 from google import genai
+
+from src.services.genai_client import get_client
 from google.genai import types as genai_types
 
 from src.services.detection.prompt import (
@@ -221,7 +223,7 @@ async def gemini_provider(
         },
     )
 
-    client = genai.Client(api_key=settings.gemini_api_key)
+    client = get_client(settings.gemini_api_key)
     # `VideoMetadata.fps` is protobuf-typed (numeric, but the proto
     # may reject Python floats); cast to int before passing.
     video_metadata = (
