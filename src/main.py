@@ -6,6 +6,8 @@ new aggregate appends one `include_router` line.
 """
 
 import logging
+import subprocess
+import sys
 import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -15,35 +17,19 @@ from fastapi import FastAPI
 # Process-wide logging: single stdout handler (JSON on Railway so log
 # levels classify correctly, plain locally), uvicorn loggers routed
 # through it, livekit burst-dedup. Honors NEMARA_LOG_LEVEL and
-# NEMARA_LOG_JSON. Must run before the boxmot/ultralytics imports
-# below so their import-time logger tweaks land on top of ours.
+# NEMARA_LOG_JSON.
 from src.logging_setup import configure_logging
 
 configure_logging()
 
-# Silence verbose third-party loggers that flood every tick.
-#
-# - boxmot's `boxmot.utils.__init__` calls `configure_logging()` at
-#   import time, which installs a RichHandler on the "boxmot" logger
-#   with propagate=False and a hardcoded INFO level. We need to
-#   import that submodule explicitly — `import boxmot` alone doesn't
-#   pull in boxmot.utils, so configure_logging would only fire later
-#   (when the tracker first instantiates) and clobber any override
-#   we set here.
-# - ultralytics also chatters at INFO about model loading.
-#
-# After both have done their import-time logger setup, we strip
-# RichHandler and set propagate=True so anything WARNING+ flows
-# through our standard root config.
-import boxmot.utils  # noqa: F401, E402
-import ultralytics  # noqa: F401, E402
-
-for _noisy in ("boxmot", "ultralytics"):
-    _lg = logging.getLogger(_noisy)
-    _lg.setLevel(logging.WARNING)
-    for _h in list(_lg.handlers):
-        _lg.removeHandler(_h)
-    _lg.propagate = True
+# NOTE: torch-family imports (ultralytics, boxmot, torch) are banned at
+# module level in this process. This file used to import boxmot.utils +
+# ultralytics here purely to silence their loggers, which paid the full
+# torch runtime (hundreds of MB resident) in a process that runs YOLO
+# only in child processes. boxmot is no longer imported anywhere in the
+# backend (the re-id brain lives in the GPU sidecar); ultralytics is
+# lazy-imported by `censor._get_seg_model`, which silences its logger
+# at that point.
 
 
 # Quiet uvicorn's access log for the docs/schema endpoints. They're hit
@@ -116,17 +102,40 @@ from src.services.scheduling.scheduler import ScheduledDetectorRunner
 from src.settings import get_settings
 
 
-def _warm_censor_model() -> None:
-    """Preload YOLO seg weights for the clip censor (daemon thread)."""
-    try:
-        from src.services.detection import censor
+def _warm_censor_weights() -> None:
+    """Fetch the censor's YOLO seg weights into cwd via a THROWAWAY
+    child process (daemon thread wrapper).
 
-        censor._get_seg_model()
-        logging.getLogger(__name__).info("censor model warmed")
+    Replaces `_warm_censor_model`, which loaded the model in THIS
+    process and pinned the full torch runtime (hundreds of MB) for the
+    process lifetime — even though tier-1 censoring runs in child
+    processes and the only in-parent consumer (privacy-masked door
+    stills) can lazy-load on first use. The child pays the download +
+    torch init, dies, and leaves the weights file cached in cwd where
+    every later censor subprocess (and a lazy in-parent load) finds it.
+    """
+    from src.services.detection.censor import _SEG_MODEL_NAME
+
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable, "-c",
+                "from ultralytics import YOLO; "
+                f"YOLO({_SEG_MODEL_NAME!r})",
+            ],
+            capture_output=True, timeout=600,
+        )
+        if proc.returncode == 0:
+            logging.getLogger(__name__).info("censor weights warmed (subprocess)")
+        else:
+            logging.getLogger(__name__).warning(
+                "censor weights warmup exited %d: %s",
+                proc.returncode, proc.stderr.decode(errors="replace")[-500:],
+            )
     except Exception:
         logging.getLogger(__name__).warning(
-            "censor model warmup failed; will retry lazily on first "
-            "censored clip", exc_info=True,
+            "censor weights warmup failed; first censored clip or masked "
+            "still pays the download", exc_info=True,
         )
 
 
@@ -142,18 +151,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Same for the data-collection recorder's tempfiles, which are raw
     # uncensored video/audio and had no sweep of their own until now.
     recorder_manager.sweep_temp_dir()
-    # Warm the censor's YOLO seg model off the startup path: the first
-    # load pays weights download + torch init (measured minutes on a
-    # cold host vs ~9s steady-state per censored clip). Daemon thread —
-    # never blocks startup, failure just re-raises lazily on first use.
-    # Still valuable now that tier-1 censoring runs in a child process
-    # (censor._censor_person_mask_subprocess): ultralytics resolves the
-    # bare "yolo11n-seg.pt" name against the process cwd, the warmup
-    # downloads it there (repo root locally, WORKDIR /app in the
-    # container), and the child inherits that cwd — so every censor
-    # subprocess finds the weights cached instead of re-downloading.
+    # Warm the censor's YOLO seg WEIGHTS off the startup path — in a
+    # throwaway subprocess, so this process never pays torch residency
+    # for a model it runs in children. ultralytics resolves the bare
+    # "yolo11n-seg.pt" name against cwd (repo root locally, WORKDIR
+    # /app in the container); the child downloads it there and every
+    # censor subprocess finds it cached instead of re-downloading.
     threading.Thread(
-        target=_warm_censor_model, name="censor-model-warmup", daemon=True
+        target=_warm_censor_weights, name="censor-weights-warmup", daemon=True
     ).start()
     # Phase 2: in-process detector subscriber-bot. Webhook-driven; the
     # `/v1/livekit/webhooks` route reads `app.state.detector_worker`

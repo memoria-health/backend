@@ -230,6 +230,18 @@ def _get_seg_model():
         import torch
         from ultralytics import YOLO
 
+        # ultralytics chatters at INFO about model loading, and its
+        # import-time logger setup can't flow through our root config.
+        # Silenced here (not in main.py) because this import is LAZY —
+        # the parent process only pays torch residency if the
+        # masked-still path actually fires (main.py deliberately never
+        # imports the torch family at module level).
+        _ul = logging.getLogger("ultralytics")
+        _ul.setLevel(logging.WARNING)
+        for _h in list(_ul.handlers):
+            _ul.removeHandler(_h)
+        _ul.propagate = True
+
         # Deadlock guard (2026-07-28): a multi-threaded torch inference
         # froze the entire process (event loop included) in the local
         # Docker VM — classic libomp hang. Single-threaded inference is

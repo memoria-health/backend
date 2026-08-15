@@ -78,6 +78,13 @@ RUN uv run python -c "from insightface.app import FaceAnalysis; \
 RUN uv run python -c "from ultralytics import YOLO; \
     m = YOLO('yolo11n.pt'); \
     print('yolo11n warmed')"
+# Censor seg weights (~6 MB, /app/yolo11n-seg.pt). The runtime warmup
+# in main.py is a throwaway subprocess that finds this file already
+# cached, so no deploy ever pays the CDN download — and the backend
+# parent process never loads torch for it.
+RUN uv run python -c "from ultralytics import YOLO; \
+    m = YOLO('yolo11n-seg.pt'); \
+    print('yolo11n-seg warmed')"
 RUN uv run python -c "import torch; \
     from pathlib import Path; \
     from boxmot.reid.backends.pytorch_backend import PyTorchBackend; \
