@@ -122,41 +122,80 @@ fi
 # Restart backoff: a hot 3s loop turned one refusing-to-serve config into
 # ~120 restarts that orphaned ~90 CUDA processes and OOMed the GPU on E.
 # Exponential to 120s, reset after any run that survived 300s.
-PLOG="$LOGDIR/perception-$(hostname).log"
-(
-  backoff=3
-  while true; do
-    cd /workspace/edgetam || exit 1
-    # Reap ORPHANED CUDA children before every (re)launch. When
-    # perception dies hard (the L5 OOM, 2026-08-13), its face-worker
-    # child — a multiprocessing spawn — outlives it holding VRAM, and
-    # the successor then cannot load SAM while REPORTING healthy. Only
-    # perception uses multiprocessing in this container, so the
-    # pattern is safe to kill globally here.
-    pkill -9 -f "multiprocessing.spawn" 2>/dev/null
-    pkill -9 -f "multiprocessing.resource_tracker" 2>/dev/null
-    t0=$(date +%s)
-    python3 -m uvicorn perception.server:app \
-      --host "${PERCEPTION_HOST:-127.0.0.1}" \
-      --port "${PERCEPTION_PORT:-8000}" \
-      --timeout-keep-alive 75 2>&1 | tee -a "$PLOG"
-    rc=$?
-    dt=$(( $(date +%s) - t0 ))
-    [ "$dt" -gt 300 ] && backoff=3
-    echo "$(date -u +%FT%TZ) perception exited rc=$rc after ${dt}s — restart in ${backoff}s" | tee -a "$PLOG"
-    sleep "$backoff"
-    backoff=$(( backoff * 2 ))
-    [ "$backoff" -gt 120 ] && backoff=120
-  done
-) &
-
-log "waiting for perception on 127.0.0.1:${PERCEPTION_PORT:-8000}"
-for _ in $(seq 1 90); do
-  curl -sf -m 2 -o /dev/null "http://127.0.0.1:${PERCEPTION_PORT:-8000}/health" && break
-  sleep 2
+#
+# WORKER POOL (2026-08-15, the concurrency-corruption fix). The E2b
+# matrix proved that ANY two passes overlapping inside one perception
+# process corrupt EdgeTAM's propagation (ctrl 58 / nocache 43 /
+# sam3-lock 5 / edge-lock 32 drops; fully serialized 0 in 442 ticks).
+# So: N worker PROCESSES on ports 8000..8000+N-1, each internally
+# single-flight (set NEMARA_PERCEPTION_CONCURRENCY=1), parallelism
+# ACROSS processes with zero shared model state — the July-measured
+# 1.5-1.9x multi-camera speedup without the corruption. Identity
+# processes reach the extra workers via NEMARA_POD_URLS (exported
+# below); camera→worker assignment is a stable hash in loop.sam_for.
+WORKERS="${NEMARA_PERCEPTION_WORKERS:-1}"
+w=0
+while [ "$w" -lt "$WORKERS" ]; do
+  PPORT=$((${PERCEPTION_PORT:-8000} + w))
+  PLOG="$LOGDIR/perception-$(hostname)-w$w.log"
+  (
+    backoff=3
+    while true; do
+      cd /workspace/edgetam || exit 1
+      # Reap ORPHANED CUDA children before every (re)launch — but only
+      # THIS worker's: a global multiprocessing pkill from worker 0
+      # would murder worker 1's live face child (they are siblings
+      # now). Match on the child's parent port marker in its argv is
+      # not possible, so reap only when SINGLE-worker (the historical
+      # behavior); multi-worker relies on each server's own
+      # start-timeout kill + the container restart as the backstop.
+      if [ "$WORKERS" = "1" ]; then
+        pkill -9 -f "multiprocessing.spawn" 2>/dev/null
+        pkill -9 -f "multiprocessing.resource_tracker" 2>/dev/null
+      fi
+      t0=$(date +%s)
+      PERCEPTION_PORT=$PPORT python3 -m uvicorn perception.server:app \
+        --host "${PERCEPTION_HOST:-127.0.0.1}" \
+        --port "$PPORT" \
+        --timeout-keep-alive 75 2>&1 | tee -a "$PLOG"
+      rc=$?
+      dt=$(( $(date +%s) - t0 ))
+      [ "$dt" -gt 300 ] && backoff=3
+      echo "$(date -u +%FT%TZ) perception w$w exited rc=$rc after ${dt}s — restart in ${backoff}s" | tee -a "$PLOG"
+      sleep "$backoff"
+      backoff=$(( backoff * 2 ))
+      [ "$backoff" -gt 120 ] && backoff=120
+    done
+  ) &
+  w=$((w + 1))
 done
-curl -sf -m 2 -o /dev/null "http://127.0.0.1:${PERCEPTION_PORT:-8000}/health" \
-  || log "WARNING: perception not answering yet — identity will retry"
+
+# Identity processes (roster or static) read this env to fan cameras
+# out across the extra workers; empty when WORKERS=1 (exact old
+# behavior, one-var revert).
+if [ "$WORKERS" -gt 1 ]; then
+  EXTRA=""
+  w=1
+  while [ "$w" -lt "$WORKERS" ]; do
+    EXTRA="${EXTRA:+$EXTRA,}http://127.0.0.1:$((${PERCEPTION_PORT:-8000} + w))"
+    w=$((w + 1))
+  done
+  export NEMARA_POD_URLS="$EXTRA"
+  log "perception worker pool: $WORKERS workers; NEMARA_POD_URLS=$EXTRA"
+fi
+
+w=0
+while [ "$w" -lt "$WORKERS" ]; do
+  PPORT=$((${PERCEPTION_PORT:-8000} + w))
+  log "waiting for perception w$w on 127.0.0.1:$PPORT"
+  for _ in $(seq 1 90); do
+    curl -sf -m 2 -o /dev/null "http://127.0.0.1:$PPORT/health" && break
+    sleep 2
+  done
+  curl -sf -m 2 -o /dev/null "http://127.0.0.1:$PPORT/health" \
+    || log "WARNING: perception w$w not answering yet — identity will retry"
+  w=$((w + 1))
+done
 
 # ── 3.5 local-rig tailnet DB bridge ────────────────────────────────────
 # Userspace tailscale (no /dev/net/tun) does NOT route outbound dials
