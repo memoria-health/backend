@@ -93,8 +93,29 @@ def test_custom_environment_multiroom_is_room_bars() -> None:
 
 
 def test_custom_high_severity_leading_is_streak() -> None:
-    spec = compile_widget(_det(category="safety", severity=150))
+    # 85 sits in the real emergency band [80,100] — custom severities
+    # clamp to 100, so the bar must catch the whole band, not just 100.
+    spec = compile_widget(_det(category="safety", severity=85))
     assert spec["widget"] == "streak_tile"
+
+
+def test_severity_outranks_sustained_shape() -> None:
+    # An agitation-shaped severe custom (leading + sustained) is still a
+    # rare alarm: streak, not heatmap.
+    spec = compile_widget(_det(category="behaviour", is_sustained=True,
+                               severity=90))
+    assert spec["widget"] == "streak_tile"
+
+
+def test_severity_outranks_environment_scope() -> None:
+    spec = compile_widget(_det(subject_scope="environment", where_rooms=None,
+                               severity=95))
+    assert spec["widget"] == "streak_tile"
+
+
+def test_severity_does_not_hijack_non_leading_triggers() -> None:
+    spec = compile_widget(_det(alert_trigger="record_only", severity=95))
+    assert spec["widget"] == "trend_band"
 
 
 def test_custom_night_window_leading_is_hour_clock() -> None:

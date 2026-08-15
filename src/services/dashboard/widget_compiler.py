@@ -30,8 +30,11 @@ LlmPick = Callable[[Any, dict], dict]
 
 # Leading detectors at or above this severity are expected-rare alarms:
 # the caregiver-relevant number is "days since", not a frequency chart.
-# 100 = the catalog_v2 severity band where scheduler exemptions begin.
-_RARE_SEVERITY = 100
+# Must match scheduler._EMERGENCY_SEVERITY (=80), where the cost-gate
+# exemption band begins — real loadout: choking 100, fall 95,
+# calling_for_help 88, and custom severities clamp to [0,100], so a
+# higher bar here would silently exclude the very detectors it's for.
+_RARE_SEVERITY = 80
 
 _RANGED_DEFAULT = ["W", "M", "3M"]
 
@@ -125,7 +128,14 @@ def _rules_spec(det: _DetectorLike) -> dict:
     spec: dict[str, Any] = {"size": "wide", "title": _title(det.name),
                             "params": base_params, "min_days": 3}
 
-    if det.alert_trigger == "record_only":
+    # Severity outranks shape (design §5 row 1): a severe leading alarm
+    # is a streak tile even if it's also sustained or environment-scoped
+    # — "days since" is the read a caregiver wants for a rare alarm.
+    if det.alert_trigger == "leading" and (det.severity or 0) >= _RARE_SEVERITY:
+        spec.update(widget="streak_tile", size="tile", min_days=1)
+        spec["params"] = {"metric": "daysSince", "detector": str(det.id)}
+        spec["caption_fields"] = ["longest_gap"]
+    elif det.alert_trigger == "record_only":
         spec.update(widget="trend_band", min_days=7,
                     ranges=["D", *_RANGED_DEFAULT])
         base_params.update(days=30, baseline=True)
@@ -148,10 +158,6 @@ def _rules_spec(det: _DetectorLike) -> dict:
         spec.update(widget="room_bars", size="tile", min_days=7)
         base_params.update(byRoom=True, days=30)
         spec["caption_fields"] = ["count"]
-    elif (det.severity or 0) >= _RARE_SEVERITY:
-        spec.update(widget="streak_tile", size="tile", min_days=1)
-        spec["params"] = {"metric": "daysSince", "detector": str(det.id)}
-        spec["caption_fields"] = ["longest_gap"]
     elif _is_night(det.when_scope):
         spec.update(widget="hour_clock")
         base_params.update(byHour=True, days=14, domain=_domain(det.when_scope),
