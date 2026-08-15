@@ -120,6 +120,11 @@ async def run(wipe: bool) -> None:
             created_at=NOW - timedelta(days=60), updated_at=NOW,
         ))
         await s.flush()   # children below FK onto the patient row
+        # Access flows through patient_members, NOT patients.caregiver_id —
+        # without this row the roster never lists her.
+        await s.execute(text(
+            "insert into patient_members (patient_id, caregiver_id, role) "
+            "values (:p, :c, 'owner')"), {"p": pid, "c": caregiver_id})
 
         cams = []
         for i, room in enumerate(["Living Room", "Bedroom", "Kitchen"]):
