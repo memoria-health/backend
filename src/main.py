@@ -6,22 +6,20 @@ new aggregate appends one `include_router` line.
 """
 
 import logging
-import os
 import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-# Connect Python's root logger to stdout so application loggers
-# (`logging.getLogger(__name__)` calls throughout src/) actually emit.
-# Uvicorn configures its own access/error loggers separately; this
-# covers everything else (detector worker tick logs, webhook handlers,
-# clip archival, push dispatch, etc.). Honors NEMARA_LOG_LEVEL.
-logging.basicConfig(
-    level=os.getenv("NEMARA_LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+# Process-wide logging: single stdout handler (JSON on Railway so log
+# levels classify correctly, plain locally), uvicorn loggers routed
+# through it, livekit burst-dedup. Honors NEMARA_LOG_LEVEL and
+# NEMARA_LOG_JSON. Must run before the boxmot/ultralytics imports
+# below so their import-time logger tweaks land on top of ours.
+from src.logging_setup import configure_logging
+
+configure_logging()
 
 # Silence verbose third-party loggers that flood every tick.
 #
