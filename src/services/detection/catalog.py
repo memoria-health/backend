@@ -1302,26 +1302,31 @@ CATALOG: tuple[CatalogEntry, ...] = (
 # subtly-broken detector at runtime. Duplicate keys would silently shadow each
 # other; duplicate schema fields would blow up `prompt.build_prompt_and_schema`
 # mid-tick.
+def validate_widget_spec(key: str, w: dict) -> None:
+    """Shared shape check for widget specs — catalog templates at import
+    time AND compiler output (rules or LLM) at compile time. A spec that
+    fails here would render as a blank card (or an invalid widget-data
+    request) on every caregiver's Home tab."""
+    if w.get("widget") not in WIDGET_TYPES:
+        raise ValueError(f"[catalog] {key}: bad widget type {w.get('widget')!r}")
+    if w.get("size") not in ("tile", "wide"):
+        raise ValueError(f"[catalog] {key}: bad widget size {w.get('size')!r}")
+    title = w.get("title")
+    if not isinstance(title, str) or not 0 < len(title) <= 24:
+        raise ValueError(f"[catalog] {key}: widget title must be 1-24 chars")
+    params = w.get("params")
+    if not isinstance(params, dict) or not params.get("metric"):
+        raise ValueError(f"[catalog] {key}: widget params need a metric")
+    if not isinstance(w.get("min_days"), int) or w["min_days"] < 0:
+        raise ValueError(f"[catalog] {key}: widget min_days must be an int >= 0")
+
+
 def _validate_widget(e: CatalogEntry) -> None:
-    """A widget template that fails here would render as a blank card (or
-    an invalid widget-data request) on every caregiver's Home tab."""
     if e.widget is None:
         return
     if e.hidden:
         raise ValueError(f"[catalog] {e.key}: hidden entries carry no widget")
-    w = e.widget
-    if w.get("widget") not in WIDGET_TYPES:
-        raise ValueError(f"[catalog] {e.key}: bad widget type {w.get('widget')!r}")
-    if w.get("size") not in ("tile", "wide"):
-        raise ValueError(f"[catalog] {e.key}: bad widget size {w.get('size')!r}")
-    title = w.get("title")
-    if not isinstance(title, str) or not 0 < len(title) <= 24:
-        raise ValueError(f"[catalog] {e.key}: widget title must be 1-24 chars")
-    params = w.get("params")
-    if not isinstance(params, dict) or not params.get("metric"):
-        raise ValueError(f"[catalog] {e.key}: widget params need a metric")
-    if not isinstance(w.get("min_days"), int) or w["min_days"] < 0:
-        raise ValueError(f"[catalog] {e.key}: widget min_days must be an int >= 0")
+    validate_widget_spec(e.key, e.widget)
 
 
 def _validate_catalog() -> None:
