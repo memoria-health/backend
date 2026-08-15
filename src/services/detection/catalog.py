@@ -916,6 +916,16 @@ _SETUP_TEST_PROMPT_FRAGMENT = (
 # ══════════════════════════════════════════════════════════════════
 
 
+# The Home-tab widget primitives the iOS client can render. A catalog
+# template (or the custom-detector compiler) may only ever name one of
+# these — anything else fails catalog validation / compiler fallback.
+WIDGET_TYPES = frozenset({
+    "streak_tile", "dot_calendar", "hour_clock", "trend_band",
+    "sleep_bands", "week_heatmap", "delta_tile", "duration_bars",
+    "count_bars", "ratio_tile", "room_bars",
+})
+
+
 @dataclass(frozen=True)
 class CatalogEntry:
     """One built-in detector definition. `key` is the runtime `identifier`."""
@@ -975,6 +985,13 @@ class CatalogEntry:
     # they reach the LLM RESPONSE SCHEMA — a field named only in the prompt is
     # never returned by structured output. {"field": {"type": "string"}, ...}
     extra_schema: "dict[str, dict[str, str]] | None" = None
+    # Pinned Home-tab widget template (docs/plans/2026-08-15-patient-home-
+    # dashboard.md). None = no widget: hidden entries always, and the child
+    # cohort until that cohort ships in the app. `params` may carry `$self`
+    # (this detector row's id) and `$when_scope` / `$schedule` (axis domain /
+    # adherence windows) — resolved by widget_compiler at compile time, so
+    # the template stays row-independent.
+    widget: "dict | None" = None
 
     @property
     def detected_key(self) -> str:
@@ -1015,6 +1032,9 @@ CATALOG: tuple[CatalogEntry, ...] = (
         category="safety", cohort="both",
         recommended=True, seeded=True, prompt_fragment=_FALL_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
+        widget={"widget": "streak_tile", "size": "tile", "title": "Falls",
+                "params": {"metric": "daysSince", "detector": "$self"},
+                "caption_fields": ["longest_gap"], "min_days": 1},
     ),
     CatalogEntry(
         key="agitation", name="Agitation", icon_name="figure.walk.motion",
@@ -1022,6 +1042,10 @@ CATALOG: tuple[CatalogEntry, ...] = (
         category="behaviour", is_sustained=True, cohort="adult",
         recommended=False, seeded=True, prompt_fragment=_AGITATION_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
+        widget={"widget": "week_heatmap", "size": "wide", "title": "Agitation",
+                "params": {"metric": "events", "detector": "$self",
+                           "heatmap": True, "days": 14, "comparePrev": True},
+                "caption_fields": ["delta"], "min_days": 7},
     ),
     # Convulsion REMOVED from the catalog (Aryaman 2026-07-28): the
     # benchmark showed VLM video sampling sits below tremor frequency
@@ -1037,6 +1061,11 @@ CATALOG: tuple[CatalogEntry, ...] = (
         category="safety", cohort="adult",
         recommended=False, seeded=True, prompt_fragment=_WANDERING_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
+        widget={"widget": "hour_clock", "size": "wide", "title": "Night exits",
+                "params": {"metric": "events", "detector": "$self",
+                           "byHour": True, "days": 14, "domain": "$when_scope",
+                           "ratio": "nightsWith"},
+                "caption_fields": ["ratio", "door"], "min_days": 3},
     ),
     CatalogEntry(
         key="sleep", name="Sleep", icon_name="bed.double",
@@ -1047,6 +1076,10 @@ CATALOG: tuple[CatalogEntry, ...] = (
         promotion_threshold=0.60,
         alert_trigger="record_only",
         extra_schema={"sleep_activity": {"type": "string"}},
+        widget={"widget": "sleep_bands", "size": "wide", "title": "Sleep",
+                "params": {"metric": "sleepNights", "days": 7},
+                "caption_fields": ["avg_duration", "restless_nights"],
+                "ranges": ["W", "M"], "min_days": 3},
     ),
     CatalogEntry(
         key="activity", name="Activity", icon_name="figure.walk",
@@ -1058,6 +1091,10 @@ CATALOG: tuple[CatalogEntry, ...] = (
         promotion_threshold=0.60,
         alert_trigger="record_only",
         extra_schema={"activity_state": {"type": "string"}},
+        widget={"widget": "trend_band", "size": "wide", "title": "Activity",
+                "params": {"metric": "activity", "days": 30, "baseline": True},
+                "caption_fields": ["baseline_position"],
+                "ranges": ["D", "W", "M", "3M"], "min_days": 7},
     ),
     CatalogEntry(
         key="medication", name="Medication adherence", icon_name="pills",
@@ -1071,6 +1108,11 @@ CATALOG: tuple[CatalogEntry, ...] = (
         # format no editor could edit.
         promotion_threshold=0.70,
         detected_field="medication_taken",
+        widget={"widget": "dot_calendar", "size": "wide", "title": "Medication",
+                "params": {"metric": "events", "detector": "$self",
+                           "mode": "adherence", "days": 14,
+                           "windows": "$schedule"},
+                "caption_fields": ["adherence"], "min_days": 3},
     ),
     CatalogEntry(
         key="climbing", name="Climbing", icon_name="figure.climbing",
@@ -1145,6 +1187,9 @@ CATALOG: tuple[CatalogEntry, ...] = (
         category="safety", cohort="adult",
         recommended=False, prompt_fragment=_CALLING_FOR_HELP_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
+        widget={"widget": "streak_tile", "size": "tile", "title": "Calls for help",
+                "params": {"metric": "daysSince", "detector": "$self"},
+                "caption_fields": ["longest_gap"], "min_days": 1},
     ),
     CatalogEntry(
         key="choking", name="Choking", icon_name="lungs",
@@ -1152,6 +1197,9 @@ CATALOG: tuple[CatalogEntry, ...] = (
         category="safety", cohort="adult",
         recommended=False, prompt_fragment=_CHOKING_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
+        widget={"widget": "streak_tile", "size": "tile", "title": "Choking",
+                "params": {"metric": "daysSince", "detector": "$self"},
+                "caption_fields": ["longest_gap"], "min_days": 1},
     ),
     CatalogEntry(
         key="meal_eaten", name="Meal eaten", icon_name="fork.knife",
@@ -1159,6 +1207,11 @@ CATALOG: tuple[CatalogEntry, ...] = (
         category="routine", cohort="adult",
         recommended=False, prompt_fragment=_MEAL_EATEN_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
+        widget={"widget": "dot_calendar", "size": "wide", "title": "Meals",
+                "params": {"metric": "events", "detector": "$self",
+                           "mode": "occurrence", "days": 14,
+                           "ratio": "daysWith"},
+                "caption_fields": ["ratio"], "min_days": 3},
     ),
     CatalogEntry(
         key="stove_left_on", name="Stove left on", icon_name="flame.fill",
@@ -1169,6 +1222,10 @@ CATALOG: tuple[CatalogEntry, ...] = (
         # "Left on" is a duration threshold, not an instant — fire once a lit
         # unattended stove has persisted past this bar (10 min).
         alert_trigger="duration", is_sustained=True, duration_seconds=600,
+        widget={"widget": "dot_calendar", "size": "wide", "title": "Stove left on",
+                "params": {"metric": "events", "detector": "$self",
+                           "mode": "occurrence", "days": 14},
+                "caption_fields": ["count"], "min_days": 3},
     ),
     # ── both cohorts (not recommended) ──
     CatalogEntry(
@@ -1177,6 +1234,9 @@ CATALOG: tuple[CatalogEntry, ...] = (
         category="safety", cohort="both",
         recommended=False, prompt_fragment=_EMERGENCY_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
+        widget={"widget": "streak_tile", "size": "tile", "title": "Emergencies",
+                "params": {"metric": "daysSince", "detector": "$self"},
+                "caption_fields": ["longest_gap"], "min_days": 1},
     ),
     CatalogEntry(
         key="possible_intruder", name="Possible Intruder", icon_name="person.fill.questionmark",
@@ -1184,6 +1244,10 @@ CATALOG: tuple[CatalogEntry, ...] = (
         category="safety", cohort="both",
         recommended=False, prompt_fragment=_POSSIBLE_INTRUDER_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
+        widget={"widget": "hour_clock", "size": "tile", "title": "Sightings",
+                "params": {"metric": "events", "detector": "$self",
+                           "byHour": True, "days": 30},
+                "caption_fields": ["count"], "min_days": 3},
     ),
     CatalogEntry(
         key="env_hazard_glass", name="Environmental hazard — Glass",
@@ -1192,6 +1256,10 @@ CATALOG: tuple[CatalogEntry, ...] = (
         category="safety", cohort="both",
         recommended=False, prompt_fragment=_ENV_HAZARD_GLASS_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
+        widget={"widget": "room_bars", "size": "tile", "title": "Glass hazards",
+                "params": {"metric": "events", "detector": "$self",
+                           "byRoom": True, "days": 30},
+                "caption_fields": ["count"], "min_days": 7},
     ),
     CatalogEntry(
         key="env_hazard_water", name="Environmental hazard — Spilled water",
@@ -1200,6 +1268,10 @@ CATALOG: tuple[CatalogEntry, ...] = (
         category="safety", cohort="both",
         recommended=False, prompt_fragment=_ENV_HAZARD_WATER_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
+        widget={"widget": "room_bars", "size": "tile", "title": "Water hazards",
+                "params": {"metric": "events", "detector": "$self",
+                           "byRoom": True, "days": 30},
+                "caption_fields": ["count"], "min_days": 7},
     ),
     CatalogEntry(
         key="fire_smoke", name="Fire / smoke", icon_name="flame",
@@ -1207,6 +1279,9 @@ CATALOG: tuple[CatalogEntry, ...] = (
         category="safety", cohort="both",
         recommended=False, prompt_fragment=_FIRE_SMOKE_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
+        widget={"widget": "streak_tile", "size": "tile", "title": "Fire & smoke",
+                "params": {"metric": "daysSince", "detector": "$self"},
+                "caption_fields": ["longest_gap"], "min_days": 1},
     ),
     # ── internal: one-time setup self-test (hidden, fire-once) ──
     # Seeded for every new patient and assigned to every camera (source=preset),
@@ -1227,10 +1302,33 @@ CATALOG: tuple[CatalogEntry, ...] = (
 # subtly-broken detector at runtime. Duplicate keys would silently shadow each
 # other; duplicate schema fields would blow up `prompt.build_prompt_and_schema`
 # mid-tick.
+def _validate_widget(e: CatalogEntry) -> None:
+    """A widget template that fails here would render as a blank card (or
+    an invalid widget-data request) on every caregiver's Home tab."""
+    if e.widget is None:
+        return
+    if e.hidden:
+        raise ValueError(f"[catalog] {e.key}: hidden entries carry no widget")
+    w = e.widget
+    if w.get("widget") not in WIDGET_TYPES:
+        raise ValueError(f"[catalog] {e.key}: bad widget type {w.get('widget')!r}")
+    if w.get("size") not in ("tile", "wide"):
+        raise ValueError(f"[catalog] {e.key}: bad widget size {w.get('size')!r}")
+    title = w.get("title")
+    if not isinstance(title, str) or not 0 < len(title) <= 24:
+        raise ValueError(f"[catalog] {e.key}: widget title must be 1-24 chars")
+    params = w.get("params")
+    if not isinstance(params, dict) or not params.get("metric"):
+        raise ValueError(f"[catalog] {e.key}: widget params need a metric")
+    if not isinstance(w.get("min_days"), int) or w["min_days"] < 0:
+        raise ValueError(f"[catalog] {e.key}: widget min_days must be an int >= 0")
+
+
 def _validate_catalog() -> None:
     seen_keys: set[str] = set()
     seen_fields: set[str] = set()
     for e in CATALOG:
+        _validate_widget(e)
         if e.key in seen_keys:
             raise ValueError(f"[catalog] duplicate detector key: {e.key!r}")
         seen_keys.add(e.key)
