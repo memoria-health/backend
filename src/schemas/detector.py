@@ -139,6 +139,9 @@ class DetectorResponse(BaseModel):
     # Written on detector writes only, never computed at read time; the
     # iOS Home tab renders it as-is. Null = this detector has no widget.
     dashboard_widget: dict[str, Any] | None = None
+    # v2 within-tick precedence (read-only for clients). The Home tab
+    # orders widgets inside a category by it, severe-first.
+    severity: int | None = None
     # Wandering only: the caregiver's saved exit-door choice, so the picker can
     # pre-highlight it. {box:[x,y,w,h]|null, label, source, no_exit_door}.
     door_config: dict | None = None
