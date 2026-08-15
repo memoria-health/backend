@@ -47,9 +47,11 @@ Two problems this solves:
    blocked. Catch-up is bounded per wake for the same reason: a long
    stall must not turn into one enormous blocking write.
 
-Off-size frames are scaled to the fixed output size (LiveKit publishes
-720p with simulcast off, so this is a rare safety net) so the rawvideo
-input dimensions never change mid-stream.
+Off-size frames are scaled to the fixed output size so the rawvideo
+input dimensions never change mid-stream. In production the publisher
+sends native resolution (2K), so this scaling runs on every recorded
+frame — see `_scale_to_output` for why it resizes I420 planes in
+place instead of round-tripping through BGR.
 """
 
 from __future__ import annotations
@@ -194,21 +196,40 @@ class StreamingMp4Writer:
     def _scale_to_output(self, data: bytes, width: int, height: int) -> bytes:
         """Resample an off-size I420 frame to the fixed output size.
 
-        Imported lazily — the common path (LiveKit's fixed 720p,
-        simulcast off) never hits this, so cv2/numpy load only if an
-        off-size frame actually arrives.
+        In production this is NOT a rare path: the publisher sends the
+        camera's native resolution (2K on Tapo), so every recorded
+        frame lands here. It runs synchronously inside the detection
+        frame callback, so it must allocate as little as possible.
+        Resizing each I420 plane directly (Y, then quarter-size U and
+        V) skips the YUV→BGR→YUV round-trip an earlier version did —
+        that round-trip allocated ~14 MB of transient BGR per 2K frame
+        at the delivered rate, which fragmented the allocator badly
+        enough to ratchet RSS for the life of the process.
         """
         import cv2
         import numpy as np
 
         if len(data) != _i420_size(width, height):
             raise ValueError("frame byte length does not match its declared size")
-        yuv = np.frombuffer(data, dtype=np.uint8).reshape((height * 3 // 2, width))
-        bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
-        bgr = cv2.resize(
-            bgr, (self._width, self._height), interpolation=cv2.INTER_AREA
+        src = np.frombuffer(data, dtype=np.uint8)
+        out = np.empty(self._frame_bytes, dtype=np.uint8)
+        dw, dh = self._width, self._height
+        # Plane offsets in I420: full-res Y, then U and V at half
+        # resolution in each dimension.
+        planes = (
+            (0, width, height, 0, dw, dh),
+            (width * height, width // 2, height // 2,
+             dw * dh, dw // 2, dh // 2),
+            (width * height * 5 // 4, width // 2, height // 2,
+             dw * dh * 5 // 4, dw // 2, dh // 2),
         )
-        out = cv2.cvtColor(bgr, cv2.COLOR_BGR2YUV_I420)
+        for s_off, sw, sh, d_off, pdw, pdh in planes:
+            cv2.resize(
+                src[s_off:s_off + sw * sh].reshape(sh, sw),
+                (pdw, pdh),
+                dst=out[d_off:d_off + pdw * pdh].reshape(pdh, pdw),
+                interpolation=cv2.INTER_AREA,
+            )
         return out.tobytes()
 
     # ── lifecycle ───────────────────────────────────────────────────
@@ -326,7 +347,15 @@ class StreamingMp4Writer:
             for _ in range(count):
                 proc.stdin.write(frame)
                 self.written += 1
-            await proc.stdin.drain()
+                # Drain per frame, not per burst. The stdin transport
+                # buffers everything handed to write() and only applies
+                # back-pressure at the next drain(), so a burst-level
+                # drain let a catch-up write park `count × frame_bytes`
+                # in one bytearray — ~620 MB at the closing burst's 450
+                # frames. Per-frame drain caps the buffer at the
+                # transport's high-water mark; when the pipe is free it
+                # returns immediately, so the healthy path pays nothing.
+                await proc.stdin.drain()
         except (BrokenPipeError, ConnectionResetError):
             return False
         return True

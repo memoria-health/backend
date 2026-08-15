@@ -113,3 +113,24 @@ async def test_aclose_is_idempotent_and_returns_path(tmp_path) -> None:
     assert await w.aclose() == out
     # Second close must not raise even though ffmpeg is already gone.
     assert await w.aclose() == out
+
+
+def test_off_size_scale_preserves_plane_values() -> None:
+    """The scaler resizes Y/U/V planes in place (no BGR round-trip).
+    A frame with uniform-but-distinct plane values must come out with
+    the same values in the same plane regions — a plane-offset bug
+    would smear them."""
+    w = StreamingMp4Writer("/tmp/unused.mp4", width=1280, height=720, fps=15)
+    sw, sh = 2560, 1440
+    y = bytes([50]) * (sw * sh)
+    u = bytes([100]) * (sw * sh // 4)
+    v = bytes([200]) * (sw * sh // 4)
+    w.feed(sw, sh, y + u + v)
+    out = w._latest
+    assert len(out) == 1280 * 720 * 3 // 2
+    y_out = out[: 1280 * 720]
+    u_out = out[1280 * 720 : 1280 * 720 * 5 // 4]
+    v_out = out[1280 * 720 * 5 // 4 :]
+    assert set(y_out) == {50}
+    assert set(u_out) == {100}
+    assert set(v_out) == {200}
