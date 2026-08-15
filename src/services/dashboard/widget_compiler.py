@@ -35,6 +35,22 @@ _RARE_SEVERITY = 100
 
 _RANGED_DEFAULT = ["W", "M", "3M"]
 
+# PATCH fields whose change alters the compiled widget. `is_on`,
+# sensitivity, icon and description are display/behaviour-only —
+# recompiling on them would churn the spec for nothing (custom_prompt
+# edits recompile through the background detector compile instead).
+# `name` is here because custom widget titles derive from it.
+SHAPE_FIELDS = frozenset({
+    "name", "category", "alert_trigger", "is_sustained",
+    "duration_seconds", "schedule_config", "when_scope", "where_rooms",
+    "subject_scope", "severity",
+})
+
+
+def should_recompile(patched_fields) -> bool:
+    """True when a PATCH payload touches any compiler input."""
+    return bool(SHAPE_FIELDS & set(patched_fields))
+
 
 class _DetectorLike(Protocol):
     id: Any
