@@ -429,6 +429,32 @@ class CameraIngest:
                         task.cancel()
                 await asyncio.gather(*bg, return_exceptions=True)
         self._motion_cache.drop(self.camera_id)
+        # Detach the media buffers so THIS ingest stops pinning ~100 MB
+        # the moment it stops. A stopped ingest can stay referenced (a
+        # done-callback, the parent's dict during teardown), and before
+        # this swap each such orphan held a full retention window of 2K
+        # JPEGs + audio until the GC got around to the whole object.
+        #
+        # SWAP, do not clear in place: an in-flight `archive_event`
+        # post-roll (up to 15 s out) and a `room_classifier.kick` still
+        # read the OLD buffer objects they were handed. They keep their
+        # reference and see whatever frames existed when we stopped;
+        # the old buffer frees naturally when the last of them finishes
+        # (seconds, bounded). Clearing in place would silently truncate
+        # those clips' post-roll — reviewed and rejected 2026-08-15.
+        # No writers race the swap: the video/audio consumer tasks are
+        # cancelled by the caller before stop() runs, and the tick loop
+        # above is already down.
+        self.frame_buffer = FrameBuffer(
+            window_seconds=self.frame_buffer._window_seconds,
+            target_fps=self.frame_buffer.target_fps,
+        )
+        self.audio_buffer = AudioBuffer(
+            window_seconds=self.audio_buffer._window_seconds,
+            sample_rate=self.audio_buffer.sample_rate,
+            num_channels=self.audio_buffer.num_channels,
+        )
+        self.ingress_meter = IngressMeter()
 
     async def _tick_loop(self) -> None:
         # Fire-and-forget: every `tick_seconds`, kick off a tick as its
@@ -738,10 +764,11 @@ class CameraIngest:
         """Run one tick, then drive the data-collection recorder.
 
         The recorder is driven in a `finally` so EVERY tick path —
-        including the early-return short-circuits below — gets a chance
-        to advance an open recording session toward its linger/finalize.
-        `_drive_recorder` is a no-op unless the feature is wired and the
-        tick got far enough to know which patient it's for.
+        including the early-return short-circuits and outright failures
+        below — gets a chance to advance an open recording session
+        toward its linger/finalize. A tick that died before building a
+        ctx drives the recorder in advance-only mode (see
+        `RecorderManager.on_tick`).
         """
         decision = _RecorderDecision()
         try:
@@ -751,8 +778,13 @@ class CameraIngest:
 
     async def _drive_recorder(self, decision: "_RecorderDecision") -> None:
         """Hand the per-tick decision to the recorder. Never raises into
-        the tick — recording must never affect detection."""
-        if self._recorder is None or decision.ctx is None:
+        the tick — recording must never affect detection.
+
+        Runs even when `decision.ctx` is None (the tick died before its
+        DB rows loaded): the recorder treats that as advance-only, so
+        an open session still walks toward linger/finalize instead of
+        recording forever off a camera whose ticks are all failing."""
+        if self._recorder is None:
             return
         try:
             await self._recorder.on_tick(

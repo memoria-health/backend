@@ -2,8 +2,9 @@
 
 The deep tick body (LLM, re-ID) is covered by the e2e test; here we
 verify just the seam: _drive_recorder forwards the per-tick decision to
-the recorder, and is an inert no-op when the feature isn't wired or the
-tick bailed before learning the patient.
+the recorder — including ctx=None advance-only when the tick bailed
+before learning the patient — and is an inert no-op only when the
+feature isn't wired at all.
 """
 
 from __future__ import annotations
@@ -92,8 +93,15 @@ async def test_drive_recorder_is_noop_without_a_recorder() -> None:
 
 
 @pytest.mark.asyncio
-async def test_drive_recorder_is_noop_before_patient_loaded() -> None:
+async def test_drive_recorder_advances_even_before_patient_loaded() -> None:
+    """A tick that died before building a ctx still drives the
+    recorder (ctx=None = advance-only). The old behavior — skip the
+    recorder entirely — left an open session stuck RECORDING forever
+    when every tick failed early (2026-08-14 OOM spiral)."""
     rec = _FakeRecorder()
     ing = _ingest(rec)
     await ing._drive_recorder(_RecorderDecision())  # ctx is None
-    assert rec.calls == []
+    assert len(rec.calls) == 1
+    cam_id, collect, got_ctx, frames, audio = rec.calls[0]
+    assert cam_id == ing.camera_id
+    assert got_ctx is None

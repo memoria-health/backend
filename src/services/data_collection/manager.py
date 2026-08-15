@@ -202,14 +202,26 @@ class RecorderManager:
         camera_id: UUID,
         collect: bool,
         *,
-        ctx: RecorderCtx,
+        ctx: RecorderCtx | None,
         lead_in_frames: Sequence[Any] | None = None,
         lead_in_audio: bytes | None = None,
     ) -> None:
+        """``ctx=None`` means advance-only: never start a session, but
+        still walk an open one toward linger/finalize. Ticks that fail
+        before their DB rows load (camera vanished, pool exhausted)
+        can't build a ctx — without this path such a camera's open
+        session was stuck RECORDING forever: it kept its cap slot, its
+        ffmpeg child, and the full native-res convert on every frame
+        (observed amplifying the 2026-08-14 OOM spiral).
+        """
+        if ctx is None:
+            # No ctx = the tick could not evaluate anything, so it has
+            # no standing to extend a recording either.
+            collect = False
         async with self._lock_for(camera_id):
             rec = self._sessions.get(camera_id)
             if rec is None:
-                if not collect:
+                if not collect or ctx is None:
                     return  # idle camera, nothing to record
                 if self.active_count >= self._max_concurrent:
                     logger.warning(
