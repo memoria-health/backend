@@ -153,8 +153,8 @@ def _rules_spec(det: _DetectorLike) -> dict:
         spec["params"] = {"metric": "daysSince", "detector": str(det.id)}
         spec["caption_fields"] = ["longest_gap"]
     elif det.alert_trigger == "record_only":
-        spec.update(widget="trend_band", min_days=7,
-                    ranges=["D", *_RANGED_DEFAULT])
+        # No "D" on trends: one bucket is a dot, not a trend.
+        spec.update(widget="trend_band", min_days=7, ranges=_RANGED_DEFAULT)
         base_params.update(days=30, baseline=True)
     elif det.alert_trigger == "absence" and det.schedule_config:
         spec.update(widget="dot_calendar")

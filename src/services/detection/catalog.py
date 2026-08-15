@@ -1094,7 +1094,7 @@ CATALOG: tuple[CatalogEntry, ...] = (
         widget={"widget": "trend_band", "size": "wide", "title": "Activity",
                 "params": {"metric": "activity", "days": 30, "baseline": True},
                 "caption_fields": ["baseline_position"],
-                "ranges": ["D", "W", "M", "3M"], "min_days": 7},
+                "ranges": ["W", "M", "3M"], "min_days": 7},
     ),
     CatalogEntry(
         key="medication", name="Medication adherence", icon_name="pills",
