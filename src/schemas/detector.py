@@ -6,7 +6,7 @@ The four enum values match the SQL enums in `supabase/schema.sql`.
 
 from datetime import datetime
 from enum import Enum
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -135,6 +135,10 @@ class DetectorResponse(BaseModel):
     user_criteria: list[str] | None = None
     # Plain-words change requests accumulated via /refine, oldest first.
     refinements: list[str] | None = None
+    # Compiled Home-tab widget spec ({widget, size, title, params, …}).
+    # Written on detector writes only, never computed at read time; the
+    # iOS Home tab renders it as-is. Null = this detector has no widget.
+    dashboard_widget: dict[str, Any] | None = None
     # Wandering only: the caregiver's saved exit-door choice, so the picker can
     # pre-highlight it. {box:[x,y,w,h]|null, label, source, no_exit_door}.
     door_config: dict | None = None
