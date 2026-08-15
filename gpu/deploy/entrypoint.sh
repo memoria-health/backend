@@ -138,23 +138,31 @@ w=0
 while [ "$w" -lt "$WORKERS" ]; do
   PPORT=$((${PERCEPTION_PORT:-8000} + w))
   PLOG="$LOGDIR/perception-$(hostname)-w$w.log"
+  FACEPID="/run/nemara/facepid-$PPORT"
+  mkdir -p /run/nemara
   (
     backoff=3
     while true; do
       cd /workspace/edgetam || exit 1
-      # Reap ORPHANED CUDA children before every (re)launch — but only
-      # THIS worker's: a global multiprocessing pkill from worker 0
-      # would murder worker 1's live face child (they are siblings
-      # now). Match on the child's parent port marker in its argv is
-      # not possible, so reap only when SINGLE-worker (the historical
-      # behavior); multi-worker relies on each server's own
-      # start-timeout kill + the container restart as the backstop.
+      # Reap THIS worker's orphaned face child before every (re)launch
+      # (2026-08-15 review finding 1): a hard-killed parent (SIGKILL,
+      # segfault, CUDA crash) leaves the multiprocessing child alive
+      # holding VRAM — daemon cleanup never runs on hard death, and the
+      # crash is absorbed by THIS loop so the container never restarts.
+      # The child writes its PID to $FACEPID on ready (face_worker.py),
+      # so reaping is scoped to exactly this worker's child and can
+      # never touch a live sibling. WORKERS=1 keeps the historic global
+      # pkill as a second belt.
+      if [ -f "$FACEPID" ]; then
+        kill -9 "$(cat "$FACEPID" 2>/dev/null)" 2>/dev/null
+        rm -f "$FACEPID"
+      fi
       if [ "$WORKERS" = "1" ]; then
         pkill -9 -f "multiprocessing.spawn" 2>/dev/null
         pkill -9 -f "multiprocessing.resource_tracker" 2>/dev/null
       fi
       t0=$(date +%s)
-      PERCEPTION_PORT=$PPORT python3 -m uvicorn perception.server:app \
+      NEMARA_FACE_PIDFILE="$FACEPID" python3 -m uvicorn perception.server:app \
         --host "${PERCEPTION_HOST:-127.0.0.1}" \
         --port "$PPORT" \
         --timeout-keep-alive 75 2>&1 | tee -a "$PLOG"
@@ -165,6 +173,30 @@ while [ "$w" -lt "$WORKERS" ]; do
       sleep "$backoff"
       backoff=$(( backoff * 2 ))
       [ "$backoff" -gt 120 ] && backoff=120
+    done
+  ) &
+  # Hang watchdog (2026-08-15 review finding 2): the loop above only
+  # catches EXITS. A wedged worker (stuck GPU op, deadlock) never
+  # exits, never restarts, and its cameras fail silently forever. Four
+  # consecutive failed health probes (2 min) -> kill the uvicorn on
+  # this port; the supervisor loop above restarts it. 240s boot grace
+  # covers the model warm. Bracket pattern so pkill can't match itself.
+  (
+    sleep 240
+    fails=0
+    while true; do
+      sleep 30
+      if curl -sf -m 5 -o /dev/null "http://127.0.0.1:$PPORT/health"; then
+        fails=0
+      else
+        fails=$((fails + 1))
+        if [ "$fails" -ge 4 ]; then
+          echo "$(date -u +%FT%TZ) watchdog: w$w unresponsive x$fails — killing for restart" | tee -a "$PLOG"
+          pkill -9 -f -- "[-]-port $PPORT" 2>/dev/null
+          fails=0
+          sleep 60
+        fi
+      fi
     done
   ) &
   w=$((w + 1))

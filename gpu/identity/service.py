@@ -655,7 +655,16 @@ async def _amain(args: argparse.Namespace) -> None:
         while True:
             await asyncio.sleep(HEARTBEAT_S)
             try:
+                # ALL workers, not just the base pod (2026-08-15 review
+                # finding 2 on the v3.0 worker pool): a HUNG extra
+                # worker never exits — the entrypoint's crash-restart
+                # can't see it — so its cameras would fail silently
+                # forever while worker 0's heartbeat kept this watchdog
+                # happy. Any worker failing keeps last_pod_ok stale and
+                # the wedge exit below gets a fresh start loudly.
                 await home_ref.sam.health()
+                for _extra in home_ref.pods:
+                    await _extra.health()
                 home_ref.last_pod_ok = time.time()
             except Exception as e:               # noqa: BLE001
                 log.warning("identity.pod_heartbeat_failed: %s", e)

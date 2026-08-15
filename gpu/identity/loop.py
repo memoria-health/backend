@@ -219,6 +219,22 @@ class IdentityHome:
             max(1, int(os.environ.get("NEMARA_POD_CONCURRENCY", "2")))
         )
     )
+    # PER-WORKER admission (2026-08-15 review finding 3 on the v3.0
+    # worker pool): one shared semaphore sized for a single pod let one
+    # wedged worker's 25s-timeout calls hold the room's whole admission
+    # budget and starve cameras on a HEALTHY sibling worker — and
+    # capped total concurrency at single-pod levels no matter how many
+    # workers exist. One semaphore per pod client, created lazily; the
+    # legacy pod_lock above stays for anything still holding it.
+    pod_locks: dict = field(default_factory=dict)
+
+    def lock_for(self, client) -> asyncio.Semaphore:
+        sem = self.pod_locks.get(id(client))
+        if sem is None:
+            sem = self.pod_locks[id(client)] = asyncio.Semaphore(
+                max(1, int(os.environ.get("NEMARA_POD_CONCURRENCY", "2")))
+            )
+        return sem
     # Guards `seat`: candidates fold from per-camera worker THREADS
     # (asyncio.to_thread), so the read-modify-write must serialize.
     seat_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -634,9 +650,10 @@ class CameraLoop:
         )
         encode_ms = (time.time() - t_e) * 1000.0
         t_q = time.time()
-        async with self.home.pod_lock:       # bounded pod admission
+        _pod = self.home.sam_for(self.camera_id)
+        async with self.home.lock_for(_pod):  # per-WORKER admission
             t0 = time.time()                 # queue wait ends here
-            obs = await self.home.sam_for(self.camera_id).observe(
+            obs = await _pod.observe(
                 send_frames,
                 camera_id=f"identity_{self.camera_id}",
                 person_thr=0.4,
