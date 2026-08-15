@@ -918,6 +918,30 @@ class CameraIngest:
                 patient.cameras_paused,
             )
 
+            # ── read phase ends here (tick session split, 2026-08-15) ──
+            # Prefetch the few lookups the rest of the tick needs, then
+            # RELEASE the connection before any heavy work. This tick
+            # used to hold one pooled connection idle-in-transaction
+            # across the mp4 build, the identity call, and the ~28s
+            # Gemini call — at 2 in-flight ticks × N cameras that
+            # exhausted the 20+20 pool the moment latency stretched
+            # (the 2026-08-14 pre-OOM spiral). After close() the session
+            # transparently re-acquires a connection for the short write
+            # transactions below; every row read above lives on as plain
+            # detached attributes. Net extra read cost: one EXISTS per
+            # tick (the vlm choice is 60s-cached, the tz is cached on
+            # self after the first tick).
+            enrollment_ready = await has_ready_enrollment(
+                session, self.patient_id,
+            )
+            vlm_choice = await resolve_vlm_provider(
+                session, patient.caregiver_id, self._settings,
+            )
+            caregiver_local_tz = await self._resolve_caregiver_tz(
+                session, patient,
+            )
+            await session.close()
+
             # User-facing "off" short-circuit. A camera's OWN flags
             # suppress the LLM call:
             #   - cam.disabled  → user hid + paused via Hide button
@@ -1510,7 +1534,7 @@ class CameraIngest:
                 and self._patient_presence is not None
                 and self._patient_presence.confirmed_elsewhere(self.camera_id)
             ):
-                if await has_ready_enrollment(session, self.patient_id):
+                if enrollment_ready:
                     state_after = await apply_tick_update(
                         session,
                         camera_id=self.camera_id,
@@ -1576,10 +1600,8 @@ class CameraIngest:
             # through the rest of the chain so a single provider's outage /
             # rate-limit can't blind the family. Gemini gets native video;
             # openai / dashscope share the frame-sampling path. See
-            # services/detection/vlm_routing.py.
-            vlm_choice = await resolve_vlm_provider(
-                session, patient.caregiver_id, self._settings,
-            )
+            # services/detection/vlm_routing.py. `vlm_choice` was resolved
+            # in the read phase above, before the connection was released.
 
             # Scene/person calls always run on the CLEAN clip. The motion
             # overlay (red tint) is a RAPID-lane recipe property only: the
@@ -1635,9 +1657,7 @@ class CameraIngest:
                         self._patient_presence.confirmed_elsewhere(self.camera_id)
                         if self._patient_presence else False
                     ),
-                    local_now=datetime.now(
-                        await self._resolve_caregiver_tz(session, patient)
-                    ),
+                    local_now=datetime.now(caregiver_local_tz),
                 )
                 plans = pack_calls(due_set, settings=self._settings)
                 log.info(
@@ -1947,8 +1967,11 @@ class CameraIngest:
                 # the log line rather than leaving it unbound.
                 no_people_count_log = cam.no_people_count
             else:
-                # State machine update. Same session, one commit at
-                # the end.
+                # State machine update. First statement of the tick's
+                # WRITE transaction — the session re-acquires a pooled
+                # connection here (released after the read phase) and
+                # the single commit below lands the row, the state
+                # transition, and any promotion together.
                 state_after = await apply_tick_update(
                     session,
                     camera_id=self.camera_id,
