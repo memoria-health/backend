@@ -51,22 +51,31 @@ class WidgetRequest(BaseModel):
     source: dict[str, Any] | None = None
 
 
-def _terms_filter(terms: list[str], alias: str = "") -> str:
+def _terms_filter(terms: list[str], alias: str = "",
+                  detector: str | None = None) -> str:
     """Sanitised interpolation — the TS route's exact approach. Only
     [\\w\\s-] survives, so the interpolated string cannot escape its
     quotes; parity beats parameter purity here because the term list
-    is variable-length inside an OR chain."""
-    if not terms:
-        return "true"
+    is variable-length inside an OR chain.
+
+    `detector` (Home-tab widgets, 2026-08-15) narrows every events query
+    to one detector's rows. It is interpolated only after widget_data
+    has round-tripped it through UUID() AND scope-checked it, so the
+    string is guaranteed hex-and-hyphens."""
     a = f"{alias}." if alias else ""
-    parts = []
-    for t in terms:
-        esc = re.sub(r"[^\w\s-]", "", str(t))
-        parts.append(
-            f"({a}title ilike '%{esc}%' or {a}narrative ilike '%{esc}%' "
-            f"or {a}category::text ilike '%{esc}%')"
-        )
-    return "(" + " or ".join(parts) + ")"
+    base = "true"
+    if terms:
+        parts = []
+        for t in terms:
+            esc = re.sub(r"[^\w\s-]", "", str(t))
+            parts.append(
+                f"({a}title ilike '%{esc}%' or {a}narrative ilike '%{esc}%' "
+                f"or {a}category::text ilike '%{esc}%')"
+            )
+        base = "(" + " or ".join(parts) + ")"
+    if detector is None:
+        return base
+    return f"({base} and {a}detector_id = '{detector}')"
 
 
 async def _scoped(session, auth) -> list[UUID]:
@@ -152,8 +161,9 @@ def _series_rows(rows: list[dict]) -> list[dict]:
 
 # ── query helpers ────────────────────────────────────────────────────
 
-async def _term_series(session, patient, term, days, gran, night, offset=0):
-    tf = _terms_filter([term] if term else [])
+async def _term_series(session, patient, term, days, gran, night, offset=0,
+                       detector=None):
+    tf = _terms_filter([term] if term else [], detector=detector)
     rows = (await session.execute(text(f"""
         select to_char(date_trunc(:gran, occurred_at)::date, 'YYYY-MM-DD') as bucket,
                count(*)::int as n
@@ -170,8 +180,8 @@ async def _term_series(session, patient, term, days, gran, night, offset=0):
 
 
 async def _categorical(session, patient, terms, days, night, bucket_expr,
-                       join_cameras=False):
-    tf = _terms_filter(terms, "e")
+                       join_cameras=False, detector=None):
+    tf = _terms_filter(terms, "e", detector=detector)
     join = "left join cameras c on c.id = e.camera_id" if join_cameras else ""
     rows = (await session.execute(text(f"""
         select {bucket_expr} as t, count(*)::int as n
@@ -206,6 +216,25 @@ async def widget_data(
         d = 14
     night = bool(source.get("night"))
     patient = _narrow(allowed, source.get("patient"))
+
+    # Per-detector narrowing (Home-tab widgets). Same disclosure rule as
+    # _narrow: unknown and foreign ids are both 404. The patient set
+    # collapses to the detector's own patient so a spec can't mix one
+    # detector's events with another patient's scope.
+    det: str | None = None
+    if source.get("detector") is not None:
+        try:
+            det_uuid = UUID(str(source["detector"]))
+        except ValueError:
+            raise HTTPException(status_code=404, detail="detector_not_found")
+        drow = (await session.execute(
+            text("select patient_id from detectors where id = :i"),
+            {"i": det_uuid},
+        )).first()
+        if drow is None or drow[0] not in patient:
+            raise HTTPException(status_code=404, detail="detector_not_found")
+        patient = [drow[0]]
+        det = str(det_uuid)
 
     # ── activity ────────────────────────────────────────────────
     if metric == "activity":
@@ -297,7 +326,7 @@ async def widget_data(
                 "cameras": [dict(r) for r in rows]}
 
     if metric == "timeline":
-        tf = _terms_filter(terms, "e")
+        tf = _terms_filter(terms, "e", detector=det)
         rows = (await session.execute(text(f"""
             select to_char(occurred_at, 'YYYY-MM-DD HH24\:MI') as ts,
                    to_char(occurred_at::date, 'YYYY-MM-DD') as date,
@@ -331,7 +360,7 @@ async def widget_data(
                 "statValue": str(sum(r["events"] for r in ranking))}
 
     if metric == "daysSince":
-        tf = _terms_filter(terms)
+        tf = _terms_filter(terms, detector=det)
         rows = (await session.execute(text(f"""
             select occurred_at, {KIND} as t from events
             where patient_id = any(:ids) and {tf}
@@ -399,7 +428,7 @@ async def widget_data(
                 "rows": rs}
 
     if metric == "reviews":
-        tf = _terms_filter(terms)
+        tf = _terms_filter(terms, detector=det)
         rows = (await session.execute(text(f"""
             select case when not reviewed then 'Unreviewed'
                         else initcap(coalesce(nullif(review_choice::text,''), 'reviewed')) end as t,
@@ -448,7 +477,7 @@ async def widget_data(
         }
 
     if metric == "clips":
-        tf = _terms_filter(terms, "e")
+        tf = _terms_filter(terms, "e", detector=det)
         rows = (await session.execute(text(f"""
             select title, to_char(occurred_at, 'Mon DD HH24\:MI') as ts,
                    clip_storage_key as "clipKey", p.preferred_name as who
@@ -466,7 +495,7 @@ async def widget_data(
     ratio = source.get("ratio")
     if ratio in ("nightsWith", "daysWith"):
         is_night = ratio == "nightsWith"
-        tf = _terms_filter(terms)
+        tf = _terms_filter(terms, detector=det)
 
         async def qn(offset: int) -> int:
             row = (await session.execute(text(f"""
@@ -492,21 +521,23 @@ async def widget_data(
         }
 
     if source.get("breakdown"):
-        rows = await _categorical(session, patient, terms, d, night, KIND)
+        rows = await _categorical(session, patient, terms, d, night, KIND,
+                                  detector=det)
         return {"kind": "series", "categorical": True, "terms": ["events"],
                 "rows": _series_rows(rows),
                 "statValue": str(sum(r["n"] for r in rows))}
     if source.get("byRoom"):
         rows = await _categorical(
             session, patient, terms, d, night,
-            "coalesce(c.room, 'Unknown room')", join_cameras=True)
+            "coalesce(c.room, 'Unknown room')", join_cameras=True,
+            detector=det)
         return {"kind": "series", "categorical": True, "terms": ["events"],
                 "rows": _series_rows(rows),
                 "statValue": str(sum(r["n"] for r in rows))}
     if source.get("byHour"):
         rows = await _categorical(
             session, patient, terms, d, night,
-            r"""to_char(occurred_at, 'HH24"\:00"')""")
+            r"""to_char(occurred_at, 'HH24"\:00"')""", detector=det)
         by = {r["t"]: r["n"] for r in rows}
         return {
             "kind": "series", "categorical": True, "terms": ["events"],
@@ -517,7 +548,7 @@ async def widget_data(
     if source.get("byDow"):
         rows = await _categorical(
             session, patient, terms, d, night,
-            "extract(isodow from occurred_at)::int::text")
+            "extract(isodow from occurred_at)::int::text", detector=det)
         by = {int(r["t"]): r["n"] for r in rows}
         return {
             "kind": "series", "categorical": True, "terms": ["events"],
@@ -526,7 +557,7 @@ async def widget_data(
             "statValue": str(sum(r["n"] for r in rows)),
         }
     if source.get("heatmap"):
-        tf = _terms_filter(terms)
+        tf = _terms_filter(terms, detector=det)
         rows = (await session.execute(text(f"""
             select extract(isodow from occurred_at)::int as dow,
                    extract(hour from occurred_at)::int as h, count(*)::int as n
@@ -544,7 +575,7 @@ async def widget_data(
         other = _narrow(allowed, source["compareWith"])
 
         async def combined(ids, offset=0):
-            tf = _terms_filter(terms)
+            tf = _terms_filter(terms, detector=det)
             rows = (await session.execute(text(f"""
                 select to_char(date_trunc(:gran, occurred_at)::date, 'YYYY-MM-DD') as bucket,
                        count(*)::int as n
@@ -574,7 +605,7 @@ async def widget_data(
         cur = await _term_series(session, patient, None, d, gran, night, 0) \
             if not terms else None
         # combined over the term set, matching the TS combinedSeries
-        tf = _terms_filter(terms)
+        tf = _terms_filter(terms, detector=det)
 
         async def combined(offset):
             rows = (await session.execute(text(f"""
@@ -602,9 +633,11 @@ async def widget_data(
         }
 
     active_terms: list[str | None] = terms if terms else [None]
-    cur_all = [await _term_series(session, patient, t, d, gran, night, 0)
+    cur_all = [await _term_series(session, patient, t, d, gran, night, 0,
+                                  detector=det)
                for t in active_terms]
-    prev_all = [await _term_series(session, patient, t, d, gran, night, d)
+    prev_all = [await _term_series(session, patient, t, d, gran, night, d,
+                                   detector=det)
                 for t in active_terms]
     names = terms if terms else ["events"]
     by_bucket: dict[str, dict] = {}
