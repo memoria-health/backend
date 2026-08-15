@@ -69,6 +69,7 @@ from src.api.health import router as health_router
 from src.api.home_report import router as home_report_router
 from src.api.insights import router as insights_router
 from src.api.insights_widgets import router as insights_widgets_router
+from src.api.summaries import router as summaries_router
 from src.api.internal.cameras import router as internal_cameras_router
 from src.api.livekit import router as livekit_router
 from src.api.livekit_webhooks import router as livekit_webhooks_router
@@ -263,6 +264,7 @@ def create_app() -> FastAPI:
     # the web app's direct nemara_readonly/BYPASSRLS Postgres connection.
     app.include_router(insights_router)
     app.include_router(insights_widgets_router)
+    app.include_router(summaries_router)
     # Operator-only event gate: pre-dispatch false-positive check.
     # Bearer token separate from caregiver auth (deps.operator_auth).
     app.include_router(event_gate_router)
