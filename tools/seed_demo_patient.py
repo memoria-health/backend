@@ -34,7 +34,9 @@ from src.db.detector import Detector
 from src.db.event import Event
 from src.db.patient import Patient
 from src.db.session import get_sessionmaker
+from src.services import storage
 from src.services.detection import catalog, catalog_v2
+from src.settings import get_settings
 
 NOW = datetime.now(timezone.utc)
 # Filled in run() from the caregiver row — every seeded moment is
@@ -144,6 +146,17 @@ async def run(wipe: bool) -> None:
         await s.execute(text(
             "insert into patient_members (patient_id, caregiver_id, role) "
             "values (:p, :c, 'owner')"), {"p": pid, "c": caregiver_id})
+
+        # Portrait survives reseeds: drop a JPEG at this path once and
+        # every seed run re-attaches it to the fresh row.
+        portrait = Path("/tmp/margaret-portrait.jpg")
+        if portrait.exists():
+            key = await storage.upload_patient_photo(
+                patient_id=pid, image_bytes=portrait.read_bytes(),
+                content_type="image/jpeg", settings=get_settings())
+            await s.execute(text(
+                "update patients set photo_storage_key = :k where id = :p"),
+                {"k": key, "p": pid})
 
         cams = []
         for i, room in enumerate(["Living Room", "Bedroom", "Kitchen"]):
