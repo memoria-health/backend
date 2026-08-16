@@ -37,7 +37,6 @@ from src.db.detector import Detector
 from src.db.event import Event
 from src.db.patient import Patient
 from src.db.session import get_sessionmaker
-from src.services.dashboard.widget_compiler import apply_widget
 from src.services.detection import catalog, catalog_v2
 
 NOW = datetime.now(timezone.utc)
@@ -62,7 +61,6 @@ def _preset(patient_id, key, i, **over):
         schedule_config=over.pop("schedule_config", None),
         **catalog_v2.row_kwargs(e.key),
     )
-    apply_widget(det)
     return det
 
 
@@ -82,7 +80,6 @@ def _custom(patient_id, name, category, i, *, alert_trigger="leading",
         schema_json=None, always_on=False, schedule_config=None,
         subject_scope="patient", severity=severity,
     )
-    apply_widget(det)
     return det
 
 
@@ -142,8 +139,6 @@ async def run(wipe: bool) -> None:
             "cadence": "daily", "window_start": "07:00",
             "window_end": "21:00", "deadline": "21:00",
         }
-        for k in ("wandering", "medication"):
-            apply_widget(dets[k])
         company = _custom(pid, "Company at meals", "care", 100)
         tv = _custom(pid, "TV after 11 PM", "behaviour", 101,
                      alert_trigger="duration", is_sustained=True,
