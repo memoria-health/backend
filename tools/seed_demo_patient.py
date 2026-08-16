@@ -208,7 +208,7 @@ async def run(wipe: bool) -> None:
         # clip: the Events page showpiece (video + review flow), while
         # the 47-day streak holds because reviewed-wrong never counts.
         events.append(_event(
-            pid, dets["fall"], _at(2, 15, 42), living,
+            pid, dets["fall"], _at(2, 0, 17), living,
             "Margaret bent down quickly to pick up a dropped book and "
             "steadied herself on the coffee table. Flagged as a possible "
             "fall; you reviewed the clip and marked that nothing "
