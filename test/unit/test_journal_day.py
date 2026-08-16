@@ -269,3 +269,9 @@ def test_off_detector_keeps_its_event_history() -> None:
     assert "Falls" in titles          # history survives the toggle
     assert "Wandering" not in titles  # no quiet claims for off detectors
     assert "Choking" in titles
+
+
+def test_entries_carry_the_detector_icon() -> None:
+    entry = jd.point_line(_det(icon_name="figure.fall"), [], TZ, streak_days=5)
+    assert entry["icon"] == "figure.fall"
+    assert jd.sleep_line(None, TZ)["icon"] == "bed.double"

@@ -76,6 +76,7 @@ def _entry(det, kind: str, primary: str, meta: str | None, status: str,
     return {
         "detector_id": str(det.id) if det is not None else None,
         "title": det.name if det is not None else kind,
+        "icon": getattr(det, "icon_name", None) if det is not None else None,
         "category": det.category if det is not None else "routine",
         "severity": getattr(det, "severity", None) if det is not None else None,
         "kind": kind,
@@ -144,7 +145,7 @@ def sleep_line(row: dict | None, tz: tzinfo) -> dict:
     det = None
     if row is None or not row.get("bedtime") or not row.get("wake_time"):
         e = _entry(det, "record_sleep", "No sleep recorded", None, "none", None)
-        e["title"], e["category"] = "Sleep", "routine"
+        e["title"], e["category"], e["icon"] = "Sleep", "routine", "bed.double"
         return e
     bed, wake = row["bedtime"], row["wake_time"]
     n = int(row.get("disturbances") or 0)
@@ -154,7 +155,7 @@ def sleep_line(row: dict | None, tz: tzinfo) -> dict:
         f"{_clock(bed, tz)} – {_clock(wake, tz)}", meta, "none",
         _strip("noon", [[hour_x(bed, tz, "noon"), hour_x(wake, tz, "noon")]], []),
     )
-    e["title"], e["category"] = "Sleep", "routine"
+    e["title"], e["category"], e["icon"] = "Sleep", "routine", "bed.double"
     return e
 
 
@@ -191,7 +192,7 @@ def activity_line(ticks: list, tz: tzinfo) -> dict:
     minutes = moving_total * _TICK_SECONDS / 60
     e = _entry(None, "record_activity", _moving_words(minutes), None, "none",
                _strip("midnight", spans, []) if ticks else None)
-    e["title"], e["category"] = "Activity", "routine"
+    e["title"], e["category"], e["icon"] = "Activity", "routine", "figure.walk"
     return e
 
 
