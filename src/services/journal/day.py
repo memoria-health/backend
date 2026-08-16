@@ -216,3 +216,63 @@ def assemble_sections(entries: list[dict]) -> list[dict]:
         rows.sort(key=lambda e: -(e.get("severity") or 0))
         out.append({"category": cat, "entries": rows})
     return out
+
+
+def _duration_words(minutes: float) -> str:
+    m15 = int(round(minutes / 15) * 15)
+    if m15 <= 0:
+        return "Under 15 m"
+    if m15 < 60:
+        return f"About {m15} m"
+    h, rem = divmod(m15, 60)
+    return f"About {h} h" if rem == 0 else f"About {h} h {rem} m"
+
+
+def duration_line(det, tick_times: list, tz: tzinfo) -> dict:
+    """Sustained record streams (TV, time alone): contiguous detected
+    ticks are RECORDED timestamps, so merging runs (gap <= 60 s) into
+    session spans is a clean map, not an inference."""
+    if not tick_times:
+        return _entry(det, "record_duration", "None today", None, "none", None)
+    spans: list[list[float]] = []
+    run_start = prev = tick_times[0]
+    for t in tick_times[1:]:
+        if (t - prev).total_seconds() > 60:
+            spans.append([hour_x(run_start, tz), hour_x(prev, tz)])
+            run_start = t
+        prev = t
+    spans.append([hour_x(run_start, tz), hour_x(prev, tz)])
+    minutes = len(tick_times) * _TICK_SECONDS / 60
+    return _entry(det, "record_duration", _duration_words(minutes), None,
+                  "none", _strip("midnight", spans, []))
+
+
+def build_entries(*, detectors: list, events_by_detector: dict, tz: tzinfo,
+                  sleep_row: dict | None, activity_ticks: list,
+                  detected_times_by_identifier: dict,
+                  streak_days_by_detector: dict) -> list[dict]:
+    """Route each active detector to its taxonomy's builder. Pure — the
+    endpoint does the queries, this does the shape."""
+    entries: list[dict] = []
+    for det in detectors:
+        events = events_by_detector.get(str(det.id), [])
+        if det.alert_trigger == "record_only":
+            if det.identifier == "sleep":
+                e = sleep_line(sleep_row, tz)
+                e["detector_id"] = str(det.id)
+            elif det.identifier == "activity":
+                e = activity_line(activity_ticks, tz)
+                e["detector_id"] = str(det.id)
+            else:
+                times = detected_times_by_identifier.get(det.identifier or "", [])
+                e = (duration_line(det, times, tz) if det.is_sustained
+                     else count_line(det, times, tz))
+        elif det.alert_trigger == "absence":
+            e = absence_line(det, events, tz)
+        elif det.is_sustained:
+            e = episode_line(det, events, tz)
+        else:
+            e = point_line(det, events, tz,
+                           streak_days_by_detector.get(str(det.id)))
+        entries.append(e)
+    return entries

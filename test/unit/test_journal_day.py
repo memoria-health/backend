@@ -173,3 +173,42 @@ def test_sections_fixed_order_and_severity_within() -> None:
     sections = jd.assemble_sections(entries)
     assert [s["category"] for s in sections] == ["safety", "behaviour"]
     assert [e["title"] for e in sections[0]["entries"]] == ["Choking", "Falls"]
+
+
+def test_duration_line_merges_contiguous_ticks_into_sessions() -> None:
+    # 40 min of contiguous TV ticks + a separate 20-min run later.
+    times = [_local(23, 20) + timedelta(seconds=10 * i) for i in range(240)]
+    times += [_local(21, 0) + timedelta(seconds=10 * i) for i in range(120)]
+    det = _det(name="TV after 11 PM", category="behaviour",
+               alert_trigger="record_only", is_sustained=True)
+    entry = jd.duration_line(det, sorted(times), TZ)
+    assert entry["line"]["primary"] == "About 1 h"
+    assert len(entry["strip"]["spans"]) == 2
+    s, e = entry["strip"]["spans"][1]
+    assert abs(s - (23 + 20 / 60)) < 0.01
+
+
+def test_build_entries_dispatches_by_taxonomy() -> None:
+    dets = [
+        _det(id="p1", name="Falls", severity=95),
+        _det(id="a1", name="Medication", category="routine",
+             alert_trigger="absence", schedule_config={"deadline": "21:00"}),
+        _det(id="s1", name="Sleep", category="routine", identifier="sleep",
+             alert_trigger="record_only"),
+        _det(id="c1", name="Water", category="routine",
+             identifier="custom_ab", alert_trigger="record_only"),
+        _det(id="e1", name="Agitation", category="behaviour",
+             alert_trigger="leading", is_sustained=True, severity=60),
+    ]
+    entries = jd.build_entries(
+        detectors=dets, events_by_detector={}, tz=TZ,
+        sleep_row=None, activity_ticks=[],
+        detected_times_by_identifier={"custom_ab": [_local(10, 0)]},
+        streak_days_by_detector={"p1": 12},
+    )
+    kinds = {e["title"]: e["kind"] for e in entries}
+    assert kinds["Falls"] == "point"
+    assert kinds["Medication"] == "absence"
+    assert kinds["Sleep"] == "record_sleep"
+    assert kinds["Water"] == "record_count"
+    assert kinds["Agitation"] == "episode"
