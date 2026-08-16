@@ -310,6 +310,46 @@ _REQUIRE_GPU_FACES = os.environ.get(
 @app.on_event("startup")
 def _startup() -> None:
     global _ready
+    # ── Process-global probes (2026-08-16, post-pool falsification) ──
+    # The predictor-pool run proved private model instances do NOT stop
+    # the overlap corruption (17 drops/362 ticks vs control 63/721 —
+    # corrupted family), so the culprit is PROCESS-level state. These
+    # arms neutralize the three audited suspects one at a time, from
+    # OUR side, without touching vendored model code.
+    #
+    # Arm A: SAM3's close_session runs gc.collect() after EVERY ground
+    # and a device-wide torch.cuda.empty_cache() whenever VRAM use is
+    # above its threshold — mid-flight for every other pass. The old
+    # NEMARA_EXP_NO_EMPTY_CACHE arm only skipped OUR flush; SAM3's
+    # internal one ran in every matrix arm, so it was never falsified.
+    # This stubs both process-wide (supersedes the old arm).
+    if os.environ.get("NEMARA_EXP_SAM3_NO_GC", "").strip() in ("1", "true"):
+        import gc as _gc
+
+        import torch as _torch
+        _gc.collect = lambda *a, **k: 0
+        if _torch.cuda.is_available():
+            _torch.cuda.empty_cache = lambda *a, **k: None
+        log.warning(
+            "EXP arm A: gc.collect + cuda.empty_cache stubbed process-wide",
+        )
+    # Arm B: both models write the process-global SDPA backend enables
+    # on the hot path (SAM3 unconditionally per attention call; EdgeTAM
+    # via a save/flip/restore context that mis-restores under
+    # interleaving). Pin all three ON once, then no-op the setters so
+    # nothing can flip them mid-inference. EdgeTAM's context manager is
+    # neutralized at its module in continuous._get_edge (same env).
+    if os.environ.get("NEMARA_EXP_SDP_PIN", "").strip() in ("1", "true"):
+        import torch as _torch
+        _torch.backends.cuda.enable_flash_sdp(True)
+        _torch.backends.cuda.enable_math_sdp(True)
+        _torch.backends.cuda.enable_mem_efficient_sdp(True)
+        _torch.backends.cuda.enable_flash_sdp = lambda *a, **k: None
+        _torch.backends.cuda.enable_math_sdp = lambda *a, **k: None
+        _torch.backends.cuda.enable_mem_efficient_sdp = lambda *a, **k: None
+        log.warning(
+            "EXP arm B: SDPA backend flags pinned all-on, setters no-oped",
+        )
     t0 = time.time()
     provider = "worker-failed"
     try:

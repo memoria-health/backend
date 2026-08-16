@@ -172,6 +172,18 @@ def _get_edge():
         if _EDGE_ROOT not in sys.path:
             sys.path.insert(0, _EDGE_ROOT)
         from sam2.build_sam import build_sam2_video_predictor
+        # Arm B (see server._startup): EdgeTAM's sdp_kernel_context
+        # save/flips/restores the PROCESS-global SDPA backend flags
+        # around every attention op — interleaved enter/exit from two
+        # passes mis-restores them. With the flags pinned all-on at
+        # startup the context is pure hazard, so neutralize it at the
+        # module (looked up per call, so patching any time works).
+        if os.environ.get("NEMARA_EXP_SDP_PIN", "").strip() in ("1", "true"):
+            from sam2.modeling.sam import transformer as _s2t
+            _s2t.sdp_kernel_context = (
+                lambda dropout_p: _contextlib.nullcontext()
+            )
+            log.warning("EXP arm B: sam2 sdp_kernel_context -> nullcontext")
         edge = build_sam2_video_predictor(
             _EDGE_CFG, _EDGE_CKPT, device="cuda",
         )
