@@ -720,7 +720,16 @@ def _infer_meta_prompt(*, name: str | None, prompt: str) -> str:
         "count into one. If the request says count / how many / how often, "
         "is_sustained is false. Instantaneous events (a fall, choking, "
         "arriving) are always false. 'trailing' and 'duration' are always "
-        "sustained; record_only counting requests are never sustained.\n\n"
+        "sustained. CONTEXT: the system analyzes video in ~10-second "
+        "chunks. An action that fits inside one chunk (a sip, standing "
+        "up) is an INSTANCE — not sustained, counted per occurrence. An "
+        "activity spanning many consecutive chunks (watching TV, "
+        "sleeping, pacing) IS sustained — chunks latch into one episode. "
+        "For record_only this choice sets the REPORTING UNIT: sustained "
+        "records duration (minutes/sessions per day), not-sustained "
+        "records a count (times per day). 'Count how much TV' is "
+        "sustained (you count minutes); 'count sips of water' is not "
+        "(you count instances).\n\n"
         "JSON fields:\n"
         '  "alert_trigger": "leading" | "trailing" | "duration" | "absence" | "record_only"\n'
         '  "is_sustained": true | false\n'

@@ -675,12 +675,12 @@ async def create_detector(
         category=body.category.value,
         source="custom",
         alert_trigger=body.alert_trigger.value,
-        # Tenet guard: record_only means "record instances, never alert"
-        # — the sustained latch exists for alerting episodes and would
-        # collapse counted instances into one. Matches the built-in
-        # record streams (sleep/activity), which are never sustained.
-        is_sustained=(body.is_sustained
-                      and body.alert_trigger.value != "record_only"),
+        # For record_only, is_sustained is the REPORTING UNIT chosen at
+        # infer (10s-chunk context in the prompt): sustained = duration
+        # (TV minutes), not sustained = instance count (sips). No blanket
+        # override — a forced false here made 40 min of TV read as ~240
+        # "instances" (one per analysis chunk).
+        is_sustained=body.is_sustained,
         duration_seconds=(
             body.duration_seconds
             if body.alert_trigger == AlertTrigger.duration else None
