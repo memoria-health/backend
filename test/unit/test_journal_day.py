@@ -51,26 +51,22 @@ def test_hour_x_noon_axis_wraps_evening_before_morning() -> None:
 
 # ── activity (pinned definition) ─────────────────────────────────────
 
-def test_activity_blocks_need_ten_moving_minutes_per_half_hour() -> None:
-    # 9:00-9:30 bucket: 70 moving ticks (11.7 min) → block.
-    # 10:00-10:30 bucket: 30 moving ticks (5 min) → no block.
-    ticks = [( _local(9, 0) + timedelta(seconds=10 * i), "active")
-             for i in range(70)]
-    ticks += [(_local(10, 0) + timedelta(seconds=10 * i), "standing")
-              for i in range(30)]
-    ticks += [(_local(10, 5) + timedelta(seconds=10 * i), "lying")
-              for i in range(60)]
+def test_activity_is_a_ratio_not_a_timeline() -> None:
+    ticks = [(_local(9, 0) + timedelta(seconds=10 * i), "active")
+             for i in range(100)]
+    ticks += [(_local(12, 0) + timedelta(seconds=10 * i), "lying")
+              for i in range(200)]
     entry = jd.activity_line(ticks, TZ)
-    assert entry["strip"]["spans"] == [[9.0, 9.5]]
-    # 100 moving ticks ≈ 16.7 min → "about 15 m" rounding to 15-min steps
-    assert "up and moving" in entry["line"]["primary"]
+    assert entry["strip"] is None
+    assert entry["ratio"] == {"active_minutes": 17, "labeled_minutes": 50}
+    assert entry["line"]["primary"] == "About 15 m active"
 
 
 def test_activity_reports_hours_when_large() -> None:
     ticks = [(_local(9, 0) + timedelta(seconds=10 * i), "active")
              for i in range(1080)]  # 3 h of moving ticks
     entry = jd.activity_line(ticks, TZ)
-    assert entry["line"]["primary"] == "About 3 h up and moving"
+    assert entry["line"]["primary"] == "About 3 h active"
 
 
 # ── sleep (noon axis) ────────────────────────────────────────────────
@@ -275,3 +271,26 @@ def test_entries_carry_the_detector_icon() -> None:
     entry = jd.point_line(_det(icon_name="figure.fall"), [], TZ, streak_days=5)
     assert entry["icon"] == "figure.fall"
     assert jd.sleep_line(None, TZ)["icon"] == "bed.double"
+
+
+def test_multiple_point_events_say_twice_never_x2() -> None:
+    evs = [SimpleNamespace(id=f"e{i}", occurred_at=_local(7 + i, 35),
+                           location="Living Room", reviewed=True)
+           for i in range(2)]
+    entry = jd.point_line(_det(name="Wandering"), evs, TZ, streak_days=None)
+    assert entry["line"]["primary"] == "Wandering"
+    assert entry["line"]["meta"] == "Twice, first 7:35 AM"
+    assert "×" not in entry["line"]["primary"]
+
+
+def test_sleep_gaps_split_the_band() -> None:
+    bed = _local(22, 0, DAY - timedelta(days=1))
+    wake = _local(6, 0)
+    row = {"bedtime": bed, "wake_time": wake, "disturbances": 1,
+           "out_of_bed_events": [{"start": _local(2, 0).isoformat(),
+                                  "end": _local(2, 30).isoformat()}]}
+    entry = jd.sleep_line(row, TZ)
+    spans = entry["strip"]["spans"]
+    assert len(spans) == 2
+    assert abs(spans[0][1] - 14.0) < 0.01   # gap opens at 2 AM (noon axis)
+    assert abs(spans[1][0] - 14.5) < 0.01   # resumes 2:30 AM

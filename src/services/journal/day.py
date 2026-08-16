@@ -103,10 +103,14 @@ def point_line(det, events: list, tz: tzinfo, streak_days: int | None) -> dict:
         )
     status, review_id = _review_state(events)
     first = events[0]
-    meta = f"{_clock(first.occurred_at, tz)} · {first.location}"
-    primary = det.name if len(events) == 1 else f"{det.name} ×{len(events)}"
+    n = len(events)
+    if n == 1:
+        meta = f"{_clock(first.occurred_at, tz)}, {first.location}"
+    else:
+        word = "Twice" if n == 2 else f"{n} times"
+        meta = f"{word}, first {_clock(first.occurred_at, tz)}"
     marks = [hour_x(ev.occurred_at, tz) for ev in events]
-    return _entry(det, "point", primary, meta, status,
+    return _entry(det, "point", det.name, meta, status,
                   _strip("midnight", [], marks), review_id)
 
 
@@ -119,7 +123,7 @@ def episode_line(det, events: list, tz: tzinfo) -> dict:
         return _entry(det, "episode", f"No {det.name.lower()}", None, "ok", None)
     status, review_id = _review_state(events)
     n = len(events)
-    meta = f"{_clock(events[0].occurred_at, tz)} · {events[0].location}"
+    meta = f"{_clock(events[0].occurred_at, tz)}, {events[0].location}"
     marks = [hour_x(ev.occurred_at, tz) for ev in events]
     return _entry(det, "episode",
                   f"{n} episode{'' if n == 1 else 's'}", meta, status,
@@ -150,49 +154,68 @@ def sleep_line(row: dict | None, tz: tzinfo) -> dict:
     bed, wake = row["bedtime"], row["wake_time"]
     n = int(row.get("disturbances") or 0)
     meta = "no wake-ups" if n == 0 else f"{n} wake-up{'' if n == 1 else 's'}"
+    spans = _sleep_spans(bed, wake, row.get("out_of_bed_events"), tz)
     e = _entry(
         det, "record_sleep",
         f"{_clock(bed, tz)} – {_clock(wake, tz)}", meta, "none",
-        _strip("noon", [[hour_x(bed, tz, "noon"), hour_x(wake, tz, "noon")]], []),
+        _strip("noon", spans, []),
     )
     e["title"], e["category"], e["icon"] = "Sleep", "routine", "bed.double"
     return e
 
 
+def _sleep_spans(bed, wake, out_of_bed, tz: tzinfo) -> list[list[float]]:
+    """Split the night band at recorded out-of-bed intervals. The
+    summarizer owns the interval shape; anything unparseable degrades
+    to the unbroken band, never a fabricated gap."""
+    b, w = hour_x(bed, tz, "noon"), hour_x(wake, tz, "noon")
+    gaps: list[tuple[float, float]] = []
+    for item in (out_of_bed or []):
+        try:
+            gs = datetime.fromisoformat(str(item["start"]))
+            ge = datetime.fromisoformat(str(item.get("end") or item["start"]))
+            g0, g1 = hour_x(gs, tz, "noon"), hour_x(ge, tz, "noon")
+            if b < g0 < w:
+                gaps.append((g0, max(g0 + 0.15, min(g1, w))))
+        except Exception:
+            continue
+    spans, cursor = [], b
+    for g0, g1 in sorted(gaps):
+        if g0 > cursor:
+            spans.append([cursor, g0])
+        cursor = max(cursor, g1)
+    if cursor < w:
+        spans.append([cursor, w])
+    return spans or [[b, w]]
+
+
 def _moving_words(minutes: float) -> str:
     m15 = int(round(minutes / 15) * 15)
     if m15 <= 0:
-        return "Little movement seen"
+        return "Under 15 m active"
     if m15 < 60:
-        return f"About {m15} m up and moving"
+        return f"About {m15} m active"
     h, rem = divmod(m15, 60)
-    return f"About {h} h up and moving" if rem == 0 \
-        else f"About {h} h {rem} m up and moving"
+    return f"About {h} h active" if rem == 0 \
+        else f"About {h} h {rem} m active"
 
 
 def activity_line(ticks: list, tz: tzinfo) -> dict:
-    """ticks: [(captured_at, activity_state)] for the local day."""
-    moving_by_bucket: dict[float, int] = {}
-    moving_total = 0
-    for captured_at, state in ticks:
-        if state not in _MOVING_STATES:
-            continue
-        moving_total += 1
-        x = hour_x(captured_at, tz)
-        bucket = int(x / _BLOCK_BUCKET_HOURS) * _BLOCK_BUCKET_HOURS
-        moving_by_bucket[bucket] = moving_by_bucket.get(bucket, 0) + 1
-    need = _BLOCK_MIN_MOVING_MINUTES * 60 / _TICK_SECONDS
-    blocks = sorted(b for b, n in moving_by_bucket.items() if n >= need)
-    spans: list[list[float]] = []
-    for b in blocks:
-        if spans and abs(spans[-1][1] - b) < 1e-9:
-            spans[-1][1] = b + _BLOCK_BUCKET_HOURS
-        else:
-            spans.append([b, b + _BLOCK_BUCKET_HOURS])
-    minutes = moving_total * _TICK_SECONDS / 60
+    """ticks: [(captured_at, activity_state)] for the local day.
+    Renders as a two-color tug-of-war: active minutes vs the rest of
+    the observed, labeled time — a ratio, not a timeline, so there is
+    no axis to misread."""
+    moving = sum(1 for _, state in ticks if state in _MOVING_STATES)
+    labeled = len(ticks)
+    minutes = moving * _TICK_SECONDS / 60
     e = _entry(None, "record_activity", _moving_words(minutes), None, "none",
-               _strip("midnight", spans, []) if ticks else None)
+               None)
     e["title"], e["category"], e["icon"] = "Activity", "routine", "figure.walk"
+    if labeled:
+        e["ratio"] = {
+            "active_minutes": round(minutes),
+            "labeled_minutes": round(labeled * _TICK_SECONDS / 60),
+        }
     return e
 
 
