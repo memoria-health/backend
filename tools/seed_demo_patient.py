@@ -165,7 +165,12 @@ async def run(wipe: bool) -> None:
                          created_at=NOW - timedelta(days=60),
                          # Paired + recently seen, or the startup sweep
                          # flips the demo sensors offline.
-                         api_key_hash="seeded-demo", app_present=True)
+                         api_key_hash="seeded-demo", app_present=True,
+                         # The Live carousel requires an identity and a
+                         # connected intent before it will render a tile
+                         # (the DEBUG demo frame fills the video slot).
+                         livekit_identity=f"cam_demo_{i + 1}",
+                         desired_state="connected")
             cams.append(cam)
             s.add(cam)
         living, bedroom, kitchen = cams
