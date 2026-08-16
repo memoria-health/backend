@@ -295,7 +295,7 @@ def _startup() -> None:
     # ground plus a device-wide torch.cuda.empty_cache() under VRAM
     # pressure — a whole-GPU stall per ground. Stub both process-wide.
     # Needs a memory-growth soak before becoming fleet default.
-    if os.environ.get("NEMARA_EXP_SAM3_NO_GC", "").strip() in ("1", "true"):
+    if os.environ.get("NEMARA_SAM3_NO_GC", "").strip() in ("1", "true"):
         import gc as _gc
 
         import torch as _torch
@@ -310,7 +310,7 @@ def _startup() -> None:
     # tax). Pin all three ON once, no-op the setters; EdgeTAM's
     # flag-flipping context is neutralized in continuous._get_edge
     # (same env).
-    if os.environ.get("NEMARA_EXP_SDP_PIN", "").strip() in ("1", "true"):
+    if os.environ.get("NEMARA_SDP_PIN", "").strip() in ("1", "true"):
         import torch as _torch
         _torch.backends.cuda.enable_flash_sdp(True)
         _torch.backends.cuda.enable_math_sdp(True)
@@ -780,7 +780,7 @@ def _observe_sync(
         # Return cached blocks to the driver after every pass (leak
         # incident 2026-07-21): costs ~0.1-0.3s of re-allocation on the
         # next tick; 19GB of allocator drift cost the whole service.
-        # Under the no-gc lever (NEMARA_EXP_SAM3_NO_GC) empty_cache is
+        # Under the no-gc lever (NEMARA_SAM3_NO_GC) empty_cache is
         # a process-wide no-op and this call is inert by design.
         import torch
 

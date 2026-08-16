@@ -32,6 +32,91 @@ batch):
         backend (assigns homes+ports to nodes; reads /state for seat)
 ```
 
+## 0. Current architecture (2026-08-16, gpu-v3.3.1) — read this first
+
+Everything below this section still describes the system accurately
+EXCEPT where it says perception is "one process" and except the §5
+capacity numbers — both are superseded by the 2026-08-15/16
+concurrency campaign and its aftermath. The deltas:
+
+**The concurrency law (proven, not designed):** two inference passes
+running at the same time inside one perception process silently
+corrupt EdgeTAM's carry — a present, visible person vanishes with no
+error. Every Python-reachable cause was falsified by experiment
+(private per-pass model instances, gc/cache-flush stubs, kernel-flag
+pinning, YOLO serialization, all combined); only full serialization or
+separate processes ever produced zero drops (~5,000 scored ticks).
+The fault is below Python, in the CUDA/torch substrate threads share.
+Full evidence: docs/GPU-CROSS-CAMERA-BATCHING.md §1.
+
+**Therefore: N single-flight worker processes per node.**
+`NEMARA_PERCEPTION_WORKERS=N` (2 on a 24GB card; 3-4 on 48GB), each
+with `NEMARA_PERCEPTION_CONCURRENCY=1`, ports 8000..8000+N-1.
+Parallelism happens ACROSS processes; nothing overlaps within one.
+
+**Stateless workers + shared-queue dispatch (2026-08-16).** A camera's
+cross-tick state (previous masks bit-packed + counters, <200KB) is
+owned by its CameraLoop in the identity service and travels with every
+request (`session_state` in the raw-wire header; updated snapshot in
+the response). With `NEMARA_STATELESS_DISPATCH=1` the first free
+worker serves the next camera (loop.pod_for_dispatch); workers keep
+nothing. Flag off = the older camera→worker hash pin (loop.sam_for),
+kept as the revert.
+
+**Speed levers (single-flight-safe, in the image behind env flags):**
+- `NEMARA_SDP_PIN=1` — pin the process-global SDPA kernel flags once,
+  no-op the setters, neutralize sam2's per-call flag-flip context.
+  Both models flipped these on the hot path; removing the churn was
+  measured as a multi-x cadence gain.
+- `NEMARA_SAM3_NO_GC=1` — stub gc.collect + torch.cuda.empty_cache
+  process-wide. SAM3's close_session otherwise runs both after EVERY
+  ground (a device-wide stall mid-everyone-else's-inference). Needs a
+  long memory soak before becoming fleet default; clean in all runs so
+  far.
+
+**Measured capacity (4090, 2 workers, both levers, stateless dispatch,
+2026-08-16 ladder, 5-min holds, synthetic occupied rooms at 15fps):**
+
+| cameras | lag p50 / p95 | gpu | verdict |
+|---|---|---|---|
+| 5  | 0.30s / 0.82s  | 55-99% | in SLA |
+| 10 | 1.38s / 2.20s  | 98-99% | in SLA (was 6.11s pinned, 3.06s on the corrupted build) |
+| 15 | 4.78s / 7.29s  | 92-98% | in SLA |
+| 20 | 10.30s / 11.93s | 94-99% | just over — needs 48GB/4-worker or encoder batching |
+
+Zero identity drops in 995 scored ticks; all 20 cameras served by both
+workers (shared queue verified live). In-frame acceptance passed the
+same day: bedroom camera + 14 synthetics, seat held through stillness,
+orientation changes, and walking; the one flagged event was the
+YOLO-trigger→forced-reground self-heal closing in one tick.
+
+**Production node deployment (the runbook):**
+1. Build: push a `gpu-v*` tag → CI builds
+   `ghcr.io/aryamandarda/memoria-gpu:<tag>`.
+2. Create the pod with: the secrets block (DB, LiveKit, tokens, TS,
+   HF), `NEMARA_PERCEPTION_WORKERS=2` (24GB) with
+   `OMP/MKL/OPENBLAS_NUM_THREADS=4` (3-4 workers → pins=3),
+   `NEMARA_PERCEPTION_CONCURRENCY=1`, `NEMARA_STATELESS_DISPATCH=1`,
+   `NEMARA_SDP_PIN=1`, `NEMARA_TORCH_COMPILE=0`,
+   `NEMARA_TARGET_FPS=2.0`, capacity + roster poll, PUBLIC_KEY —
+   and **`allowedCudaVersions: ["12.4","12.5"]`** (newer-driver hosts
+   crash LiveKit NVDEC on multi-stream decode).
+   `NEMARA_SAM3_NO_GC=1` only on nodes you are willing to soak.
+3. Reconfiguring an existing node: PATCH the pod (image+env) in place
+   — same machine, no stock lottery, and the pod id keeps its home
+   assignments. Prefer this over create-and-migrate.
+4. Homes follow the roster; manual moves must move `identity_port`
+   WITH the home (the roster only assigns ports to unassigned homes).
+5. Experiment nodes additionally get `NEMARA_DEV_CODE=1`: every
+   service relaunch overlays code from `/persist/dev-code/nemara`
+   (rsync via any volume-mounted pod), and `POST /admin/exit`
+   (perception any worker port, identity any room port, bearer-authed)
+   restarts in seconds — the iteration loop is rsync + curl, never an
+   image build. Production nodes never set this.
+6. Logs: `GET :8000/logs` lists the shared log dir;
+   `GET :8000/logs?file=<name>&tail=N` tails one file. Note the dir is
+   the SHARED volume — filter by the node's container hostname.
+
 ## 1. Fleet layer — nodes are cattle
 
 - A node is a RunPod GPU pod created from an IMAGE TAG
@@ -173,7 +258,7 @@ checkpoints → tailscale supervisor → perception (log TEES to console
 with per-container filename — a file-only log on a shell-less node is
 a black box) → DB bridge (local rig) → tailnet name → roster agent.
 
-## 5. Measured performance and capacity (2026-08-13)
+## 5. Measured performance and capacity (2026-08-13) — SUPERSEDED by §0
 
 Question (Aryaman): how many concurrently-occupied cameras can one
 node serve with lag always under the 7-10s SLA, and what breaks first.

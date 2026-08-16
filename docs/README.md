@@ -1,8 +1,17 @@
 # docs
 
-> Last updated: 2026-07-27
+> Last updated: 2026-08-16
 
 Documentation for nemara-backend. The repo root keeps only [README.md](../README.md) (local dev quickstart); everything else lives here.
+
+**Identity / perception GPU stack — start here:**
+- [IDENTITY-GPU-ARCHITECTURE.md](IDENTITY-GPU-ARCHITECTURE.md) — the
+  master doc: architecture, the in-process concurrency law, worker
+  pool + stateless dispatch, measured capacity, and the production
+  deployment runbook (§0 is current; later sections are history).
+- [GPU-CROSS-CAMERA-BATCHING.md](GPU-CROSS-CAMERA-BATCHING.md) —
+  deferred capacity enhancement, with the full falsification evidence
+  behind the concurrency law.
 
 ## Layout
 
