@@ -96,7 +96,8 @@ def point_line(det, events: list, tz: tzinfo, streak_days: int | None) -> dict:
         return _entry(
             det, "point",
             f"No {det.name.lower()}",
-            f"{streak_days} days" if streak_days else None,
+            (f"{streak_days} day{'' if streak_days == 1 else 's'}"
+             if streak_days else None),
             "ok", None,
         )
     status, review_id = _review_state(events)
@@ -267,7 +268,11 @@ def build_entries(*, detectors: list, events_by_detector: dict, tz: tzinfo,
                 times = detected_times_by_identifier.get(det.identifier or "", [])
                 e = (duration_line(det, times, tz) if det.is_sustained
                      else count_line(det, times, tz))
-        elif det.alert_trigger == "absence":
+        elif det.alert_trigger == "absence" or (
+            (det.schedule_config or {}).get("deadline")
+        ):
+            # Legacy absence detectors (medication) predate the absence
+            # trigger value: leading + a schedule deadline.
             e = absence_line(det, events, tz)
         elif det.is_sustained:
             e = episode_line(det, events, tz)

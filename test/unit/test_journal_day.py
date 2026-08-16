@@ -212,3 +212,19 @@ def test_build_entries_dispatches_by_taxonomy() -> None:
     assert kinds["Sleep"] == "record_sleep"
     assert kinds["Water"] == "record_count"
     assert kinds["Agitation"] == "episode"
+
+
+def test_legacy_absence_routes_by_deadline_not_trigger() -> None:
+    det = _det(id="m1", name="Medication adherence", category="routine",
+               alert_trigger="leading",
+               schedule_config={"deadline": "21:00"})
+    entries = jd.build_entries(
+        detectors=[det], events_by_detector={}, tz=TZ, sleep_row=None,
+        activity_ticks=[], detected_times_by_identifier={},
+        streak_days_by_detector={})
+    assert entries[0]["kind"] == "absence"
+
+
+def test_one_day_streak_is_singular() -> None:
+    entry = jd.point_line(_det(), [], TZ, streak_days=1)
+    assert entry["line"]["meta"] == "1 day"
