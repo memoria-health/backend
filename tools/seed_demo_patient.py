@@ -238,7 +238,8 @@ async def run(wipe: bool) -> None:
             events.append(_event(
                 pid, dets["agitation"], _at(day, h, rng.randrange(59)),
                 living,
-                "A stretch of restless pacing in the late afternoon."))
+                "A stretch of restless pacing in the late afternoon.",
+                reviewed=day != 3))
         events.append(_event(
             pid, dets["stove_left_on"], _at(4, 12, 48), kitchen,
             "A burner stayed lit with nothing on it for twelve minutes "
@@ -247,16 +248,27 @@ async def run(wipe: bool) -> None:
             pid, dets["wandering"], _at(9, 23, 5), living,
             "The front door opened late; Margaret checked the porch and "
             "came back in."))
+        events.append(_event(
+            pid, dets["wandering"], _at(2, 23, 48), living,
+            "The front door opened just before midnight. Margaret stood in "
+            "the doorway for a moment before closing it.", reviewed=False))
         for day in (2, 3, 6, 8, 11):
             events.append(_event(
                 pid, tv, _at(day, 23, rng.randrange(5, 50)), living,
-                "Television on past 11 PM."))
+                "Television on past 11 PM.", reviewed=day != 2))
         # ── So-far-today texture (guarded to the past only).
         for cand in (
             _event(pid, dets["meal_eaten"], _at(0, 8, 10), kitchen,
                    "Margaret had breakfast at the kitchen table."),
             _event(pid, company, _at(0, 8, 15), kitchen,
                    "Her daughter shared coffee with her at breakfast."),
+            _event(pid, dets["stove_left_on"], _at(0, 11, 5), kitchen,
+                   "A burner stayed lit with an empty pan for eight "
+                   "minutes after breakfast.", reviewed=False),
+            _event(pid, dets["agitation"], _at(0, 10, 20), living,
+                   "Margaret circled the living room several times, "
+                   "picking things up and putting them down.",
+                   reviewed=False),
         ):
             if cand.occurred_at < datetime.now(TZ):
                 events.append(cand)
