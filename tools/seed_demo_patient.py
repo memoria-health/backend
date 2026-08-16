@@ -162,7 +162,10 @@ async def run(wipe: bool) -> None:
         for i, room in enumerate(["Living Room", "Bedroom", "Kitchen"]):
             cam = Camera(id=uuid4(), patient_id=pid, display_id=i + 1,
                          room=room, icon_name="web.camera", online=True,
-                         created_at=NOW - timedelta(days=60))
+                         created_at=NOW - timedelta(days=60),
+                         # Paired + recently seen, or the startup sweep
+                         # flips the demo sensors offline.
+                         api_key_hash="seeded-demo", app_present=True)
             cams.append(cam)
             s.add(cam)
         living, bedroom, kitchen = cams
@@ -205,7 +208,8 @@ async def run(wipe: bool) -> None:
         events.append(_event(
             pid, dets["agitation"], _at(1, 17, 10), living,
             "Margaret paced between the couch and the window for around "
-            "twenty minutes, wringing her hands and checking the door."))
+            "twenty minutes, wringing her hands and checking the door.",
+            reviewed=False))
         events.append(_event(
             pid, dets["meal_eaten"], _at(1, 12, 35), kitchen,
             "Margaret ate lunch at the kitchen table, finishing most of "
@@ -219,7 +223,7 @@ async def run(wipe: bool) -> None:
         events.append(_event(
             pid, tv, _at(1, 23, 25), living,
             "The television stayed on past 11 PM while Margaret dozed on "
-            "the couch."))
+            "the couch.", reviewed=False))
 
         # ── History (days 2-14): believable texture, all reviewed.
         for day in (2, 3, 5, 6, 8, 9, 10, 12, 13, 14):

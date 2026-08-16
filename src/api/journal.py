@@ -123,7 +123,8 @@ async def get_journal(
     # Last night's sleep = the night that ENDED on this day's morning
     # (sleep_nights.night_date is the evening's calendar date).
     sleep_row = (await session.execute(text("""
-        select bedtime, wake_time, duration_minutes, disturbances
+        select bedtime, wake_time, duration_minutes, disturbances,
+               out_of_bed_events
         from sleep_nights
         where patient_id = :p and night_date = :n
         """), {"p": patient_id, "n": day - timedelta(days=1)})).mappings().first()
