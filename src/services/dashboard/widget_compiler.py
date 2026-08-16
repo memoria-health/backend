@@ -162,11 +162,15 @@ def _rules_spec(det: _DetectorLike) -> dict:
                            windows=det.schedule_config)
         spec["caption_fields"] = ["adherence"]
     elif det.alert_trigger == "duration" or det.is_sustained:
-        if det.category == "behaviour":
+        if det.category == "behaviour" and not _is_night(det.when_scope):
+            # One week: the dow grid FOLDS days — 14 would silently
+            # stack two weeks into seven columns.
             spec.update(widget="week_heatmap", min_days=7)
-            base_params.update(heatmap=True, days=14, comparePrev=True)
+            base_params.update(heatmap=True, days=7, comparePrev=True)
             spec["caption_fields"] = ["delta"]
         else:
+            # Windowed sustained behaviours (TV after 11 PM) light one
+            # heatmap row forever — per-day bars say it better.
             spec.update(widget="duration_bars", ranges=_RANGED_DEFAULT)
             base_params.update(days=7, instances=True)
     elif det.subject_scope == "environment" and (

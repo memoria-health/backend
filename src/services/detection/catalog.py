@@ -1044,7 +1044,7 @@ CATALOG: tuple[CatalogEntry, ...] = (
         promotion_threshold=0.70,
         widget={"widget": "week_heatmap", "size": "wide", "title": "Agitation",
                 "params": {"metric": "events", "detector": "$self",
-                           "heatmap": True, "days": 14, "comparePrev": True},
+                           "heatmap": True, "days": 7, "comparePrev": True},
                 "caption_fields": ["delta"], "min_days": 7},
     ),
     # Convulsion REMOVED from the catalog (Aryaman 2026-07-28): the
