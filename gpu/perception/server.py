@@ -405,6 +405,72 @@ def health():
     return body
 
 
+# ── Experiment ergonomics (2026-08-16, Aryaman: kill the 30-min
+# debug loop). /admin/exit restarts this worker under its entrypoint
+# supervisor — which re-copies /persist/dev-code first when
+# NEMARA_DEV_CODE=1 — so a code iteration is rsync + curl, no image
+# build, no SSH. /logs tails the shared log directory over HTTP so
+# scoring needs no log-reader pod. Both behind the same bearer auth
+# as /observe.
+_LOGDIR = os.environ.get("NEMARA_LOGDIR", "/persist/state/logs")
+
+
+@app.post("/admin/exit")
+async def admin_exit(request: Request) -> JSONResponse:
+    """Exit(0) shortly after replying; the entrypoint supervisor
+    relaunches (fresh dev code first when NEMARA_DEV_CODE=1)."""
+    _require_auth(request)
+
+    def _die() -> None:
+        time.sleep(0.3)
+        os._exit(0)
+
+    threading.Thread(target=_die, daemon=True).start()
+    return JSONResponse({"status": "restarting"})
+
+
+@app.get("/logs")
+async def logs(request: Request, file: str = "", tail: int = 400):
+    """List log files (no `file`) or tail one. `file` is a bare name
+    inside the log dir — path components are rejected."""
+    _require_auth(request)
+    import pathlib
+    root = pathlib.Path(_LOGDIR)
+    if not file:
+        try:
+            entries = sorted(
+                root.iterdir(), key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )[:50]
+        except OSError:
+            raise HTTPException(503, "log dir unavailable")
+        return {"files": [
+            {"name": p.name, "bytes": p.stat().st_size,
+             "mtime": int(p.stat().st_mtime)}
+            for p in entries if p.is_file()
+        ]}
+    if "/" in file or "\\" in file or file.startswith("."):
+        raise HTTPException(400, "bare filenames only")
+    path = root / file
+    if not path.is_file():
+        raise HTTPException(404, "no such log")
+    tail = max(1, min(int(tail), 20000))
+    from fastapi.responses import PlainTextResponse
+
+    def _tail() -> str:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            # ~200 bytes/line generous estimate, capped at 32MB
+            take = min(size, min(tail * 200, 32_000_000))
+            fh.seek(size - take)
+            data = fh.read()
+        lines = data.decode(errors="replace").splitlines()
+        return "\n".join(lines[-tail:]) + "\n"
+
+    return PlainTextResponse(await asyncio.to_thread(_tail))
+
+
 # Display-veto concept (2026-07-21, screen-face incident): measured on
 # the incident frames — finds displays reliably; phantom containment
 # 1.0 vs patient 0.13. Compound prompts win in SAM3 grounding (same

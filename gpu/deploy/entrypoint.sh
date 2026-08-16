@@ -134,6 +134,21 @@ fi
 # processes reach the extra workers via NEMARA_POD_URLS (exported
 # below); camera→worker assignment is a stable hash in loop.sam_for.
 WORKERS="${NEMARA_PERCEPTION_WORKERS:-1}"
+
+# DEV CODE MODE (2026-08-16, experiment ergonomics): with
+# NEMARA_DEV_CODE=1, every service (re)launch first overlays the code
+# from the SHARED volume — pushed there by rsync through any pod that
+# mounts it — so an iteration is rsync + POST /admin/exit (seconds),
+# not an image build (30 min). EXPERIMENT NODES ONLY: production runs
+# immutable tagged images, which is why pod.sh-style rsync deploys
+# were deleted in the first place.
+dev_code_overlay() {
+  if [ "${NEMARA_DEV_CODE:-}" = "1" ] && [ -d /persist/dev-code/nemara ]; then
+    cp -a /persist/dev-code/nemara/. /workspace/nemara/ 2>/dev/null \
+      && log "dev-code overlay applied from /persist/dev-code/nemara"
+  fi
+}
+
 w=0
 while [ "$w" -lt "$WORKERS" ]; do
   PPORT=$((${PERCEPTION_PORT:-8000} + w))
@@ -161,6 +176,7 @@ while [ "$w" -lt "$WORKERS" ]; do
         pkill -9 -f "multiprocessing.spawn" 2>/dev/null
         pkill -9 -f "multiprocessing.resource_tracker" 2>/dev/null
       fi
+      dev_code_overlay
       t0=$(date +%s)
       NEMARA_FACE_PIDFILE="$FACEPID" python3 -m uvicorn perception.server:app \
         --host "${PERCEPTION_HOST:-127.0.0.1}" \
@@ -363,6 +379,7 @@ for room in "${ROOMS[@]}"; do
   (
     while true; do
       cd "$STATE_DIR/$room" || exit 1
+      dev_code_overlay
       # --patient explicitly: its argparse default is a hardcoded pilot UUID,
       # which on any other home would silently bind the wrong patient.
       python3 -m identity.service \

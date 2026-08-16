@@ -88,6 +88,26 @@ def index() -> HTMLResponse:
     )
 
 
+@app.post("/admin/exit")
+def admin_exit(request: Request) -> JSONResponse:
+    """Exit(0) shortly after replying; the entrypoint supervisor
+    relaunches this room (fresh dev code first under NEMARA_DEV_CODE=1
+    — experiment-node iteration without an image build). Same auth as
+    /state."""
+    from identity.contract import auth_ok
+
+    if not auth_ok(
+        request.headers.get("authorization"), _STATE_TOKEN,
+    ):
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    def _die() -> None:
+        time.sleep(0.3)
+        os._exit(0)
+
+    threading.Thread(target=_die, daemon=True).start()
+    return JSONResponse({"status": "restarting"})
+
+
 @app.get("/state")
 def state(request: Request) -> JSONResponse:
     from identity.contract import STATE_CONTRACT, auth_ok
