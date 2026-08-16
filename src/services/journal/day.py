@@ -251,12 +251,27 @@ def duration_line(det, tick_times: list, tz: tzinfo) -> dict:
 def build_entries(*, detectors: list, events_by_detector: dict, tz: tzinfo,
                   sleep_row: dict | None, activity_ticks: list,
                   detected_times_by_identifier: dict,
-                  streak_days_by_detector: dict) -> list[dict]:
-    """Route each active detector to its taxonomy's builder. Pure — the
-    endpoint does the queries, this does the shape."""
+                  streak_days_by_detector: dict,
+                  coverage_hours: int = 24) -> list[dict]:
+    """Route each detector to its taxonomy's builder. Pure — the
+    endpoint does the queries, this does the shape.
+
+    Honesty rules (phase review, Aug 16):
+      - A detector that is OFF still contributes its line on days it
+        HAS events — history never vanishes on a toggle. Off detectors
+        with nothing that day are skipped (no quiet claims for them).
+      - When the day had zero watched hours, quiet lines say
+        "Not watched" instead of asserting a clean bill that was never
+        observed.
+    """
     entries: list[dict] = []
     for det in detectors:
         events = events_by_detector.get(str(det.id), [])
+        if not getattr(det, "is_on", True):
+            had_ticks = bool(detected_times_by_identifier.get(
+                det.identifier or ""))
+            if not events and not had_ticks:
+                continue
         if det.alert_trigger == "record_only":
             if det.identifier == "sleep":
                 e = sleep_line(sleep_row, tz)
@@ -280,4 +295,12 @@ def build_entries(*, detectors: list, events_by_detector: dict, tz: tzinfo,
             e = point_line(det, events, tz,
                            streak_days_by_detector.get(str(det.id)))
         entries.append(e)
+    if coverage_hours == 0:
+        for e in entries:
+            quiet = (e["line"]["status"] == "ok"
+                     or (e["kind"].startswith("record") and e["strip"] is None))
+            if quiet:
+                e["line"] = {"primary": "Not watched", "meta": None,
+                             "status": "none"}
+                e["strip"] = None
     return entries

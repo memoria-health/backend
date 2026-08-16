@@ -228,3 +228,44 @@ def test_legacy_absence_routes_by_deadline_not_trigger() -> None:
 def test_one_day_streak_is_singular() -> None:
     entry = jd.point_line(_det(), [], TZ, streak_days=1)
     assert entry["line"]["meta"] == "1 day"
+
+
+def test_unwatched_day_never_claims_clean(  ) -> None:
+    dets = [_det(id="p1", name="Falls", severity=95),
+            _det(id="a1", name="Medication", category="routine",
+                 alert_trigger="absence",
+                 schedule_config={"deadline": "21:00"})]
+    entries = jd.build_entries(
+        detectors=dets, events_by_detector={}, tz=TZ, sleep_row=None,
+        activity_ticks=[], detected_times_by_identifier={},
+        streak_days_by_detector={}, coverage_hours=0)
+    for e in entries:
+        assert e["line"]["primary"] == "Not watched"
+        assert e["line"]["status"] == "none"
+
+
+def test_unwatched_day_still_shows_events() -> None:
+    ev = SimpleNamespace(id="e9", occurred_at=_local(2, 14),
+                         location="Living Room", reviewed=False)
+    entries = jd.build_entries(
+        detectors=[_det(id="p1")], events_by_detector={"p1": [ev]}, tz=TZ,
+        sleep_row=None, activity_ticks=[], detected_times_by_identifier={},
+        streak_days_by_detector={}, coverage_hours=0)
+    assert entries[0]["line"]["status"] == "review"
+
+
+def test_off_detector_keeps_its_event_history() -> None:
+    ev = SimpleNamespace(id="e8", occurred_at=_local(9, 0),
+                         location="Kitchen", reviewed=False)
+    on_quiet = _det(id="q1", name="Choking", is_on=True)
+    off_with_event = _det(id="p1", name="Falls", is_on=False)
+    off_quiet = _det(id="p2", name="Wandering", is_on=False)
+    entries = jd.build_entries(
+        detectors=[on_quiet, off_with_event, off_quiet],
+        events_by_detector={"p1": [ev]}, tz=TZ, sleep_row=None,
+        activity_ticks=[], detected_times_by_identifier={},
+        streak_days_by_detector={}, coverage_hours=14)
+    titles = [e["title"] for e in entries]
+    assert "Falls" in titles          # history survives the toggle
+    assert "Wandering" not in titles  # no quiet claims for off detectors
+    assert "Choking" in titles

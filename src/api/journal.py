@@ -58,11 +58,10 @@ async def get_journal(
     end = start + timedelta(days=1)
     today_local = datetime.now(tz).date()
 
-    detectors = [
-        d for d in await detector_repo.list_for_patient(
-            session, patient_id, caregiver_id=auth.id)
-        if d.is_on
-    ]
+    # ALL displayed detectors, on or off — build_entries keeps history
+    # for off detectors that have events, and skips their quiet lines.
+    detectors = list(await detector_repo.list_for_patient(
+        session, patient_id, caregiver_id=auth.id))
 
     # The day's events, grouped per detector.
     events = (await session.execute(
@@ -135,6 +134,7 @@ async def get_journal(
         activity_ticks=activity_ticks,
         detected_times_by_identifier=detected_times,
         streak_days_by_detector=streaks,
+        coverage_hours=int(cov["n"]),
     )
     return {
         "date": date,
