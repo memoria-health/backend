@@ -209,10 +209,10 @@ async def run(wipe: bool) -> None:
         # the 47-day streak holds because reviewed-wrong never counts.
         events.append(_event(
             pid, dets["fall"], _at(2, 0, 17), living,
-            "Margaret bent down quickly to pick up a dropped book and "
-            "steadied herself on the coffee table. Flagged as a possible "
-            "fall; you reviewed the clip and marked that nothing "
-            "happened.", clip_key=FALL_CLIP_KEY, choice="wrong"))
+            "Margaret reached over the desk and fell flat onto her side. "
+            "She stayed down for a few moments, then pushed herself up "
+            "with the chair and steadied herself.",
+            clip_key=FALL_CLIP_KEY, choice="wrong"))
 
         # ── HERO DAY (yesterday) ─────────────────────────────────
         events.append(_event(
