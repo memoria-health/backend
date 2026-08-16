@@ -104,7 +104,15 @@ YOLO-trigger→forced-reground self-heal closing in one tick.
    `NEMARA_SAM3_NO_GC=1` only on nodes you are willing to soak.
 3. Reconfiguring an existing node: PATCH the pod (image+env) in place
    — same machine, no stock lottery, and the pod id keeps its home
-   assignments. Prefer this over create-and-migrate.
+   assignments. Prefer this over create-and-migrate. CAVEAT (bitten
+   2026-08-16): the restart's image pull can exceed the roster's 90s
+   staleness window, so the sweeper may release the node's homes to
+   whoever polls next — after any PATCH, verify home assignments and
+   re-pin any that moved. Also: a room stopped on one node does not
+   un-publish its tailnet port there, and `tailscale serve` state can
+   thin out across reconciliations — if a room's port stops answering
+   while its process logs look healthy, bump the room's
+   `identity_port` in the DB; the restart re-serves it.
 4. Homes follow the roster; manual moves must move `identity_port`
    WITH the home (the roster only assigns ports to unassigned homes).
 5. Experiment nodes additionally get `NEMARA_DEV_CODE=1`: every
