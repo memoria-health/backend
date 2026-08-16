@@ -153,9 +153,12 @@ def _rules_spec(det: _DetectorLike) -> dict:
         spec["params"] = {"metric": "daysSince", "detector": str(det.id)}
         spec["caption_fields"] = ["longest_gap"]
     elif det.alert_trigger == "record_only":
-        # No "D" on trends: one bucket is a dot, not a trend.
-        spec.update(widget="trend_band", min_days=7, ranges=_RANGED_DEFAULT)
-        base_params.update(days=30, baseline=True)
+        # Custom record_only detectors never promote events — their
+        # per-day instance counts come from analyses via detectedTicks.
+        # (Built-in sleep/activity carry pinned templates instead.)
+        spec.update(widget="count_bars", min_days=3, ranges=_RANGED_DEFAULT)
+        spec["params"] = {"metric": "detectedTicks",
+                          "detector": str(det.id), "days": 7}
     elif det.alert_trigger == "absence" and det.schedule_config:
         spec.update(widget="dot_calendar")
         base_params.update(mode="adherence", days=14,

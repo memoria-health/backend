@@ -61,9 +61,10 @@ def test_hidden_setup_test_compiles_to_none() -> None:
 
 # ── customs: trigger-shape rules ─────────────────────────────────────
 
-def test_custom_record_only_is_trend_band() -> None:
+def test_custom_record_only_counts_ticks_not_events() -> None:
     spec = compile_widget(_det(alert_trigger="record_only"))
-    assert spec["widget"] == "trend_band"
+    assert spec["widget"] == "count_bars"
+    assert spec["params"]["metric"] == "detectedTicks"
     assert spec["compiler"] == "rules"
 
 
@@ -115,7 +116,7 @@ def test_severity_outranks_environment_scope() -> None:
 
 def test_severity_does_not_hijack_non_leading_triggers() -> None:
     spec = compile_widget(_det(alert_trigger="record_only", severity=95))
-    assert spec["widget"] == "trend_band"
+    assert spec["widget"] == "count_bars"
 
 
 def test_custom_night_window_leading_is_hour_clock() -> None:

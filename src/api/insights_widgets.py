@@ -292,6 +292,35 @@ async def widget_data(
             ),
         }
 
+    # ── detectedTicks: record_only customs ──────────────────────
+    # A record_only detector never promotes events (records, not
+    # alarms) — its truth lives in analyses.detector_fields. This is
+    # the per-day instance count for counting-style customs.
+    if metric == "detectedTicks":
+        ident = None
+        if det:
+            row = (await session.execute(text(
+                "select identifier from detectors where id = :i"),
+                {"i": UUID(det)})).first()
+            ident = row[0] if row else None
+        if not ident:
+            return {"kind": "series", "rows": [], "statValue": None,
+                    "unavailable": "detector is still compiling"}
+        rows = (await session.execute(text("""
+            select to_char(date_trunc(:gran, captured_at)::date, 'YYYY-MM-DD') as bucket,
+                   count(*) filter (where (detector_fields->>:f) = 'true')::int as n
+            from analyses
+            where patient_id = any(:ids)
+              and captured_at >= now() - (:days * interval '1 day')
+            group by 1 order by 1
+            """), {"ids": patient, "days": d, "gran": gran,
+                   "f": f"{ident}_detected"})).mappings().all()
+        filled = fill_buckets(
+            [{"bucket": r["bucket"], "events": int(r["n"])} for r in rows],
+            ["events"], d, gran, "zero")
+        return {"kind": "series", "terms": ["events"], "rows": filled,
+                "statValue": str(sum(int(r["n"]) for r in rows))}
+
     # ── activity ────────────────────────────────────────────────
     if metric == "activity":
         if source.get("byHour"):
