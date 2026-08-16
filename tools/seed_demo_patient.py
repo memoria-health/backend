@@ -1,9 +1,9 @@
-"""Demo seed: Margaret Ellis + historical data for every widget shape.
+"""Demo seed: Margaret Ellis + historical data for every journal line kind.
 
 Local/dev only — creates a SYNTHETIC patient on the caregiver account that owns
 'Aryaman Darda' (falls back to the first caregiver),
 detectors across all four categories (presets + two customs, incl. a
-Care custom since Care has no built-ins), compiled widget specs, and
+Care custom since Care has no built-ins) and
 ~60 days of history shaped so each chart has something honest to show:
 
   fall (streak 47d) · wandering (night exits, 2 of 14 nights) ·
