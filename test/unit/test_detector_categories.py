@@ -160,18 +160,10 @@ def test_category_is_no_longer_a_near_constant():
     )
 
 
-def test_reclassified_detectors_kept_their_severity():
-    """The whole safety argument for the reclassification: moving a label must
-    not move treatment. `distress` is the case that would bite — it leaves
-    'safety' but must stay above the inclusive-prompt threshold."""
-    from src.services.detection import catalog, catalog_v2
-
-    specs = {s.key: s for s in catalog.CATALOG}
-    assert specs["distress"].category == "behaviour"
-    assert catalog_v2.DIMS["distress"].severity >= INCLUSIVE_BIAS_SEVERITY
-    assert _is_high_stakes(
-        category="behaviour", severity=catalog_v2.DIMS["distress"].severity
-    ) is True
+# test_reclassified_detectors_kept_their_severity deleted 2026-08-16:
+# its subject was `distress`, removed with the whole child cohort (the
+# app never displayed it). The reclassification-safety property it
+# guarded lives on via the severity pins in test_catalog_v2.
 
 
 def test_care_is_empty_and_that_is_deliberate():

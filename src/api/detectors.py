@@ -675,7 +675,12 @@ async def create_detector(
         category=body.category.value,
         source="custom",
         alert_trigger=body.alert_trigger.value,
-        is_sustained=body.is_sustained,
+        # Tenet guard: record_only means "record instances, never alert"
+        # — the sustained latch exists for alerting episodes and would
+        # collapse counted instances into one. Matches the built-in
+        # record streams (sleep/activity), which are never sustained.
+        is_sustained=(body.is_sustained
+                      and body.alert_trigger.value != "record_only"),
         duration_seconds=(
             body.duration_seconds
             if body.alert_trigger == AlertTrigger.duration else None
