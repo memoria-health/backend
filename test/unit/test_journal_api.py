@@ -74,3 +74,22 @@ async def test_shape_with_no_detectors(owned) -> None:
     assert out["sections"] == []
     assert out["timezone"] == "America/Los_Angeles"
     assert out["partial"] in (True, False)
+
+
+async def test_reviewed_wrong_events_do_not_reach_the_day(owned) -> None:
+    from types import SimpleNamespace as NS
+    from datetime import datetime, timezone
+    ev_ok = NS(detector_id="d1", review_choice=None, reviewed=False,
+               occurred_at=datetime(2026, 8, 15, 9, tzinfo=timezone.utc),
+               id="e1", location="X")
+    ev_wrong = NS(detector_id="d1", review_choice="wrong", reviewed=True,
+                  occurred_at=datetime(2026, 8, 15, 10, tzinfo=timezone.utc),
+                  id="e2", location="X")
+    session = _Session([
+        ("from caregivers", [("UTC",)]),
+        ("FROM events", [ev_ok, ev_wrong]),      # ORM select renders caps
+        ("date_trunc('hour'", [{"n": 5}]),
+    ])
+    out = await journal.get_journal(owned, SimpleNamespace(id=uuid4()),
+                                    session, date="2026-08-15")
+    assert out["coverage_hours"] == 5

@@ -91,7 +91,7 @@ def _custom(patient_id, name, category, i, *, identifier=None,
 
 
 def _event(patient_id, det, occurred_at, camera, narrative, *,
-           reviewed=True, clip_key=None):
+           reviewed=True, clip_key=None, choice=None):
     return Event(
         id=uuid4(), patient_id=patient_id, category=det.category,
         source=det.source, icon_name=det.icon_name,
@@ -100,7 +100,7 @@ def _event(patient_id, det, occurred_at, camera, narrative, *,
         narrative=narrative,
         opened=reviewed, reviewed=reviewed, created_at=occurred_at,
         detector_id=det.id, camera_id=camera.id,
-        review_choice="correct" if reviewed else None,
+        review_choice=(choice or "correct") if reviewed else None,
         clip_storage_key=clip_key,
     )
 
@@ -203,6 +203,16 @@ async def run(wipe: bool) -> None:
             "sat down hard on the rug. She stayed alert, and got up with "
             "help from the sofa arm after about a minute.",
             clip_key=FALL_CLIP_KEY))
+
+        # A recent flagged-then-cleared fall carrying the SAME real
+        # clip: the Events page showpiece (video + review flow), while
+        # the 47-day streak holds because reviewed-wrong never counts.
+        events.append(_event(
+            pid, dets["fall"], _at(2, 15, 42), living,
+            "Margaret bent down quickly to pick up a dropped book and "
+            "steadied herself on the coffee table. Flagged as a possible "
+            "fall; you reviewed the clip and marked that nothing "
+            "happened.", clip_key=FALL_CLIP_KEY, choice="wrong"))
 
         # ── HERO DAY (yesterday) ─────────────────────────────────
         events.append(_event(

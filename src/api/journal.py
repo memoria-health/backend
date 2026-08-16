@@ -72,6 +72,11 @@ async def get_journal(
     )).scalars().all()
     events_by_detector: dict[str, list] = {}
     for ev in events:
+        # Reviewed-as-wrong events are confirmed false alarms: they stay
+        # on the Events page, but the journal doesn't narrate them and
+        # they never break a streak — reviewing pays the caregiver back.
+        if ev.review_choice == "wrong":
+            continue
         if ev.detector_id is not None:
             events_by_detector.setdefault(str(ev.detector_id), []).append(ev)
 
@@ -113,6 +118,7 @@ async def get_journal(
         from events
         where patient_id = :p and detector_id is not null
           and occurred_at < :e
+          and review_choice is distinct from 'wrong'
         group by detector_id
         """), {"p": patient_id, "e": end})).mappings().all()
     streaks: dict[str, int] = {}
