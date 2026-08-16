@@ -30,47 +30,15 @@ import numpy as np
 
 log = logging.getLogger("perception.continuous")
 
-# EdgeTAM instances keyed by admission slot — slot 0 is the historic
-# process singleton; extra slots exist only under NEMARA_EXP_PRED_POOL
-# (see server.py and sam_track._SAM_SLOTS for the rationale). A pass
-# announces its slot via set_predictor_slot() on its own worker thread;
-# everything below it in the call stack (_propagate -> _get_edge) then
-# resolves to that pass's private instance.
-_EDGE_SLOTS: "dict[int, object]" = {}
-_edge_lock = threading.Lock()
-_EDGE_TLS = threading.local()
-
-
-def set_predictor_slot(slot: int) -> None:
-    """Pin THIS thread's perception pass to predictor slot `slot`.
-    Thread-local, not a ContextVar: the whole pass runs synchronously on
-    one to_thread worker, and worker threads are REUSED — so every pass
-    must set its slot on entry (server._observe_sync does)."""
-    _EDGE_TLS.slot = int(slot)
-
-
-def warm_edge(slot: int = 0) -> None:
-    """Build `slot`'s EdgeTAM instance now (startup warm) so the first
-    real tick on that slot doesn't pay the model-build latency."""
-    prev = getattr(_EDGE_TLS, "slot", 0)
-    _EDGE_TLS.slot = int(slot)
-    try:
-        _get_edge()
-    finally:
-        _EDGE_TLS.slot = prev
-# E2b-3 (2026-08-15 concurrency matrix): serialize ALL EdgeTAM
-# propagation behind one lock while SAM3 stays concurrent — isolates
-# whether the mid-carry dropout lives in the follower's internals.
-# Env-gated, off by default.
-_EDGE_SERIALIZE = os.environ.get(
-    "NEMARA_EXP_LOCK_EDGE", "",
-).strip() in ("1", "true")
-_EDGE_CALL_LOCK = threading.Lock()
+# Process-singleton EdgeTAM. Workers are single-flight and one
+# instance per process is correct: the 2026-08-15/16 campaign closed
+# with every in-process concurrency variant falsified (private
+# per-pass instances, serialization probes, global-state stubs — see
+# docs/GPU-CROSS-CAMERA-BATCHING.md §1), so that machinery was deleted.
 import contextlib as _contextlib
 
-
-def _edge_gate():
-    return _EDGE_CALL_LOCK if _EDGE_SERIALIZE else _contextlib.nullcontext()
+_EDGE = None
+_edge_lock = threading.Lock()
 _SESSIONS: "dict[str, CameraSession]" = {}
 _sessions_lock = threading.Lock()
 
@@ -159,31 +127,29 @@ _COMPILE = os.environ.get(
 
 
 def _get_edge():
-    """EdgeTAM (sam2) video predictor for the calling pass's slot."""
-    slot = int(getattr(_EDGE_TLS, "slot", 0))
-    got = _EDGE_SLOTS.get(slot)
-    if got is not None:
-        return got
+    """Process-singleton EdgeTAM (sam2) video predictor."""
+    global _EDGE
+    if _EDGE is not None:
+        return _EDGE
     with _edge_lock:
-        got = _EDGE_SLOTS.get(slot)
-        if got is not None:
-            return got
+        if _EDGE is not None:
+            return _EDGE
         import sys
         if _EDGE_ROOT not in sys.path:
             sys.path.insert(0, _EDGE_ROOT)
         from sam2.build_sam import build_sam2_video_predictor
-        # Arm B (see server._startup): EdgeTAM's sdp_kernel_context
-        # save/flips/restores the PROCESS-global SDPA backend flags
-        # around every attention op — interleaved enter/exit from two
-        # passes mis-restores them. With the flags pinned all-on at
-        # startup the context is pure hazard, so neutralize it at the
+        # SDP-pin lever (see server._startup): EdgeTAM's
+        # sdp_kernel_context flips the PROCESS-global SDPA backend
+        # flags around every attention op. With the flags pinned
+        # all-on at startup the context is pure per-call overhead
+        # (measured a large cadence tax), so neutralize it at the
         # module (looked up per call, so patching any time works).
         if os.environ.get("NEMARA_EXP_SDP_PIN", "").strip() in ("1", "true"):
             from sam2.modeling.sam import transformer as _s2t
             _s2t.sdp_kernel_context = (
                 lambda dropout_p: _contextlib.nullcontext()
             )
-            log.warning("EXP arm B: sam2 sdp_kernel_context -> nullcontext")
+            log.warning("lever: sam2 sdp_kernel_context -> nullcontext")
         edge = build_sam2_video_predictor(
             _EDGE_CFG, _EDGE_CKPT, device="cuda",
         )
@@ -208,11 +174,9 @@ def _get_edge():
                     "continuous.edgetam_compile_failed — "
                     "running eager", exc_info=True,
                 )
-        _EDGE_SLOTS[slot] = edge
-        log.info(
-            "continuous.edgetam_loaded ckpt=%s slot=%d", _EDGE_CKPT, slot,
-        )
-        return edge
+        _EDGE = edge
+        log.info("continuous.edgetam_loaded ckpt=%s", _EDGE_CKPT)
+        return _EDGE
 
 
 def _iou(a: np.ndarray, b: np.ndarray) -> float:
@@ -307,6 +271,74 @@ class CameraSession:
         # consecutive carry ticks where the person trigger saw FEWER
         # people than the carry (see person_trigger.should_force_reground)
         self._under_streak = 0
+
+    # ── Portable state (stateless-worker mode, 2026-08-16) ─────────
+    # Everything a camera needs to continue its identity across ticks
+    # is SMALL: the previous tick's final masks plus a few counters —
+    # EdgeTAM's heavy inference state is rebuilt from these each pass.
+    # Serializing it lets the identity service own it and hand each
+    # tick to ANY free worker (shared-queue dispatch) instead of
+    # pinning cameras to workers. Masks are bit-packed: 640x360 ≈ 29KB
+    # per track before base64 — loopback noise.
+    def to_state(self) -> dict:
+        """Portable snapshot of cross-tick state. Version-tagged so a
+        future shape change degrades to a fresh session, never a crash."""
+        import base64
+        masks = {}
+        for tid, m in self.last_masks.items():
+            mm = np.ascontiguousarray(m.astype(bool))
+            masks[str(int(tid))] = {
+                "shape": [int(mm.shape[0]), int(mm.shape[1])],
+                "bits": base64.b64encode(np.packbits(mm).tobytes()).decode(),
+            }
+        return {
+            "v": 1,
+            "epoch": self.epoch,
+            "tick": int(self.tick),
+            "next_id": int(self.next_id),
+            "last_ground": int(self.last_ground),
+            "under_streak": int(self._under_streak),
+            "masks": masks,
+        }
+
+    @classmethod
+    def from_state(
+        cls, camera_id: str, state: "dict | None",
+        *, reground_every: int = 5,
+    ) -> "CameraSession":
+        """Rebuild a session from to_state() output. Any malformed or
+        version-mismatched state yields a FRESH session (new epoch →
+        downstream re-binds cleanly) — bad state must degrade to a
+        re-ground, never crash a tick."""
+        import base64
+        s = cls(camera_id, reground_every=reground_every)
+        if not isinstance(state, dict) or int(state.get("v", 0) or 0) != 1:
+            return s
+        try:
+            s.epoch = str(state["epoch"])[:32]
+            s.tick = int(state["tick"])
+            s.next_id = int(state["next_id"])
+            s.last_ground = int(state["last_ground"])
+            s._under_streak = int(state.get("under_streak", 0))
+            masks: "dict[int, np.ndarray]" = {}
+            for tid, rec in (state.get("masks") or {}).items():
+                h, w = (int(v) for v in rec["shape"][:2])
+                if not (0 < h <= 4096 and 0 < w <= 4096):
+                    raise ValueError(f"mask dims {w}x{h}")
+                raw = np.frombuffer(
+                    base64.b64decode(rec["bits"]), dtype=np.uint8,
+                )
+                m = np.unpackbits(raw, count=h * w).reshape(h, w).astype(bool)
+                if m.any():
+                    masks[int(tid)] = m
+            s.last_masks = masks
+            return s
+        except Exception:  # noqa: BLE001 — degrade, never crash
+            log.warning(
+                "continuous.session_state_rejected cam=%s — fresh session",
+                camera_id, exc_info=True,
+            )
+            return cls(camera_id, reground_every=reground_every)
 
     # ── SAM3 grounding (periodic) ──────────────────────────────────
     def _ground(self, frames, person_thr, sam_pred) -> "dict[int, np.ndarray]":
@@ -428,7 +460,7 @@ class CameraSession:
             for fr in frames
         ]
         out: "dict[int, dict]" = {}
-        with _edge_gate(), torch.inference_mode(), torch.autocast(
+        with torch.inference_mode(), torch.autocast(
             "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available(),
         ), frame_tensor.staged_frames(
             tracked, edge, "cuda" if torch.cuda.is_available() else "cpu",

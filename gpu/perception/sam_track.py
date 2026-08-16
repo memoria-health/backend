@@ -27,32 +27,13 @@ import numpy as np
 
 log = logging.getLogger("perception.track")
 
-# Predictor instances keyed by admission slot. Slot 0 is the historic
-# process singleton and what every caller gets by default; extra slots
-# exist only under the NEMARA_EXP_PRED_POOL experiment (see server.py),
-# which hands each concurrently-admitted pass a PRIVATE instance. The
-# 2026-08-15 concurrency matrix localized the pass-overlap corruption
-# mostly to SAM3-vs-SAM3 overlap (58 drops -> 5 with only SAM3
-# serialized), so this model is the prime suspect for object-level
-# shared state. Builds are serialized: two multi-GB checkpoint loads
-# racing would spike VRAM at the worst moment.
-_SAM_SLOTS: "dict[int, object]" = {}
+# Process-singleton predictor. The 2026-08-15/16 concurrency campaign
+# is CLOSED: two passes overlapping in one process corrupt tracking at
+# a layer below Python (private instances, lock probes, and global-state
+# stubs were all falsified — see docs/GPU-CROSS-CAMERA-BATCHING.md §1),
+# so workers run single-flight and one instance per process is correct.
+_SAM = None
 _SAM_BUILD_LOCK = threading.Lock()
-
-# E2b-2 (2026-08-15 concurrency matrix): serialize ALL SAM3 passes
-# behind one lock while EdgeTAM stays concurrent — isolates whether the
-# corruption lives in SAM3's session machinery. Env-gated, off by
-# default; the whole-stream lock is deliberately coarse (held across a
-# track_stream's consumption) — an upper bound on SAM3 serialization.
-_SAM3_SERIALIZE = os.environ.get(
-    "NEMARA_EXP_LOCK_SAM3", "",
-).strip() in ("1", "true")
-_SAM3_LOCK = threading.Lock()
-import contextlib as _contextlib
-
-
-def _sam3_gate():
-    return _SAM3_LOCK if _SAM3_SERIALIZE else _contextlib.nullcontext()
 
 
 def _np(x):
@@ -61,16 +42,14 @@ def _np(x):
     return x.cpu().numpy() if hasattr(x, "cpu") else np.asarray(x)
 
 
-def get_sam(ckpt_path: str, slot: int = 0):
-    """Native SAM 3.1 multiplex video predictor for `slot` (see
-    _SAM_SLOTS). Existing callers pass no slot and keep the singleton."""
-    got = _SAM_SLOTS.get(slot)
-    if got is not None:
-        return got
+def get_sam(ckpt_path: str):
+    """Process-singleton native SAM 3.1 multiplex video predictor."""
+    global _SAM
+    if _SAM is not None:
+        return _SAM
     with _SAM_BUILD_LOCK:
-        got = _SAM_SLOTS.get(slot)
-        if got is not None:
-            return got
+        if _SAM is not None:
+            return _SAM
         import inspect
 
         from sam3.model_builder import build_sam3_multiplex_video_predictor
@@ -83,9 +62,9 @@ def get_sam(ckpt_path: str, slot: int = 0):
         pred.model.init_state = lambda **kw: orig(
             **{k: v for k, v in kw.items() if k in sig.parameters}
         )
-        _SAM_SLOTS[slot] = pred
-        log.info("sam_track.loaded ckpt=%s slot=%d", ckpt_path, slot)
-        return pred
+        _SAM = pred
+        log.info("sam_track.loaded ckpt=%s", ckpt_path)
+        return _SAM
 
 
 def mask_bbox(m: np.ndarray) -> tuple[float, float, float, float] | None:
@@ -156,8 +135,7 @@ def ground_frame0(
         return []
     path = _write_clip(frames_bgr)
     session_id = None
-    with _sam3_gate():
-      try:
+    try:
         with torch.autocast(
             "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available(),
         ):
@@ -171,7 +149,7 @@ def ground_frame0(
             ))
         outputs = seeded.get("outputs")
         return parse_frame(outputs, thr) if outputs is not None else []
-      finally:
+    finally:
         if session_id is not None:
             try:
                 pred.handle_request(request=dict(
@@ -221,15 +199,6 @@ def track_stream(
     `frames_bgr`, in order. Position indexes into frames_bgr; the
     caller owns any orig-index mapping. Masks are valid only during
     the yield (dropped by GC as the caller releases them)."""
-    with _sam3_gate():
-        yield from _track_stream_impl(
-            pred, frames_bgr, concept=concept, thr=thr,
-        )
-
-
-def _track_stream_impl(
-    pred, frames_bgr: list[np.ndarray], *, concept: str, thr: float,
-) -> Iterator[tuple[int, list]]:
     import cv2
 
     if not frames_bgr:

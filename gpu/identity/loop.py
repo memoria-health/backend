@@ -53,6 +53,16 @@ from identity.state import CameraState
 
 log = logging.getLogger(__name__)
 
+# Stateless-worker dispatch (2026-08-16): the camera's cross-tick
+# session state travels with every request (CameraLoop owns it) and any
+# free worker serves any camera — shared-queue dispatch instead of the
+# camera→worker pin. Requires a worker image that echoes session_state
+# (gpu-v3.3+); the loop logs loudly if it doesn't. Off = exactly the
+# pinned behavior.
+_STATELESS_DISPATCH = os.environ.get(
+    "NEMARA_STATELESS_DISPATCH", "",
+).strip() in ("1", "true")
+
 # ── Cadence + identity constants (pilot-calibration targets) ─────────
 ACTIVE_INTERVAL_S = 0.6        # batch cadence while the room is occupied
 NONPATIENT_INTERVAL_S = 4.0    # tiny scheduler v1: a camera with people
@@ -269,6 +279,33 @@ class IdentityHome:
         # per process, so a restart would reshuffle every camera onto a
         # different worker and throw away all their sessions.
         return pool[sum(camera_id.encode()) % len(pool)]
+
+    def pod_for_dispatch(self, camera_id: str) -> SamServiceClient:
+        """Shared-queue dispatch (stateless-worker mode, 2026-08-16):
+        first worker with a free admission slot serves the camera.
+
+        Only valid when the camera's session state travels WITH the
+        request (NEMARA_STATELESS_DISPATCH=1) — the pin in sam_for
+        exists solely because state used to live in worker memory.
+        One line of queueing theory motivates this: one line feeding k
+        cashiers beats k separate lines (measured: the pinned 2-worker
+        fleet sat at 6.1s@10 cams where a shared queue ran ~3.1s).
+
+        The scan starts at the camera's hash slot so an all-busy
+        moment degrades to exactly the old pinned behaviour, and
+        different cameras don't herd onto the same first worker."""
+        pool = [self.sam, *self.pods]
+        if len(pool) == 1:
+            return self.sam
+        start = sum(camera_id.encode()) % len(pool)
+        for i in range(len(pool)):
+            c = pool[(start + i) % len(pool)]
+            # No await between this check and the caller's acquire —
+            # asyncio is single-threaded, so the free slot cannot be
+            # stolen before the caller enters the semaphore.
+            if self.lock_for(c)._value > 0:
+                return c
+        return pool[start]
     journal: Optional[EventJournal] = None
     # camera-id-8-prefix → room name (from the cameras table) — every
     # user-facing surface shows ROOM NAMES, never raw ids (Aryaman).
@@ -460,6 +497,10 @@ class CameraLoop:
         self._probed_at = 0.0
         self._scanned_to = 0.0   # coverage-scan high-water mark (ring ts)
         self._pod_epoch: Optional[str] = None  # session-id-reuse guard
+        # Stateless-worker mode: THIS loop owns the camera's cross-tick
+        # perception state; {} = "stateless, no history yet" (the key's
+        # presence in the request is what switches the worker).
+        self._session_state: dict = {}
         self._probe_task: Optional[asyncio.Task] = None
         self.stage_ms: dict = {}     # per-batch stage timings (measured)
         self.probe_ms: dict = {}     # per-probe stage timings (measured)
@@ -650,7 +691,12 @@ class CameraLoop:
         )
         encode_ms = (time.time() - t_e) * 1000.0
         t_q = time.time()
-        _pod = self.home.sam_for(self.camera_id)
+        if _STATELESS_DISPATCH:
+            # Stateless mode: this loop owns the camera's cross-tick
+            # state and any free worker can serve the tick.
+            _pod = self.home.pod_for_dispatch(self.camera_id)
+        else:
+            _pod = self.home.sam_for(self.camera_id)
         async with self.home.lock_for(_pod):  # per-WORKER admission
             t0 = time.time()                 # queue wait ends here
             obs = await _pod.observe(
@@ -660,8 +706,24 @@ class CameraLoop:
                 face_interval=999,
                 face_cap=0,
                 detect_screens=want_screens,
+                session_state=(
+                    self._session_state if _STATELESS_DISPATCH else None
+                ),
             )
             self.home.last_pod_ok = time.time()  # pod-progress watchdog feed
+        if _STATELESS_DISPATCH:
+            if obs.session_state is not None:
+                self._session_state = obs.session_state
+            else:
+                # A worker that doesn't echo state is running a pre-
+                # stateless image — continuing would re-ground every
+                # tick and renumber ids silently. Loud, once per tick,
+                # until the fleet image matches the flag.
+                log.error(
+                    "identity.stateless_not_echoed cam=%s — worker image "
+                    "predates stateless mode; state kept as-is",
+                    self.camera_id,
+                )
         self.pod_ms = (time.time() - t0) * 1000.0
         self.queue_ms = (t0 - t_q) * 1000.0  # other cameras' turn ahead of us
         # Epoch guard (2026-07-25 "born again as T13"): pod restarts

@@ -33,7 +33,6 @@ import base64
 import hmac
 import logging
 import os
-import queue
 import threading
 import time
 
@@ -186,29 +185,6 @@ _PERCEPTION_CONCURRENCY = max(
 )
 _perception_lock = _Gate(_PERCEPTION_CONCURRENCY)
 
-# ── Predictor-pool experiment (2026-08-16) ─────────────────────────────
-# The concurrency-corruption campaign (2026-08-15) proved ANY two
-# overlapping passes in one process corrupt EdgeTAM's carry — matrix:
-# control 58 drops / SAM3-lock-only 5 / EdgeTAM-lock-only 32 / fully
-# serialized 0/442. (The _Gate docstring's older claim that "a torch
-# forward has no mutable module state" is exactly what that campaign
-# falsified.) Hypothesis under test here: the unsafe shared state lives
-# in the predictor OBJECTS, not the process. NEMARA_EXP_PRED_POOL=1
-# builds one PRIVATE (SAM3, EdgeTAM) instance pair per admission slot
-# and each pass borrows a pair for its lifetime, so passes overlap in
-# time while sharing no predictor state. Zero ladder drops => single-
-# process concurrency is safe again (shared queue, one CUDA context);
-# drops persisting => the corruption sits in torch/CUDA process globals
-# and the worker-process fleet architecture stands. Off by default;
-# slot 0 with the flag off is byte-for-byte the old behavior.
-_PRED_POOL = os.environ.get(
-    "NEMARA_EXP_PRED_POOL", "",
-).strip() in ("1", "true")
-_POOL_SIZE = _PERCEPTION_CONCURRENCY if _PRED_POOL else 1
-_SLOT_QUEUE: "queue.Queue[int]" = queue.Queue()
-for _s in range(_POOL_SIZE):
-    _SLOT_QUEUE.put(_s)
-
 # Upload sanity caps (review S4): reject absurd requests before they
 # reach decode; skip any decoded frame beyond a sane camera size (a
 # crafted small JPEG can decode to gigabytes).
@@ -310,19 +286,15 @@ _REQUIRE_GPU_FACES = os.environ.get(
 @app.on_event("startup")
 def _startup() -> None:
     global _ready
-    # ── Process-global probes (2026-08-16, post-pool falsification) ──
-    # The predictor-pool run proved private model instances do NOT stop
-    # the overlap corruption (17 drops/362 ticks vs control 63/721 —
-    # corrupted family), so the culprit is PROCESS-level state. These
-    # arms neutralize the three audited suspects one at a time, from
-    # OUR side, without touching vendored model code.
+    # ── Speed levers (2026-08-16, survivors of the corruption hunt).
+    # Neither fixes the in-process overlap corruption (falsified) —
+    # they cut per-pass overhead, and are safe because each worker
+    # process is single-flight.
     #
-    # Arm A: SAM3's close_session runs gc.collect() after EVERY ground
-    # and a device-wide torch.cuda.empty_cache() whenever VRAM use is
-    # above its threshold — mid-flight for every other pass. The old
-    # NEMARA_EXP_NO_EMPTY_CACHE arm only skipped OUR flush; SAM3's
-    # internal one ran in every matrix arm, so it was never falsified.
-    # This stubs both process-wide (supersedes the old arm).
+    # No-gc lever: SAM3's close_session runs gc.collect() after EVERY
+    # ground plus a device-wide torch.cuda.empty_cache() under VRAM
+    # pressure — a whole-GPU stall per ground. Stub both process-wide.
+    # Needs a memory-growth soak before becoming fleet default.
     if os.environ.get("NEMARA_EXP_SAM3_NO_GC", "").strip() in ("1", "true"):
         import gc as _gc
 
@@ -331,14 +303,13 @@ def _startup() -> None:
         if _torch.cuda.is_available():
             _torch.cuda.empty_cache = lambda *a, **k: None
         log.warning(
-            "EXP arm A: gc.collect + cuda.empty_cache stubbed process-wide",
+            "lever: gc.collect + cuda.empty_cache stubbed process-wide",
         )
-    # Arm B: both models write the process-global SDPA backend enables
-    # on the hot path (SAM3 unconditionally per attention call; EdgeTAM
-    # via a save/flip/restore context that mis-restores under
-    # interleaving). Pin all three ON once, then no-op the setters so
-    # nothing can flip them mid-inference. EdgeTAM's context manager is
-    # neutralized at its module in continuous._get_edge (same env).
+    # SDP-pin lever: both models write the process-global SDPA backend
+    # enables on the hot attention path (measured as a large cadence
+    # tax). Pin all three ON once, no-op the setters; EdgeTAM's
+    # flag-flipping context is neutralized in continuous._get_edge
+    # (same env).
     if os.environ.get("NEMARA_EXP_SDP_PIN", "").strip() in ("1", "true"):
         import torch as _torch
         _torch.backends.cuda.enable_flash_sdp(True)
@@ -348,7 +319,7 @@ def _startup() -> None:
         _torch.backends.cuda.enable_math_sdp = lambda *a, **k: None
         _torch.backends.cuda.enable_mem_efficient_sdp = lambda *a, **k: None
         log.warning(
-            "EXP arm B: SDPA backend flags pinned all-on, setters no-oped",
+            "lever: SDPA backend flags pinned all-on, setters no-oped",
         )
     t0 = time.time()
     provider = "worker-failed"
@@ -382,18 +353,14 @@ def _startup() -> None:
         os._exit(1)
     global _sam_error
     try:
+        pred = sam_track.get_sam(_CKPT)
         # Warm the full path (CUDA kernel compile + temp-clip round
-        # trip) so the first real /observe isn't a cold 30s. Under the
-        # predictor pool every slot gets the same treatment — a cold
-        # slot would hand the first CONCURRENT pass the 30s bill.
-        for slot in range(_POOL_SIZE):
-            pred = sam_track.get_sam(_CKPT, slot=slot)
-            for _ in sam_track.track_stream(
-                pred, [np.zeros((360, 640, 3), np.uint8)],
-                concept="person", thr=0.4,
-            ):
-                pass
-            continuous.warm_edge(slot)
+        # trip) so the first real /observe isn't a cold 30s.
+        for _ in sam_track.track_stream(
+            pred, [np.zeros((360, 640, 3), np.uint8)],
+            concept="person", thr=0.4,
+        ):
+            pass
         _sam_error = None
     except Exception as exc:  # noqa: BLE001
         _sam_error = repr(exc)
@@ -453,32 +420,7 @@ def _observe_sync(
     detect_screens: bool = False,
     camera_id: str = "default",
     client_stamp: str = "UNSTAMPED",
-) -> dict:
-    """Borrow a predictor slot for the pass, then run it. With the pool
-    off this is slot 0 every time — the old singleton, zero behavior
-    change. Slot acquisition precedes the admission gate; the pool is
-    sized == gate width, so every gate holder owns a slot and a
-    slot-waiter is just an early gate-waiter — no deadlock shape."""
-    slot = _SLOT_QUEUE.get()
-    try:
-        continuous.set_predictor_slot(slot)
-        return _observe_impl(
-            named_frames, person_thr, face_interval, face_cap,
-            detect_screens, camera_id, client_stamp, slot,
-        )
-    finally:
-        _SLOT_QUEUE.put(slot)
-
-
-def _observe_impl(
-    named_frames: list[tuple[int, "bytes | np.ndarray"]],
-    person_thr: float,
-    face_interval: int,
-    face_cap: int,
-    detect_screens: bool,
-    camera_id: str,
-    client_stamp: str,
-    slot: int,
+    session_state: "dict | None" = None,
 ) -> dict:
     """The whole perception pass, run in a worker thread under
     `_perception_lock` so /health stays responsive while SAM grinds
@@ -551,7 +493,7 @@ def _observe_impl(
 
         global _sam_error
         try:
-            pred = sam_track.get_sam(_CKPT, slot=slot)
+            pred = sam_track.get_sam(_CKPT)
         except Exception as exc:  # noqa: BLE001
             # Surfaced on /health as 503 (see below): a perception that
             # cannot load its tracker must look SICK, not "ok" — after
@@ -569,7 +511,21 @@ def _observe_impl(
         # subject across ticks and stranded the backend binding into a
         # ghost. Masks are held in `session_out` for this tick; frame
         # pixels (`imgs[pos]`) are still released after the face pass.
-        session = continuous.get_session(camera_id)
+        #
+        # STATELESS MODE (2026-08-16, shared-queue dispatch): when the
+        # request carries `session_state`, the CALLER owns the camera's
+        # cross-tick state — build a transient session from it, run the
+        # tick, hand the updated state back in the response. No entry in
+        # _SESSIONS, so any worker can serve any camera. The request
+        # shape (not an env var) selects the mode: identity turns it on
+        # per-request, workers need no coordinated config.
+        stateless = session_state is not None
+        if stateless:
+            session = continuous.CameraSession.from_state(
+                camera_id, session_state or None,
+            )
+        else:
+            session = continuous.get_session(camera_id)
         session_out = session.observe(
             imgs, person_thr=person_thr, sam_pred=pred,
         )
@@ -742,6 +698,10 @@ def _observe_impl(
             },
             "screen_regions": screen_regions,
         }
+        if stateless:
+            # The caller owns this camera's continuity — hand back the
+            # updated snapshot; nothing about it remains in this worker.
+            payload["session_state"] = session.to_state()
         log.info(
             "perception.observe client=%s frames=%d tracks=%d dets=%d max_prob=%.2f "
             "face_attempts=%d faces=%d | decode=%.0fms sam=%.0fms "
@@ -754,15 +714,11 @@ def _observe_impl(
         # Return cached blocks to the driver after every pass (leak
         # incident 2026-07-21): costs ~0.1-0.3s of re-allocation on the
         # next tick; 19GB of allocator drift cost the whole service.
-        # E2b-1 (2026-08-15 concurrency matrix): skippable via env — a
-        # mid-pass empty_cache from camera A while camera B is inside a
-        # forward is one of the shared-simultaneity suspects.
-        if os.environ.get("NEMARA_EXP_NO_EMPTY_CACHE", "").strip() not in (
-            "1", "true",
-        ):
-            import torch
+        # Under the no-gc lever (NEMARA_EXP_SAM3_NO_GC) empty_cache is
+        # a process-wide no-op and this call is inert by design.
+        import torch
 
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
         return payload
 
 
@@ -973,6 +929,9 @@ async def observe_raw(request: Request) -> JSONResponse:
     try:
         header, named_frames = _parse_raw_frames(data)
         client_stamp = request.headers.get("x-nemara-client", "UNSTAMPED")
+        # session_state: {} = "stateless mode, first tick"; a populated
+        # dict = continue from it; absent = stateful mode (_SESSIONS).
+        _sess = header.get("session_state")
         payload = await asyncio.to_thread(
             _observe_sync, named_frames,
             float(header.get("person_thr", 0.4)),
@@ -981,6 +940,7 @@ async def observe_raw(request: Request) -> JSONResponse:
             bool(int(header.get("detect_screens", 0))),
             str(header.get("camera_id", "default")),
             client_stamp,
+            _sess if isinstance(_sess, dict) else None,
         )
     finally:
         global _last_request_ts

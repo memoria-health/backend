@@ -172,6 +172,7 @@ class SamServiceClient:
         face_interval: int,
         face_cap: int,
         detect_screens: bool = False,
+        session_state: "dict | None" = None,
     ) -> RemoteObservations:
         """POST ordered (orig_idx, frame) frames; parse the raw
         observations. Raises on transport/HTTP errors (fail-open is
@@ -179,22 +180,28 @@ class SamServiceClient:
         screen-concept pass on the newest frame (display-veto map
         refresh, ~0.5s).
 
+        `session_state` (stateless-worker mode): the camera's portable
+        cross-tick state — pass {} on the first tick. Presence of the
+        key switches the WORKER to stateless for this request, and the
+        updated snapshot comes back on the response. Raw wire only.
+
         ndarray frames ride the raw wire (/observe_raw — no JPEG
         encode here, no decode on the pod); bytes keep multipart."""
         if frames_by_index and isinstance(frames_by_index[0][1], np.ndarray):
+            header = {
+                "v": 1,
+                "camera_id": camera_id,
+                "person_thr": person_thr,
+                "face_interval": face_interval,
+                "face_cap": face_cap,
+                "detect_screens": 1 if detect_screens else 0,
+            }
+            if session_state is not None:
+                header["session_state"] = session_state
             # to_thread: packing a batch is a ~tens-of-MB memcpy — off
             # the event loop, same as the JPEG encode it replaced.
             body = await asyncio.to_thread(
-                pack_frames,
-                {
-                    "v": 1,
-                    "camera_id": camera_id,
-                    "person_thr": person_thr,
-                    "face_interval": face_interval,
-                    "face_cap": face_cap,
-                    "detect_screens": 1 if detect_screens else 0,
-                },
-                frames_by_index,
+                pack_frames, header, frames_by_index,
             )
             resp = await self._client.post(
                 f"{self._base}/observe_raw",
@@ -322,4 +329,8 @@ def _parse_observe(j: dict) -> RemoteObservations:
             k: float(v) for k, v in j.get("timings_ms", {}).items()
         },
         screen_regions=tuple(screen_regions),
+        session_state=(
+            j["session_state"]
+            if isinstance(j.get("session_state"), dict) else None
+        ),
     )

@@ -21,10 +21,8 @@ trigger for the process and the engine behaves exactly as before.
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import os
-import threading
 from typing import Optional
 
 log = logging.getLogger("perception")
@@ -35,19 +33,6 @@ _CONF = float(os.environ.get("NEMARA_TRIGGER_CONF", "0.45"))
 
 _model = None
 _dead = False
-
-# Arm C (2026-08-16 process-global falsification, see server._startup):
-# this YOLO instance is the one model the predictor pool did NOT
-# duplicate — every concurrent pass still runs through it. Serializing
-# it isolates whether ultralytics' predictor carries the unsafe state.
-_YOLO_SERIALIZE = os.environ.get(
-    "NEMARA_EXP_YOLO_LOCK", "",
-).strip() in ("1", "true")
-_YOLO_LOCK = threading.Lock()
-
-
-def _yolo_gate():
-    return _YOLO_LOCK if _YOLO_SERIALIZE else contextlib.nullcontext()
 
 
 def _load():
@@ -72,11 +57,10 @@ def person_boxes(bgr) -> "Optional[list]":
     if _dead:
         return None
     try:
-        with _yolo_gate():
-            res = _load().predict(
-                bgr, imgsz=_IMGSZ, conf=_CONF, classes=[0],
-                verbose=False, device=0,
-            )
+        res = _load().predict(
+            bgr, imgsz=_IMGSZ, conf=_CONF, classes=[0],
+            verbose=False, device=0,
+        )
         out = []
         for b in res[0].boxes:
             x1, y1, x2, y2 = (float(v) for v in b.xyxy[0])
@@ -103,11 +87,10 @@ def person_masks(bgr) -> "Optional[list]":
         model = _load()
         if getattr(model, "task", "") != "segment":
             return None
-        with _yolo_gate():
-            res = model.predict(
-                bgr, imgsz=_IMGSZ, conf=_CONF, classes=[0],
-                verbose=False, device=0, retina_masks=True,
-            )
+        res = model.predict(
+            bgr, imgsz=_IMGSZ, conf=_CONF, classes=[0],
+            verbose=False, device=0, retina_masks=True,
+        )
         m = res[0].masks
         if m is None:  # zero detections, NOT a missing seg head
             return []
