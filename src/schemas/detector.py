@@ -135,10 +135,6 @@ class DetectorResponse(BaseModel):
     user_criteria: list[str] | None = None
     # Plain-words change requests accumulated via /refine, oldest first.
     refinements: list[str] | None = None
-    # Compiled Home-tab widget spec ({widget, size, title, params, …}).
-    # Written on detector writes only, never computed at read time; the
-    # iOS Home tab renders it as-is. Null = this detector has no widget.
-    dashboard_widget: dict[str, Any] | None = None
     # v2 within-tick precedence (read-only for clients). The Home tab
     # orders widgets inside a category by it, severe-first.
     severity: int | None = None

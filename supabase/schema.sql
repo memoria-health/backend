@@ -634,7 +634,6 @@ create table public.detectors (
   severity        integer,  -- within-tick precedence; moves out of catalog._SEVERITY
   cooldown_seconds integer, -- per-detector re-fire spacing for point shapes
   degradation_warning text check (degradation_warning in ('none', 'distance_class')),
-  dashboard_widget jsonb,   -- compiled Home-tab widget spec; written on detector writes only
   created_at      timestamptz not null default now(),
   updated_at      timestamptz not null default now()
 );

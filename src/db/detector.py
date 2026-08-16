@@ -120,10 +120,3 @@ class Detector(Base):
     cooldown_seconds: Mapped[int | None] = mapped_column(Integer, default=None)
     degradation_warning: Mapped[str | None] = mapped_column(String(20), default=None)
 
-    # ── Home-tab widget spec (2026-08-15) ───────────────────────────
-    # The compiled dashboard widget for this detector — written ONLY on
-    # detector create/from-library/refine, and on update when a shape
-    # field changes (see src/services/dashboard/widget_compiler.py).
-    # Never computed at read time; the iOS Home tab renders it as-is.
-    # NULL = no widget (hidden/internal detectors, or not yet compiled).
-    dashboard_widget: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
