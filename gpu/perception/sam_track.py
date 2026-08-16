@@ -27,7 +27,17 @@ import numpy as np
 
 log = logging.getLogger("perception.track")
 
-_SAM = None
+# Predictor instances keyed by admission slot. Slot 0 is the historic
+# process singleton and what every caller gets by default; extra slots
+# exist only under the NEMARA_EXP_PRED_POOL experiment (see server.py),
+# which hands each concurrently-admitted pass a PRIVATE instance. The
+# 2026-08-15 concurrency matrix localized the pass-overlap corruption
+# mostly to SAM3-vs-SAM3 overlap (58 drops -> 5 with only SAM3
+# serialized), so this model is the prime suspect for object-level
+# shared state. Builds are serialized: two multi-GB checkpoint loads
+# racing would spike VRAM at the worst moment.
+_SAM_SLOTS: "dict[int, object]" = {}
+_SAM_BUILD_LOCK = threading.Lock()
 
 # E2b-2 (2026-08-15 concurrency matrix): serialize ALL SAM3 passes
 # behind one lock while EdgeTAM stays concurrent — isolates whether the
@@ -51,10 +61,16 @@ def _np(x):
     return x.cpu().numpy() if hasattr(x, "cpu") else np.asarray(x)
 
 
-def get_sam(ckpt_path: str):
-    """Process-singleton native SAM 3.1 multiplex video predictor."""
-    global _SAM
-    if _SAM is None:
+def get_sam(ckpt_path: str, slot: int = 0):
+    """Native SAM 3.1 multiplex video predictor for `slot` (see
+    _SAM_SLOTS). Existing callers pass no slot and keep the singleton."""
+    got = _SAM_SLOTS.get(slot)
+    if got is not None:
+        return got
+    with _SAM_BUILD_LOCK:
+        got = _SAM_SLOTS.get(slot)
+        if got is not None:
+            return got
         import inspect
 
         from sam3.model_builder import build_sam3_multiplex_video_predictor
@@ -67,9 +83,9 @@ def get_sam(ckpt_path: str):
         pred.model.init_state = lambda **kw: orig(
             **{k: v for k, v in kw.items() if k in sig.parameters}
         )
-        _SAM = pred
-        log.info("sam_track.loaded ckpt=%s", ckpt_path)
-    return _SAM
+        _SAM_SLOTS[slot] = pred
+        log.info("sam_track.loaded ckpt=%s slot=%d", ckpt_path, slot)
+        return pred
 
 
 def mask_bbox(m: np.ndarray) -> tuple[float, float, float, float] | None:

@@ -30,8 +30,34 @@ import numpy as np
 
 log = logging.getLogger("perception.continuous")
 
-_EDGE = None
+# EdgeTAM instances keyed by admission slot — slot 0 is the historic
+# process singleton; extra slots exist only under NEMARA_EXP_PRED_POOL
+# (see server.py and sam_track._SAM_SLOTS for the rationale). A pass
+# announces its slot via set_predictor_slot() on its own worker thread;
+# everything below it in the call stack (_propagate -> _get_edge) then
+# resolves to that pass's private instance.
+_EDGE_SLOTS: "dict[int, object]" = {}
 _edge_lock = threading.Lock()
+_EDGE_TLS = threading.local()
+
+
+def set_predictor_slot(slot: int) -> None:
+    """Pin THIS thread's perception pass to predictor slot `slot`.
+    Thread-local, not a ContextVar: the whole pass runs synchronously on
+    one to_thread worker, and worker threads are REUSED — so every pass
+    must set its slot on entry (server._observe_sync does)."""
+    _EDGE_TLS.slot = int(slot)
+
+
+def warm_edge(slot: int = 0) -> None:
+    """Build `slot`'s EdgeTAM instance now (startup warm) so the first
+    real tick on that slot doesn't pay the model-build latency."""
+    prev = getattr(_EDGE_TLS, "slot", 0)
+    _EDGE_TLS.slot = int(slot)
+    try:
+        _get_edge()
+    finally:
+        _EDGE_TLS.slot = prev
 # E2b-3 (2026-08-15 concurrency matrix): serialize ALL EdgeTAM
 # propagation behind one lock while SAM3 stays concurrent — isolates
 # whether the mid-carry dropout lives in the follower's internals.
@@ -133,41 +159,48 @@ _COMPILE = os.environ.get(
 
 
 def _get_edge():
-    """Process-singleton EdgeTAM (sam2) video predictor."""
-    global _EDGE
-    if _EDGE is None:
-        with _edge_lock:
-            if _EDGE is None:
-                import sys
-                if _EDGE_ROOT not in sys.path:
-                    sys.path.insert(0, _EDGE_ROOT)
-                from sam2.build_sam import build_sam2_video_predictor
-                _EDGE = build_sam2_video_predictor(
-                    _EDGE_CFG, _EDGE_CKPT, device="cuda",
-                )
-                if _COMPILE:
-                    import torch
+    """EdgeTAM (sam2) video predictor for the calling pass's slot."""
+    slot = int(getattr(_EDGE_TLS, "slot", 0))
+    got = _EDGE_SLOTS.get(slot)
+    if got is not None:
+        return got
+    with _edge_lock:
+        got = _EDGE_SLOTS.get(slot)
+        if got is not None:
+            return got
+        import sys
+        if _EDGE_ROOT not in sys.path:
+            sys.path.insert(0, _EDGE_ROOT)
+        from sam2.build_sam import build_sam2_video_predictor
+        edge = build_sam2_video_predictor(
+            _EDGE_CFG, _EDGE_CKPT, device="cuda",
+        )
+        if _COMPILE:
+            import torch
 
-                    try:
-                        _EDGE.image_encoder = torch.compile(
-                            _EDGE.image_encoder, dynamic=True,
-                        )
-                        _EDGE.memory_attention = torch.compile(
-                            _EDGE.memory_attention, dynamic=True,
-                        )
-                        log.info(
-                            "continuous.edgetam_compiled "
-                            "(image_encoder + memory_attention)",
-                        )
-                    except Exception:  # noqa: BLE001 — compile is an
-                        # optimisation, never a dependency: any failure
-                        # leaves the eager modules in place.
-                        log.warning(
-                            "continuous.edgetam_compile_failed — "
-                            "running eager", exc_info=True,
-                        )
-                log.info("continuous.edgetam_loaded ckpt=%s", _EDGE_CKPT)
-    return _EDGE
+            try:
+                edge.image_encoder = torch.compile(
+                    edge.image_encoder, dynamic=True,
+                )
+                edge.memory_attention = torch.compile(
+                    edge.memory_attention, dynamic=True,
+                )
+                log.info(
+                    "continuous.edgetam_compiled "
+                    "(image_encoder + memory_attention)",
+                )
+            except Exception:  # noqa: BLE001 — compile is an
+                # optimisation, never a dependency: any failure
+                # leaves the eager modules in place.
+                log.warning(
+                    "continuous.edgetam_compile_failed — "
+                    "running eager", exc_info=True,
+                )
+        _EDGE_SLOTS[slot] = edge
+        log.info(
+            "continuous.edgetam_loaded ckpt=%s slot=%d", _EDGE_CKPT, slot,
+        )
+        return edge
 
 
 def _iou(a: np.ndarray, b: np.ndarray) -> float:

@@ -33,6 +33,7 @@ import base64
 import hmac
 import logging
 import os
+import queue
 import threading
 import time
 
@@ -185,6 +186,29 @@ _PERCEPTION_CONCURRENCY = max(
 )
 _perception_lock = _Gate(_PERCEPTION_CONCURRENCY)
 
+# ── Predictor-pool experiment (2026-08-16) ─────────────────────────────
+# The concurrency-corruption campaign (2026-08-15) proved ANY two
+# overlapping passes in one process corrupt EdgeTAM's carry — matrix:
+# control 58 drops / SAM3-lock-only 5 / EdgeTAM-lock-only 32 / fully
+# serialized 0/442. (The _Gate docstring's older claim that "a torch
+# forward has no mutable module state" is exactly what that campaign
+# falsified.) Hypothesis under test here: the unsafe shared state lives
+# in the predictor OBJECTS, not the process. NEMARA_EXP_PRED_POOL=1
+# builds one PRIVATE (SAM3, EdgeTAM) instance pair per admission slot
+# and each pass borrows a pair for its lifetime, so passes overlap in
+# time while sharing no predictor state. Zero ladder drops => single-
+# process concurrency is safe again (shared queue, one CUDA context);
+# drops persisting => the corruption sits in torch/CUDA process globals
+# and the worker-process fleet architecture stands. Off by default;
+# slot 0 with the flag off is byte-for-byte the old behavior.
+_PRED_POOL = os.environ.get(
+    "NEMARA_EXP_PRED_POOL", "",
+).strip() in ("1", "true")
+_POOL_SIZE = _PERCEPTION_CONCURRENCY if _PRED_POOL else 1
+_SLOT_QUEUE: "queue.Queue[int]" = queue.Queue()
+for _s in range(_POOL_SIZE):
+    _SLOT_QUEUE.put(_s)
+
 # Upload sanity caps (review S4): reject absurd requests before they
 # reach decode; skip any decoded frame beyond a sane camera size (a
 # crafted small JPEG can decode to gigabytes).
@@ -318,14 +342,18 @@ def _startup() -> None:
         os._exit(1)
     global _sam_error
     try:
-        pred = sam_track.get_sam(_CKPT)
         # Warm the full path (CUDA kernel compile + temp-clip round
-        # trip) so the first real /observe isn't a cold 30s.
-        for _ in sam_track.track_stream(
-            pred, [np.zeros((360, 640, 3), np.uint8)],
-            concept="person", thr=0.4,
-        ):
-            pass
+        # trip) so the first real /observe isn't a cold 30s. Under the
+        # predictor pool every slot gets the same treatment — a cold
+        # slot would hand the first CONCURRENT pass the 30s bill.
+        for slot in range(_POOL_SIZE):
+            pred = sam_track.get_sam(_CKPT, slot=slot)
+            for _ in sam_track.track_stream(
+                pred, [np.zeros((360, 640, 3), np.uint8)],
+                concept="person", thr=0.4,
+            ):
+                pass
+            continuous.warm_edge(slot)
         _sam_error = None
     except Exception as exc:  # noqa: BLE001
         _sam_error = repr(exc)
@@ -385,6 +413,32 @@ def _observe_sync(
     detect_screens: bool = False,
     camera_id: str = "default",
     client_stamp: str = "UNSTAMPED",
+) -> dict:
+    """Borrow a predictor slot for the pass, then run it. With the pool
+    off this is slot 0 every time — the old singleton, zero behavior
+    change. Slot acquisition precedes the admission gate; the pool is
+    sized == gate width, so every gate holder owns a slot and a
+    slot-waiter is just an early gate-waiter — no deadlock shape."""
+    slot = _SLOT_QUEUE.get()
+    try:
+        continuous.set_predictor_slot(slot)
+        return _observe_impl(
+            named_frames, person_thr, face_interval, face_cap,
+            detect_screens, camera_id, client_stamp, slot,
+        )
+    finally:
+        _SLOT_QUEUE.put(slot)
+
+
+def _observe_impl(
+    named_frames: list[tuple[int, "bytes | np.ndarray"]],
+    person_thr: float,
+    face_interval: int,
+    face_cap: int,
+    detect_screens: bool,
+    camera_id: str,
+    client_stamp: str,
+    slot: int,
 ) -> dict:
     """The whole perception pass, run in a worker thread under
     `_perception_lock` so /health stays responsive while SAM grinds
@@ -457,7 +511,7 @@ def _observe_sync(
 
         global _sam_error
         try:
-            pred = sam_track.get_sam(_CKPT)
+            pred = sam_track.get_sam(_CKPT, slot=slot)
         except Exception as exc:  # noqa: BLE001
             # Surfaced on /health as 503 (see below): a perception that
             # cannot load its tracker must look SICK, not "ok" — after
