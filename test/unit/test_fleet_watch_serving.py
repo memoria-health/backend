@@ -1,6 +1,6 @@
 """FleetWatch serving extension (2026-08-14): the lag alarm and the
 occupancy duty-cycle sampler — the production tripwire the capacity
-rating leans on (docs/IDENTITY-GPU-ARCHITECTURE.md).
+rating leans on (docs/architecture/identity-gpu-architecture.md).
 
 Pure unit: DB and HTTP are both faked; what's under test is the
 decision logic — streaks, the empty-room exemption, recovery, and what

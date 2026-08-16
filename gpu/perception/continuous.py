@@ -34,7 +34,7 @@ log = logging.getLogger("perception.continuous")
 # instance per process is correct: the 2026-08-15/16 campaign closed
 # with every in-process concurrency variant falsified (private
 # per-pass instances, serialization probes, global-state stubs — see
-# docs/GPU-CROSS-CAMERA-BATCHING.md §1), so that machinery was deleted.
+# docs/plans/2026-08-16-cross-camera-batching.md §1), so that machinery was deleted.
 import contextlib as _contextlib
 
 _EDGE = None
@@ -687,7 +687,7 @@ class CameraSession:
 # the VRAM-aware prime skip is the OOM guard; refusing cameras is a
 # policy call we are not making in code). Above this we log loudly so
 # FleetWatch/operators see a node past its rated envelope (rated 4,
-# surge 6-8, SLA gone by 10 — docs/IDENTITY-GPU-ARCHITECTURE.md).
+# surge 6-8, SLA gone by 10 — docs/architecture/identity-gpu-architecture.md).
 _MAX_SESSIONS = int(os.environ.get("NEMARA_MAX_SESSIONS", "10"))
 # A session idle this long belongs to a camera that stopped (nothing
 # calls drop_session in the normal flow) — evict it before refusing a

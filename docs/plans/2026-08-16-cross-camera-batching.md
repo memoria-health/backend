@@ -1,6 +1,6 @@
 # Cross-camera batching — future enhancement plan
 
-Status: **deferred by design** (2026-08-16, Aryaman's call). Build it only
+> Status: **deferred by design** (2026-08-16, Aryaman's call). Build it only
 if the cheaper capacity levers — 4 workers on a 48GB card, stateless
 workers with a shared queue, the SDP-pin and no-gc speedups — measurably
 fail to reach ~15-20 occupied cameras per node inside the 10s SLA.

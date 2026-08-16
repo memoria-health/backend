@@ -30,7 +30,7 @@ log = logging.getLogger("perception.track")
 # Process-singleton predictor. The 2026-08-15/16 concurrency campaign
 # is CLOSED: two passes overlapping in one process corrupt tracking at
 # a layer below Python (private instances, lock probes, and global-state
-# stubs were all falsified — see docs/GPU-CROSS-CAMERA-BATCHING.md §1),
+# stubs were all falsified — see docs/plans/2026-08-16-cross-camera-batching.md §1),
 # so workers run single-flight and one instance per process is correct.
 _SAM = None
 _SAM_BUILD_LOCK = threading.Lock()

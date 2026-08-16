@@ -69,7 +69,7 @@ _KEY_LAG = "identity-fleet:lag:"
 # page fires. One bad cycle is a re-ground or a batch spike; three in a
 # row (~1.5-3 min at the default watch interval) is a node past its
 # rated envelope — the exact production tripwire the capacity rating
-# leans on (docs/IDENTITY-GPU-ARCHITECTURE.md: SLA = lag under the tick,
+# leans on (docs/architecture/identity-gpu-architecture.md: SLA = lag under the tick,
 # rated 4 occupied cams/4090, surge 6-8, gone by 10).
 LAG_ALARM_CYCLES = 3
 
@@ -269,7 +269,7 @@ class FleetWatch:
                                 "remedy": (
                                     "node past its rated occupied-camera "
                                     "envelope — add a node or move homes "
-                                    "(docs/IDENTITY-GPU-ARCHITECTURE.md)"
+                                    "(docs/architecture/identity-gpu-architecture.md)"
                                 ),
                             },
                         )

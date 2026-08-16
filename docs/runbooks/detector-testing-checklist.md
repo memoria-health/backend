@@ -187,7 +187,7 @@ now) → 9. F1-F3 if daylight remains → 10. M1-M5.
 
 ## 2026-08-13 — GPU load test + optimization sprint (F-series continuation)
 
-DONE. Full record: docs/IDENTITY-GPU-ARCHITECTURE.md. Headline: at 3
+DONE. Full record: docs/architecture/identity-gpu-architecture.md. Headline: at 3
 concurrently-occupied cameras, lag p50 10.9s -> 0.33s (SLA <7-10s now
 holds with ~30x headroom); root causes were CPU-wheel onnxruntime
 shadowing (faces on CPU since gpu-v1) + the JPEG loopback hop. Fleet is

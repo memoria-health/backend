@@ -47,7 +47,7 @@ error. Every Python-reachable cause was falsified by experiment
 pinning, YOLO serialization, all combined); only full serialization or
 separate processes ever produced zero drops (~5,000 scored ticks).
 The fault is below Python, in the CUDA/torch substrate threads share.
-Full evidence: docs/GPU-CROSS-CAMERA-BATCHING.md §1.
+Full evidence: docs/plans/2026-08-16-cross-camera-batching.md §1.
 
 **Therefore: N single-flight worker processes per node.**
 `NEMARA_PERCEPTION_WORKERS=N` (2 on a 24GB card; 3-4 on 48GB), each
