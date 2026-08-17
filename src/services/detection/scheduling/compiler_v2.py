@@ -119,10 +119,20 @@ def validate_schema_fields(schema_json: dict) -> None:
 
 # ── 3. Dims classification (conservative keyword rules) ──────────
 
+# Hazard NOUNS and hazard EVENTS both live here. Morphology matters:
+# real caregivers write in the past tense ("water spilled", "a glass
+# broke"), so each verb carries its s/ed/ing forms — the bare-stem
+# `spill` missed "spilled" and sent a floor-hazard ask to the patient
+# branch (compiler eval 2026-08-17). Glass is deliberately NOT matched
+# bare: "drinks a glass of water" is a body-scale person ask, so glass
+# only counts alongside breakage language (broke/shatter/shards).
 _ENV_SUBJECT = re.compile(
     r"\b(stove|oven|burner|kettle|faucet|tap|sink|door|window|gate|"
-    r"fridge|freezer|light(s)?|lamp|tv\s+left\s+on|fire|smoke|water\s+"
-    r"(leak|running)|spill)\b", re.I,
+    r"fridge|freezer|light(s)?|lamp|tv\s+left\s+on|fire|smoke|"
+    r"water\s+(leak(s|ed|ing)?|running)|spill(s|ed|ing)?|"
+    r"leak(s|ed|ing)?|puddle(s)?|shard(s)?|shatter(s|ed|ing)?|"
+    r"broken\s+glass|glass\s+(break(s|ing)?|broke|shatter(s|ed|ing)?|"
+    r"smash\w*))\b", re.I,
 )
 _ANYONE_SUBJECT = re.compile(
     r"\b(visitor|stranger|intruder|anyone|any\s+person|someone\s+"
@@ -131,7 +141,12 @@ _ANYONE_SUBJECT = re.compile(
 _AUDIO_EVIDENCE = re.compile(
     r"\b(call(s|ing)?\s+(out|for)|yell(s|ing)?|scream(s|ing)?|shout|"
     r"cry(ing)?|says?\b|saying|asks?\b|asking|talk(s|ing)?|moan(s|ing)?|"
-    r"groan(s|ing)?|verbal|repeat(s|ing)?\s+(words|questions)|swear)", re.I,
+    r"groan(s|ing)?|verbal|repeat(s|ing)?\s+(words|questions)|swear|"
+    # Agitation/distress asks: the state is substantially VOCAL (moaning,
+    # muttering, repeated questions) — the built-in agitation detector
+    # carries needs_audio=True for the same reason, and a custom compiled
+    # without audio would judge a shouting spell on picture alone.
+    r"agitat(ed|es|ion|ing)?|distress(ed)?)", re.I,
 )
 _STILL_ACTIVITY = re.compile(
     r"\b(watch(es|ing)?\s+tv|on\s+(the\s+)?phone|read(s|ing)?|"
@@ -143,8 +158,17 @@ _STILL_ACTIVITY = re.compile(
 # ask, not a door-state check (P5 review F4: env branch gates on
 # motion OUTSIDE person boxes post-soak, which would skip exactly the
 # tick that matters).
+#
+# 'leave' only counts with a PLACE or a direction, mirroring how 'left'
+# always did: bare `leav(e|es|ing)` also matched the transitive sense —
+# "shatters and LEAVES shards", "leaves the water running" — and that
+# vetoed the environment branch on a floor-hazard ask (compiler eval
+# 2026-08-17). A leaving-the-house ask always names where or which way.
 _EXIT_VERBS = re.compile(
-    r"\b(leav(e|es|ing)|left\s+(the\s+)?(house|home|room|building)|"
+    r"\b(leav(e|es|ing)\s+(through|out|via|for)\b|"
+    r"leav(e|es|ing)\s+(the\s+|her\s+|his\s+|their\s+)?"
+    r"(house|home|room|building|apartment|bed)\b|"
+    r"left\s+(the\s+)?(house|home|room|building)|"
     r"exit(s|ing)?|walk(s|ing)?\s+out|wander(s|ing)?|go(es|ing)?\s+"
     r"out(side)?|knock(s|ing)?)\b", re.I,
 )
@@ -177,6 +201,11 @@ _DISTANCE_CLASS = re.compile(
 _BODY_SCALE_ACTION = re.compile(
     r"\b(drink(s|ing)?|sip(s|ping)?|swallow(s|ing)?|eat(s|ing)?|"
     r"chew(s|ing)?|bite(s)?|feed(s|ing)?|"
+    # Choking evidence is hands-to-throat and face colour — body scale,
+    # exactly why the choking PRESET is bucket=person; a custom "grandpa
+    # is choking" must land in the same crop. `meds` is the everyday
+    # word for medication ("did he take his meds") the formal stems miss.
+    r"chok(e|es|ed|ing)|meds|"
     r"medicat(e|es|ion)|pill(s)?|tablet(s)?|dose|inhaler|"
     r"brush(es|ing)?\s+(teeth|hair)|shav(e|es|ing)|groom(s|ing)?|"
     r"wip(e|es|ing)|rub(s|bing)?|touch(es|ing)?\s+(face|mouth|head)|"
