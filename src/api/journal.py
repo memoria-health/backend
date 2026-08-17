@@ -106,11 +106,18 @@ async def get_journal(
                 detected_times[ident].append(r["captured_at"])
 
     # Coverage: hours of the day with any analysis at all.
+    # Hours the AI actually analyzed (analyses rows only exist when a
+    # tick ran — camera-online-but-paused contributes nothing), bucketed
+    # in the CAREGIVER's timezone. Truncating in UTC counted 25 buckets
+    # on a fully-watched IST day: the local day spans 18:30->18:30 UTC,
+    # clipping two PARTIAL utc-hour buckets at the edges ("cameras
+    # watched 25 of 24 hours", live 2026-08-17).
     cov = (await session.execute(text("""
-        select count(distinct date_trunc('hour', captured_at))::int as n
+        select count(distinct date_trunc('hour', captured_at at time zone :tz))::int as n
         from analyses
         where patient_id = :p and captured_at >= :s and captured_at < :e
-        """), {"p": patient_id, "s": start, "e": end})).mappings().one()
+        """), {"p": patient_id, "s": start, "e": end,
+               "tz": str(tz)})).mappings().one()
 
     # Days-since streaks for quiet point detectors.
     last_rows = (await session.execute(text("""

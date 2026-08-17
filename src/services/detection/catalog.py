@@ -922,7 +922,7 @@ CATALOG: tuple[CatalogEntry, ...] = (
         promotion_threshold=0.70,
     ),
     CatalogEntry(
-        key="fire_smoke", name="Fire / smoke", icon_name="flame",
+        key="fire_smoke", name="Fire Hazard", icon_name="flame",
         description="Visible flames or smoke.",
         category="safety", cohort="both",
         recommended=False, prompt_fragment=_FIRE_SMOKE_PROMPT_FRAGMENT,
