@@ -584,48 +584,52 @@ _POSSIBLE_INTRUDER_PROMPT_FRAGMENT = (
 )
 
 _ENV_HAZARD_GLASS_PROMPT_FRAGMENT = (
-    "env_hazard_glass_detected: boolean. TRUE only if there is BROKEN GLASS in "
-    "the scene — a shattered glass, bottle, dish, mirror, or window, with "
-    "visible shards / fragments scattered on the floor or a surface, or the act "
-    "of glass shattering during the clip. The broken glass / shards must be "
-    "visible.\n"
+    "env_hazard_glass_detected: boolean. TRUE only if glass BREAKS DURING THIS "
+    "CLIP — a glass, bottle, dish, mirror, or window shattering on camera, or "
+    "shards appearing during the clip that were not there at the start. This "
+    "detects the breakage EVENT, not the lingering aftermath.\n"
     "\n"
     "Set FALSE if any of:\n"
+    "  - shards / broken glass already present and unchanged for the WHOLE "
+    "clip (a pre-existing mess is not a new breakage);\n"
     "  - intact glassware, windows, or mirrors (whole, unbroken glass is "
     "normal);\n"
     "  - a spill of liquid with no broken glass;\n"
     "  - reflections or glare that are not actually broken glass;\n"
-    "  - nothing resembling glass shards is visible.\n"
+    "  - nothing resembling glass breaking or shards is visible.\n"
     "\n"
-    "env_hazard_glass_confidence: number 0–1. 0 = no broken glass. 0.3–0.6 = "
-    "something on the floor that might be shards but is unclear. 0.7+ = clearly "
-    "broken glass / scattered shards.\n"
-    "env_hazard_glass_reasoning: 1 short sentence (e.g. 'a glass shattered on "
-    "the floor at 5s, shards scattered', 'intact glasses on the table — nothing "
-    "broken', 'no broken glass visible')."
+    "env_hazard_glass_confidence: number 0–1. 0 = no glass broke. 0.3–0.6 = "
+    "something may have broken or shards may have appeared, but it is unclear. "
+    "0.7+ = glass clearly broke during the clip.\n"
+    "env_hazard_glass_reasoning: 1 short sentence (e.g. 'a glass fell and "
+    "shattered on the floor at 5s', 'shards visible but unchanged the whole "
+    "clip, pre-existing', 'no broken glass visible')."
 )
 
 _ENV_HAZARD_WATER_PROMPT_FRAGMENT = (
-    "env_hazard_water_detected: boolean. TRUE only if WATER (or another clear "
-    "liquid) is SPILLED on the floor — a visible puddle or wet patch on the "
-    "floor, or a spill happening during the clip — creating a slip hazard. The "
-    "spilled liquid on the floor must be visible.\n"
+    "env_hazard_water_detected: boolean. TRUE only if a SPILL HAPPENS DURING "
+    "THIS CLIP — water (or another liquid) being spilled, knocked over, "
+    "dropped, or actively spreading across the floor on camera, creating a "
+    "slip hazard. This detects the spill EVENT, not a puddle that was already "
+    "there.\n"
     "\n"
     "Set FALSE if any of:\n"
+    "  - a puddle / wet patch already present and unchanged for the WHOLE "
+    "clip (a pre-existing spill is not a new one);\n"
     "  - liquid contained in a glass, cup, bottle, sink, or tub (not spilled on "
     "the floor);\n"
     "  - a normal wet / shiny floor finish, rug, or mat that is not an actual "
     "spill;\n"
     "  - broken glass with no liquid (that is the glass hazard, not this "
     "one);\n"
-    "  - no spilled liquid on the floor is visible.\n"
+    "  - no spill happening is visible.\n"
     "\n"
-    "env_hazard_water_confidence: number 0–1. 0 = no spill. 0.3–0.6 = a patch "
-    "on the floor that might be a spill but is unclear. 0.7+ = a clear puddle / "
-    "spilled liquid on the floor.\n"
+    "env_hazard_water_confidence: number 0–1. 0 = no spill happened. 0.3–0.6 = "
+    "liquid may have spilled during the clip but it is unclear. 0.7+ = a spill "
+    "clearly happened during the clip.\n"
     "env_hazard_water_reasoning: 1 short sentence (e.g. 'a glass of water "
-    "spilled, leaving a puddle on the kitchen floor at 6s', 'shiny floor but no "
-    "actual spill', 'no spill visible')."
+    "tipped over at 6s, spreading across the kitchen floor', 'wet patch "
+    "visible but unchanged the whole clip, pre-existing', 'no spill visible')."
 )
 
 _FIRE_SMOKE_PROMPT_FRAGMENT = (
@@ -908,7 +912,7 @@ CATALOG: tuple[CatalogEntry, ...] = (
     CatalogEntry(
         key="env_hazard_glass", name="Broken glass",
         icon_name="wineglass",
-        description="Broken glass or scattered shards on the floor.",
+        description="A glass, dish, mirror, or window breaking, leaving shards.",
         category="safety", cohort="both",
         recommended=False, prompt_fragment=_ENV_HAZARD_GLASS_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
@@ -916,7 +920,7 @@ CATALOG: tuple[CatalogEntry, ...] = (
     CatalogEntry(
         key="env_hazard_water", name="Spilled water",
         icon_name="drop",
-        description="Water or liquid spilled on the floor, a slip hazard.",
+        description="A drink or liquid spilling onto the floor, a slip hazard.",
         category="safety", cohort="both",
         recommended=False, prompt_fragment=_ENV_HAZARD_WATER_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
