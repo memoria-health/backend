@@ -31,12 +31,13 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any
+from typing import Any, Protocol
 from uuid import UUID
 
 import httpx
 
 from src.services.identity.observations import (
+    BBOX_SPACE_NATIVE,
     LABEL_PATIENT,
     LABEL_UNKNOWN,
     TrackObservation,
@@ -60,6 +61,20 @@ _MAX_CAMERAS = 32
 _MAX_TRACKS = 64
 
 
+class IdentityProvider(Protocol):
+    """What `CameraIngest` actually needs from an identity source.
+
+    Two things satisfy it: `IdentityClient` (one node) and `IdentityRouter`
+    (per-patient across a fleet). Naming the contract keeps call sites from
+    depending on which one they were handed — the router became the
+    production choice without a single caller changing.
+    """
+
+    async def label_clip(self, **kwargs: Any) -> Any: ...
+    def timing(self, camera_id: Any) -> Any: ...
+    async def aclose(self) -> None: ...
+
+
 class IdentityClient:
     """`label_clip`-compatible provider backed by the identity service.
 
@@ -69,7 +84,7 @@ class IdentityClient:
 
     def __init__(
         self, *, sessionmaker: Any = None, settings: Any,
-        body_gallery: Any = None,
+        body_gallery: Any = None, base_url: str | None = None,
     ) -> None:
         # Tracker-eval trace tap. Legacy armed this inside
         # ReIDInference.__init__, so sidecar mode silently left the
@@ -82,13 +97,22 @@ class IdentityClient:
             enabled=getattr(settings, "reid_trace_enabled", False),
             path=getattr(settings, "reid_trace_path", "out/track_trace.jsonl"),
         )
-        self._url = settings.identity_state_url.rstrip("/")
+        # `base_url` is the roster's answer for one GPU node and is what
+        # production uses (see IdentityRouter). settings.identity_state_url is
+        # the single-node fallback: correct for a local stack, meaningless
+        # once more than one node exists, since a global URL cannot describe
+        # a fleet.
+        self._url = (base_url or settings.identity_state_url).rstrip("/")
         token = getattr(settings, "identity_state_token", "")
         self._auth_headers = (
             {"Authorization": f"Bearer {token}"} if token else {}
         )
+        # trust_env is left at its default, but the proxy is passed
+        # EXPLICITLY rather than picked up from ALL_PROXY: an env var would
+        # silently capture every other outbound call this process makes.
+        proxy = getattr(settings, "identity_proxy_url", "") or None
         self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(STATE_TIMEOUT_S),
+            timeout=httpx.Timeout(STATE_TIMEOUT_S), proxy=proxy,
         )
         self._cache: tuple[float, dict] | None = None
 
@@ -230,6 +254,12 @@ class IdentityClient:
                 label=LABEL_PATIENT if is_patient else LABEL_UNKNOWN,
                 confidence=seat_score if is_patient else 0.0,
                 bbox_series=((0, bb),),
+                # The sidecar pushes frames at native resolution
+                # (`INTAKE_MAX_W = 0`) and hands these boxes back on
+                # that same grid. Saying so is what stops the crop /
+                # motion-mask consumers rescaling them by
+                # native/reid_inference_sample_width.
+                bbox_space=BBOX_SPACE_NATIVE,
                 face_locked=face_locked,
                 pre_labeled=is_patient and not face_locked,
                 pre_label_source=(

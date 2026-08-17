@@ -6,46 +6,30 @@ new aggregate appends one `include_router` line.
 """
 
 import logging
-import os
+import subprocess
+import sys
 import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-# Connect Python's root logger to stdout so application loggers
-# (`logging.getLogger(__name__)` calls throughout src/) actually emit.
-# Uvicorn configures its own access/error loggers separately; this
-# covers everything else (detector worker tick logs, webhook handlers,
-# clip archival, push dispatch, etc.). Honors NEMARA_LOG_LEVEL.
-logging.basicConfig(
-    level=os.getenv("NEMARA_LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+# Process-wide logging: single stdout handler (JSON on Railway so log
+# levels classify correctly, plain locally), uvicorn loggers routed
+# through it, livekit burst-dedup. Honors NEMARA_LOG_LEVEL and
+# NEMARA_LOG_JSON.
+from src.logging_setup import configure_logging
 
-# Silence verbose third-party loggers that flood every tick.
-#
-# - boxmot's `boxmot.utils.__init__` calls `configure_logging()` at
-#   import time, which installs a RichHandler on the "boxmot" logger
-#   with propagate=False and a hardcoded INFO level. We need to
-#   import that submodule explicitly — `import boxmot` alone doesn't
-#   pull in boxmot.utils, so configure_logging would only fire later
-#   (when the tracker first instantiates) and clobber any override
-#   we set here.
-# - ultralytics also chatters at INFO about model loading.
-#
-# After both have done their import-time logger setup, we strip
-# RichHandler and set propagate=True so anything WARNING+ flows
-# through our standard root config.
-import boxmot.utils  # noqa: F401, E402
-import ultralytics  # noqa: F401, E402
+configure_logging()
 
-for _noisy in ("boxmot", "ultralytics"):
-    _lg = logging.getLogger(_noisy)
-    _lg.setLevel(logging.WARNING)
-    for _h in list(_lg.handlers):
-        _lg.removeHandler(_h)
-    _lg.propagate = True
+# NOTE: torch-family imports (ultralytics, boxmot, torch) are banned at
+# module level in this process. This file used to import boxmot.utils +
+# ultralytics here purely to silence their loggers, which paid the full
+# torch runtime (hundreds of MB resident) in a process that runs YOLO
+# only in child processes. boxmot is no longer imported anywhere in the
+# backend (the re-id brain lives in the GPU sidecar); ultralytics is
+# lazy-imported by `censor._get_seg_model`, which silences its logger
+# at that point.
 
 
 # Quiet uvicorn's access log for the docs/schema endpoints. They're hit
@@ -57,7 +41,7 @@ for _noisy in ("boxmot", "ultralytics"):
 class _AccessLogQuietFilter(logging.Filter):
     _QUIET_PATHS = frozenset({"/openapi.json", "/docs", "/redoc"})
 
-    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
+    def filter(self, record: logging.LogRecord) -> bool:
         args = record.args
         if isinstance(args, tuple) and len(args) >= 3:
             path = str(args[2]).split("?", 1)[0]
@@ -71,26 +55,31 @@ logging.getLogger("uvicorn.access").addFilter(_AccessLogQuietFilter())
 # Register every ORM model in SQLAlchemy metadata at startup so foreign
 # keys resolve when the first INSERT/SELECT runs. Imported for side
 # effects only.
+from src.api.briefing import router as briefing_router
 from src.api.cameras import router as cameras_router
 from src.api.cameras_ingest import router as cameras_ingest_router
 from src.api.caregivers import router as caregivers_router
-from src.api.briefing import router as briefing_router
-from src.api.presence import router as presence_router
-from src.api.home_report import router as home_report_router
-from src.api.review import router as review_router
 from src.api.detectors import router as detectors_router
 from src.api.devices import router as devices_router
+from src.api.event_gate import router as event_gate_router
 from src.api.events import router as events_router
 from src.api.face_embeddings import router as face_embeddings_router
 from src.api.feedback import router as feedback_router
 from src.api.health import router as health_router
+from src.api.home_report import router as home_report_router
+from src.api.insights import router as insights_router
+from src.api.insights_widgets import router as insights_widgets_router
+from src.api.journal import router as journal_router
+from src.api.summaries import router as summaries_router
 from src.api.internal.cameras import router as internal_cameras_router
 from src.api.livekit import router as livekit_router
 from src.api.livekit_webhooks import router as livekit_webhooks_router
 from src.api.pairing import router as pairing_router
 from src.api.patient_members import router as patient_members_router
 from src.api.patients import router as patients_router
-from src.api.pi_discovery import router as pi_discovery_router
+from src.api.presence import router as presence_router
+from src.api.security_headers import SecurityHeadersMiddleware
+from src.api.identity_roster import router as identity_roster_router
 from src.api.support import router as support_router
 from src.api.talk import router as talk_router
 from src.db import analysis as _analysis  # noqa: F401
@@ -105,25 +94,50 @@ from src.db import patient as _patient  # noqa: F401
 from src.db import patient_face_embedding as _patient_face_embedding  # noqa: F401
 from src.db import pi_discovery as _pi_discovery  # noqa: F401
 from src.db.session import get_engine, get_sessionmaker
-from src.services import clip_archival, email, push
+from src.services import clip_archival, email, event_gate, pager, push
+from src.services.data_collection import manager as recorder_manager
 from src.services.detection.presence_cache import PresenceCache
 from src.services.detection.presence_sweeper import PresenceSweeper
+from src.services.identity.fleet_watch import FleetWatch
 from src.services.detection.worker import DetectorWorker
 from src.services.scheduling.scheduler import ScheduledDetectorRunner
 from src.settings import get_settings
 
 
-def _warm_censor_model() -> None:
-    """Preload YOLO seg weights for the clip censor (daemon thread)."""
-    try:
-        from src.services.detection import censor
+def _warm_censor_weights() -> None:
+    """Fetch the censor's YOLO seg weights into cwd via a THROWAWAY
+    child process (daemon thread wrapper).
 
-        censor._get_seg_model()
-        logging.getLogger(__name__).info("censor model warmed")
-    except Exception:  # noqa: BLE001 — warmup is best-effort
+    Replaces `_warm_censor_model`, which loaded the model in THIS
+    process and pinned the full torch runtime (hundreds of MB) for the
+    process lifetime — even though tier-1 censoring runs in child
+    processes and the only in-parent consumer (privacy-masked door
+    stills) can lazy-load on first use. The child pays the download +
+    torch init, dies, and leaves the weights file cached in cwd where
+    every later censor subprocess (and a lazy in-parent load) finds it.
+    """
+    from src.services.detection.censor import _SEG_MODEL_NAME
+
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable, "-c",
+                "from ultralytics import YOLO; "
+                f"YOLO({_SEG_MODEL_NAME!r})",
+            ],
+            capture_output=True, timeout=600,
+        )
+        if proc.returncode == 0:
+            logging.getLogger(__name__).info("censor weights warmed (subprocess)")
+        else:
+            logging.getLogger(__name__).warning(
+                "censor weights warmup exited %d: %s",
+                proc.returncode, proc.stderr.decode(errors="replace")[-500:],
+            )
+    except Exception:
         logging.getLogger(__name__).warning(
-            "censor model warmup failed; will retry lazily on first "
-            "censored clip", exc_info=True,
+            "censor weights warmup failed; first censored clip or masked "
+            "still pays the download", exc_info=True,
         )
 
 
@@ -136,18 +150,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # previous process — raw clip bytes must never outlive a crash.
     # See clip_archival.sweep_scratch_dir; runs before any clip work.
     clip_archival.sweep_scratch_dir()
-    # Warm the censor's YOLO seg model off the startup path: the first
-    # load pays weights download + torch init (measured minutes on a
-    # cold host vs ~9s steady-state per censored clip). Daemon thread —
-    # never blocks startup, failure just re-raises lazily on first use.
-    # Still valuable now that tier-1 censoring runs in a child process
-    # (censor._censor_person_mask_subprocess): ultralytics resolves the
-    # bare "yolo11n-seg.pt" name against the process cwd, the warmup
-    # downloads it there (repo root locally, WORKDIR /app in the
-    # container), and the child inherits that cwd — so every censor
-    # subprocess finds the weights cached instead of re-downloading.
+    # Same for the data-collection recorder's tempfiles, which are raw
+    # uncensored video/audio and had no sweep of their own until now.
+    recorder_manager.sweep_temp_dir()
+    # Warm the censor's YOLO seg WEIGHTS off the startup path — in a
+    # throwaway subprocess, so this process never pays torch residency
+    # for a model it runs in children. ultralytics resolves the bare
+    # "yolo11n-seg.pt" name against cwd (repo root locally, WORKDIR
+    # /app in the container); the child downloads it there and every
+    # censor subprocess finds it cached instead of re-downloading.
     threading.Thread(
-        target=_warm_censor_model, name="censor-model-warmup", daemon=True
+        target=_warm_censor_weights, name="censor-weights-warmup", daemon=True
     ).start()
     # Phase 2: in-process detector subscriber-bot. Webhook-driven; the
     # `/v1/livekit/webhooks` route reads `app.state.detector_worker`
@@ -190,29 +203,73 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.presence_sweeper = presence_sweeper
     await presence_sweeper.start()
+    # Durable half of the event gate's auto-release. The per-event
+    # asyncio timer dies with this process, so a deploy inside a hold
+    # window would strand an alert at 'pending' forever and no
+    # caregiver would ever be told. This sweeps those out. Runs
+    # unconditionally — it is a safety net, not a feature.
+    gate_sweeper = event_gate.GateSweeper(
+        settings=get_settings(), sessionmaker=get_sessionmaker(),
+    )
+    app.state.gate_sweeper = gate_sweeper
+    await gate_sweeper.start()
+    # Dead-man watch over the GPU nodes. Identity fails OPEN, so a node
+    # that dies costs its homes their routine detections while everything
+    # keeps looking healthy — that is how the 2026-07-26 OOM went unnoticed
+    # for hours. Nothing else notices, so this does.
+    fleet_watch = FleetWatch(
+        settings=get_settings(), sessionmaker=get_sessionmaker(),
+    )
+    app.state.fleet_watch = fleet_watch
+    await fleet_watch.start()
     try:
         yield
     finally:
+        await fleet_watch.stop()
+        await gate_sweeper.stop()
         await presence_sweeper.stop()
         await scheduler.stop()
         await worker.stop()
         await push.close()
+        await pager.close()
         await email.close()
         await engine.dispose()
 
 
 def create_app() -> FastAPI:
+    # Interactive docs and the raw schema are developer conveniences, and
+    # outside local/test they are pure reconnaissance: production served
+    # /openapi.json unauthenticated, handing over all 53 paths and 68
+    # operations with request/response schemas. Same fail-closed shape as
+    # _require_internal_key — local and test keep the convenience, every
+    # other env gets nothing. Passing None also unmounts the routes, so
+    # this cannot be defeated by requesting the path directly.
+    _docs_enabled = get_settings().env in ("local", "test")
     app = FastAPI(
         title="nemara-backend",
         version="0.0.1",
         lifespan=lifespan,
+        docs_url="/docs" if _docs_enabled else None,
+        redoc_url="/redoc" if _docs_enabled else None,
+        openapi_url="/openapi.json" if _docs_enabled else None,
     )
+    # Baseline browser-facing headers on every response (HSTS, CSP,
+    # nosniff, frame-deny). See src/api/security_headers.py.
+    app.add_middleware(SecurityHeadersMiddleware)
     app.include_router(health_router)
     app.include_router(caregivers_router)
     app.include_router(briefing_router)
     app.include_router(presence_router)
     app.include_router(home_report_router)
-    app.include_router(review_router)
+    # Insights read API: the caregiver dashboard's data layer — replaces
+    # the web app's direct nemara_readonly/BYPASSRLS Postgres connection.
+    app.include_router(insights_router)
+    app.include_router(insights_widgets_router)
+    app.include_router(summaries_router)
+    app.include_router(journal_router)
+    # Operator-only event gate: pre-dispatch false-positive check.
+    # Bearer token separate from caregiver auth (deps.operator_auth).
+    app.include_router(event_gate_router)
     app.include_router(patients_router)
     app.include_router(patient_members_router)
     app.include_router(detectors_router)
@@ -224,8 +281,6 @@ def create_app() -> FastAPI:
     # Pairing flow + LiveKit token minting.
     app.include_router(pairing_router)
     app.include_router(livekit_router)
-    # Pi-device announce + caregiver-facing discovered list.
-    app.include_router(pi_discovery_router)
     # Phase 2: webhook receiver feeding the in-process detector worker.
     app.include_router(livekit_webhooks_router)
     # Phase 3 caregiver Talk mode.
@@ -234,6 +289,9 @@ def create_app() -> FastAPI:
     app.include_router(face_embeddings_router)
     # Contact Support (Resend forwarding) from the iOS app's Settings.
     app.include_router(support_router)
+    # GPU node roster — nodes poll to be told which homes to run. This is
+    # also their heartbeat, so it is what makes failover and scale-out work.
+    app.include_router(identity_roster_router)
     # Product Feedback (persisted + best-effort Resend) from Settings.
     app.include_router(feedback_router)
     # Support-only /internal routes (room-privacy reclassify escape

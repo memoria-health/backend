@@ -83,28 +83,82 @@ async def test_local_needs_no_key(fake_settings, monkeypatch):
     assert resp.checks["identity"] != "not_configured"
 
 
-async def test_prod_dev_identity_url_reads_not_configured(
+async def test_prod_with_no_registered_node_is_not_benign(
     fake_settings, monkeypatch,
 ):
-    """A deploy that never set the identity URL must say so by name.
+    """Prod with an empty roster means NOBODY is watching any home.
 
-    Probing host.docker.internal from Railway just times out on every
-    call, so /ready would read 'fail' forever and be ignored. The remedy
-    is a deploy env var, not an incident, and the word should say that.
+    This used to read 'not_configured', on the reasoning that a deploy
+    which never set the identity URL wanted an env var rather than an
+    incident. Under the roster that reasoning inverts: production nodes
+    register themselves, so an empty roster is not a missing setting, it
+    is an absent fleet — every home blind, and the backend failing open
+    over it. It must not be reported with a benign-sounding word.
     """
     fake_settings(internal_service_key="k", env="prod")
     monkeypatch.setattr(
         "src.db.session.get_sessionmaker", lambda: _ok_sessionmaker(),
     )
     resp = await ready(x_internal_key="k")
-    assert resp.checks["identity"] == "not_configured"
+    assert resp.checks["identity"] == "no_nodes_registered"
     assert resp.status == "degraded"
 
 
-def _ok_sessionmaker():
+async def test_all_nodes_unreachable_reads_zero_of_n(
+    fake_settings, monkeypatch,
+):
+    """Registered but unreachable is the tailnet/ACL failure, and it must count.
+
+    Nothing is listening on these ports, so both probes fail. The single-URL
+    check this replaces would have reported on at most one node.
+    """
+    fake_settings(internal_service_key="k", env="prod")
+    monkeypatch.setattr(
+        "src.db.session.get_sessionmaker",
+        lambda: _ok_sessionmaker(nodes=[
+            ("pod-a", "http://127.0.0.1", 65001),
+            ("pod-b", "http://127.0.0.1", 65002),
+        ]),
+    )
+    resp = await ready(x_internal_key="k")
+    assert resp.checks["identity"] == "degraded_0_of_2_nodes"
+    # Each failing node is named, so the reader knows WHICH to go look at.
+    assert resp.checks["identity_node:pod-a"] == "fail"
+    assert resp.checks["identity_node:pod-b"] == "fail"
+    assert resp.status == "degraded"
+
+
+async def test_only_broken_nodes_get_their_own_line(fake_settings, monkeypatch):
+    """A per-node key appears only for a node that is NOT ok.
+
+    Otherwise the check grows a line per home and stops being readable at
+    the ten-node scale this design is for.
+    """
+    fake_settings(internal_service_key="k", env="prod")
+    monkeypatch.setattr(
+        "src.db.session.get_sessionmaker",
+        lambda: _ok_sessionmaker(nodes=[("pod-a", "http://127.0.0.1", 65001)]),
+    )
+    resp = await ready(x_internal_key="k")
+    named = {k for k in resp.checks if k.startswith("identity_node:")}
+    # This node fails (nothing is listening), so it IS named...
+    assert named == {"identity_node:pod-a"}
+    # ...and every named node is a failing one, never a healthy one.
+    assert all(resp.checks[k] != "ok" for k in named)
+
+
+def _ok_sessionmaker(nodes=()):
+    """A sessionmaker whose SELECT 1 succeeds and whose roster returns `nodes`.
+
+    `nodes` is what `_identity_node_targets` reads: rows of
+    (node_id, base_url, lowest_assigned_port).
+    """
     class _Result:
         def one(self):
             return (1,)
+
+        def all(self):
+            return list(nodes)
 
     class _Session:
         async def __aenter__(self):

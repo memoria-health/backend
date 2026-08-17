@@ -86,12 +86,23 @@ def _patch_censor(monkeypatch, *, raises: bool = False) -> list[dict[str, Any]]:
 
     async def _censor(
         in_path: str, out_path: str, *, full_frame: bool = False,
-        keep_audio: bool = True,
+        keep_audio: bool = True, mode: str | None = None,
     ) -> None:
         # keep_audio records the intimate-situation carve-out: censored
         # clips carry sound EXCEPT on a positive intimacy verdict, where
         # the audio is itself the exposure.
-        calls.append({"full_frame": full_frame, "keep_audio": keep_audio})
+        #
+        # `mode` was added to censor_clip for the research-corpus mask
+        # (clip_archival passes CENSOR_MODE_RESEARCH on the B2 path) but
+        # not to this double, so every call through here raised TypeError
+        # inside the archival task. The task swallows exceptions, so the
+        # visible symptom was an empty upload list rather than an error —
+        # which is why it read as "no upload happened" instead of "the
+        # stub has the wrong signature". Recorded, not just accepted, so
+        # a test can assert which mode a given path used.
+        calls.append(
+            {"full_frame": full_frame, "keep_audio": keep_audio, "mode": mode}
+        )
         if raises:
             raise CensorError("censor stack down")
         with open(out_path, "wb") as f:

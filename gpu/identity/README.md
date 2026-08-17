@@ -16,11 +16,21 @@ sits on top.
 
 Entry point: `gpu/identity/service.py`, ex `tools/run_identity.py`
 (MJPEG overlay :8012 + the versioned, token-authenticated `/state` seam
-defined in `contract.py`); supervised launch via
-`gpu/deploy/identity_supervisor.sh`:
+defined in `contract.py`).
 
-    NEMARA_IDENTITY_ROOM=patient_<uuid> gpu/deploy/identity_supervisor.sh
-    # or directly: uv run python gpu/identity/service.py --room patient_<uuid>
+On a **node**, processes are started and supervised by
+`gpu/deploy/roster_agent.sh`, one per room, on ports the backend assigns
+via `POST /v1/identity/roster`. Nothing is launched by hand there — the
+node is told which homes to run and reconciles to that list.
+(`gpu/deploy/identity_supervisor.sh`, which ran a single room from an env
+var, was deleted 2026-08-11.)
+
+**Locally**, run one directly:
+
+    uv run python gpu/identity/service.py --room patient_<uuid> --patient <uuid>
+
+Pass `--patient` explicitly. Its argparse default is a hardcoded pilot
+UUID, so on any other home it silently binds the wrong patient.
 
 Pure modules are unit-tested (`test/unit/test_identity_*.py`).
 

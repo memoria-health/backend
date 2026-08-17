@@ -31,6 +31,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from google import genai
+
+from src.services.genai_client import get_client
 from google.genai import types as genai_types
 
 if TYPE_CHECKING:
@@ -226,7 +228,7 @@ async def screen_clip(mp4: bytes, *, settings: Settings) -> ScreenResult:
             video_metadata = genai_types.VideoMetadata(fps=int(float(fps_raw)))
         except ValueError:
             video_metadata = None
-    client = genai.Client(api_key=settings.gemini_api_key)
+    client = get_client(settings.gemini_api_key)
     response = await asyncio.wait_for(
         client.aio.models.generate_content(
             model=settings.sensitivity_model,

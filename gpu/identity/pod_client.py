@@ -21,13 +21,21 @@ that a Re-ID infrastructure failure must never silence detection.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
+import os
 
 import httpx
 import numpy as np
 
 from identity.wire import RemoteFaceObs, RemoteObservations
+# Raw frame wire (2026-08-13): pixels as-is over loopback instead of a
+# JPEG encode/decode pair — a top CPU stage under multi-camera load.
+# The format lives in ONE module both services import, so pack and
+# parse cannot drift. Importing perception here is the allowed
+# direction (identity is the higher layer).
+from perception.rawwire import pack_frames
 
 log = logging.getLogger(__name__)
 
@@ -73,6 +81,14 @@ class SamServiceClient:
         self._client.headers["X-Nemara-Client"] = (
             f"identity-service@{socket.gethostname()}"
         )
+        # Perception grew bearer auth on 2026-08-11. Same shared-token shape
+        # as /state, and same "empty disables it" semantics on the server, so
+        # an unset token leaves dev exactly as it was. Sent on every request
+        # via the client's default headers rather than per-call, so a new
+        # endpoint cannot forget it.
+        _tok = os.environ.get("NEMARA_PERCEPTION_TOKEN", "").strip()
+        if _tok:
+            self._client.headers["Authorization"] = f"Bearer {_tok}"
         self._expected_face_model = expected_face_model
 
     async def aclose(self) -> None:
@@ -85,7 +101,7 @@ class SamServiceClient:
 
     async def faces(
         self,
-        jpeg: bytes,
+        frame: "bytes | np.ndarray",
         boxes: list[tuple[int, float, float, float, float]],
         *,
         full: bool = False,
@@ -95,17 +111,38 @@ class SamServiceClient:
         identity). `full=True` also detects faces on the whole frame
         (track_id=-1, caller assigns) — lag-immune for close faces.
         Returns (track_id, embedding, face_px, det, cx, cy) with cx/cy
-        the face center in the sent frame's pixel space."""
+        the face center in the sent frame's pixel space.
+
+        `frame` as an ndarray rides the raw wire (/faces_raw, no codec
+        work); JPEG bytes keep the multipart path."""
         import json as _json
 
-        resp = await self._client.post(
-            f"{self._base}/faces",
-            data={
-                "boxes": _json.dumps([list(b) for b in boxes]),
-                "full": "1" if full else "0",
-            },
-            files=[("frame", ("f.jpg", jpeg, "image/jpeg"))],
-        )
+        if isinstance(frame, np.ndarray):
+            # to_thread: packing is a multi-MB memcpy — off the event
+            # loop, same as the JPEG encode it replaced always was.
+            body = await asyncio.to_thread(
+                pack_frames,
+                {
+                    "v": 1,
+                    "boxes": [list(b) for b in boxes],
+                    "full": 1 if full else 0,
+                },
+                [(0, frame)],
+            )
+            resp = await self._client.post(
+                f"{self._base}/faces_raw",
+                content=body,
+                headers={"Content-Type": "application/octet-stream"},
+            )
+        else:
+            resp = await self._client.post(
+                f"{self._base}/faces",
+                data={
+                    "boxes": _json.dumps([list(b) for b in boxes]),
+                    "full": "1" if full else "0",
+                },
+                files=[("frame", ("f.jpg", frame, "image/jpeg"))],
+            )
         resp.raise_for_status()
         j = resp.json()
         if j.get("contract") != "faces-v1":
@@ -128,34 +165,65 @@ class SamServiceClient:
 
     async def observe(
         self,
-        jpegs_by_index: list[tuple[int, bytes]],
+        frames_by_index: list[tuple[int, "bytes | np.ndarray"]],
         *,
         camera_id: str,
         person_thr: float,
         face_interval: int,
         face_cap: int,
         detect_screens: bool = False,
+        session_state: "dict | None" = None,
     ) -> RemoteObservations:
-        """POST ordered (orig_idx, jpeg_bytes) frames; parse the raw
+        """POST ordered (orig_idx, frame) frames; parse the raw
         observations. Raises on transport/HTTP errors (fail-open is
         the caller's job). `detect_screens` asks the pod for one
         screen-concept pass on the newest frame (display-veto map
-        refresh, ~0.5s)."""
-        files = [
-            ("frames", (f"{idx:05d}.jpg", jpeg, "image/jpeg"))
-            for idx, jpeg in jpegs_by_index
-        ]
-        resp = await self._client.post(
-            f"{self._base}/observe",
-            data={
+        refresh, ~0.5s).
+
+        `session_state` (stateless-worker mode): the camera's portable
+        cross-tick state — pass {} on the first tick. Presence of the
+        key switches the WORKER to stateless for this request, and the
+        updated snapshot comes back on the response. Raw wire only.
+
+        ndarray frames ride the raw wire (/observe_raw — no JPEG
+        encode here, no decode on the pod); bytes keep multipart."""
+        if frames_by_index and isinstance(frames_by_index[0][1], np.ndarray):
+            header = {
+                "v": 1,
                 "camera_id": camera_id,
-                "person_thr": str(person_thr),
-                "face_interval": str(face_interval),
-                "face_cap": str(face_cap),
-                "detect_screens": "1" if detect_screens else "0",
-            },
-            files=files,
-        )
+                "person_thr": person_thr,
+                "face_interval": face_interval,
+                "face_cap": face_cap,
+                "detect_screens": 1 if detect_screens else 0,
+            }
+            if session_state is not None:
+                header["session_state"] = session_state
+            # to_thread: packing a batch is a ~tens-of-MB memcpy — off
+            # the event loop, same as the JPEG encode it replaced.
+            body = await asyncio.to_thread(
+                pack_frames, header, frames_by_index,
+            )
+            resp = await self._client.post(
+                f"{self._base}/observe_raw",
+                content=body,
+                headers={"Content-Type": "application/octet-stream"},
+            )
+        else:
+            files = [
+                ("frames", (f"{idx:05d}.jpg", jpeg, "image/jpeg"))
+                for idx, jpeg in frames_by_index
+            ]
+            resp = await self._client.post(
+                f"{self._base}/observe",
+                data={
+                    "camera_id": camera_id,
+                    "person_thr": str(person_thr),
+                    "face_interval": str(face_interval),
+                    "face_cap": str(face_cap),
+                    "detect_screens": "1" if detect_screens else "0",
+                },
+                files=files,
+            )
         resp.raise_for_status()
         j = resp.json()
         # Contract + face-model guards: a stale v1 server would parse
@@ -261,4 +329,8 @@ def _parse_observe(j: dict) -> RemoteObservations:
             k: float(v) for k, v in j.get("timings_ms", {}).items()
         },
         screen_regions=tuple(screen_regions),
+        session_state=(
+            j["session_state"]
+            if isinstance(j.get("session_state"), dict) else None
+        ),
     )

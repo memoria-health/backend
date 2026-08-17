@@ -4,8 +4,9 @@
 `/ready`  is the readiness check: can it reach Postgres.
 """
 
+import logging
 import secrets
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel, ConfigDict
@@ -14,6 +15,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.session import get_session
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(tags=["health"])
 
@@ -116,9 +119,17 @@ async def ready(
             detail={"status": "fail", "checks": {"db": "fail"}, "error": str(exc)},
         ) from exc
 
-    async def _probe(url: str, headers: dict[str, str] | None = None) -> str:
+    async def _probe(
+        url: str, headers: dict[str, str] | None = None,
+        proxy: str | None = None,
+    ) -> str:
+        # `proxy` matters for identity specifically: on Railway those nodes
+        # are only reachable through tailscaled's HTTP proxy. Probing them
+        # directly would report the whole fleet down while the real data
+        # path — which does use the proxy — was working fine. A readiness
+        # check must take the same route as the traffic it speaks for.
         try:
-            async with httpx.AsyncClient(timeout=1.5) as client:
+            async with httpx.AsyncClient(timeout=1.5, proxy=proxy) as client:
                 r = await client.get(url, headers=headers or {})
             # 401/403 is NOT reachability — it means our token is wrong
             # or missing, and `< 500` would have quietly called that
@@ -129,6 +140,13 @@ async def ready(
             return "ok" if r.status_code < 500 else "fail"
         except httpx.HTTPError:
             return "fail"
+        except httpx.InvalidURL:
+            # NOT an HTTPError — it derives straight from Exception, so the
+            # clause above misses it. Reachable because a node's base_url is
+            # self-reported into identity_nodes; a malformed one would turn a
+            # readiness probe into a 500. The roster validates on the way in,
+            # this covers rows written before it did.
+            return "bad_url"
 
     # Concurrent, and short — a readiness probe must not take longer
     # than the interval a monitor polls it on.
@@ -136,23 +154,73 @@ async def ready(
         settings.livekit_url.replace("wss://", "https://")
         if settings.livekit_url else ""
     )
-    # A prod deploy that still carries the dev-rig identity URL is
-    # MISCONFIGURED, not down — probing it would just time out on every
-    # call and report "fail" forever. Say so by name and skip the probe.
-    id_configured = not (
-        settings.env not in ("local", "test")
-        and _IDENTITY_DEV_DEFAULT in settings.identity_state_url
-    )
-    id_url = f"{settings.identity_state_url}/state"
     id_token = getattr(settings, "identity_state_token", "")
     id_headers = {"Authorization": f"Bearer {id_token}"} if id_token else None
-    results = await asyncio.gather(
-        _probe(lk_url) if lk_url else _noop_ok(),
-        _probe(id_url, id_headers) if id_configured else _noop_ok(),
+    id_proxy = getattr(settings, "identity_proxy_url", "") or None
+
+    # Identity is a FLEET now, not one sidecar. Probing a single configured
+    # URL was accurate when there was one process; with the roster it reports
+    # on at most one node and would say "ok" with every other node dead —
+    # exactly the silent-blindness failure the roster exists to prevent.
+    #
+    # So: ask the roster who is registered, then probe one room per node.
+    # One per node, not one per room: this catches the failure that actually
+    # takes a whole node out (the tailnet path, a dead container) at a cost
+    # that stays flat as homes are added. A single wedged room is a
+    # per-home concern and belongs to /health/freshness, which is the
+    # product-truth probe.
+    nodes = await _identity_node_targets(
+        sm, getattr(settings, "identity_roster_stale_after_s", 90),
     )
+    if nodes:
+        # LiveKit rides along in the SAME gather. Every probe carries a 1.5s
+        # timeout, so running the legs in sequence would make the worst case
+        # additive — and a readiness endpoint that takes longer than its own
+        # poll interval starts reporting on the past.
+        lk_result, *node_results = await asyncio.gather(
+            _probe(lk_url) if lk_url else _noop_ok(),
+            *(_probe(f"{url}/state", id_headers, id_proxy) for _, url in nodes),
+        )
+        live = sum(1 for r in node_results if r == "ok")
+        if live == len(nodes):
+            checks["identity"] = "ok"
+        else:
+            # Name the count, not just "fail". "1 of 3 nodes" is a capacity
+            # problem to page on; "0 of 3" is an outage; the two want very
+            # different responses at 3am.
+            checks["identity"] = f"degraded_{live}_of_{len(nodes)}_nodes"
+        for (node_id, _), r in zip(nodes, node_results, strict=True):
+            if r != "ok":
+                checks[f"identity_node:{node_id}"] = r
+    else:
+        # No node has ever registered. Fall back to the single-URL probe so
+        # local development — where identity runs on the laptop and there is
+        # no roster at all — keeps working unchanged.
+        #
+        # A prod deploy that still carries the dev-rig identity URL is
+        # MISCONFIGURED, not down — probing it would just time out on every
+        # call and report "fail" forever. Say so by name and skip the probe.
+        id_configured = not (
+            settings.env not in ("local", "test")
+            and _IDENTITY_DEV_DEFAULT in settings.identity_state_url
+        )
+        lk_result, id_result = await asyncio.gather(
+            _probe(lk_url) if lk_url else _noop_ok(),
+            _probe(f"{settings.identity_state_url}/state", id_headers, id_proxy)
+            if id_configured else _noop_ok(),
+        )
+        if id_configured:
+            checks["identity"] = id_result
+        elif settings.env not in ("local", "test"):
+            # Production with no registered node and no usable URL means
+            # nothing is watching any home. That is not "not configured",
+            # it is down, and it must not read as benign.
+            checks["identity"] = "no_nodes_registered"
+        else:
+            checks["identity"] = "not_configured"
+
     if lk_url:
-        checks["livekit"] = results[0]
-    checks["identity"] = results[1] if id_configured else "not_configured"
+        checks["livekit"] = lk_result
 
     age = _time.monotonic() - last_gateway_poll_mono
     if last_gateway_poll_mono == float("-inf"):
@@ -183,6 +251,54 @@ class FreshnessResponse(BaseModel):
 async def _noop_ok() -> str:
     """Placeholder result for a dependency that isn't configured."""
     return "ok"
+
+
+async def _identity_node_targets(sm: Any, stale_s: int) -> list[tuple[str, str]]:
+    """One probeable `(node_id, base_url:port)` per registered GPU node.
+
+    Only nodes that are BOTH heartbeating and actually serving a room are
+    returned, for opposite reasons:
+
+    * A node whose last poll has aged out is already being drained by the
+      roster — its homes are being handed to a survivor. Reporting it as a
+      dead dependency would page for a failover that is working.
+    * A node with no assigned room has nothing listening on any identity
+      port yet, so probing it would report "fail" for an idle-but-healthy
+      node. This is the normal state of a freshly started node in the
+      seconds before its first claim.
+
+    Lowest port per node: an arbitrary but STABLE choice, so the check reads
+    the same across polls rather than hopping between rooms.
+    """
+    try:
+        async with sm() as s:
+            rows = (
+                await s.execute(
+                    text(
+                        "SELECT n.node_id, n.base_url, min(p.identity_port) "
+                        "  FROM public.identity_nodes n "
+                        "  JOIN public.patients p "
+                        "    ON p.identity_node_id = n.node_id "
+                        "   AND p.identity_port IS NOT NULL "
+                        " WHERE n.last_seen_at > now() - make_interval("
+                        "         secs => :stale) "
+                        " GROUP BY n.node_id, n.base_url "
+                        " ORDER BY n.node_id"
+                    ),
+                    # Passed in rather than read here: the handler already
+                    # holds settings, and re-importing get_settings inside a
+                    # helper would bind past the monkeypatch the tests use.
+                    {"stale": stale_s},
+                )
+            ).all()
+        return [(r[0], f"{r[1].rstrip('/')}:{r[2]}") for r in rows]
+    except SQLAlchemyError:
+        # The db check above already ran and passed, so this is unexpected —
+        # most likely the roster delta has not been applied to this
+        # environment. Degrade to the single-URL path rather than 500 a
+        # readiness probe.
+        log.exception("ready: could not read identity node roster")
+        return []
 
 
 _FRESHNESS_STALE_S = 300

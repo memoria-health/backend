@@ -31,7 +31,83 @@ class DetectorSpec:
 
 BASE_PROMPT = (
     "You are monitoring a home camera to look after the person in view. "
-    "Respond with a JSON object containing every field below.\n\n"
+    "Respond with a JSON object containing every field below, FILLING THEM "
+    "IN THE ORDER GIVEN.\n\n"
+    # ── The base rate (2026-08-08) ────────────────────────────────────
+    # Stated globally, once, because it was stated nowhere: every
+    # detector fragment carries its own "when unsure, FALSE" fine print,
+    # but nothing ever told the model that all-FALSE is the EXPECTED
+    # output. Acquiescence bias on binary formats is measured behavior
+    # in LLMs (arXiv:2504.19445), and the standard mitigation is to
+    # state the prior and grant abstention explicitly. Measured need:
+    # 35 confabulated drinking-water fires in one day at conf 0.9-1.0,
+    # each one narrating a drink whose vessel `seen` never recorded.
+    "IMPORTANT — the base rate. Almost every clip shows ordinary life "
+    "with nothing to detect. Answering FALSE for every detector below "
+    "is the normal, correct output most of the time, and doing so when "
+    "the evidence holds nothing is a complete, correct job. You are "
+    "never asked to find something; you are asked whether the evidence "
+    "you recorded in `heard` and `seen` contains it. A TRUE whose "
+    "object, action, or words are not established there is the worst "
+    "error you can make: it sends a caregiver rushing to something "
+    "that never happened. No answer is improved by leaning TRUE. When "
+    "torn, FALSE.\n\n"
+    # ── Evidence before verdict (2026-08-06) ──────────────────────────
+    # The prompt used to open with `description`, defined as justifying the
+    # detections ("justify whatever you detect below"). That is verdict-first
+    # reasoning: the model settles on a label and then writes prose to support
+    # it. It is the mechanism behind the 08-05/06 false positives — the
+    # narrative was accurate right up to the verb ("crouches down and FALLS
+    # onto the floor", "bends to clean the table then COLLAPSES"), because the
+    # sentence existed to justify a conclusion already reached.
+    #
+    # `observed` runs first and is deliberately verdict-free. Fields are
+    # generated in order, so committing to neutral observations first means
+    # the detections below are conditioned on evidence rather than the reverse.
+    # Measured on the 08-05 clips: forcing transcribe-then-attribute-then-
+    # describe before the question took flash-lite from firing on ordinary
+    # conversation to 8/8 correct, and recovered a real call for help that the
+    # verdict-first shape scored at 0.2 confidence.
+    # These are three SEPARATE fields, not one `observed` blob. The blob was
+    # tried first (2026-08-06) and silently failed: asked for an AUDIO line
+    # and a VIDEO line in one string, the model wrote only the video half —
+    # "A person is seated in a chair facing a desk with a laptop." — and then
+    # fired calling_for_help claiming 'At 00:08, the person clearly says
+    # "help me"'. A single string can be satisfied by any sentence, so it
+    # gets satisfied by the easy one. A required field cannot be skipped.
+    "heard: transcribe any speech VERBATIM. If words cannot be made out, "
+    "write exactly UNINTELLIGIBLE. If there is no sound, write SILENCE. "
+    "Never substitute a plausible-sounding phrase for one you did not hear, "
+    "and never translate into another language. This is the ONLY place "
+    "speech may be quoted — if a phrase does not appear here, no detector "
+    "below may claim it was said.\n"
+    "audio_source: exactly one of 'person_on_camera' (you can see them "
+    "speaking), 'device' (a TV, phone, laptop or speaker — including video "
+    "or music being played), 'other_room' (off-camera), 'none' (no speech), "
+    "'cannot_tell'. A person watching a video is 'device'.\n"
+    "seen: what is physically visible, in two parts.\n"
+    "  - BODY: position and how it changes, in plain physical terms "
+    "(standing, crouching, kneeling, lying, sitting, walking toward). Do NOT "
+    "write fell, collapsed, fainted, took, swallowed or drank — those are "
+    "conclusions and belong to the detectors below, not here.\n"
+    "  - HANDS AND OBJECTS: anything the person is holding, and anything they "
+    "raise toward their face, mouth or body. Name the object only if you can "
+    "actually make it out (a cup, a bottle, a phone, a pill bottle) — "
+    "otherwise say an unidentified object, or say their hands are empty.\n"
+    "Write UNCLEAR for anything you cannot resolve at this distance or "
+    "resolution; guessing here corrupts every field after it.\n"
+    # The video twin of the `heard` rule. Without it the constraint was
+    # audio-only, and the same confabulation simply moved channel: on
+    # 2026-08-06 the drinking-water detector fired twice at 0.9 claiming
+    # "clearly seen lifting a water bottle to their mouth and drinking",
+    # while `seen` said "sitting in a chair at a desk, holding and looking
+    # down at a mobile phone" and the description agreed. No bottle existed
+    # in either field — it was invented at the verdict, exactly as the
+    # phantom "help me" had been before `heard` closed that door.
+    "This is the ONLY place objects and physical actions may be established. "
+    "If an object or a movement does not appear here, no detector below may "
+    "claim it happened — a detector that needs a cup reaching a mouth must "
+    "find that cup and that movement written above, or answer FALSE.\n\n"
     "description: write this for the caregiver who could not watch live — "
     "from it alone they should understand exactly what "
     "happened, start to finish, and why it was flagged. So justify whatever "
@@ -128,6 +204,34 @@ def build_prompt_and_schema(
     if motion_overlay:
         parts.append(_MOTION_OVERLAY_NOTE)
     schema_properties: dict[str, dict[str, str]] = {
+        # FIRST, deliberately: structured output is generated in property
+        # order, so this is what makes "evidence before verdict" real rather
+        # than advisory. See the note in BASE_PROMPT.
+        "heard": {
+            "type": "string",
+            "description": (
+                "Verbatim speech only, or UNINTELLIGIBLE, or SILENCE. Never "
+                "a plausible substitute, never translated. The only place "
+                "speech may be quoted."
+            ),
+        },
+        "audio_source": {
+            "type": "string",
+            "enum": [
+                "person_on_camera", "device", "other_room", "none",
+                "cannot_tell",
+            ],
+        },
+        "seen": {
+            "type": "string",
+            "description": (
+                "Body position AND any object held or raised toward the "
+                "face/mouth/body. No conclusions: never 'fell', 'collapsed', "
+                "'took a pill', 'drank'. The only place objects and physical "
+                "actions are established — a detector may not claim one that "
+                "is absent here. UNCLEAR for anything not resolvable."
+            ),
+        },
         "description": {
             "type": "string",
             # Schema-level reinforcement of the BASE_PROMPT rule —
@@ -141,7 +245,7 @@ def build_prompt_and_schema(
             ),
         },
     }
-    schema_required: list[str] = ["description"]
+    schema_required: list[str] = ["heard", "audio_source", "seen", "description"]
 
     # Always-on people_present block, RE-ENABLED. The LLM is the generic
     # presence detector again (camera_ingest's gate reads result.people_present

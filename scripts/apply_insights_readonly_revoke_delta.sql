@@ -1,0 +1,26 @@
+-- Revoke BYPASSRLS from nemara_readonly (2026-08-11).
+--
+-- WHY: the web dashboard used this role to query prod directly, and
+-- BYPASSRLS existed only because that path predated an authenticated
+-- read API. Every insight surface now reads /v1/insights/* behind
+-- caregiver auth (backend f9fd897, web 3cba8f5), so the superpower has
+-- no remaining consumer. The role itself STAYS — nemara-cost still
+-- reads through it — it just stops being able to cross RLS.
+--
+-- ORDER MATTERS (prod deploy runbook: DB delta BEFORE backend deploy,
+-- but THIS one is the exception that must run AFTER the web deploy):
+--   1. Deploy backend (adds /v1/insights/*).
+--   2. Deploy web (stops using the direct connection).
+--   3. Run this delta.
+-- Running it while the old web build is still live breaks the
+-- dashboard outright (better than leaking, but avoidable by ordering).
+--
+-- Verification after applying:
+--   select rolname, rolbypassrls from pg_roles where rolname = 'nemara_readonly';
+--   -- expect rolbypassrls = f
+-- And as the role (or via nemara-cost's connection):
+--   select count(*) from patients;   -- expect 0 rows or permission
+--                                    -- behavior per RLS policies, NOT
+--                                    -- the whole table.
+
+alter role nemara_readonly nobypassrls;

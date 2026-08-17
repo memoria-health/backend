@@ -97,8 +97,11 @@ class PatientResponse(BaseModel):
     # the wire until both clients ship without the toggle.
     privacy_mode_enabled: bool
 
-    # Review-gate toggle (additive; absent on older backends)
-    require_review: bool | None = None
+    # Evaluation mode, surfaced to the caregiver as an Accuracy setting on
+    # all three clients. ON by default. Reversed on 2026-08-05 from the
+    # operator-only design: a household should be able to see, and turn
+    # off, the fact that a reviewer looks at masked footage of their home.
+    event_gate_enabled: bool = True
 
 class PhotoURLResponse(BaseModel):
     """Returned by `GET /v1/patients/{id}/photo-url`. Signed URL is
@@ -176,6 +179,14 @@ class UpdatePatientRequest(BaseModel):
     # `data_collection_decided_at` server-side. `decided_at` itself is
     # NOT writable here (server-managed) — `extra="forbid"` rejects it.
     data_collection_enabled: bool | None = None
+    # Evaluation mode. Holds this patient's alerts for a few seconds so a
+    # Memoria reviewer can drop false alarms before the family is told.
+    # Caregiver-writable as of 2026-08-05: it used to be operator-only,
+    # but the setting is what makes it consented rather than something
+    # done to a household without their knowledge. Our own
+    # /v1/event-gate/toggle writes the SAME column, so either side can
+    # change it — the ops route logs every write for that reason.
+    event_gate_enabled: bool | None = None
     # NOTE (2026-07-27): `privacy_mode_enabled` is deliberately ABSENT.
     # Privacy is per-camera now (cameras.privacy_enabled, derived from
     # the room class and never user-settable); a client that still sends

@@ -14,7 +14,7 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.patient import Patient
-from src.repos.access import accessible_patient_ids
+from src.repos.access import accessible_patient_ids, owned_patient_ids
 
 
 async def list_for_caregiver(
@@ -86,17 +86,25 @@ async def update_partial(
 async def delete_by_id(
     session: AsyncSession, patient_id: UUID, *, caregiver_id: UUID
 ) -> bool:
-    """Delete a caregiver-owned patient. Returns True if a row was
-    deleted, False if no caregiver-owned row matched.
+    """Delete a patient the caregiver OWNS. Returns True if a row was
+    deleted, False if no owned row matched.
 
     Cascades to cameras / detectors / events via DB-level
     `ON DELETE CASCADE` on the FKs.
+
+    Scoped with `owned_patient_ids`, not `accessible_patient_ids`
+    (audit finding H3). Membership grants read/write; it must not grant
+    the ability to destroy the record — a caregiver invited to help
+    watch someone's parent could otherwise delete that patient and
+    cascade away every camera, detector and event with it. A non-owner
+    member now falls through to the same 404 as a stranger, which also
+    avoids confirming the patient exists.
     """
     result = await session.execute(
         delete(Patient)
         .where(
             Patient.id == patient_id,
-            Patient.id.in_(accessible_patient_ids(caregiver_id)),
+            Patient.id.in_(owned_patient_ids(caregiver_id)),
         )
         .returning(Patient.id)
     )

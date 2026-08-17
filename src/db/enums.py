@@ -14,7 +14,7 @@ type character varying`.
 from sqlalchemy.dialects.postgresql import ENUM
 
 DetectorCategoryEnum = ENUM(
-    "safety", "routine",
+    "safety", "routine", "behaviour", "care",
     name="detector_category", create_type=False,
 )
 DetectorSourceEnum = ENUM(

@@ -153,6 +153,36 @@ _DISTANCE_CLASS = re.compile(
     r"at|scratch(es|ing)?|finger|hand[- ]?motion|utensil|cigarette|"
     r"remote)\b", re.I,
 )
+# Actions whose EVIDENCE lives at the person's own scale — a hand, an
+# object, the space between a hand and a face — not at room scale.
+#
+# These must compile to the `person` bucket so the scheduler crops to
+# the body. Answering them from a full 1080p room is not a degraded
+# answer, it is a wrong one: the object is a few dozen pixels after
+# downsampling, so the model has nothing to read and describes what is
+# LIKELY instead. That is not hypothetical —
+#
+#   - `medication` (preset, bucket=person) once ran full-scene at 4fps
+#     and "reported a pill being swallowed while the man held a camera"
+#     (scheduler.py:309).
+#   - a custom `drinking water` ask compiled to SCENE and produced 11
+#     false fires on 2026-08-06 and 8 more in one hour on 08-07,
+#     inventing a cup in the `seen` field itself while the subject sat
+#     with both hands on a laptop (verified against the clips).
+#
+# The second is why this class exists. `_STILL_ACTIVITY` was the only
+# route to `person`, so every ACTIVE body-scale ask — drinking, eating,
+# taking medication, grooming — fell through to `person_motion` and
+# `scene`, which is the one combination guaranteed to hallucinate.
+_BODY_SCALE_ACTION = re.compile(
+    r"\b(drink(s|ing)?|sip(s|ping)?|swallow(s|ing)?|eat(s|ing)?|"
+    r"chew(s|ing)?|bite(s)?|feed(s|ing)?|"
+    r"medicat(e|es|ion)|pill(s)?|tablet(s)?|dose|inhaler|"
+    r"brush(es|ing)?\s+(teeth|hair)|shav(e|es|ing)|groom(s|ing)?|"
+    r"wip(e|es|ing)|rub(s|bing)?|touch(es|ing)?\s+(face|mouth|head)|"
+    r"hand\s+to\s+(mouth|face)|to\s+(his|her|their)\s+(mouth|lips|face))\b",
+    re.I,
+)
 def _entry_confidence_for(
     is_sustained: bool, bucket: str, degradation: str, category: str,
 ) -> dict | None:
@@ -167,16 +197,32 @@ def _entry_confidence_for(
     Emergencies must not wait, so safety stakes cap corroboration lower
     than routine.
 
-    Only SUSTAINED detectors accumulate entry evidence — instant events fire
-    on-sight and absence fires on its schedule; cross-tick corroboration for
-    those would be the within-clip confirm (k-of-N), not entry M-of-N.
+    Only SUSTAINED detectors accumulate entry evidence — instant events
+    fire on a single tick, so their corroboration is the WITHIN-CLIP
+    confirm (k-of-N): on a fire, the same clip is re-judged by fresh
+    calls that never see the first call's answer, and the fire is
+    suppressed unless k of n agree. Independent re-judging is the
+    variant the verification literature actually validates — a checker
+    that can read the draft happily re-copies the draft's hallucination
+    (Chain-of-Verification, arXiv:2309.11495).
+
+    Derived 2026-08-08 from the drinking-water FP episode: an instant
+    routine custom fired 35×/day at confidence 0.9-1.0 on confabulated
+    drinks, and the confirm dial — named below since P4 but never set
+    by any code path — existed precisely for this. Safety instants stay
+    on-sight: a real fall must not risk being outvoted by two noisier
+    re-checks, the same stakes carve-out the sustained branch makes.
+    Cost is bounded by the fire rate, not the tick rate (~n-1 extra
+    calls per fire), so a well-behaved detector pays nothing.
 
     Windows satisfy `t_seconds >= m * scheduler_tick` (~60 s) so M is
     physically reachable. TODO(soak): the exact (m, t) per tier are
     placeholders to calibrate against golden soak data before prod.
     """
     if not is_sustained:
-        return None
+        if category == "safety":
+            return None
+        return {"confirm": {"k": 2, "n": 3}}
     if degradation == "distance_class":
         m, t = (2, 180) if category == "safety" else (3, 300)
     elif bucket in ("rapid", "fine_motion"):
@@ -184,6 +230,26 @@ def _entry_confidence_for(
     else:
         return None  # easy to see → fire on the first confident detection
     return {"entry": {"m": m, "t_seconds": t}}
+
+
+def apply_confirm_need(eventing: dict | None, confirm_need: str | None) -> dict | None:
+    """Relax the instant-custom confirm gate when the COMPILER judged the
+    evidence low-risk (Aryaman 2026-08-14: confirmation should follow
+    evidence risk — subtle motion, small-object interaction, confounding
+    context — not be a blanket default).
+
+    Deliberately narrow: it can ONLY turn the exact instant-non-safety
+    default `{"confirm": {"k": 2, "n": 3}}` into None (fire on sight).
+    Sustained entry windows, safety instants (already None), and any
+    hand-tuned eventing pass through untouched. confirm_need None or
+    anything but "low" → unchanged, so a missing/garbled compiler line
+    lands on today's behavior — the 2026-08-08 confabulation storm
+    (35 fires/day on imagined drinks) is why the gate must never be
+    dropped by accident.
+    """
+    if confirm_need == "low" and eventing == {"confirm": {"k": 2, "n": 3}}:
+        return None
+    return eventing
 
 
 def classify_custom_dims(
@@ -202,6 +268,11 @@ def classify_custom_dims(
         branch, subject, bucket = "environment", "environment", "scene"
     elif _STILL_ACTIVITY.search(hay):
         branch, subject, bucket = "person_still", "patient", "person"
+    elif _BODY_SCALE_ACTION.search(hay):
+        # Moving, but the evidence is at body scale — crop to the person.
+        # Checked BEFORE the person_motion default, which is what sent
+        # every drinking/eating/medication ask to the whole room.
+        branch, subject, bucket = "person_motion", "patient", "person"
     else:
         branch, subject, bucket = "person_motion", "patient", "scene"
 

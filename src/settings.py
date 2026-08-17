@@ -127,15 +127,6 @@ class Settings(BaseSettings):
     openai_compile_model: str = Field(default="gpt-5.4")
     openai_frames_fps: int = Field(ge=1, le=30, default=4)
 
-    # ── OpenRouter (brokers Qwen3-VL etc.) ───────────────────────────
-    # OpenAI-compatible endpoint, so the provider reuses the frame-based
-    # path (OpenRouter does NOT accept native video). Used when a caregiver
-    # is routed to a non-Gemini/OpenAI model. Model ids are namespaced
-    # slugs, e.g. "qwen/qwen3-vl-32b-instruct".
-    openrouter_api_key: str = Field(default="")
-    openrouter_model: str = Field(default="qwen/qwen3-vl-32b-instruct")
-    openrouter_base_url: str = Field(default="https://openrouter.ai/api/v1")
-
     # ── DashScope (Alibaba Model Studio — Qwen3-VL, NATIVE video+fps) ──
     # SANDBOX: go direct to Alibaba instead of OpenRouter. The OpenAI-
     # compatible endpoint accepts a real `video` content part with an `fps`
@@ -159,7 +150,7 @@ class Settings(BaseSettings):
     dashscope_max_frames: int = Field(ge=1, le=768, default=55)
 
     # Per-account VLM routing: a caregiver may carry a `vlm_provider`
-    # override ("gemini" | "openai" | "openrouter" | "dashscope"); when
+    # override ("gemini" | "openai" | "dashscope"); when
     # null/unset we fall back to this global default. So you can move
     # individual families onto a different model without a deploy (just flip
     # the caregivers column). See services/detection/vlm_routing.py.
@@ -249,6 +240,46 @@ class Settings(BaseSettings):
     # Env: NEMARA_CENSOR_TIMEOUT_SECONDS.
     censor_timeout_seconds: float = Field(gt=0, le=900, default=180.0)
 
+    # Inline recorder masking: run segmentation every Nth frame and carry
+    # the (extra-dilated) mask across the rest. At 15fps there is only
+    # ~66ms per frame and segmentation costs tens of ms, so segmenting
+    # every frame does not fit the budget. 5 → segment 3x a second; a
+    # person moves very little in 200ms and the wider dilation covers it.
+    # Lower is safer and more expensive. Env:
+    # NEMARA_CENSOR_STREAM_SEGMENT_EVERY.
+    censor_stream_segment_every: int = Field(ge=1, le=60, default=5)
+
+    # How often a recording camera asks whether the moment is sensitive.
+    # ── Finalize-time redaction (2026-08-12) ────────────────────
+    # (The tick-time sensitivity screen and its cadence knob were
+    # retired 2026-08-14: the chunked finalize re-screen below is the
+    # sole redaction net — ~30% tick-cost saving on recording cameras.)
+    # (Replaces the per-clip masked-audio switch: audio is now kept
+    # unconditionally per the 2026-07-28 product call — redaction
+    # pixelates video spans and never touches the track. Capture is
+    # still severed at the publisher by patients.audio_capture_enabled.)
+    # Recording is raw-to-local-disk; between mux and upload the clip is
+    # re-screened in chunks and the sensitive spans pixelated via the
+    # event-clip censor (research mode, span-gated). ANY redaction
+    # failure drops the clip — raw never leaves the box on an error
+    # path. Disabling this uploads clips with only the tick-verdict
+    # priors unexamined — LOCAL RIGS ONLY, never a consented family.
+    # Env: NEMARA_DATA_COLLECTION_REDACTION_ENABLED etc.
+    data_collection_redaction_enabled: bool = True
+    # Chunk length for the finalize re-screen. Spans resolve to chunk
+    # granularity before padding; smaller = finer spans, more calls.
+    data_collection_redaction_chunk_seconds: float = Field(
+        ge=5.0, le=120.0, default=30.0
+    )
+    # Padding added to each side of every detected span before merging.
+    data_collection_redaction_pad_seconds: float = Field(
+        ge=0.0, le=30.0, default=3.0
+    )
+    # Concurrent chunk-screen calls per clip.
+    data_collection_redaction_concurrency: int = Field(
+        ge=1, le=16, default=4
+    )
+
     # ── Detector subscriber-bot (Phase 2) ───────────────────────
     # The bot lives inside the FastAPI process as an asyncio task tree
     # that subscribes to LiveKit rooms and runs the detector pipeline.
@@ -313,7 +344,33 @@ class Settings(BaseSettings):
     # Base URL of the identity service (the GPU-host sidecar that
     # synthesizes per-tick IdentityResults from /state — the ONLY
     # identity provider since the legacy brain's deletion 2026-07-26).
+    # How long a GPU node may go without polling /v1/identity/roster before
+    # its homes are released to whichever node polls next. MUST exceed the
+    # node's poll interval with margin, or nodes will steal homes from each
+    # other on a slow poll and every home pays a ~30-60s re-ground for
+    # nothing. 90s against a 30s poll gives two misses of slack.
+    identity_roster_stale_after_s: int = Field(ge=30, le=900, default=90)
+    # How often FleetWatch asks whether any home has no node. Cheap (four
+    # counting queries) and deliberately slower than the roster poll, so a
+    # normal failover completes between two checks and never pages.
+    identity_fleet_watch_seconds: int = Field(ge=15, le=3600, default=120)
     identity_state_url: str = Field(default="http://host.docker.internal:8012")
+    # HTTP proxy used ONLY for calls to identity nodes. On Railway that is
+    # tailscaled's --outbound-http-proxy-listen, which is how a container
+    # with no TUN device reaches a tailnet host.
+    #
+    # An HTTP proxy rather than tailscaled's SOCKS one: httpx needs the
+    # `socksio` package for socks5:// and we do not ship it, so an
+    # ALL_PROXY=socks5://... would raise ImportError on the first identity
+    # call — at runtime, in production, on a path that otherwise fails open.
+    #
+    # SCOPED to this client rather than set as a process-wide ALL_PROXY,
+    # because that would also route Gemini, OpenAI, LiveKit, Supabase and
+    # Resend through tailscaled. Only identity lives on the tailnet.
+    #
+    # It also fixes DNS: MagicDNS names do not resolve in the container's
+    # resolver, but a CONNECT carries the hostname and the proxy resolves it.
+    identity_proxy_url: str = Field(default="")
     # Bearer token for /state (gpu/identity/contract.py). Empty = no
     # auth (local dev, host-only traffic). ONE env name on BOTH sides:
     # NEMARA_IDENTITY_STATE_TOKEN. The service used to read
@@ -692,7 +749,6 @@ class Settings(BaseSettings):
     # held a departed patient present for 890s over an empty room. A still
     # patient in bed is re-grounded by SAM3 within this window. 0 = old
     # unbounded behaviour.
-    reid_scene_extension_max_s: float = Field(ge=0, default=150.0)
     # W5 — face-lock quality floors: dim faces may VOTE, only quality
     # faces may LOCK (the lunch green-box fix: 15-30px guest faces
     # cleared the quality-ADAPTIVE match bar and locked PATIENT).
@@ -771,6 +827,48 @@ class Settings(BaseSettings):
     # Token TTL refresh policy. Apple rejects JWTs older than 60 min;
     # we refresh slightly under that to leave headroom.
     apns_jwt_lifetime_seconds: int = Field(ge=60, le=3600, default=3300)
+
+    # ── Event gate: operator paging + verdict links ─────────────
+    # The gate holds an alert and pages an operator (not a caregiver —
+    # see src/services/event_gate.py). Paging goes through PagerDuty
+    # rather than our own APNs because their app already holds Apple's
+    # critical-alerts entitlement and does repeat-until-acknowledged.
+    #
+    # `pagerduty_routing_key` is the Integration Key of a PagerDuty
+    # service (Service → Integrations → Events API v2). Empty disables
+    # paging: the gate still holds and still auto-releases, but nobody
+    # is told, so the gate silently does nothing. Never leave it empty
+    # in an environment where any patient has event_gate_enabled on.
+    pagerduty_routing_key: str = Field(default="")
+    pagerduty_events_url: str = Field(
+        default="https://events.pagerduty.com/v2/enqueue"
+    )
+
+    # Public origin of THIS backend, used to build the verdict link that
+    # travels inside the page. Must be reachable from a phone on cellular
+    # — a LAN address here produces a link that works only at your desk.
+    event_gate_public_base_url: str = Field(default="")
+
+    # HMAC key for verdict links. One link grants sight of a single
+    # household's clip and the power to suppress a single real alert, so
+    # treat it as a live credential: rotating it kills every outstanding
+    # link. Empty disables link minting (fail closed — the page then
+    # carries no action link rather than an unsigned one).
+    event_gate_link_secret: str = Field(default="")
+
+    # How long a verdict link stays valid. Deliberately longer than the
+    # auto-release so a link opened late renders "already dispatched"
+    # instead of a signature error, which would look like a bug.
+    event_gate_link_ttl_seconds: int = Field(ge=30, le=900, default=180)
+
+    # Bearer token for the operator-only queue endpoint. Cross-tenant by
+    # design — it reads every household. Never ship it in a client.
+    ops_api_token: str = Field(default="")
+
+    # Cadence of the durable auto-release sweeper. The in-process timer
+    # gives an exact 60s release but dies with the process; this sweeper
+    # is what stops a deploy mid-window from stranding an alert forever.
+    event_gate_sweep_seconds: int = Field(ge=5, le=300, default=15)
 
     # ── Clip archival (Phase 4) ─────────────────────────────────
     # Wait this many seconds after an event fires before snapshotting

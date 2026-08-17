@@ -40,7 +40,7 @@ class Caregiver(Base):
         String(64), server_default=text("'America/New_York'"), default="America/New_York",
     )
 
-    # Per-account VLM override: "gemini" | "openai" | "openrouter".
+    # Per-account VLM override: "gemini" | "openai" | "dashscope".
     # NULL ⇒ use the global `settings.default_vlm_provider`. Lets us route
     # individual families onto a different model (e.g. Qwen3-VL via
     # OpenRouter) by flipping this one column — no deploy. Read (cached) by

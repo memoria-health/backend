@@ -21,14 +21,15 @@ from __future__ import annotations
 
 import array
 import asyncio
+import functools
 import json
 import logging
 import math
 import secrets
-import tempfile
 import time
 from collections.abc import Awaitable, Callable
-from datetime import timedelta
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -39,6 +40,7 @@ from sqlalchemy import select
 from src.db.camera import Camera
 from src.db.patient import Patient
 from src.services.data_collection.manager import RecorderManager
+from src.services.data_collection.manager import temp_root as recorder_temp_root
 from src.services.detection import frame_codec
 from src.services.detection.camera_ingest import CameraIngest
 from src.services.detection.patient_presence import PatientPresence
@@ -48,7 +50,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
     from src.services.detection.motion_cache import MotionCache
-    from src.services.identity.identity_client import IdentityClient
+    from src.services.identity.identity_client import IdentityProvider
     from src.settings import Settings
 
 log = logging.getLogger(__name__)
@@ -119,6 +121,37 @@ _CONSUMER_RETRY_BACKOFF_INITIAL = 1.0
 _CONSUMER_RETRY_BACKOFF_MAX = 16.0
 _CONSUMER_MAX_RETRIES = 5
 
+# Capacity for the SDK-side frame queues. LiveKit's VideoStream /
+# AudioStream default to capacity=0 == UNBOUNDED (RingQueue only
+# drops when capacity > 0), and each queued video event pins a full
+# native-resolution frame copy (~5.5 MB at 2K). Any sustained
+# delivery-minus-drain deficit therefore grows RSS without limit: a
+# 0.1 fps shortfall at 2K is ~2 GB/hour — the exact shape of the
+# 2026-08-14 production OOMs (linear climb while streaming, flat when
+# idle). With a bound, the ring drops the OLDEST frame, which is the
+# semantic the pipeline already has: FrameBuffer.push re-applies its
+# min-gap rule and discards most delivered frames anyway.
+#
+# Video: 8 frames ≈ half a second at the 15 fps publish rate — enough
+# to absorb a compress hop or a brief event-loop stall, small enough
+# that a stalled consumer costs ~44 MB/camera, not gigabytes.
+# Audio: 200 chunks (10 ms each at 16 kHz) ≈ 2 s ≈ 64 kB — audio
+# gaps degrade clips, so it gets a deeper buffer; it is cheap.
+_VIDEO_STREAM_QUEUE_CAPACITY = 8
+_AUDIO_STREAM_QUEUE_CAPACITY = 200
+
+# Dedicated pool for per-frame JPEG compression. `asyncio.to_thread`
+# uses the loop's DEFAULT executor, which the tick path saturates with
+# multi-hundred-ms numpy/ffmpeg jobs (compute_tick_signals,
+# sample_stats, mp4 materialize). Frame compression queued behind
+# those stalls the video consumer, which is what lets the SDK-side
+# stream queue above grow in the first place. Ingress work gets its
+# own lane so tick load can never throttle the drain. Two workers
+# cover ~12 cameras at 4 fps × ~20 ms/frame with headroom.
+_FRAME_COMPRESS_POOL = ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix="frame-compress",
+)
+
 # Idle-room auto-teardown window. After this many seconds connected
 # to a room with zero `cam_*` ingests, the RoomWorker asks its
 # parent DetectorWorker to remove it. Prevents the
@@ -152,7 +185,7 @@ class RoomWorker:
         settings: "Settings",
         sessionmaker: "async_sessionmaker",
         motion_cache: "MotionCache",
-        reid: "IdentityClient",
+        reid: "IdentityProvider",
         lk_api: "object | None" = None,
         on_idle_timeout: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
@@ -235,27 +268,46 @@ class RoomWorker:
         # cap bounds the whole room). Reuses the frames detection already
         # decodes — no extra LiveKit subscription. Inert unless a patient
         # has opted in; idle cameras pay an O(1) no-op feed.
-        recorder_temp_dir = Path(tempfile.gettempdir()) / "memoria-data-collection"
-        recorder_temp_dir.mkdir(parents=True, exist_ok=True)
+        # One shared directory, owned by the data_collection package, so
+        # the startup sweep in main.py knows where to look.
         self._recorder = RecorderManager(
             settings=settings,
-            temp_dir=recorder_temp_dir,
-            privacy_check=self._camera_privacy_check,
+            temp_dir=recorder_temp_root(),
             region_lookup=self._patient_region,
+            sidecar_builder=self._build_sidecar,
         )
 
-    async def _camera_privacy_check(self, camera_id) -> bool:
-        """Upload-boundary guard for the recorder: re-read the CAMERA's
-        room-derived privacy flag at the moment a clip is about to leave
-        the box, so a privacy flip (classifier finalizing, support
-        override) during the finalize→upload window still drops it."""
+    async def _build_sidecar(self, fs, clip_key: str, clip_metadata: dict):
+        """The note that travels with a clip: what the pipeline already
+        recorded inside this clip's window, re-expressed against its
+        timeline.
+
+        Reads only. Nothing new is computed for it, and a failure here
+        never costs the clip — the caller treats it as best-effort.
+        """
+        from src.services.annotations.fetch import (
+            build_for_clip,
+            clip_facts_from_upload,
+        )
+
+        clip = clip_facts_from_upload(
+            key=clip_key,
+            started_at=fs.session_start_utc,
+            duration_seconds=float(fs.video_duration_seconds or 0.0),
+            caregiver_id=fs.ctx.caregiver_id,
+            patient_id=fs.ctx.patient_id,
+            camera_id=fs.ctx.camera_id,
+            room=fs.ctx.room,
+            # Span-level redaction (2026-08-12): "masked" now means "this
+            # clip carries pixelated spans" — the exact ranges ride the
+            # object metadata as `sensitive_spans`.
+            masked=clip_metadata.get("redacted") == "true",
+            timeline_exact=clip_metadata.get("timeline_exact") != "false",
+        )
         async with self._sessionmaker() as session:
-            cam = await session.get(Camera, camera_id)
-        if cam is None:
-            # Row vanished mid-session — fail CLOSED: never upload a clip
-            # we can't positively confirm is allowed to leave the box.
-            return True
-        return cam.privacy_enabled
+            return await build_for_clip(
+                session, clip, generated_at=datetime.now(timezone.utc),
+            )
 
     async def _patient_region(self, patient_id) -> str:
         """Data-residency lookup for the recorder: resolve the patient's
@@ -945,7 +997,8 @@ class RoomWorker:
 
         def _push_audio(event: object) -> None:
             pcm = bytes(event.frame.data)  # type: ignore[attr-defined]
-            ingest.audio_buffer.push(data=pcm, captured_at=time.monotonic())
+            captured_at = time.monotonic()
+            ingest.audio_buffer.push(data=pcm, captured_at=captured_at)
             samples = array.array("h")
             samples.frombytes(pcm[: len(pcm) - (len(pcm) % 2)])
             if samples:
@@ -961,14 +1014,17 @@ class RoomWorker:
                 )
                 meter.update(peak=0, chunks=0, last_log=now)
             # Fork to the data-collection recorder (sync, non-blocking;
-            # no-op unless this camera has an active session).
-            self._recorder.feed_audio(ingest.camera_id, pcm)
+            # no-op unless this camera has an active session). The same
+            # capture time the buffer gets goes with it, so the recorder
+            # can line audio up against video and spot a stream stall.
+            self._recorder.feed_audio(ingest.camera_id, pcm, captured_at)
 
         await self._consume_with_retry(
             label="audio",
             ingest=ingest,
             open_stream=lambda: rtc.AudioStream(
                 track,
+                capacity=_AUDIO_STREAM_QUEUE_CAPACITY,
                 sample_rate=ingest.audio_buffer.sample_rate,
                 num_channels=ingest.audio_buffer.num_channels,
             ),
@@ -1025,10 +1081,13 @@ class RoomWorker:
                     )
                 if will_buffer:
                     try:
-                        jpeg, luma = await asyncio.to_thread(
-                            frame_codec.compress_for_buffer,
-                            frame.width, frame.height, frame_bytes,
-                            quality=self._settings.frame_jpeg_quality,
+                        jpeg, luma = await asyncio.get_running_loop().run_in_executor(
+                            _FRAME_COMPRESS_POOL,
+                            functools.partial(
+                                frame_codec.compress_for_buffer,
+                                frame.width, frame.height, frame_bytes,
+                                quality=self._settings.frame_jpeg_quality,
+                            ),
                         )
                     except Exception:  # noqa: BLE001 — never kill the reader
                         log.exception(
@@ -1071,7 +1130,9 @@ class RoomWorker:
         await self._consume_with_retry(
             label="video",
             ingest=ingest,
-            open_stream=lambda: rtc.VideoStream(track),
+            open_stream=lambda: rtc.VideoStream(
+                track, capacity=_VIDEO_STREAM_QUEUE_CAPACITY,
+            ),
             consume_one=_push_video,
         )
 

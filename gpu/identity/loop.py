@@ -53,6 +53,16 @@ from identity.state import CameraState
 
 log = logging.getLogger(__name__)
 
+# Stateless-worker dispatch (2026-08-16): the camera's cross-tick
+# session state travels with every request (CameraLoop owns it) and any
+# free worker serves any camera — shared-queue dispatch instead of the
+# camera→worker pin. Requires a worker image that echoes session_state
+# (gpu-v3.3+); the loop logs loudly if it doesn't. Off = exactly the
+# pinned behavior.
+_STATELESS_DISPATCH = os.environ.get(
+    "NEMARA_STATELESS_DISPATCH", "",
+).strip() in ("1", "true")
+
 # ── Cadence + identity constants (pilot-calibration targets) ─────────
 ACTIVE_INTERVAL_S = 0.6        # batch cadence while the room is occupied
 NONPATIENT_INTERVAL_S = 4.0    # tiny scheduler v1: a camera with people
@@ -100,7 +110,12 @@ EMPTY_INTERVAL_S = 20.0        # poll cadence for an empty room. Each
 # STABILITY IS THE PRODUCT; LATENCY IS SACRIFICIAL (Aryaman,
 # 2026-07-24): identity is ASYNC — detection ticks ride the published
 # Patient State, so tracking lag costs nothing downstream.
-TARGET_FPS = 3.0               # THE GPU-duty lever (measured
+# Env-overridable (2026-08-14) for the capacity experiments — the
+# 15-cams-per-node program A/Bs 2.0 against the proven 3.0. Default
+# unchanged; a lower value trades state-freshness for capacity and
+# needs an accuracy soak before it becomes the fleet default.
+TARGET_FPS = float(os.environ.get("NEMARA_TARGET_FPS", "3.0"))
+_TARGET_FPS_PROVEN = 3.0       # THE GPU-duty lever (measured
                                # 2026-07-26: pod cost ≈ 200-250ms x
                                # FRAMES, near-independent of
                                # resolution). 3fps → 10-19 frame
@@ -113,6 +128,12 @@ MAX_BATCH = 40                 # ceiling only — batches self-pace to
                                # load stride stretches instead of lag
                                # compounding (graceful degradation)
 JPEG_QUALITY = 80
+# Frame wire to perception (2026-08-13). "raw" ships BGR pixels as-is —
+# identity and perception share the box, and the JPEG encode/decode pair
+# on that loopback hop was a top CPU stage under multi-camera load
+# (encode p50 391ms at 3 cams, plus the pod's decode out of the same
+# starved cores). "jpeg" is the one-env revert: NEMARA_FRAME_WIRE=jpeg.
+FRAME_WIRE = os.environ.get("NEMARA_FRAME_WIRE", "raw").strip().lower()
 SCREEN_REFRESH_S = 120.0       # screens are furniture
 SEAT_FLOOR = 0.4               # combined-score floor to take an empty seat
                                # (calibrated with scoring.py 2026-07-24 so
@@ -208,6 +229,22 @@ class IdentityHome:
             max(1, int(os.environ.get("NEMARA_POD_CONCURRENCY", "2")))
         )
     )
+    # PER-WORKER admission (2026-08-15 review finding 3 on the v3.0
+    # worker pool): one shared semaphore sized for a single pod let one
+    # wedged worker's 25s-timeout calls hold the room's whole admission
+    # budget and starve cameras on a HEALTHY sibling worker — and
+    # capped total concurrency at single-pod levels no matter how many
+    # workers exist. One semaphore per pod client, created lazily; the
+    # legacy pod_lock above stays for anything still holding it.
+    pod_locks: dict = field(default_factory=dict)
+
+    def lock_for(self, client) -> asyncio.Semaphore:
+        sem = self.pod_locks.get(id(client))
+        if sem is None:
+            sem = self.pod_locks[id(client)] = asyncio.Semaphore(
+                max(1, int(os.environ.get("NEMARA_POD_CONCURRENCY", "2")))
+            )
+        return sem
     # Guards `seat`: candidates fold from per-camera worker THREADS
     # (asyncio.to_thread), so the read-modify-write must serialize.
     seat_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -242,6 +279,33 @@ class IdentityHome:
         # per process, so a restart would reshuffle every camera onto a
         # different worker and throw away all their sessions.
         return pool[sum(camera_id.encode()) % len(pool)]
+
+    def pod_for_dispatch(self, camera_id: str) -> SamServiceClient:
+        """Shared-queue dispatch (stateless-worker mode, 2026-08-16):
+        first worker with a free admission slot serves the camera.
+
+        Only valid when the camera's session state travels WITH the
+        request (NEMARA_STATELESS_DISPATCH=1) — the pin in sam_for
+        exists solely because state used to live in worker memory.
+        One line of queueing theory motivates this: one line feeding k
+        cashiers beats k separate lines (measured: the pinned 2-worker
+        fleet sat at 6.1s@10 cams where a shared queue ran ~3.1s).
+
+        The scan starts at the camera's hash slot so an all-busy
+        moment degrades to exactly the old pinned behaviour, and
+        different cameras don't herd onto the same first worker."""
+        pool = [self.sam, *self.pods]
+        if len(pool) == 1:
+            return self.sam
+        start = sum(camera_id.encode()) % len(pool)
+        for i in range(len(pool)):
+            c = pool[(start + i) % len(pool)]
+            # No await between this check and the caller's acquire —
+            # asyncio is single-threaded, so the free slot cannot be
+            # stolen before the caller enters the semaphore.
+            if self.lock_for(c)._value > 0:
+                return c
+        return pool[start]
     journal: Optional[EventJournal] = None
     # camera-id-8-prefix → room name (from the cameras table) — every
     # user-facing surface shows ROOM NAMES, never raw ids (Aryaman).
@@ -433,6 +497,10 @@ class CameraLoop:
         self._probed_at = 0.0
         self._scanned_to = 0.0   # coverage-scan high-water mark (ring ts)
         self._pod_epoch: Optional[str] = None  # session-id-reuse guard
+        # Stateless-worker mode: THIS loop owns the camera's cross-tick
+        # perception state; {} = "stateless, no history yet" (the key's
+        # presence in the request is what switches the worker).
+        self._session_state: dict = {}
         self._probe_task: Optional[asyncio.Task] = None
         self.stage_ms: dict = {}     # per-batch stage timings (measured)
         self.probe_ms: dict = {}     # per-probe stage timings (measured)
@@ -618,22 +686,44 @@ class CameraLoop:
         # identity again (face batches inside /observe were 3-5x the
         # cost and strangled the carry).
         t_e = time.time()
-        jpegs, inv_scale = await asyncio.to_thread(
+        send_frames, inv_scale = await asyncio.to_thread(
             self._encode, batch, TRACK_SEND_W,
         )
         encode_ms = (time.time() - t_e) * 1000.0
         t_q = time.time()
-        async with self.home.pod_lock:       # bounded pod admission
+        if _STATELESS_DISPATCH:
+            # Stateless mode: this loop owns the camera's cross-tick
+            # state and any free worker can serve the tick.
+            _pod = self.home.pod_for_dispatch(self.camera_id)
+        else:
+            _pod = self.home.sam_for(self.camera_id)
+        async with self.home.lock_for(_pod):  # per-WORKER admission
             t0 = time.time()                 # queue wait ends here
-            obs = await self.home.sam_for(self.camera_id).observe(
-                jpegs,
+            obs = await _pod.observe(
+                send_frames,
                 camera_id=f"identity_{self.camera_id}",
                 person_thr=0.4,
                 face_interval=999,
                 face_cap=0,
                 detect_screens=want_screens,
+                session_state=(
+                    self._session_state if _STATELESS_DISPATCH else None
+                ),
             )
             self.home.last_pod_ok = time.time()  # pod-progress watchdog feed
+        if _STATELESS_DISPATCH:
+            if obs.session_state is not None:
+                self._session_state = obs.session_state
+            else:
+                # A worker that doesn't echo state is running a pre-
+                # stateless image — continuing would re-ground every
+                # tick and renumber ids silently. Loud, once per tick,
+                # until the fleet image matches the flag.
+                log.error(
+                    "identity.stateless_not_echoed cam=%s — worker image "
+                    "predates stateless mode; state kept as-is",
+                    self.camera_id,
+                )
         self.pod_ms = (time.time() - t0) * 1000.0
         self.queue_ms = (t0 - t_q) * 1000.0  # other cameras' turn ahead of us
         # Epoch guard (2026-07-25 "born again as T13"): pod restarts
@@ -743,8 +833,8 @@ class CameraLoop:
             "identity.batch cam=%s frames=%d span=%.1fs stride=%.0fms | "
             "encode=%.0f queue=%.0f pod=%.0f (compute=%.0f sam=%.0f "
             "decode=%.0f wire=%.0f) publish=%.0f (ms)",
-            self.camera_id, len(jpegs), span,
-            span * 1000.0 / max(1, len(jpegs) - 1),
+            self.camera_id, len(send_frames), span,
+            span * 1000.0 / max(1, len(send_frames) - 1),
             encode_ms, self.queue_ms, self.pod_ms,
             pod_total, pt.get("sam", 0.0), pt.get("decode", 0.0),
             self.pod_ms - pod_total,
@@ -756,10 +846,13 @@ class CameraLoop:
 
     def _encode(
         self, batch: list, send_w: Optional[int],
-    ) -> tuple[list[tuple[int, bytes]], float]:
-        """JPEG-encode a batch, optionally downscaled to send_w wide.
+    ) -> tuple[list[tuple[int, "bytes | np.ndarray"]], float]:
+        """Prepare a batch for the pod, optionally downscaled to send_w
+        wide. Raw wire (default): the frames themselves, untouched
+        pixels — pod_client ships them codec-free. JPEG wire: encoded
+        bytes as before.
 
-        Returns (jpegs, inv_scale) — multiply pod bbox coords by
+        Returns (frames, inv_scale) — multiply pod bbox coords by
         inv_scale to get back to ring-frame space.
         """
         out = []
@@ -770,6 +863,9 @@ class CameraLoop:
                 s = send_w / bgr.shape[1]
                 inv = 1.0 / s
                 img = cv2.resize(bgr, (send_w, int(bgr.shape[0] * s)))
+            if FRAME_WIRE == "raw":
+                out.append((idx, img))
+                continue
             ok, jpg = cv2.imencode(
                 ".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY],
             )
@@ -841,12 +937,21 @@ class CameraLoop:
                             for tid, x1, y1, x2, y2 in boxes
                         ]
                 self._probed_at = now
+                # Raw wire: ship pixels as-is — probing encoded NATIVE
+                # frames to JPEG every 1.5s while searching, for a
+                # loopback hop (see FRAME_WIRE). t_e/t_w bracket the
+                # payload prep so the probe stage timings below survive
+                # (encode ≈ 0 on the raw wire, by design).
                 t_e = time.time()
-                jpeg = await asyncio.to_thread(
-                    lambda: cv2.imencode(
-                        ".jpg", probe_frame, [cv2.IMWRITE_JPEG_QUALITY, 88],
-                    )[1].tobytes(),
-                )
+                if FRAME_WIRE == "raw":
+                    payload = probe_frame
+                else:
+                    payload = await asyncio.to_thread(
+                        lambda: cv2.imencode(
+                            ".jpg", probe_frame,
+                            [cv2.IMWRITE_JPEG_QUALITY, 88],
+                        )[1].tobytes(),
+                    )
                 t_w = time.time()
                 # While SEARCHING, also detect faces on the WHOLE frame:
                 # crop boxes ride the tracking pipeline and lag the world
@@ -854,7 +959,7 @@ class CameraLoop:
                 # WAS (live 2026-07-24, seat stayed empty through a
                 # clear pass). Full-frame is lag-immune for close faces.
                 hits = await self.home.sam_for(self.camera_id).faces(
-                    jpeg, face_boxes, full=(seat is None),
+                    payload, face_boxes, full=(seat is None),
                 )
                 # COVERAGE scan (searching only): every ring frame since
                 # the last probe, ≥PROBE_SCAN_GAP_S apart, full-frame in
@@ -874,12 +979,15 @@ class CameraLoop:
                         if len(extra) >= PROBE_SCAN_MAX:
                             break
                     if extra:
-                        jpegs = await asyncio.to_thread(lambda: [
-                            cv2.imencode(
-                                ".jpg", fr,
-                                [cv2.IMWRITE_JPEG_QUALITY, 88],
-                            )[1].tobytes() for fr in extra
-                        ])
+                        if FRAME_WIRE == "raw":
+                            payloads = extra
+                        else:
+                            payloads = await asyncio.to_thread(lambda: [
+                                cv2.imencode(
+                                    ".jpg", fr,
+                                    [cv2.IMWRITE_JPEG_QUALITY, 88],
+                                )[1].tobytes() for fr in extra
+                            ])
                         # Politeness cap: 2 concurrent scans, never a
                         # burst — a 5-wide burst landing on a SAM3
                         # reground ground the shared A40 to a 35s pod
@@ -887,14 +995,14 @@ class CameraLoop:
                         # unchanged; the burst is flattened.
                         sem = asyncio.Semaphore(2)
 
-                        async def _scan(j: bytes):
+                        async def _scan(j):
                             async with sem:
                                 return await self.home.sam_for(self.camera_id).faces(
                                     j, [], full=True,
                                 )
 
                         for more in await asyncio.gather(
-                            *[_scan(j) for j in jpegs],
+                            *[_scan(j) for j in payloads],
                             return_exceptions=True,
                         ):
                             if isinstance(more, list):

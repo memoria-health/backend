@@ -17,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 # Same camera-role naming the dashboard uses (`'camera' | 'viewer'`).
 # `'broadcaster'` is new for nemara — caregiver Talk mode (Phase 3).
-LiveKitRole = Literal["camera", "viewer", "broadcaster"]
+LiveKitRole = Literal["camera", "viewer", "broadcaster", "gateway"]
 
 
 class MintTokenRequest(BaseModel):

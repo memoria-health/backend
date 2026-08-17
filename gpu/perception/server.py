@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hmac
 import logging
 import os
 import threading
@@ -41,7 +42,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Request
 from fastapi.responses import JSONResponse
 
 from perception.face_worker import FaceWorker
-from perception import continuous, sam_track
+from perception import continuous, rawwire, sam_track
 
 log = logging.getLogger("perception")
 logging.basicConfig(
@@ -49,6 +50,55 @@ logging.basicConfig(
 )
 
 app = FastAPI(title="nemara-sam-perception-v2")
+
+# ── Bearer auth ────────────────────────────────────────────────────────
+# /observe takes patient frames and /faces returns face embeddings, and
+# until 2026-08-11 neither had ANY authentication. That was survivable only
+# because the server binds 127.0.0.1 and the sole route in was an ssh
+# tunnel — i.e. the security property lived in a deployment detail, not in
+# the service. Split the services, run anything else on the box, or set
+# PERCEPTION_HOST=0.0.0.0 for one debug session, and it was wide open with
+# nothing complaining.
+#
+# Deliberately NOT imported from identity.contract: perception is the lower
+# layer and must not depend on the brain. Eight lines of hmac is a better
+# trade than that coupling. Same semantics as contract.auth_ok, including
+# "empty token disables auth" — see the boot warning below.
+_AUTH_TOKEN = os.environ.get("NEMARA_PERCEPTION_TOKEN", "").strip()
+
+
+def _auth_ok(header_value: str | None) -> bool:
+    """True iff the caller may use the perception API.
+
+    Constant-time compare (hmac.compare_digest) — no timing oracle on the
+    token.
+    """
+    if not _AUTH_TOKEN:
+        return True
+    if not header_value or not header_value.startswith("Bearer "):
+        return False
+    return hmac.compare_digest(
+        header_value.removeprefix("Bearer "), _AUTH_TOKEN,
+    )
+
+
+def _require_auth(request: Request) -> None:
+    """Raise 401 unless the request carries the shared bearer.
+
+    /health is deliberately left open: it carries no patient data and is
+    what a supervisor and the container healthcheck poll.
+    """
+    if not _auth_ok(request.headers.get("authorization")):
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+
+if not _AUTH_TOKEN:
+    log.warning(
+        "perception.auth_disabled — NEMARA_PERCEPTION_TOKEN is unset, so "
+        "/observe and /faces accept EVERY caller. Safe only while bound to "
+        "loopback (host=%s). Set the token before exposing this port.",
+        os.environ.get("PERCEPTION_HOST", "127.0.0.1"),
+    )
 
 _CKPT = os.environ.get(
     "NEMARA_SAM_CKPT", "/workspace/nemara/models/sam3.1_multiplex.pt",
@@ -62,6 +112,11 @@ _face = FaceWorker(
     ),
 )
 _ready = False
+# Deep-health state: repr of the last SAM load failure, None when the
+# tracker is known-good. Set at startup warm and on every observe's
+# get_sam; /health returns 503 while set. Shallow health (process up,
+# models unchecked) hid a 5-hour total outage on 2026-08-13.
+_sam_error: "str | None" = None
 
 # Single-flight admission control (reviews E1/S1/C7): SAM perception is
 # ~10-20s of GPU work per request and the predictor is a process
@@ -137,6 +192,45 @@ _MAX_FRAMES = 128
 _MAX_FILE_BYTES = 2_500_000
 _MAX_SIDE_PX = 2560
 
+
+# ── raw frame wire (2026-08-13) ────────────────────────────────────────
+# Format and rationale live in perception/rawwire.py — one module owns
+# both directions so identity's pack and this parse cannot drift.
+# Same auth, same caps. The JPEG routes stay for any off-box caller.
+#
+# Body ceilings (the multipart path's per-file cap, translated): a real
+# observe batch is ≤40 native frames ≈ 250MB; a faces frame is one
+# native image ≈ 6MB. Checked against Content-Length BEFORE
+# request.body() buffers anything — the raw routes must not be the one
+# door with no size gate on an authenticated-but-hostile caller.
+_RAW_MAX_OBSERVE_BODY = 512 * 1024 * 1024
+_RAW_MAX_FACES_BODY = 64 * 1024 * 1024
+
+
+async def _read_raw_body(request: Request, cap: int) -> bytes:
+    cl = request.headers.get("content-length")
+    try:
+        if cl is not None and int(cl) > cap:
+            raise HTTPException(413, f"raw body over {cap} bytes")
+    except ValueError:
+        raise HTTPException(400, "bad content-length")
+    data = await request.body()
+    if len(data) > cap:
+        raise HTTPException(413, f"raw body over {cap} bytes")
+    return data
+
+
+def _parse_raw_frames(
+    data: bytes,
+) -> tuple[dict, list[tuple[int, np.ndarray]]]:
+    """rawwire.parse_frames with this server's caps; malformed → 400."""
+    try:
+        return rawwire.parse_frames(
+            data, max_frames=_MAX_FRAMES, max_side_px=_MAX_SIDE_PX,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
 # Mirrors _TrackState.last_face_check_frame's sentinel so the pod's
 # face schedule replays the brain's arithmetic exactly: first attempt
 # on the first frame a track appears, then every `face_interval`
@@ -176,9 +270,57 @@ def _recycle_watchdog() -> None:
             os._exit(0)
 
 
+# Refuse to serve with faces on CPU when a GPU is present (default on).
+# ORT does not raise when the CUDA EP fails to load — it warns and falls
+# back, and that silence cost us a node-wide CPU wall before anyone
+# noticed (2026-08-13: face on CPUExecutionProvider starved every other
+# stage at 96-100% CPU while the 4090 sat at 0-13%). Exiting here keeps
+# the supervisor restarting a loudly-broken node instead of the fleet
+# quietly running at a tenth of its capacity. Set to 0 only for a
+# deliberate CPU-faces session.
+_REQUIRE_GPU_FACES = os.environ.get(
+    "NEMARA_FACE_REQUIRE_GPU", "1",
+).strip() not in ("0", "false", "")
+
+
 @app.on_event("startup")
 def _startup() -> None:
     global _ready
+    # ── Speed levers (2026-08-16, survivors of the corruption hunt).
+    # Neither fixes the in-process overlap corruption (falsified) —
+    # they cut per-pass overhead, and are safe because each worker
+    # process is single-flight.
+    #
+    # No-gc lever: SAM3's close_session runs gc.collect() after EVERY
+    # ground plus a device-wide torch.cuda.empty_cache() under VRAM
+    # pressure — a whole-GPU stall per ground. Stub both process-wide.
+    # Needs a memory-growth soak before becoming fleet default.
+    if os.environ.get("NEMARA_SAM3_NO_GC", "").strip() in ("1", "true"):
+        import gc as _gc
+
+        import torch as _torch
+        _gc.collect = lambda *a, **k: 0
+        if _torch.cuda.is_available():
+            _torch.cuda.empty_cache = lambda *a, **k: None
+        log.warning(
+            "lever: gc.collect + cuda.empty_cache stubbed process-wide",
+        )
+    # SDP-pin lever: both models write the process-global SDPA backend
+    # enables on the hot attention path (measured as a large cadence
+    # tax). Pin all three ON once, no-op the setters; EdgeTAM's
+    # flag-flipping context is neutralized in continuous._get_edge
+    # (same env).
+    if os.environ.get("NEMARA_SDP_PIN", "").strip() in ("1", "true"):
+        import torch as _torch
+        _torch.backends.cuda.enable_flash_sdp(True)
+        _torch.backends.cuda.enable_math_sdp(True)
+        _torch.backends.cuda.enable_mem_efficient_sdp(True)
+        _torch.backends.cuda.enable_flash_sdp = lambda *a, **k: None
+        _torch.backends.cuda.enable_math_sdp = lambda *a, **k: None
+        _torch.backends.cuda.enable_mem_efficient_sdp = lambda *a, **k: None
+        log.warning(
+            "lever: SDPA backend flags pinned all-on, setters no-oped",
+        )
     t0 = time.time()
     provider = "worker-failed"
     try:
@@ -189,6 +331,27 @@ def _startup() -> None:
         # 'ready' message — kill it or the pipe desyncs and one crop's
         # faces attach to the next crop (review C1).
         _face.stop()
+    import torch
+
+    if (
+        _REQUIRE_GPU_FACES
+        and torch.cuda.is_available()
+        and not provider.startswith("CUDA")
+    ):
+        log.critical(
+            "perception.face_on_cpu_with_gpu_present provider=%s — "
+            "refusing to serve (NEMARA_FACE_REQUIRE_GPU=0 to override). "
+            "Fix the image: the onnxruntime module lacks or cannot load "
+            "its CUDA provider (CPU-wheel shadowing or missing cuDNN).",
+            provider,
+        )
+        # Reap the face child FIRST: os._exit skips multiprocessing
+        # cleanup, and on node E (2026-08-13) ~120 supervisor restarts
+        # of this exact path orphaned ~90 CUDA processes until the GPU
+        # itself OOMed. A loud refusal must not leak.
+        _face.stop()
+        os._exit(1)
+    global _sam_error
     try:
         pred = sam_track.get_sam(_CKPT)
         # Warm the full path (CUDA kernel compile + temp-clip round
@@ -198,8 +361,13 @@ def _startup() -> None:
             concept="person", thr=0.4,
         ):
             pass
-    except Exception:  # noqa: BLE001
-        log.exception("perception.sam_warm_failed (will warm lazily)")
+        _sam_error = None
+    except Exception as exc:  # noqa: BLE001
+        _sam_error = repr(exc)
+        log.exception(
+            "perception.sam_warm_failed — /health reports 503 until a "
+            "load succeeds (a tracker-less perception must look sick)",
+        )
     threading.Thread(target=_recycle_watchdog, daemon=True).start()
     _ready = True
     log.info(
@@ -209,11 +377,13 @@ def _startup() -> None:
 
 
 @app.get("/health")
-def health() -> dict:
+def health():
     import torch
 
-    return {
-        "status": "ok" if _ready else "warming",
+    body = {
+        "status": (
+            "degraded" if _sam_error else ("ok" if _ready else "warming")
+        ),
         "contract": "observe-v2",
         "cuda": torch.cuda.is_available(),
         "gpu": (
@@ -226,6 +396,79 @@ def health() -> dict:
         # gallery's (review G4) — expose the name so it can check.
         "face_model": _FACE_MODEL,
     }
+    if _sam_error:
+        # 503, not 200-with-a-sad-body: every existing consumer (boot
+        # wait, gates, dashboards) checks with `curl -f` or status
+        # string — both must fail when the tracker cannot load.
+        body["sam_error"] = _sam_error
+        return JSONResponse(body, status_code=503)
+    return body
+
+
+# ── Experiment ergonomics (2026-08-16, Aryaman: kill the 30-min
+# debug loop). /admin/exit restarts this worker under its entrypoint
+# supervisor — which re-copies /persist/dev-code first when
+# NEMARA_DEV_CODE=1 — so a code iteration is rsync + curl, no image
+# build, no SSH. /logs tails the shared log directory over HTTP so
+# scoring needs no log-reader pod. Both behind the same bearer auth
+# as /observe.
+_LOGDIR = os.environ.get("NEMARA_LOGDIR", "/persist/state/logs")
+
+
+@app.post("/admin/exit")
+async def admin_exit(request: Request) -> JSONResponse:
+    """Exit(0) shortly after replying; the entrypoint supervisor
+    relaunches (fresh dev code first when NEMARA_DEV_CODE=1)."""
+    _require_auth(request)
+
+    def _die() -> None:
+        time.sleep(0.3)
+        os._exit(0)
+
+    threading.Thread(target=_die, daemon=True).start()
+    return JSONResponse({"status": "restarting"})
+
+
+@app.get("/logs")
+async def logs(request: Request, file: str = "", tail: int = 400):
+    """List log files (no `file`) or tail one. `file` is a bare name
+    inside the log dir — path components are rejected."""
+    _require_auth(request)
+    import pathlib
+    root = pathlib.Path(_LOGDIR)
+    if not file:
+        try:
+            entries = sorted(
+                root.iterdir(), key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )[:50]
+        except OSError:
+            raise HTTPException(503, "log dir unavailable")
+        return {"files": [
+            {"name": p.name, "bytes": p.stat().st_size,
+             "mtime": int(p.stat().st_mtime)}
+            for p in entries if p.is_file()
+        ]}
+    if "/" in file or "\\" in file or file.startswith("."):
+        raise HTTPException(400, "bare filenames only")
+    path = root / file
+    if not path.is_file():
+        raise HTTPException(404, "no such log")
+    tail = max(1, min(int(tail), 20000))
+    from fastapi.responses import PlainTextResponse
+
+    def _tail() -> str:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            # ~200 bytes/line generous estimate, capped at 32MB
+            take = min(size, min(tail * 200, 32_000_000))
+            fh.seek(size - take)
+            data = fh.read()
+        lines = data.decode(errors="replace").splitlines()
+        return "\n".join(lines[-tail:]) + "\n"
+
+    return PlainTextResponse(await asyncio.to_thread(_tail))
 
 
 # Display-veto concept (2026-07-21, screen-face incident): measured on
@@ -236,17 +479,24 @@ _SCREEN_CONCEPT = "television, laptop, or phone screen"
 
 
 def _observe_sync(
-    named_jpegs: list[tuple[int, bytes]],
+    named_frames: list[tuple[int, "bytes | np.ndarray"]],
     person_thr: float,
     face_interval: int,
     face_cap: int,
     detect_screens: bool = False,
     camera_id: str = "default",
     client_stamp: str = "UNSTAMPED",
+    session_state: "dict | None" = None,
 ) -> dict:
     """The whole perception pass, run in a worker thread under
     `_perception_lock` so /health stays responsive while SAM grinds
-    and the shared predictor + face-worker pipe stay single-flight."""
+    and the shared predictor + face-worker pipe stay single-flight.
+
+    Each frame is either JPEG bytes (the multipart /observe path) or an
+    already-decoded BGR ndarray (the /observe_raw path — identity lives
+    on the same box, so shipping JPEG across loopback bought nothing
+    and cost an encode+decode on every batch; measured 2026-08-13 it
+    was a top CPU stage under multi-camera load)."""
     with _perception_lock:
         t_start = time.time()
 
@@ -254,9 +504,12 @@ def _observe_sync(
         t0 = time.time()
         decoded: list[tuple[int, np.ndarray]] = []
         oversize = 0
-        for orig_idx, raw in named_jpegs:
-            buf = np.frombuffer(raw, dtype=np.uint8)
-            img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        for orig_idx, raw in named_frames:
+            if isinstance(raw, np.ndarray):
+                img = raw
+            else:
+                buf = np.frombuffer(raw, dtype=np.uint8)
+                img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
             if img is None:
                 continue
             if max(img.shape[:2]) > _MAX_SIDE_PX:
@@ -304,7 +557,18 @@ def _observe_sync(
         face_attempts = 0
         faces_found = 0
 
-        pred = sam_track.get_sam(_CKPT)
+        global _sam_error
+        try:
+            pred = sam_track.get_sam(_CKPT)
+        except Exception as exc:  # noqa: BLE001
+            # Surfaced on /health as 503 (see below): a perception that
+            # cannot load its tracker must look SICK, not "ok" — after
+            # the 2026-08-13 L5 OOM this exact state served 500s for ~5
+            # hours behind a green health check.
+            _sam_error = repr(exc)
+            log.exception("perception.sam_unavailable")
+            return {"_error": (503, "tracker unavailable")}
+        _sam_error = None
         t_loop = time.time()
         # CONTINUOUS SESSION (EdgeTAM-continuous arch): one persistent
         # per-camera session yields STABLE track ids across ticks (SAM3
@@ -313,7 +577,21 @@ def _observe_sync(
         # subject across ticks and stranded the backend binding into a
         # ghost. Masks are held in `session_out` for this tick; frame
         # pixels (`imgs[pos]`) are still released after the face pass.
-        session = continuous.get_session(camera_id)
+        #
+        # STATELESS MODE (2026-08-16, shared-queue dispatch): when the
+        # request carries `session_state`, the CALLER owns the camera's
+        # cross-tick state — build a transient session from it, run the
+        # tick, hand the updated state back in the response. No entry in
+        # _SESSIONS, so any worker can serve any camera. The request
+        # shape (not an env var) selects the mode: identity turns it on
+        # per-request, workers need no coordinated config.
+        stateless = session_state is not None
+        if stateless:
+            session = continuous.CameraSession.from_state(
+                camera_id, session_state or None,
+            )
+        else:
+            session = continuous.get_session(camera_id)
         session_out = session.observe(
             imgs, person_thr=person_thr, sam_pred=pred,
         )
@@ -383,15 +661,19 @@ def _observe_sync(
                 claim_frames = sorted({
                     int(fo[0]) for obs in face_by_track.values() for fo in obs
                 })
-                jpeg_by_idx = dict(named_jpegs)
+                frame_by_idx = dict(named_frames)
                 fc_imgs = []
                 fc_orig = []
                 for orig in claim_frames:
-                    raw = jpeg_by_idx.get(orig)
+                    raw = frame_by_idx.get(orig)
                     if raw is None:
                         continue
-                    im = cv2.imdecode(
-                        np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR,
+                    im = (
+                        raw if isinstance(raw, np.ndarray)
+                        else cv2.imdecode(
+                            np.frombuffer(raw, dtype=np.uint8),
+                            cv2.IMREAD_COLOR,
+                        )
                     )
                     if im is not None:
                         fc_imgs.append(im)
@@ -482,6 +764,10 @@ def _observe_sync(
             },
             "screen_regions": screen_regions,
         }
+        if stateless:
+            # The caller owns this camera's continuity — hand back the
+            # updated snapshot; nothing about it remains in this worker.
+            payload["session_state"] = session.to_state()
         log.info(
             "perception.observe client=%s frames=%d tracks=%d dets=%d max_prob=%.2f "
             "face_attempts=%d faces=%d | decode=%.0fms sam=%.0fms "
@@ -494,6 +780,8 @@ def _observe_sync(
         # Return cached blocks to the driver after every pass (leak
         # incident 2026-07-21): costs ~0.1-0.3s of re-allocation on the
         # next tick; 19GB of allocator drift cost the whole service.
+        # Under the no-gc lever (NEMARA_SAM3_NO_GC) empty_cache is
+        # a process-wide no-op and this call is inert by design.
         import torch
 
         torch.cuda.empty_cache()
@@ -502,6 +790,7 @@ def _observe_sync(
 
 @app.post("/faces")
 async def faces(
+    request: Request,
     frame: UploadFile = File(...),
     boxes: str = Form(...),
     full: str = Form("0"),
@@ -525,16 +814,44 @@ async def faces(
     """
     import json as _json
 
+    _require_auth(request)
     if not _ready:
         raise HTTPException(503, "service warming up")
     raw = await frame.read()
     img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
     if img is None:
         raise HTTPException(400, "undecodable frame")
+    return _faces_impl(img, _json.loads(boxes), full == "1")
+
+
+@app.post("/faces_raw")
+async def faces_raw(request: Request) -> JSONResponse:
+    """/faces over the raw frame wire: one frame, boxes and full ride
+    the JSON header. Same reason /observe_raw exists — the probe loop
+    was JPEG-encoding NATIVE-resolution frames every 1.5s while
+    searching, for a loopback hop."""
+    _require_auth(request)
+    if not _ready:
+        raise HTTPException(503, "service warming up")
+    header, frames = _parse_raw_frames(
+        await _read_raw_body(request, _RAW_MAX_FACES_BODY),
+    )
+    if len(frames) != 1:
+        raise HTTPException(400, "faces_raw wants exactly one frame")
+    return _faces_impl(
+        frames[0][1],
+        header.get("boxes") or [],
+        bool(int(header.get("full", 0))),
+    )
+
+
+def _faces_impl(
+    img: np.ndarray, boxes: list, full: bool,
+) -> JSONResponse:
     t0 = time.time()
     out = []
     h, w = img.shape[:2]
-    for row in _json.loads(boxes)[:16]:
+    for row in boxes[:16]:
         tid, x1, y1, x2, y2 = row[:5]
         px, py = (x2 - x1) * 0.1, (y2 - y1) * 0.1
         cx1, cy1 = max(0, int(x1 - px)), max(0, int(y1 - py))
@@ -568,7 +885,7 @@ async def faces(
                     emb.astype(np.float32).tobytes(),
                 ).decode("ascii"),
             })
-    if full == "1":
+    if full:
         hits, _ms = _face.embed(img)
         for emb, det, (fx1, fy1, fx2, fy2) in hits:
             out.append({
@@ -605,6 +922,9 @@ async def observe(
     passes at a time (default 1); calls for the SAME camera serialise on
     that camera's session lock regardless, since a session's tick
     counter, id allocator and carried masks are read-modify-write."""
+    # Before the frame reads: an unauthorized caller should not be able to
+    # make us decode its uploads.
+    _require_auth(request)
     if not _ready:
         raise HTTPException(503, "service warming up")
     if len(frames) > _MAX_FRAMES:
@@ -646,6 +966,47 @@ async def observe(
         payload = await asyncio.to_thread(
             _observe_sync, named_jpegs, person_thr, face_interval, face_cap,
             bool(detect_screens), camera_id, client_stamp,
+        )
+    finally:
+        global _last_request_ts
+        _last_request_ts = time.time()
+        _busy.release()
+    if "_error" in payload:
+        code, msg = payload["_error"]
+        raise HTTPException(code, msg)
+    return JSONResponse(payload)
+
+
+@app.post("/observe_raw")
+async def observe_raw(request: Request) -> JSONResponse:
+    """/observe over the raw frame wire (format at _parse_raw_frames):
+    identical perception pass, zero image-codec work on either end.
+    Request params ride the JSON header. A separate route rather than a
+    content-type switch because the multipart route's File(...) params
+    make FastAPI reject a non-form body before our code runs."""
+    _require_auth(request)
+    if not _ready:
+        raise HTTPException(503, "service warming up")
+    data = await _read_raw_body(request, _RAW_MAX_OBSERVE_BODY)
+    try:
+        await asyncio.wait_for(_busy.acquire(), timeout=_ACQUIRE_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        raise HTTPException(429, "perception busy — retry next tick")
+    try:
+        header, named_frames = _parse_raw_frames(data)
+        client_stamp = request.headers.get("x-nemara-client", "UNSTAMPED")
+        # session_state: {} = "stateless mode, first tick"; a populated
+        # dict = continue from it; absent = stateful mode (_SESSIONS).
+        _sess = header.get("session_state")
+        payload = await asyncio.to_thread(
+            _observe_sync, named_frames,
+            float(header.get("person_thr", 0.4)),
+            int(header.get("face_interval", 5)),
+            int(header.get("face_cap", 8)),
+            bool(int(header.get("detect_screens", 0))),
+            str(header.get("camera_id", "default")),
+            client_stamp,
+            _sess if isinstance(_sess, dict) else None,
         )
     finally:
         global _last_request_ts

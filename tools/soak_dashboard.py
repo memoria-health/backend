@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from fastapi import FastAPI
 from fastapi.responses import (
-    FileResponse, HTMLResponse, JSONResponse, StreamingResponse,
+    FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse,
 )
 from sqlalchemy import select, text
 
@@ -69,6 +69,46 @@ app = FastAPI()
 _SINCE: datetime = datetime.now(timezone.utc)
 _FRAMES_DIR = Path("out/id_frames")
 _TRACE_PATH = Path("out/track_trace.jsonl")
+
+# ONE identity process — the home under observation.
+#
+# In production a node runs one process per room on roster-assigned ports
+# from 8012 up, across several nodes. This dashboard follows ONE home; it
+# is a local soak tool, not an operations console.
+#
+# The address is resolved from the ROSTER (patients.identity_node_id ->
+# identity_nodes.base_url + patients.identity_port), cached 30s, so the
+# dashboard follows fleet swaps instead of pointing at dead nodes — on
+# 2026-08-13 it sat aimed at a terminated node until restarted by hand.
+# SOAK_IDENTITY_BASE remains as an explicit override (rigs with no DB);
+# SOAK_PATIENT_NAME picks the home.
+IDENTITY_BASE = os.environ.get("SOAK_IDENTITY_BASE", "").rstrip("/")
+_PATIENT_NAME = os.environ.get("SOAK_PATIENT_NAME", "Aryaman Darda")
+_ib_cache: dict = {"t": 0.0, "v": None}
+
+
+async def IB() -> str:
+    """Current identity-service base URL for the observed home."""
+    if IDENTITY_BASE:
+        return IDENTITY_BASE
+    now = time.time()
+    if _ib_cache["v"] and now - _ib_cache["t"] < 30:
+        return _ib_cache["v"]
+    try:
+        sm = get_sessionmaker()
+        async with sm() as session:
+            row = (await session.execute(text(
+                "SELECT n.base_url, p.identity_port "
+                "  FROM public.patients p "
+                "  JOIN public.identity_nodes n "
+                "    ON n.node_id = p.identity_node_id "
+                " WHERE p.preferred_name = :name"
+            ), {"name": _PATIENT_NAME})).first()
+        if row and row[0] and row[1]:
+            _ib_cache.update(t=now, v=f"{row[0].rstrip('/')}:{row[1]}")
+    except Exception:  # noqa: BLE001 — keep serving the last-known node
+        pass
+    return _ib_cache["v"] or "http://localhost:8012"
 
 # All displayed times are LAPTOP-LOCAL (Aryaman 2026-07-19 — the UTC
 # everywhere made cross-referencing painful; evidence-frame filenames
@@ -605,23 +645,102 @@ async def identity_stream(cam_id: str):
     is raw camera video with no room-privacy gating, and prod has no
     live-feed path that bypasses the privacy rules.
     """
+    import asyncio
+
     import httpx
 
+    # FRAME-DROPPING pump (2026-08-12). The identity service moved from
+    # localhost onto a GPU node reached over the tailnet; MJPEG has no
+    # frame dropping of its own, so when the node produces frames faster
+    # than the transocean path carries them, the backlog queues and the
+    # view trails wall clock by an ever-growing margin (~30s observed).
+    # Fix: drain the upstream as fast as the pipe allows, keep ONLY the
+    # newest complete part, forward at a fixed ~6fps. Latency becomes
+    # one frame + RTT regardless of upstream fps or path bandwidth.
     async def _pump():
-        async with httpx.AsyncClient(
-            timeout=None, headers=_ident_headers(),
-        ) as c:
-            async with c.stream(
-                "GET", f"http://localhost:8012/stream/{cam_id}",
-            ) as r:
-                if r.status_code != 200:
-                    return
-                async for chunk in r.aiter_bytes():
-                    yield chunk
+        BOUNDARY = b"--frame"
+        state: dict = {}
+
+        async def _reader():
+            buf = b""
+            try:
+                async with httpx.AsyncClient(
+                    timeout=None, headers=_ident_headers(),
+                ) as c:
+                    async with c.stream(
+                        "GET", f"{await IB()}/stream/{cam_id}",
+                    ) as r:
+                        if r.status_code != 200:
+                            return
+                        async for chunk in r.aiter_bytes():
+                            buf += chunk
+                            while True:
+                                nxt = buf.find(BOUNDARY, len(BOUNDARY))
+                                if nxt < 0:
+                                    break
+                                part, buf = buf[:nxt], buf[nxt:]
+                                if part.strip():
+                                    state["part"] = part
+            finally:
+                state["done"] = True
+
+        task = asyncio.create_task(_reader())
+        last = None
+        try:
+            while not state.get("done"):
+                part = state.get("part")
+                if part is not None and part is not last:
+                    last = part
+                    yield part
+                await asyncio.sleep(0.15)
+        finally:
+            task.cancel()
 
     return StreamingResponse(
         _pump(), media_type="multipart/x-mixed-replace; boundary=frame",
     )
+
+
+@app.get("/identity_live/{cam_id}")
+async def identity_live(cam_id: str):
+    """ONE current annotated frame, fetched on demand.
+
+    Continuous MJPEG over a slow path (tailnet to a remote node) queues
+    upstream of any client-side dropping — the writer pushes every frame
+    and the backlog lives in the node's socket/tailscale buffers, so the
+    view drifts behind wall clock without bound. A per-request grab has
+    no queue to drift: connect, take the first complete frame (the
+    stream always starts at NOW), disconnect. Latency = 1 frame + RTT,
+    by construction. The page polls this at ~1.5fps instead of holding
+    a stream open.
+    """
+    import httpx
+
+    BOUNDARY = b"--frame"
+    buf = b""
+    try:
+        async with httpx.AsyncClient(
+            timeout=8, headers=_ident_headers(),
+        ) as c:
+            async with c.stream(
+                "GET", f"{await IB()}/stream/{cam_id}",
+            ) as r:
+                if r.status_code != 200:
+                    return JSONResponse({"error": "upstream"}, status_code=502)
+                async for chunk in r.aiter_bytes():
+                    buf += chunk
+                    second = buf.find(BOUNDARY, len(BOUNDARY))
+                    if second > 0:
+                        part = buf[:second]
+                        head_end = part.find(b"\r\n\r\n")
+                        if head_end > 0:
+                            jpeg = part[head_end + 4:].rstrip(b"\r\n")
+                            return Response(jpeg, media_type="image/jpeg",
+                                            headers={"Cache-Control": "no-store"})
+                        break
+    except httpx.HTTPError:
+        pass
+    return JSONResponse({"error": "no frame"}, status_code=504)
 
 
 @app.get("/identity_snap/{name}")
@@ -636,7 +755,7 @@ async def identity_snap(name: str):
         async with httpx.AsyncClient(
             timeout=4.0, headers=_ident_headers(),
         ) as c:
-            r = await c.get(f"http://localhost:8012/snap/{name}")
+            r = await c.get(f"{await IB()}/snap/{name}")
         if r.status_code != 200:
             return Response(status_code=r.status_code)
         return Response(content=r.content, media_type="image/jpeg")
@@ -651,7 +770,7 @@ async def identity_timeline():
     import httpx
     try:
         async with httpx.AsyncClient(timeout=2.0, headers=_ident_headers()) as c:
-            r = await c.get("http://localhost:8012/timeline?n=720")
+            r = await c.get(f"{await IB()}/timeline?n=720")
             return JSONResponse(r.json())
     except Exception:                        # noqa: BLE001 — service down
         return JSONResponse({"samples": []})
@@ -664,7 +783,7 @@ async def identity_probes():
     import httpx
     try:
         async with httpx.AsyncClient(timeout=2.0, headers=_ident_headers()) as c:
-            r = await c.get("http://localhost:8012/probes?n=1600")
+            r = await c.get(f"{await IB()}/probes?n=1600")
             return JSONResponse(r.json())
     except Exception:                        # noqa: BLE001 — service down
         return JSONResponse({"probes": {}})
@@ -677,7 +796,7 @@ async def identity_events():
     import httpx
     try:
         async with httpx.AsyncClient(timeout=2.0, headers=_ident_headers()) as c:
-            r = await c.get("http://localhost:8012/events?n=250")
+            r = await c.get(f"{await IB()}/events?n=250")
             return JSONResponse(r.json())
     except Exception:                        # noqa: BLE001 — service down
         return JSONResponse({"events": [], "confirm_stats": []})
@@ -691,7 +810,7 @@ async def identity_state():
     import httpx
     try:
         async with httpx.AsyncClient(timeout=2.0, headers=_ident_headers()) as c:
-            r = await c.get("http://localhost:8012/state")
+            r = await c.get(f"{await IB()}/state")
             j = r.json()
             j["on"] = True
             return JSONResponse(j)
@@ -1148,7 +1267,21 @@ async function pollIdentity(){
     $("idsvc").innerHTML=h; window._idLastOk=Date.now();
     const cams=Object.keys(s.cameras||{});
     if(cams.length && idStreams!==cams.length){
-      $("idstreams").innerHTML=cams.map(c=>`<img src="/identity_stream/${c}" style="width:calc(50% - 4px);min-width:280px;border-radius:6px">`).join('');
+      // Snapshot polling, NOT a held-open MJPEG stream: over the tailnet
+      // to a remote node the stream queues upstream and drifts behind
+      // wall clock without bound; a per-request frame cannot lag more
+      // than 1 frame + RTT. Two buffers per cam, swapped on load, so
+      // the image never flickers white between polls.
+      $("idstreams").innerHTML=cams.map(c=>`<img id="live_${c}" src="/identity_live/${c}" style="width:calc(50% - 4px);min-width:280px;border-radius:6px">`).join('');
+      cams.forEach(c=>{
+        const el=document.getElementById("live_"+c);
+        if(!el || el._poll) return;
+        el._poll=setInterval(()=>{
+          const pre=new Image();
+          pre.onload=()=>{ el.src=pre.src; };
+          pre.src=`/identity_live/${c}?t=${Date.now()}`;
+        }, 700);
+      });
       idStreams=cams.length;
     }
   }catch(e){}

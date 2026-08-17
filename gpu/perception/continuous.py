@@ -24,10 +24,18 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 
 import numpy as np
 
 log = logging.getLogger("perception.continuous")
+
+# Process-singleton EdgeTAM. Workers are single-flight and one
+# instance per process is correct: the 2026-08-15/16 campaign closed
+# with every in-process concurrency variant falsified (private
+# per-pass instances, serialization probes, global-state stubs — see
+# docs/plans/2026-08-16-cross-camera-batching.md §1), so that machinery was deleted.
+import contextlib as _contextlib
 
 _EDGE = None
 _edge_lock = threading.Lock()
@@ -106,21 +114,69 @@ def _track_dims(w: int, h: int) -> tuple[int, int, float]:
     return _TRACK_W, max(1, round(h * s)), s
 
 
+# torch.compile on the EdgeTAM heavy modules (2026-08-14, capacity
+# program item #3). Compilation fuses the per-frame kernel storm into
+# fewer, larger launches — same math, same outputs (mask parity is the
+# empirical check on the live feed). Scope is DELIBERATELY EdgeTAM-only:
+# it is the continuous per-frame cost; SAM3 runs only on re-grounds and
+# its multiplex graph is a riskier compile target. dynamic=True because
+# batch shape varies per tick. One env kills it: NEMARA_TORCH_COMPILE=0.
+_COMPILE = os.environ.get(
+    "NEMARA_TORCH_COMPILE", "1",
+).strip() not in ("0", "false")
+
+
 def _get_edge():
     """Process-singleton EdgeTAM (sam2) video predictor."""
     global _EDGE
-    if _EDGE is None:
-        with _edge_lock:
-            if _EDGE is None:
-                import sys
-                if _EDGE_ROOT not in sys.path:
-                    sys.path.insert(0, _EDGE_ROOT)
-                from sam2.build_sam import build_sam2_video_predictor
-                _EDGE = build_sam2_video_predictor(
-                    _EDGE_CFG, _EDGE_CKPT, device="cuda",
+    if _EDGE is not None:
+        return _EDGE
+    with _edge_lock:
+        if _EDGE is not None:
+            return _EDGE
+        import sys
+        if _EDGE_ROOT not in sys.path:
+            sys.path.insert(0, _EDGE_ROOT)
+        from sam2.build_sam import build_sam2_video_predictor
+        # SDP-pin lever (see server._startup): EdgeTAM's
+        # sdp_kernel_context flips the PROCESS-global SDPA backend
+        # flags around every attention op. With the flags pinned
+        # all-on at startup the context is pure per-call overhead
+        # (measured a large cadence tax), so neutralize it at the
+        # module (looked up per call, so patching any time works).
+        if os.environ.get("NEMARA_SDP_PIN", "").strip() in ("1", "true"):
+            from sam2.modeling.sam import transformer as _s2t
+            _s2t.sdp_kernel_context = (
+                lambda dropout_p: _contextlib.nullcontext()
+            )
+            log.warning("lever: sam2 sdp_kernel_context -> nullcontext")
+        edge = build_sam2_video_predictor(
+            _EDGE_CFG, _EDGE_CKPT, device="cuda",
+        )
+        if _COMPILE:
+            import torch
+
+            try:
+                edge.image_encoder = torch.compile(
+                    edge.image_encoder, dynamic=True,
                 )
-                log.info("continuous.edgetam_loaded ckpt=%s", _EDGE_CKPT)
-    return _EDGE
+                edge.memory_attention = torch.compile(
+                    edge.memory_attention, dynamic=True,
+                )
+                log.info(
+                    "continuous.edgetam_compiled "
+                    "(image_encoder + memory_attention)",
+                )
+            except Exception:  # noqa: BLE001 — compile is an
+                # optimisation, never a dependency: any failure
+                # leaves the eager modules in place.
+                log.warning(
+                    "continuous.edgetam_compile_failed — "
+                    "running eager", exc_info=True,
+                )
+        _EDGE = edge
+        log.info("continuous.edgetam_loaded ckpt=%s", _EDGE_CKPT)
+        return _EDGE
 
 
 def _iou(a: np.ndarray, b: np.ndarray) -> float:
@@ -215,6 +271,74 @@ class CameraSession:
         # consecutive carry ticks where the person trigger saw FEWER
         # people than the carry (see person_trigger.should_force_reground)
         self._under_streak = 0
+
+    # ── Portable state (stateless-worker mode, 2026-08-16) ─────────
+    # Everything a camera needs to continue its identity across ticks
+    # is SMALL: the previous tick's final masks plus a few counters —
+    # EdgeTAM's heavy inference state is rebuilt from these each pass.
+    # Serializing it lets the identity service own it and hand each
+    # tick to ANY free worker (shared-queue dispatch) instead of
+    # pinning cameras to workers. Masks are bit-packed: 640x360 ≈ 29KB
+    # per track before base64 — loopback noise.
+    def to_state(self) -> dict:
+        """Portable snapshot of cross-tick state. Version-tagged so a
+        future shape change degrades to a fresh session, never a crash."""
+        import base64
+        masks = {}
+        for tid, m in self.last_masks.items():
+            mm = np.ascontiguousarray(m.astype(bool))
+            masks[str(int(tid))] = {
+                "shape": [int(mm.shape[0]), int(mm.shape[1])],
+                "bits": base64.b64encode(np.packbits(mm).tobytes()).decode(),
+            }
+        return {
+            "v": 1,
+            "epoch": self.epoch,
+            "tick": int(self.tick),
+            "next_id": int(self.next_id),
+            "last_ground": int(self.last_ground),
+            "under_streak": int(self._under_streak),
+            "masks": masks,
+        }
+
+    @classmethod
+    def from_state(
+        cls, camera_id: str, state: "dict | None",
+        *, reground_every: int = 5,
+    ) -> "CameraSession":
+        """Rebuild a session from to_state() output. Any malformed or
+        version-mismatched state yields a FRESH session (new epoch →
+        downstream re-binds cleanly) — bad state must degrade to a
+        re-ground, never crash a tick."""
+        import base64
+        s = cls(camera_id, reground_every=reground_every)
+        if not isinstance(state, dict) or int(state.get("v", 0) or 0) != 1:
+            return s
+        try:
+            s.epoch = str(state["epoch"])[:32]
+            s.tick = int(state["tick"])
+            s.next_id = int(state["next_id"])
+            s.last_ground = int(state["last_ground"])
+            s._under_streak = int(state.get("under_streak", 0))
+            masks: "dict[int, np.ndarray]" = {}
+            for tid, rec in (state.get("masks") or {}).items():
+                h, w = (int(v) for v in rec["shape"][:2])
+                if not (0 < h <= 4096 and 0 < w <= 4096):
+                    raise ValueError(f"mask dims {w}x{h}")
+                raw = np.frombuffer(
+                    base64.b64decode(rec["bits"]), dtype=np.uint8,
+                )
+                m = np.unpackbits(raw, count=h * w).reshape(h, w).astype(bool)
+                if m.any():
+                    masks[int(tid)] = m
+            s.last_masks = masks
+            return s
+        except Exception:  # noqa: BLE001 — degrade, never crash
+            log.warning(
+                "continuous.session_state_rejected cam=%s — fresh session",
+                camera_id, exc_info=True,
+            )
+            return cls(camera_id, reground_every=reground_every)
 
     # ── SAM3 grounding (periodic) ──────────────────────────────────
     def _ground(self, frames, person_thr, sam_pred) -> "dict[int, np.ndarray]":
@@ -559,12 +683,40 @@ class CameraSession:
         return out
 
 
+# Session-count REPORTING threshold (Aryaman 2026-08-13: no hard cap —
+# the VRAM-aware prime skip is the OOM guard; refusing cameras is a
+# policy call we are not making in code). Above this we log loudly so
+# FleetWatch/operators see a node past its rated envelope (rated 4,
+# surge 6-8, SLA gone by 10 — docs/architecture/identity-gpu-architecture.md).
+_MAX_SESSIONS = int(os.environ.get("NEMARA_MAX_SESSIONS", "10"))
+# A session idle this long belongs to a camera that stopped (nothing
+# calls drop_session in the normal flow) — evict it before refusing a
+# newcomer, so churn in camera fleets self-heals.
+_SESSION_IDLE_EVICT_S = float(os.environ.get("NEMARA_SESSION_IDLE_S", "180"))
+
+
 def get_session(camera_id: str, *, reground_every: int = _REGROUND_EVERY) -> CameraSession:
     with _sessions_lock:
         s = _SESSIONS.get(camera_id)
         if s is None:
+            if len(_SESSIONS) >= _MAX_SESSIONS:
+                now = time.time()
+                idle = [
+                    cid for cid, cs in _SESSIONS.items()
+                    if now - getattr(cs, "last_used", 0) > _SESSION_IDLE_EVICT_S
+                ]
+                for cid in idle:
+                    _SESSIONS.pop(cid, None)
+                    log.info("continuous.session_evicted_idle cam=%s", cid)
+            if len(_SESSIONS) >= _MAX_SESSIONS:
+                log.warning(
+                    "continuous.sessions_above_threshold n=%d "
+                    "threshold=%d cam=%s — serving anyway",
+                    len(_SESSIONS), _MAX_SESSIONS, camera_id,
+                )
             s = CameraSession(camera_id, reground_every=reground_every)
             _SESSIONS[camera_id] = s
+        s.last_used = time.time()
         return s
 
 

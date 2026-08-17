@@ -20,11 +20,19 @@ model:
      let someone ELSE be designated the patient — is the one edge case
      that survives into the EdgeTAM era.
   3. Once bound, the patient is HELD on the stable track unconditionally
-     until the track dies (retire on grace / bounded scene-extension).
-     No mid-track face re-litigation — the northstar: "stay locked no
-     matter where they go or what they do". This is what stops the
-     couch-at-20ft false-unbind: a face that fails at distance never
-     drops a lock earned at entry.
+     until the track dies (retire on grace). No mid-track face
+     re-litigation — the northstar: "stay locked no matter where they
+     go or what they do". This is what stops the couch-at-20ft
+     false-unbind: a face that fails at distance never drops a lock
+     earned at entry.
+
+2026-08-14 deletions (Aryaman: "delete the useless patches"): the
+scene-extension and the blackout carry are gone. Both were written for
+a payoff that no longer exists — a pod track number NEVER returns after
+death in the EdgeTAM-continuous era, and the carry's 5s physical window
+could not fire when judged at the backend's 10s tick cadence (dead on
+arrival, verified 2026-08-14). The retire grace below survives with ONE
+remaining job, documented at _retire.
 
 Deleted vs the track-anchored ledger (all compensations for SAM3's
 per-clip renumbering, dissolved by EdgeTAM's stable ids): the geometric
@@ -43,13 +51,13 @@ import logging
 import time
 from typing import TYPE_CHECKING
 
-from src.services.identity import trace
-from src.services.identity.observations import LABEL_PATIENT, LABEL_UNKNOWN
 from src.services.detection.patient_presence import (
     TIER_BODY,
     TIER_FACE,
     TIER_HELD,
 )
+from src.services.identity import trace
+from src.services.identity.observations import LABEL_PATIENT, LABEL_UNKNOWN
 
 if TYPE_CHECKING:
     from src.services.identity.result import IdentityResult
@@ -81,10 +89,6 @@ class _Entry:
     bound_at: float
     first_seen: float
     last_seen: float
-    # Monotonic ts of the last REAL body sighting (pid in the tick's seen
-    # set), distinct from last_seen which the scene-extension overwrites.
-    # Bounds the phantom lock (Fix B).
-    last_body_seen: float
     last_bbox: tuple[float, float, float, float]
     # Anchor for the harvest afterglow (last face-grade confirmation).
     last_face_confirm: float = 0.0
@@ -98,7 +102,6 @@ class TrackLedger:
         self._registry = registry
         self._settings = settings
         self._entries: dict[int, _Entry] = {}
-        self._scene_present = False
         self._last_tick_mono = 0.0
         self._last_patient_event: str | None = None
         # Throttle + truth state (read by CameraIngest before each tick).
@@ -110,18 +113,8 @@ class TrackLedger:
 
         g = lambda n, d: float(getattr(settings, n, d))  # noqa: E731
         self._retire_after_s = g("reid_binding_retire_after_s", 45.0)
-        # Fix B: cap on scene-only presence extension with no real body
-        # re-sighting — bounds a drift phantom holding a departed patient
-        # present (the 890s lock). 0 = unbounded.
-        self._scene_extension_max_s = g("reid_scene_extension_max_s", 150.0)
-        # Lean eval rig: strip scene-extension so a real track loss reads
-        # as a loss, not a 150s ghost-hold on "someone is in the room".
-        self._lean_eval = bool(getattr(settings, "reid_lean_eval_mode", False))
 
     # ── external surface (IdentityLock-compatible seam) ────────────────
-
-    def note_scene_presence(self, present: bool) -> None:
-        self._scene_present = bool(present)
 
     @property
     def is_active(self) -> bool:
@@ -173,14 +166,14 @@ class TrackLedger:
         return (e.last_bbox, float(e.confidence))
 
     def apply(
-        self, identity: "IdentityResult", *, tick_mono: float | None = None,
-    ) -> "IdentityResult":
+        self, identity: IdentityResult, *, tick_mono: float | None = None,
+    ) -> IdentityResult:
         """Fold this tick's tracks onto the ledger by stable id, bind/hold
         the patient, and rewrite the IdentityResult through the bindings.
         Never raises — a ledger bug must not break a tick."""
         try:
             return self._apply_inner(identity, tick_mono)
-        except Exception:  # noqa: BLE001
+        except Exception:
             log.exception("track_ledger.apply failed cam=%s", self._camera_id)
             return identity
 
@@ -259,7 +252,6 @@ class TrackLedger:
             bound_at=now,
             first_seen=now,
             last_seen=now,
-            last_body_seen=now,
             last_bbox=t.bbox_series[-1][1],
         )
         self._entries[tid] = e
@@ -423,30 +415,19 @@ class TrackLedger:
                 self._unbind_patient(e, reason="takeover_elsewhere", vacate=False)
 
     def _retire(self, now: float, seen: set[int]) -> None:
+        # The 45s grace's ONE remaining job (2026-08-14 audit): keeping
+        # `is_active` true through a short blind window feeds the
+        # degraded-tick state freeze in camera_ingest — the thing that
+        # stops a lights-off IR flip from wrongly closing the room as
+        # "patient left". The grace's ORIGINAL payoff (the same pod
+        # track number reappearing and re-binding instantly) is extinct:
+        # EdgeTAM-continuous never reuses a dead number. When the freeze
+        # is re-keyed to presence directly, this grace goes too.
         for pid in list(self._entries):
             e = self._entries[pid]
             if pid in seen:
-                # Real body sighting this tick — anchor the Fix B bound.
-                e.last_body_seen = now
                 continue
-            grace = self._retire_after_s
-            if (
-                e.binding == LABEL_PATIENT
-                and self._scene_present
-                and not self._lean_eval
-                and (
-                    self._scene_extension_max_s <= 0.0
-                    or now - e.last_body_seen <= self._scene_extension_max_s
-                )
-            ):
-                # Scene layer still sees a person the tracker can't (bed /
-                # occlusion) — presence extends. Fix B: BOUNDED — once the
-                # real body has been unseen for _scene_extension_max_s stop
-                # extending, so an EdgeTAM drift phantom can't hold a
-                # departed patient present for 890s. Falls through to grace.
-                e.last_seen = now
-                continue
-            if now - e.last_seen > grace:
+            if now - e.last_seen > self._retire_after_s:
                 if e.binding == LABEL_PATIENT:
                     log.info(
                         "track_ledger.patient_left_view cam=%s pid=%d "

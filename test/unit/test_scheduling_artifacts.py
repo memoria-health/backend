@@ -125,3 +125,68 @@ async def test_tint_window_bounds_native_resolution() -> None:
     tinted = await artifacts.tint_window([_big_frame() for _ in range(4)])
     assert tinted and all(t.width <= artifacts._TINT_MAX_WIDTH for t in tinted)
     assert all(len(t.data) == t.width * t.height * 3 // 2 for t in tinted)
+
+
+# ── bbox coordinate space (2026-08-07 regression) ────────────────────
+# The sidecar identity provider returns boxes in NATIVE pixels; the
+# retired in-process reid brain returned them downscaled to
+# `reid_inference_sample_width`. For ~24h the consumer applied the
+# downscaled assumption to native boxes and multiplied every one by
+# native/sample_width. On a 1920x1080 frame with sample_width=640 that
+# is 3x: a patient standing at x=333..666 produced the crop
+# (520, 0, 1920, 1080) — their legs plus 1400px of empty room — and
+# every person-bucket detector answered "no person is visible" while
+# the uncropped scene call described the patient plainly.
+#
+# These pin BOTH grids, because the bug was not a wrong constant: it
+# was a consumer that could only guess which grid it was handed.
+
+def _native_track(series) -> TrackObservation:
+    from src.services.identity.observations import BBOX_SPACE_NATIVE
+    return TrackObservation(
+        track_id=1, label="PATIENT", confidence=0.9,
+        bbox_series=tuple(series), face_locked=True, pre_labeled=False,
+        bbox_space=BBOX_SPACE_NATIVE,
+    )
+
+
+def test_native_bbox_is_not_rescaled() -> None:
+    """A native-space box must land on the person, not 3x away."""
+    window = _window()
+    box = (40.0, 30.0, 70.0, 90.0)           # already in 160x120 space
+    got = person_crop_box(
+        window, track=_native_track([(0, box)]), sample_width=40,
+    )
+    assert got is not None
+    x0, y0, x1, y1 = got
+    # Pad/min-side may GROW the box; it must never slide off the
+    # subject. The true box has to sit inside the crop.
+    assert x0 <= box[0] and y0 <= box[1]
+    assert x1 >= box[2] and y1 >= box[3]
+
+
+def test_extracted_bbox_still_scales_up() -> None:
+    """The legacy grid keeps its exact behaviour — 40w -> 160w is 4x."""
+    window = _window()                        # native 160x120
+    box = (10.0, 5.0, 20.0, 25.0)             # in a 40px-wide grid
+    got = person_crop_box(
+        window, track=_track([(0, box)]), sample_width=40,
+    )
+    assert got is not None
+    x0, _, x1, _ = got
+    # 4x scaling puts the box at x=40..80; pad only widens it.
+    assert x0 <= 40 and x1 >= 80
+
+
+def test_native_and_extracted_disagree_when_grids_differ() -> None:
+    """The tag must actually change the answer — otherwise it is
+    decoration and the next provider swap breaks silently again."""
+    window = _window()
+    box = (40.0, 30.0, 70.0, 90.0)
+    native = person_crop_box(
+        window, track=_native_track([(0, box)]), sample_width=40,
+    )
+    extracted = person_crop_box(
+        window, track=_track([(0, box)]), sample_width=40,
+    )
+    assert native != extracted

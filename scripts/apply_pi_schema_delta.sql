@@ -119,3 +119,12 @@ create index if not exists pi_discoveries_unclaimed_idx
   where claimed_at is null;
 
 commit;
+
+-- RLS (2026-08-03). Supabase grants anon/authenticated full DML on every
+-- table in public and PostgREST exposes it, so RLS is the only control —
+-- and anon is the PUBLISHABLE key that ships in the app binary. Enabling
+-- it with no policy denies all non-owner access (fail closed); the backend
+-- reaches these through the service role, which bypasses RLS.
+-- Must live in THIS file: deltas are applied one at a time, so fixing it in
+-- a later delta leaves a live exposure window in between.
+alter table public.pi_discoveries enable row level security;

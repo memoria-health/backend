@@ -66,21 +66,6 @@ DIMS: dict[str, DetectorDims] = {
     # economy as sleep. record_only.
     "activity":    DetectorDims(True, "patient", "person", 14),
     "medication":  DetectorDims(True, "patient", "person", 20),
-    "climbing":    DetectorDims(True, "patient", "scene", 66,
-                                evidence_unit="sample"),
-    "distress":    DetectorDims(True, "patient", "scene", 82,
-                                needs_audio=True, evidence_unit="sample"),
-    # ── Child library ───────────────────────────────────────────────
-    "child_crib_exit":         DetectorDims(True, "patient", "scene", 65),
-    "child_cord_entanglement": DetectorDims(True, "patient", "person", 97,
-                                            degradation_warning="distance_class"),
-    "child_stairs":            DetectorDims(True, "patient", "scene", 73),
-    "child_hazard_reach":      DetectorDims(True, "patient", "scene", 70),
-    "child_head_impact":       DetectorDims(True, "patient", "scene", 93),
-    "child_wandering":         DetectorDims(True, "patient", "scene", 55),
-    "child_device_usage":      DetectorDims(False, "patient", "person", 25,
-                                            evidence_unit="sample",
-                                            duty_cycle="thinned"),
     # ── Adult library ───────────────────────────────────────────────
     "calling_for_help": DetectorDims(True, "patient", "scene", 88,
                                      needs_audio=True),

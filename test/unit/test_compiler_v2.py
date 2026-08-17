@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import pytest
 
+from src.services.detection.scheduling.dims import CROP_BUCKETS
 from src.services.detection.scheduling.compiler_v2 import (
     DetectorRejected,
     classify_custom_dims,
@@ -142,3 +143,52 @@ def test_exit_verbs_keep_wandering_asks_person_scoped() -> None:
     # Pure door-STATE phrasing stays environment.
     d3 = _dims("Door ajar", "the front door is left open at night")
     assert d3["subject_scope"] == "environment"
+
+
+# ── body-scale actions must crop (2026-08-07) ────────────────────────
+
+
+@pytest.mark.parametrize("name,text", [
+    ("Drinking water", "Ary takes a drink from a cup or bottle"),
+    ("Evening meds",   "Check if he takes his pills in the evening"),
+    ("Eating",         "Detect when he eats a meal at the table"),
+    ("Brushing teeth", "He brushes his teeth in the morning"),
+    ("Inhaler",        "He uses his inhaler"),
+])
+def test_body_scale_actions_compile_to_the_person_bucket(name, text) -> None:
+    """Their evidence is a hand, an object, and the gap to a face —
+    all at body scale, none at room scale.
+
+    `_STILL_ACTIVITY` used to be the ONLY route to `person`, so every
+    ACTIVE body-scale ask fell through to person_motion + scene: a full
+    1080p room where the object is a few dozen pixels after
+    downsampling. The model then has nothing to read and writes what is
+    LIKELY. Measured on the live pilot camera — a custom `drinking
+    water` detector produced 11 false fires on 2026-08-06 and 8 in a
+    single hour on 08-07, and the fabrication reached all the way into
+    the `seen` field ("he holds a drinking cup in his right hand") while
+    the subject sat crouched over a laptop with both hands down.
+
+    The preset `medication` had already hit this exact failure from the
+    other direction (scheduler.py:309 — "reported a pill being
+    swallowed while the man held a camera"), which is why the rule is
+    'the bucket decides' and why these must land in a crop bucket.
+    """
+    dims = classify_custom_dims(
+        name=name, user_text=text, is_sustained=False, category="routine",
+    )
+    assert dims["bucket"] in CROP_BUCKETS, dims
+    assert dims["subject_scope"] == "patient"
+
+
+def test_environment_asks_are_not_dragged_into_the_person_bucket() -> None:
+    """The body-scale rule sits AFTER the environment check, so a stove
+    or a door still compiles scene/environment — otherwise every
+    appliance ask would start demanding a body to crop to and would
+    simply stop running."""
+    dims = classify_custom_dims(
+        name="Stove left on", user_text="Alert if the stove burner is left on",
+        is_sustained=False, category="safety",
+    )
+    assert dims["bucket"] == "scene"
+    assert dims["subject_scope"] == "environment"

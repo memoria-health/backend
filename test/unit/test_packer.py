@@ -52,14 +52,30 @@ def _idents(plan) -> list[str]:
     return [d.spec.identifier for d in plan.detectors]
 
 
-def test_scene_call_is_uncapped_and_first() -> None:
+def test_scene_call_caps_at_four_severity_first() -> None:
+    """The wide call was uncapped until 2026-08-06, so every enabled
+    detector rode one flash-lite call — 8 of them on the 08-05 night, which
+    is where that night's false positives came from. Measured: the same
+    model, clip, audio and criteria got 7/7 calling-for-help negatives right
+    as a single-detector call and fired on all of them when bundled.
+
+    Severity-first chunking matters as much as the cap: the highest-stakes
+    members must ride the first chunk rather than being diluted by the tail
+    of routine ones."""
     scene = [_due(f"s{i}", severity=i) for i in range(6)]
     person = _due("medication", bucket="person", targets=(1,), severity=20)
     plans = _pack(*scene, person)
-    assert len(plans) == 2
+
+    wide = [p for p in plans if p.crop == "full"]
+    assert len(wide) == 2                          # 6 members -> 4 + 2
+    assert [len(p.detectors) for p in wide] == [4, 2]
+    assert all(len(p.detectors) <= 4 for p in wide)
+    # highest severity first, and never split across the chunk boundary
+    assert [d.dims.severity for d in wide[0].detectors] == [5, 4, 3, 2]
     assert plans[0].crop == "full" and plans[0].fps == 4
-    assert len(plans[0].detectors) == 6            # no cap on the wide call
-    assert plans[1].crop == "person" and plans[1].target_track_id == 1
+
+    crop = [p for p in plans if p.crop == "person"]
+    assert len(crop) == 1 and crop[0].target_track_id == 1
 
 
 def test_crop_bucket_caps_at_three_severity_first() -> None:
@@ -145,9 +161,14 @@ def test_snapshot_rides_the_wide_call_until_zones_exist() -> None:
     Until then snapshot members pack into the wide video call."""
     dets = [_due(f"z{i}", bucket="snapshot", severity=i) for i in range(4)]
     plans = _pack(_due("fall", bucket="scene"), *dets)
-    (plan,) = plans
-    assert plan.frames == "video" and plan.crop == "full"
-    assert len(plan.detectors) == 5
+    # 5 members now chunk across the 4-cap (2026-08-06), but the point of
+    # this test is the ROUTING — snapshot rides the wide video call, never
+    # its own frame call — so assert that, not the call count.
+    assert all(p.frames == "video" and p.crop == "full" for p in plans)
+    assert sum(len(p.detectors) for p in plans) == 5
+    assert {d.spec.identifier for p in plans for d in p.detectors} == {
+        "fall", "z0", "z1", "z2", "z3",
+    }
 
 
 def test_needs_audio_propagates_to_the_call() -> None:

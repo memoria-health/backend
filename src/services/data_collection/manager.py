@@ -17,7 +17,10 @@ bandwidth bill).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
+import tempfile
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime, timezone
@@ -26,34 +29,83 @@ from typing import Any
 from uuid import UUID
 
 from src.services.data_collection import b2 as b2_module
+from src.services.annotations.sidecar import sidecar_key
 from src.services.data_collection.keys import build_clip_key
 from src.services.data_collection.mux import mux_av
+from src.services.data_collection.redaction import detect_spans
 from src.services.data_collection.session import (
     FinalizedSession,
     RecorderCtx,
     SessionRecorder,
 )
-from src.services.data_collection.streaming_encoder import StreamingMp4Writer
+from src.services.data_collection.streaming_encoder import (
+    _DEFAULT_FPS as RECORD_FPS,  # the recorder's encode rate (15fps)
+)
+from src.services.data_collection.streaming_encoder import (
+    StreamingMp4Writer,
+)
+from src.services.detection.censor import CENSOR_MODE_RESEARCH, censor_clip
 
 logger = logging.getLogger(__name__)
 
 # Type aliases for the injectable collaborators.
 _Muxer = Callable[..., Awaitable[Path]]
 _Uploader = Callable[..., Awaitable[str]]
-# Called with the CAMERA id (per-camera room-derived privacy, 2026-07-27
-# — the retired patient-level check took a patient id).
-_PrivacyCheck = Callable[[UUID], Awaitable[bool]]
 _RegionLookup = Callable[[UUID], Awaitable[str]]
+# (FinalizedSession, clip key, clip metadata) -> the sidecar dict.
+_SidecarBuilder = Callable[..., Awaitable[dict]]
+
+
+def temp_root() -> Path:
+    """The one directory recorder tempfiles live in.
+
+    Kept to itself so the startup sweep below is safe: nothing else
+    writes here, so whatever is present at boot is stranded.
+    """
+    path = Path(tempfile.gettempdir()) / "memoria-data-collection"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def sweep_temp_dir() -> int:
+    """Delete every recorder tempfile left over from a previous process.
+
+    Called once at startup, before any recording begins. The normal and
+    error paths both unlink their own temps, so anything sitting here at
+    boot was stranded by a SIGKILL or an OOM kill mid-session.
+
+    This matters more than ordinary tidying. Those files are RAW,
+    UNCENSORED video and audio — written before any sensitivity screen —
+    and without a sweep they stay on disk forever, growing by up to a
+    session's worth (hundreds of MB) per crash until the disk fills.
+    Event clips have had this sweep since 2026-07-29
+    (`clip_archival.sweep_scratch_dir`); the recorder never got one.
+
+    Best-effort; returns how many files were removed.
+    """
+    removed = 0
+    try:
+        root = temp_root()
+        for name in os.listdir(root):
+            try:
+                os.unlink(os.path.join(root, name))
+                removed += 1
+            except OSError:
+                continue
+    except OSError:
+        logger.warning("data_collection.temp_sweep failed", exc_info=True)
+        return removed
+    if removed:
+        logger.warning(
+            "data_collection.temp_sweep removed %d stranded recorder "
+            "tempfile(s) — raw footage left by a hard-killed process",
+            removed,
+        )
+    return removed
 
 
 def _default_encoder_factory(path: Path) -> StreamingMp4Writer:
     return StreamingMp4Writer(path)
-
-
-async def _never_private(_camera_id: UUID) -> bool:
-    """Default privacy check — used when no DB-backed check is injected
-    (e.g. unit tests). Always permits the upload."""
-    return False
 
 
 async def _always_us(_patient_id: UUID) -> str:
@@ -78,12 +130,20 @@ class RecorderManager:
         upload_retries: int = 3,
         retry_base_delay: float = 1.0,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-        privacy_check: _PrivacyCheck = _never_private,
         region_lookup: _RegionLookup = _always_us,
+        sidecar_builder: _SidecarBuilder | None = None,
+        span_detector: Callable[..., Awaitable[Any]] = detect_spans,
+        redactor: Callable[..., Awaitable[None]] = censor_clip,
     ) -> None:
         self._settings = settings
-        self._privacy_check = privacy_check
         self._region_lookup = region_lookup
+        # Finalize-time redaction seams (2026-08-12): span detection and
+        # the span-gated censor, injectable so unit tests use fakes.
+        self._span_detector = span_detector
+        self._redactor = redactor
+        # Builds the note that travels with a clip. None (unit tests, a
+        # box with no DB) simply means no sidecar — never a failed upload.
+        self._sidecar_builder = sidecar_builder
         self._temp_dir = Path(temp_dir)
         self._encoder_factory = encoder_factory
         self._muxer = muxer
@@ -96,6 +156,25 @@ class RecorderManager:
         self._upload_retries = upload_retries
         self._retry_base_delay = retry_base_delay
         self._sleep = sleep
+
+        # Running tally of what the recorder did. Without this, collection
+        # can stop completely — cap reached, B2 unconfigured, every upload
+        # failing — and nothing anywhere says so. Read it via `stats`.
+        self.stats: dict[str, int] = {
+            "sessions_started": 0,
+            "clips_uploaded": 0,
+            "clips_redacted": 0,
+            "redaction_spans_total": 0,
+            "dropped_redaction": 0,
+            "dropped_cap": 0,
+            "dropped_encoder": 0,
+            "dropped_mux": 0,
+            "dropped_no_b2": 0,
+            "dropped_upload_failed": 0,
+            "clips_short": 0,
+            "sidecars_uploaded": 0,
+            "sidecars_failed": 0,
+        }
 
         self._sessions: dict[UUID, SessionRecorder] = {}
         self._pending_uploads: set[asyncio.Task] = set()
@@ -123,14 +202,26 @@ class RecorderManager:
         camera_id: UUID,
         collect: bool,
         *,
-        ctx: RecorderCtx,
+        ctx: RecorderCtx | None,
         lead_in_frames: Sequence[Any] | None = None,
         lead_in_audio: bytes | None = None,
     ) -> None:
+        """``ctx=None`` means advance-only: never start a session, but
+        still walk an open one toward linger/finalize. Ticks that fail
+        before their DB rows load (camera vanished, pool exhausted)
+        can't build a ctx — without this path such a camera's open
+        session was stuck RECORDING forever: it kept its cap slot, its
+        ffmpeg child, and the full native-res convert on every frame
+        (observed amplifying the 2026-08-14 OOM spiral).
+        """
+        if ctx is None:
+            # No ctx = the tick could not evaluate anything, so it has
+            # no standing to extend a recording either.
+            collect = False
         async with self._lock_for(camera_id):
             rec = self._sessions.get(camera_id)
             if rec is None:
-                if not collect:
+                if not collect or ctx is None:
                     return  # idle camera, nothing to record
                 if self.active_count >= self._max_concurrent:
                     logger.warning(
@@ -139,9 +230,11 @@ class RecorderManager:
                         self._max_concurrent,
                         camera_id,
                     )
+                    self.stats["dropped_cap"] += 1
                     return
                 rec = self._make_recorder(camera_id, ctx)
                 self._sessions[camera_id] = rec
+                self.stats["sessions_started"] += 1
 
             await rec.on_tick(
                 collect, lead_in_frames=lead_in_frames, lead_in_audio=lead_in_audio
@@ -169,11 +262,11 @@ class RecorderManager:
         """Force-ABORT a camera's in-flight session, discarding temp files
         WITHOUT muxing or uploading.
 
-        This is the privacy path: when the camera's ``privacy_enabled``
-        turns on mid-session (room classifier finalizing, support
-        override), the per-tick drive calls this instead of the normal
-        gate-off route so the already-captured footage never reaches B2.
-        No-op if the camera has no active session.
+        The discard-don't-upload primitive. Its per-tick caller was the
+        room-privacy path, retired 2026-08-12 when consent became the
+        only recording boundary; the primitive stays for operational
+        kill-switches and the abort/restart machinery's tests. No-op if
+        the camera has no active session.
         """
         async with self._lock_for(camera_id):
             rec = self._sessions.pop(camera_id, None)
@@ -197,14 +290,24 @@ class RecorderManager:
         if rec is not None:
             rec.feed_video(width, height, data)
 
-    def feed_audio(self, camera_id: UUID, pcm: bytes) -> None:
+    def feed_audio(
+        self, camera_id: UUID, pcm: bytes, captured_at: float | None = None
+    ) -> None:
+        """Route a chunk of captured audio to the camera's session.
+
+        ``captured_at`` is when the chunk arrived, on the same monotonic
+        clock as the video frames. It's what lets the session line the
+        two streams up and notice a stall in the audio stream.
+        """
         rec = self._sessions.get(camera_id)
         if rec is not None:
-            rec.feed_audio(pcm)
+            rec.feed_audio(pcm, captured_at)
 
     # ── session wiring ──────────────────────────────────────────────
 
-    def _make_recorder(self, camera_id: UUID, ctx: RecorderCtx) -> SessionRecorder:
+    def _make_recorder(
+        self, camera_id: UUID, ctx: RecorderCtx,
+    ) -> SessionRecorder:
         return SessionRecorder(
             camera_id=camera_id,
             ctx=ctx,
@@ -225,9 +328,28 @@ class RecorderManager:
         never blocks the tick.
         """
         final_path = fs.video_path.with_suffix(".final.mp4")
+        audio_path = fs.audio_path
+        if not fs.encoder_ok:
+            # The encoder child died. Its file is truncated at best, and
+            # for a masked session there is no telling how much of it got
+            # masked — so it never leaves the box.
+            logger.error(
+                "data_collection: encoder failed for camera %s; discarding "
+                "the clip", fs.ctx.camera_id,
+            )
+            self.stats["dropped_encoder"] += 1
+            self._cleanup(fs.video_path, fs.audio_path)
+            return
         try:
-            await self._muxer(fs.video_path, fs.audio_path, final_path)
+            await self._muxer(
+                fs.video_path,
+                audio_path,
+                final_path,
+                audio_offset_seconds=fs.audio_offset_seconds,
+                duration_seconds=fs.video_duration_seconds,
+            )
         except Exception:
+            self.stats["dropped_mux"] += 1
             logger.exception("data_collection: mux failed; dropping session")
             self._cleanup(fs.video_path, fs.audio_path, final_path)
             return
@@ -243,6 +365,35 @@ class RecorderManager:
             "room": fs.ctx.room,
             "gate": fs.ctx.gate,
             "confidence": "" if fs.ctx.confidence is None else str(fs.ctx.confidence),
+            # The clip's own time axis, carried on the object. With the
+            # encoder now filling to the wall clock, a moment inside this
+            # file sits at `captured_at - started_at` seconds — which is
+            # what lets anything time-indexed point into the footage
+            # without opening it.
+            "started_at": fs.session_start_utc.isoformat(),
+            "duration_seconds": (
+                "" if fs.video_duration_seconds is None
+                else f"{fs.video_duration_seconds:.3f}"
+            ),
+            # Whether this clip's timeline can be trusted. "true" means
+            # duration equals the real session and an offset inside the
+            # file is exactly `captured_at - started_at`. "false" means
+            # the encoder fell too far behind to catch up, so the clip is
+            # short and later offsets have shifted — the consumer needs to
+            # know that without opening the file or reading our logs.
+            "timeline_exact": "false" if fs.deficit_seconds else "true",
+            "lost_seconds": f"{fs.deficit_seconds:.1f}",
+            # Frames overwritten before they could be encoded. Their time
+            # is still represented; the intermediate picture is not.
+            # A sharpness signal for whoever trains on this.
+            "dropped_frames": str(fs.dropped_frames),
+            # `sensitive_spans` / `redacted` are filled by the redaction
+            # stage inside the upload task (below) — redaction takes
+            # ~clip-length and MUST NOT run inline here: this path holds
+            # the camera's recorder lock, and running it inline opened a
+            # 5-minute recording hole after every roll (observed live
+            # 2026-08-12: clip rolled 13:44:37, next could not start
+            # until redaction finished at 13:49:35).
         }
 
         task = asyncio.create_task(
@@ -254,6 +405,7 @@ class RecorderManager:
                 fs.audio_path,
                 camera_id=fs.ctx.camera_id,
                 patient_id=fs.ctx.patient_id,
+                fs=fs,
             )
         )
         self._pending_uploads.add(task)
@@ -269,35 +421,72 @@ class RecorderManager:
         *,
         camera_id: UUID,
         patient_id: UUID,
+        fs: FinalizedSession | None = None,
     ) -> None:
+        upload_path = final_path
+        redacted_path = final_path.with_suffix(".redacted.mp4")
         try:
-            # Defense-in-depth: the CAMERA's privacy can flip on (room
-            # classifier finalizing bathroom/bedroom, support override)
-            # AFTER a session finalized but BEFORE its bytes leave the
-            # box. Re-check per-camera at the upload boundary and drop
-            # the clip if so — nothing private ever reaches B2 even on
-            # that race. Fail-safe: if the check itself errors, do NOT
-            # upload.
-            try:
-                if await self._privacy_check(camera_id):
-                    logger.info(
-                        "data_collection: camera privacy on at upload; "
-                        "discarding clip %s",
-                        key,
+            # ── finalize-time redaction (2026-08-12) ────────────────
+            # Runs HERE, in the fire-and-forget task, never in the
+            # recorder-lock path (see the metadata note in
+            # _handle_finalized). Find the sensitive seconds (tick
+            # priors ∪ chunked re-screen), pixelate exactly those via
+            # the event-clip censor in span-gated research mode. The
+            # invariant: never UPLOAD an unredacted clip — ANY failure
+            # in this stage drops the clip (fail closed).
+            spans: list[tuple[float, float]] = []
+            duration = float(
+                (fs.video_duration_seconds if fs else None) or 0.0
+            )
+            if (
+                fs is not None
+                and duration > 0
+                and getattr(
+                    self._settings, "data_collection_redaction_enabled", True
+                )
+            ):
+                try:
+                    plan = await self._span_detector(
+                        final_path,
+                        duration=duration,
+                        settings=self._settings,
+                    )
+                    spans = plan.spans
+                    if spans:
+                        await self._redactor(
+                            str(final_path),
+                            str(redacted_path),
+                            spans=spans,
+                            fps=float(RECORD_FPS),
+                            mode=CENSOR_MODE_RESEARCH,
+                            # Span seconds pay segmentation (~10x
+                            # realtime); passthrough re-encode is cheap.
+                            timeout_seconds=(
+                                120.0
+                                + 10.0 * sum(b - a for a, b in spans)
+                                + 0.5 * duration
+                            ),
+                        )
+                        upload_path = redacted_path
+                        self.stats["clips_redacted"] += 1
+                        self.stats["redaction_spans_total"] += len(spans)
+                except Exception:
+                    self.stats["dropped_redaction"] += 1
+                    logger.exception(
+                        "data_collection: redaction failed; dropping clip "
+                        "(raw never leaves the box on an error path)"
                     )
                     return
-            except Exception:
-                logger.exception(
-                    "data_collection: privacy check failed for camera %s; "
-                    "discarding clip %s (fail-safe)",
-                    camera_id,
-                    key,
-                )
-                return
+            metadata["sensitive_spans"] = json.dumps(
+                [[round(a, 3), round(b, 3)] for a, b in spans]
+            )
+            metadata["redacted"] = "true" if spans else "false"
+
             if not b2_module.b2_configured(self._settings):
                 logger.warning(
                     "data_collection: B2 not configured; discarding clip %s", key
                 )
+                self.stats["dropped_no_b2"] += 1
                 return
             # Data-residency: resolve the patient's region so India clips land
             # in the India bucket. A lookup failure defaults to US (never block
@@ -311,13 +500,14 @@ class RecorderManager:
                     patient_id, key,
                 )
                 region = "US"
-            await self._upload_with_retry(final_path, key, metadata, region)
+            if await self._upload_with_retry(upload_path, key, metadata, region):
+                await self._upload_sidecar(fs, key, metadata, region)
         finally:
-            self._cleanup(video_path, audio_path, final_path)
+            self._cleanup(video_path, audio_path, final_path, redacted_path)
 
     async def _upload_with_retry(
         self, final_path: Path, key: str, metadata: dict[str, str], region: str,
-    ) -> None:
+    ) -> bool:
         delay = self._retry_base_delay
         for attempt in range(1, self._upload_retries + 1):
             try:
@@ -325,7 +515,14 @@ class RecorderManager:
                     final_path, key, metadata=metadata, settings=self._settings,
                     region=region,
                 )
-                return
+                self.stats["clips_uploaded"] += 1
+                if metadata.get("timeline_exact") == "false":
+                    self.stats["clips_short"] += 1
+                logger.info(
+                    "data_collection: uploaded %s (%s) stats=%s",
+                    key, metadata.get("duration_seconds"), self.stats,
+                )
+                return True
             except Exception:
                 if attempt >= self._upload_retries:
                     logger.exception(
@@ -333,7 +530,8 @@ class RecorderManager:
                         attempt,
                         key,
                     )
-                    return
+                    self.stats["dropped_upload_failed"] += 1
+                    return False
                 logger.warning(
                     "data_collection: upload attempt %d failed key=%s; retrying",
                     attempt,
@@ -341,6 +539,51 @@ class RecorderManager:
                 )
                 await self._sleep(delay)
                 delay *= 2
+        return False
+
+    async def _upload_sidecar(
+        self, fs: FinalizedSession | None, clip_key: str,
+        clip_metadata: dict[str, str], region: str,
+    ) -> None:
+        """Write the clip's note beside it in B2.
+
+        Strictly best-effort and always AFTER the clip is safely up. The
+        video is the irreplaceable thing; a note can be regenerated from
+        the database at any time, so nothing here may cost us a clip.
+
+        A missing sidecar therefore means "no note available", never "no
+        events happened" — a consumer must not read absence as evidence.
+        """
+        if self._sidecar_builder is None or fs is None:
+            return
+        try:
+            payload = await self._sidecar_builder(fs, clip_key, clip_metadata)
+            if not payload:
+                return
+            body = json.dumps(payload, separators=(",", ":")).encode()
+            key = sidecar_key(clip_key)
+            path = self._temp_dir / f"{Path(clip_key).stem}.sidecar.json"
+            path.write_bytes(body)
+            try:
+                await self._uploader(
+                    path, key,
+                    metadata={
+                        "clip_key": clip_key,
+                        "patient_id": str(fs.ctx.patient_id),
+                    },
+                    settings=self._settings,
+                    region=region,
+                    content_type="application/json",
+                )
+                self.stats["sidecars_uploaded"] += 1
+            finally:
+                self._cleanup(path)
+        except Exception:
+            self.stats["sidecars_failed"] += 1
+            logger.exception(
+                "data_collection: sidecar failed for %s (clip is safe)",
+                clip_key,
+            )
 
     def _cleanup(self, *paths: Path | None) -> None:
         for p in paths:

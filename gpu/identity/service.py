@@ -88,6 +88,26 @@ def index() -> HTMLResponse:
     )
 
 
+@app.post("/admin/exit")
+def admin_exit(request: Request) -> JSONResponse:
+    """Exit(0) shortly after replying; the entrypoint supervisor
+    relaunches this room (fresh dev code first under NEMARA_DEV_CODE=1
+    — experiment-node iteration without an image build). Same auth as
+    /state."""
+    from identity.contract import auth_ok
+
+    if not auth_ok(
+        request.headers.get("authorization"), _STATE_TOKEN,
+    ):
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    def _die() -> None:
+        time.sleep(0.3)
+        os._exit(0)
+
+    threading.Thread(target=_die, daemon=True).start()
+    return JSONResponse({"status": "restarting"})
+
+
 @app.get("/state")
 def state(request: Request) -> JSONResponse:
     from identity.contract import STATE_CONTRACT, auth_ok
@@ -655,7 +675,16 @@ async def _amain(args: argparse.Namespace) -> None:
         while True:
             await asyncio.sleep(HEARTBEAT_S)
             try:
+                # ALL workers, not just the base pod (2026-08-15 review
+                # finding 2 on the v3.0 worker pool): a HUNG extra
+                # worker never exits — the entrypoint's crash-restart
+                # can't see it — so its cameras would fail silently
+                # forever while worker 0's heartbeat kept this watchdog
+                # happy. Any worker failing keeps last_pod_ok stale and
+                # the wedge exit below gets a fresh start loudly.
                 await home_ref.sam.health()
+                for _extra in home_ref.pods:
+                    await _extra.health()
                 home_ref.last_pod_ok = time.time()
             except Exception as e:               # noqa: BLE001
                 log.warning("identity.pod_heartbeat_failed: %s", e)

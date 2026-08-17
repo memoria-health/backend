@@ -15,15 +15,36 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.patient_member import PatientMember
 
+OWNER_ROLE = "owner"
+
 
 def accessible_patient_ids(caregiver_id: UUID):
     """Scalar subquery of patient ids `caregiver_id` is a member of.
 
     Use as `Patient.id.in_(accessible_patient_ids(cid))` or, on a child table,
     `Model.patient_id.in_(accessible_patient_ids(cid))`.
+
+    READ/WRITE scope, not a destructive-action scope — every member matches,
+    including someone the owner shared with. For anything irreversible use
+    `owned_patient_ids` instead.
     """
     return select(PatientMember.patient_id).where(
         PatientMember.caregiver_id == caregiver_id
+    )
+
+
+def owned_patient_ids(caregiver_id: UUID):
+    """Scalar subquery of patient ids `caregiver_id` OWNS.
+
+    The creator gets `role='owner'` (patients.py create); everyone added later
+    gets `role='caregiver'` (patient_members.py). Destructive, irreversible
+    actions must scope with this rather than `accessible_patient_ids`, or any
+    invited member can destroy the patient and cascade away every camera,
+    detector and event belonging to someone else's family.
+    """
+    return select(PatientMember.patient_id).where(
+        PatientMember.caregiver_id == caregiver_id,
+        PatientMember.role == OWNER_ROLE,
     )
 
 

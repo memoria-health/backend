@@ -37,12 +37,24 @@ If tier 2 also fails, `CensorError` propagates and the caller DROPS
 the clip entirely (`events.clip_suppressed`) — raw footage never
 reaches storage on any path.
 
-CPU cost: clips are ~26s @ 4fps ≈ 100 frames; yolo11n-seg runs a few
-ms-to-tens-of-ms per frame on CPU, so a censor pass is seconds — fine
-for a fire-and-forget archival task. Deploy note: the seg weights
-(`yolo11n-seg.pt`, ~6 MB) auto-download from ultralytics' CDN on first
+CPU cost: clips are ~26s @ clip_fps=8 ≈ 200 frames; yolo11s-seg at
+imgsz=1280 runs ~110-160ms per frame on CPU, so a censor pass is ~30s
+— fine for a fire-and-forget archival task, and well inside
+`censor_timeout_seconds`. Deploy note: the seg weights
+(`yolo11s-seg.pt`, ~20 MB) auto-download from ultralytics' CDN on first
 use; prefetch in the image build (tools/download_models.py pattern) if
-the deploy target has no egress.
+the deploy target has no egress. `main._warm_censor_model` does that
+download off the startup path so the first censored clip doesn't pay it.
+
+Mask source note (2026-08-07): tier 1 briefly read its masks from the
+perception pod's EdgeTAM segmentation instead of segmenting here. It was
+reverted after measurement — the pod's masks were no more stable
+frame-to-frame (consecutive-IoU 0.741 vs 0.744), arrived at a third of
+the clip's frame rate so every frame was masked with a silhouette up to
+170ms stale, and vanished entirely on a recumbent subject because SAM3
+grounds nobody lying in bed. Segmenting the frame being censored has no
+alignment error by construction. See the revert commit for the numbers
+before reaching for that again.
 """
 
 from __future__ import annotations
@@ -53,7 +65,7 @@ import os
 import subprocess
 import sys
 import tempfile
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from src.settings import get_settings
 
@@ -68,15 +80,80 @@ class CensorError(RuntimeError):
     uploading the raw bytes is never an acceptable recovery."""
 
 
-# YOLO11 nano segmentation weights. Auto-downloaded by ultralytics on
-# first construction (~6 MB); cached process-wide below.
+# Segmentation weights + inference resolution. Auto-downloaded by
+# ultralytics on first construction; cached process-wide below.
+#
+# yolo11s-seg at imgsz=1280, measured 2026-08-07 against yolo11x-seg
+# @1280 as reference, on a standing/moving clip and a recumbent one
+# (person in bed, partly behind a monitor):
+#
+#                     IoU vs ref (standing / recumbent)   ms/frame
+#     n-seg @  640          0.819 / 0.210                  25-35
+#     s-seg @  640          0.762 / 0.516                  39-45
+#     s-seg @ 1280          0.944 / 0.596                 113-159
+#     x-seg @ 1280          1.000 / 1.000                 480
+#
+# BOTH knobs have to move together: s@640 is WORSE than n@640 on the
+# standing clip, and n@1280 was worse than n@640 (its extra boundary
+# perimeter is noise, not detail — capacity is the limiter, not pixels).
+# m-seg@1280 measured 0.939, no better than s for twice the compute.
+#
+# This is a safety change, not a cosmetic one. At n@640 the recumbent
+# mask scores 0.21 against the reference — the censor was covering
+# substantially the WRONG REGION on someone lying in bed, which is the
+# case the night gate exists for. The finer outline is what Aryaman
+# asked for; the recall on hard poses is why it matters.
+#
+# Cost: ~4x, so a ~26s clip at clip_fps=8 (~208 frames) is ~30s of
+# masking rather than ~7s. Well inside `censor_timeout_seconds` (180s),
+# and the gate's operator clip already runs as a background task for
+# exactly this reason (it must never delay the caregiver's post-roll).
 _SEG_MODEL_NAME = "yolo11n-seg.pt"
+_SEG_IMGSZ = 640
+# Second pass: re-segment the person's own bounding box (padded) so the
+# body fills the model's input instead of occupying a few hundred pixels
+# of a 1080p frame. Same weights, same imgsz — the gain is entirely in
+# what fraction of the input the subject covers.
+#
+# Padding is generous because the first pass's box is itself derived
+# from a coarse mask; too tight a crop clips hair, feet and elbows and
+# the refined mask comes back amputated.
+_REFINE_PAD_FRACTION = 0.12
+_REFINE_MIN_PAD_PX = 40
+# Below this the subject is already small enough that a crop adds no
+# resolution worth the second inference pass.
+_REFINE_MIN_BOX_PX = 40
 # COCO class id 0 = person.
 _PERSON_CLASS_ID = 0
 # Deliberately LOW confidence floor: a false-positive mask just blurs a
 # bit more of the frame (harmless); a false negative leaves skin
 # visible (the failure we exist to prevent).
-_SEG_CONFIDENCE = 0.20
+#
+# 0.20 was not low enough. Measured 2026-08-05 against event 62250996,
+# a real evening clip where the subject stands by the wardrobe door in
+# white clothing, roughly 111/255 mean brightness:
+#
+#     conf=0.20   detected  3/21 frames      <- what shipped
+#     conf=0.15   detected  6/21 frames
+#     conf=0.10   detected 12/21 frames
+#     conf=0.07   detected 21/21 frames
+#     conf=0.05   detected 21/21 frames
+#
+# Both failure paths treat "no mask" as "cover everything", so 18 of
+# those 21 frames came out filled edge to edge: the operator's clip was
+# a solid green rectangle for its whole duration, useless for judging
+# anything, and the caregiver's censored clip would have been a
+# full-frame blur for the same reason. Neither is a rendering bug, both
+# are this number.
+#
+# A bigger model is NOT the fix. yolo11x-seg at 0.20 managed only 7/21
+# on the same frames, for far more compute than the gate's 60s window
+# can spare. The threshold dominates.
+#
+# 0.05 rather than 0.07 for margin: average mask coverage barely moves
+# between them (0.81% vs 0.63% of frame), so the cost of going lower is
+# close to nothing, while a miss is expensive in both directions.
+_SEG_CONFIDENCE = 0.05
 # Pixelation factor: the masked region is downsampled by this per axis
 # and re-upsampled with nearest-neighbour. 24 → a 720p body becomes a
 # handful of flat blocks — posture readable, identity/exposure not.
@@ -99,6 +176,48 @@ _FFMPEG_BLUR_FILTER = (
 # elsewhere in frame → full-frame.
 _MASK_GAP_BRIDGE_FRAMES = 3
 
+# ── research mask mode (2026-08-04) ─────────────────────────────────
+#
+# A SECOND, separate treatment used only for the B2 research corpus.
+# It is not reachable from the caregiver-facing path and does not change
+# the event-clip treatment above in any way.
+#
+# It fills the person with a flat colour instead of pixelating them, and
+# hugs the body far more closely. That is a DELIBERATE REVERSAL of the
+# block-quantisation above, and the tradeoff has to be stated plainly:
+#
+#   The event-clip mask snaps to a block grid precisely so the boundary
+#   reads as crude rectangles rather than a figure, because a smooth
+#   silhouette leaks the body OUTLINE even at infinite pixelation. This
+#   mode leaks that outline ON PURPOSE. Pose and position are exactly
+#   what a research corpus needs; appearance and skin are exactly what
+#   it must not carry.
+#
+# So this is not "a better censor" — it is a different exposure trade,
+# only defensible because the corpus is opt-in under explicit, separate
+# consent and never reaches a caregiver's phone. Anything that would put
+# it in front of a caregiver is a bug.
+#
+# Flat green: it is not a colour a room produces, so a masked region is
+# unambiguous to a human reviewer and trivially separable to a model.
+# Margin around the segmented person. 2% of the short side is ~21px on a
+# 1080p frame, which rounds off fingers and closes the gaps between limbs
+# — the silhouette reads as a blob rather than a person. That size was
+# compensating for a mask that arrived at ~160x160 and was upscaled with
+# nearest-neighbour; `_person_mask` now computes at full resolution and
+# interpolates before thresholding, so the mask itself is accurate to a
+# few pixels and the margin no longer has to cover for it.
+#
+# 0.5% (~5px at 1080p) still covers the under-coverage segmentation shows
+# at body edges, especially loose clothing and hair. Raise it if any real
+# footage shows skin outside the fill; that is the failure that matters,
+# and it is the reason this is a named constant rather than a literal.
+_RESEARCH_DILATE_FRACTION = 0.005
+_RESEARCH_DILATE_MIN_PX = 3
+
+CENSOR_MODE_PIXELATE = "pixelate"  # event clips (default, unchanged)
+CENSOR_MODE_RESEARCH = "research"  # B2 corpus only
+
 _seg_model = None
 
 
@@ -111,6 +230,18 @@ def _get_seg_model():
         import torch
         from ultralytics import YOLO
 
+        # ultralytics chatters at INFO about model loading, and its
+        # import-time logger setup can't flow through our root config.
+        # Silenced here (not in main.py) because this import is LAZY —
+        # the parent process only pays torch residency if the
+        # masked-still path actually fires (main.py deliberately never
+        # imports the torch family at module level).
+        _ul = logging.getLogger("ultralytics")
+        _ul.setLevel(logging.WARNING)
+        for _h in list(_ul.handlers):
+            _ul.removeHandler(_h)
+        _ul.propagate = True
+
         # Deadlock guard (2026-07-28): a multi-threaded torch inference
         # froze the entire process (event loop included) in the local
         # Docker VM — classic libomp hang. Single-threaded inference is
@@ -121,27 +252,115 @@ def _get_seg_model():
     return _seg_model
 
 
-def _person_mask(model, frame: np.ndarray) -> np.ndarray | None:
-    """Union of all person masks for one BGR frame, as a uint8 {0,1}
-    array at frame resolution. None when no person was segmented."""
+def _seg_union(model, image: np.ndarray) -> np.ndarray | None:
+    """One segmentation pass over `image`; union of every person mask as
+    a uint8 {0,1} array at `image`'s resolution. None when nobody was
+    segmented."""
     import cv2
     import numpy as np
 
     results = model.predict(
-        frame,
+        image,
         classes=[_PERSON_CLASS_ID],
         conf=_SEG_CONFIDENCE,
         verbose=False,
+        # Compute masks at the input image's resolution rather than at the
+        # prototype resolution (~160x160). Without this the mask is
+        # produced ~12x smaller than a 1080p frame and every edge is
+        # reconstructed by upscaling, which is where the staircase edges
+        # come from. Costs some inference time, buys the outline.
+        retina_masks=True,
+        imgsz=_SEG_IMGSZ,
     )
     result = results[0]
     if result.masks is None or len(result.masks.data) == 0:
         return None
     stacked = result.masks.data.cpu().numpy()  # (n, mh, mw) in [0,1]
-    union = (stacked.max(axis=0) > 0.5).astype(np.uint8)
-    h, w = frame.shape[:2]
-    if union.shape != (h, w):
-        union = cv2.resize(union, (w, h), interpolation=cv2.INTER_NEAREST)
+    # Union in FLOAT, resize in float, threshold last. The old order
+    # thresholded to {0,1} first and then resized with INTER_NEAREST, so
+    # each source pixel became a hard rectangular block — the single
+    # biggest cause of the blocky silhouette. Interpolating the soft mask
+    # and cutting at 0.5 recovers a smooth boundary at no real cost.
+    union_f = stacked.max(axis=0).astype(np.float32)
+    h, w = image.shape[:2]
+    if union_f.shape != (h, w):
+        union_f = cv2.resize(union_f, (w, h), interpolation=cv2.INTER_LINEAR)
+    union = (union_f > 0.5).astype(np.uint8)
     return union if union.any() else None
+
+
+def _person_mask(model, frame: np.ndarray) -> np.ndarray | None:
+    """Union of all person masks for one BGR frame, as a uint8 {0,1}
+    array at frame resolution. None when no person was segmented.
+
+    TWO PASSES (2026-08-07). The first finds the person anywhere in the
+    frame; the second re-segments their own bounding box, so the body
+    fills the model's input instead of occupying a small patch of a
+    1080p room. Measured against yolo11x-seg@1280 as reference, on a
+    standing clip and a recumbent one (person in bed, partly occluded):
+
+                                   IoU standing / recumbent   ms/frame
+        one pass,  n-seg @  640          0.819 / 0.210            25
+        one pass,  s-seg @ 1280          0.944 / 0.596           113
+        TWO PASS,  n-seg @  640          0.903 / 0.392            57
+
+    The crop recovers most of the big model's outline quality for half
+    its cost, and nearly doubles it on the recumbent case — the gain is
+    entirely in what fraction of the input the subject covers, not in
+    capacity or pixels. Cost matters here because the operator's gate
+    clip has a 60-second budget end to end: the big model pushed a ~26s
+    clip to ~30s of masking alone and the page stopped loading in time
+    (field report, 2026-08-07). Two passes land at ~12s.
+
+    Morphological smoothing was measured as an alternative and rejected:
+    it moved IoU 0.819 -> 0.820, i.e. it changes how the edge LOOKS
+    without making it more correct.
+
+    The refined mask REPLACES the coarse one only when it finds
+    something; a crop that segments to nothing falls back, because the
+    coarse mask is still better than no mask at all.
+    """
+    import numpy as np
+
+    coarse = _seg_union(model, frame)
+    if coarse is None:
+        return None
+
+    h, w = frame.shape[:2]
+    ys, xs = np.nonzero(coarse)
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    if max(y1 - y0, x1 - x0) < _REFINE_MIN_BOX_PX:
+        # Already tiny — a crop adds no resolution worth a second pass.
+        return coarse
+
+    # Pad generously: the box comes from the COARSE mask, which
+    # under-covers at exactly the extremities (hair, feet, elbows) that a
+    # tight crop would then amputate for good.
+    pad = max(
+        _REFINE_MIN_PAD_PX, int(_REFINE_PAD_FRACTION * max(y1 - y0, x1 - x0)),
+    )
+    cy0, cy1 = max(0, y0 - pad), min(h, y1 + pad)
+    cx0, cx1 = max(0, x0 - pad), min(w, x1 + pad)
+    crop = frame[cy0:cy1, cx0:cx1]
+    if crop.size == 0:
+        return coarse
+
+    refined = _seg_union(model, crop)
+    if refined is None:
+        return coarse
+    # REPLACE inside the crop, KEEP coarse outside it.
+    #
+    # Not a union: OR-ing the two together drags every imprecision of the
+    # coarse mask back in and cancels the refinement exactly — measured
+    # 0.821 IoU with the union versus 0.920 with the replace, i.e. no
+    # better than not refining at all. Inside the crop the refined mask
+    # is strictly the better estimate; outside it, coarse is the only
+    # estimate there is, and a second person out there still has to be
+    # covered because the censor masks EVERY person.
+    out = coarse.copy()
+    out[cy0:cy1, cx0:cx1] = refined
+    return out if out.any() else None
 
 
 def _pixelate(frame: np.ndarray, block: int = _PIXELATE_FACTOR) -> np.ndarray:
@@ -168,6 +387,45 @@ def _dilate_mask(mask: np.ndarray, *, extra: bool = False) -> np.ndarray:
     k = max(15, int(min(h, w) * (0.12 if extra else 0.06))) | 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
     return (cv2.dilate(mask, kernel) > 0).astype(mask.dtype)
+
+
+def _research_dilate(mask: np.ndarray) -> np.ndarray:
+    """Tight dilation for the research mode — a real but small margin."""
+    import cv2
+
+    h, w = mask.shape[:2]
+    k = max(
+        _RESEARCH_DILATE_MIN_PX,
+        int(min(h, w) * _RESEARCH_DILATE_FRACTION),
+    ) | 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    return (cv2.dilate(mask, kernel) > 0).astype(mask.dtype)
+
+
+def _research_frame(
+    frame: np.ndarray, mask: np.ndarray | None,
+) -> np.ndarray:
+    """Pixelate the person, keeping the room intact.
+
+    Pixelation rather than the original flat-green fill (Aryaman
+    2026-08-12): identical look to the app's censored event clips, and
+    posture/motion stay readable through the mask — which is research
+    value; a green matte carries none. The research-specific parts
+    stay: the wider research dilation, and full coverage always.
+
+    No mask means segmentation missed, not that the room is empty — the
+    gate upstream already established someone is present. So the frame
+    is pixelated entirely rather than left as-is. One rule, no special
+    cases: whether we mask at all is decided upstream by the sensitivity
+    verdict, and once we are masking, every frame gets covered one way or
+    another.
+    """
+    if mask is None or not mask.any():
+        return _pixelate(frame)
+    out = frame.copy()
+    region = _research_dilate(mask) > 0
+    out[region] = _pixelate(frame)[region]
+    return out
 
 
 def _censor_frame(
@@ -301,12 +559,24 @@ class _FrameEncoder:
         self._stderr.close()
 
 
-def _censor_person_mask_sync(in_path: str, out_path: str) -> None:
+def _censor_person_mask_sync(
+    in_path: str, out_path: str, *, mode: str = CENSOR_MODE_PIXELATE,
+    spans: list[tuple[float, float]] | None = None,
+    fps_override: float | None = None,
+) -> None:
     """Tier 1, synchronous (runs inside the CLI child process — see
     `_cli_main`): STREAM one frame at a time — decode → person-mask
     pixelation → straight into the piped ffmpeg encoder — so peak
     memory is O(1 frame + model), never O(clip). Audio never enters
-    the path (raw-video pipe)."""
+    the path (raw-video pipe).
+
+    ``spans`` (2026-08-12, finalize-time redaction): when given, ONLY
+    frames whose timestamp falls inside a span are censored; the rest
+    pass through untouched (and skip segmentation entirely, which is
+    what makes a 15-minute clip affordable). ``fps_override`` maps
+    frame index -> seconds for span gating; REQUIRED with spans when
+    the clip was not encoded at `clip_fps` (the data-collection
+    recorder runs 15fps, event clips run `clip_fps`)."""
     import cv2
 
     model = _get_seg_model()
@@ -329,7 +599,10 @@ def _censor_person_mask_sync(in_path: str, out_path: str) -> None:
         # sailed straight through (a variable-frame-rate file reports
         # 0.25 fps — measured), which would have written a clip 32x too
         # slow with nothing flagged anywhere.
-        fps = float(get_settings().clip_fps)
+        fps = (
+            float(fps_override) if fps_override
+            else float(get_settings().clip_fps)
+        )
         probed = cap.get(cv2.CAP_PROP_FPS)
         if probed and abs(probed - fps) > 0.5:
             log.warning(
@@ -349,14 +622,34 @@ def _censor_person_mask_sync(in_path: str, out_path: str) -> None:
         # still fail safe to full-frame.
         last_mask = None
         gap = 0
+        frame_idx = 0
         while ok:
+            if spans is not None:
+                t = frame_idx / fps
+                if not any(a <= t < b for a, b in spans):
+                    # Outside every sensitive span: pass through raw and
+                    # skip segmentation. Mask state resets so a span
+                    # entered later starts fresh instead of bridging a
+                    # minutes-old mask across clean footage.
+                    last_mask, gap = None, 0
+                    encoder.write(frame)
+                    frame_idx += 1
+                    ok, frame = cap.read()
+                    continue
             mask = _person_mask(model, frame)
             if mask is not None:
                 last_mask, gap = mask, 0
             elif last_mask is not None and gap < _MASK_GAP_BRIDGE_FRAMES:
                 gap += 1
                 mask = _dilate_mask(last_mask, extra=True)
-            encoder.write(_censor_frame(frame, mask))
+            if mode == CENSOR_MODE_RESEARCH:
+                # Always returns a fully-covered frame (person-region
+                # pixelation; full-frame on a seg miss) — no drop path.
+                censored = _research_frame(frame, mask)
+            else:
+                censored = _censor_frame(frame, mask)
+            encoder.write(censored)
+            frame_idx += 1
             ok, frame = cap.read()
     except BaseException:
         if encoder is not None:
@@ -367,21 +660,80 @@ def _censor_person_mask_sync(in_path: str, out_path: str) -> None:
     encoder.close()
 
 
-def _person_mask_subprocess_cmd(in_path: str, out_path: str) -> list[str]:
+def mask_people_in_still_sync(jpeg: bytes) -> bytes:
+    """Pixelate PEOPLE in one still, leaving the room itself visible.
+
+    For the exit-door picker on a PRIVATE camera. The caregiver has to
+    see the room to tap its doors, but privacy mode exists so they
+    cannot watch that room — and a still they can re-fetch is a
+    slideshow of it. Masking the people resolves both: doors are static
+    architecture, people are the thing being protected.
+
+    DIFFERENT FAIL RULE from `_censor_frame`, deliberately. There, a
+    frame with no segmented person is pixelated FULL-FRAME, because the
+    clip already carries a sensitive verdict and a missed body is the
+    unaffordable failure. Here the room IS the subject, so full-frame
+    pixelation would defeat the feature entirely. No person found →
+    return the frame unchanged, which is correct: an empty bedroom is
+    architecture.
+
+    Segmentation being UNABLE to run still raises, so the caller fails
+    closed and serves nothing rather than an unmasked private room.
+    """
+    import cv2
+    import numpy as np
+
+    arr = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if arr is None:
+        raise CensorError("door frame: could not decode JPEG")
+
+    # Raises on a broken CV stack — that propagates, by design.
+    mask = _person_mask(_get_seg_model(), arr)
+    if mask is None or not mask.any():
+        return jpeg  # nobody in shot; the room alone is not private
+
+    # Same treatment as the event path: generous dilation, person-relative
+    # block size, block-quantised region so the silhouette does not leak.
+    out = _censor_frame(arr, mask)
+    ok, buf = cv2.imencode(".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    if not ok:
+        raise CensorError("door frame: could not re-encode JPEG")
+    return bytes(buf)
+
+
+def _person_mask_subprocess_cmd(
+    in_path: str, out_path: str, *, mode: str = CENSOR_MODE_PIXELATE,
+    spans: list[tuple[float, float]] | None = None,
+    fps: float | None = None,
+) -> list[str]:
     """argv for the tier-1 child process. Split out as a seam so unit
     tests can substitute a scripted child (exit-code / sleep stand-ins)
     and exercise the real spawn/kill/timeout mechanics without YOLO."""
-    return [
+    argv = [
         sys.executable,
         "-m", "src.services.detection.censor",
         in_path,
         out_path,
     ]
+    if mode != CENSOR_MODE_PIXELATE:
+        argv += ["--mode", mode]
+    if spans is not None:
+        argv += ["--spans", ",".join(f"{a:.3f}-{b:.3f}" for a, b in spans)]
+    if fps is not None:
+        argv += ["--fps", f"{fps:g}"]
+    return argv
 
 
-async def _censor_person_mask_subprocess(in_path: str, out_path: str) -> None:
+async def _censor_person_mask_subprocess(
+    in_path: str, out_path: str, *, mode: str = CENSOR_MODE_PIXELATE,
+    spans: list[tuple[float, float]] | None = None,
+    fps: float | None = None,
+    timeout_seconds: float | None = None,
+) -> None:
     """Tier 1: run the person-mask censor in an ISOLATED child process
-    with a hard wall-clock deadline (`censor_timeout_seconds`).
+    with a hard wall-clock deadline (`censor_timeout_seconds`, or the
+    caller's ``timeout_seconds`` override — long research clips need a
+    duration-scaled budget the 15s-event default can't cover).
 
     Why a subprocess (2026-07-28): a multi-threaded torch inference hit
     a native OpenMP deadlock and froze the whole backend — the hang
@@ -397,9 +749,14 @@ async def _censor_person_mask_subprocess(in_path: str, out_path: str) -> None:
     `CensorError` on nonzero exit; `censor_clip` maps both onto the
     tier-2 full-frame fallback.
     """
-    timeout = get_settings().censor_timeout_seconds
+    timeout = (
+        timeout_seconds if timeout_seconds is not None
+        else get_settings().censor_timeout_seconds
+    )
     proc = await asyncio.create_subprocess_exec(
-        *_person_mask_subprocess_cmd(in_path, out_path),
+        *_person_mask_subprocess_cmd(
+            in_path, out_path, mode=mode, spans=spans, fps=fps,
+        ),
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -505,7 +862,10 @@ async def _mux_source_audio(source_path: str, video_path: str) -> None:
 
 async def censor_clip(
     in_path: str, out_path: str, *, full_frame: bool = False,
-    keep_audio: bool = True,
+    keep_audio: bool = True, mode: str = CENSOR_MODE_PIXELATE,
+    spans: list[tuple[float, float]] | None = None,
+    fps: float | None = None,
+    timeout_seconds: float | None = None,
 ) -> None:
     """Censor the clip at `in_path` into `out_path` (video pixelated/
     blurred; the SOURCE audio track is carried over — 2026-07-28
@@ -527,9 +887,28 @@ async def censor_clip(
     isolation. Raises `CensorError` only when tier 2 also fails — at
     which point the caller must drop the clip.
     """
+    if mode == CENSOR_MODE_RESEARCH:
+        # No tier-2 for research. Full-frame blur is useless to a corpus,
+        # so the only outcomes are "masked correctly" or "dropped" —
+        # CensorError propagates and the caller discards the clip.
+        if full_frame:
+            raise CensorError(
+                "censor: research mode has no full-frame fallback"
+            )
+        await _censor_person_mask_subprocess(
+            in_path, out_path, mode=mode, spans=spans, fps=fps,
+            timeout_seconds=timeout_seconds,
+        )
+        if keep_audio:
+            await _mux_source_audio(in_path, out_path)
+        return
+
     if not full_frame:
         try:
-            await _censor_person_mask_subprocess(in_path, out_path)
+            await _censor_person_mask_subprocess(
+                in_path, out_path, spans=spans, fps=fps,
+                timeout_seconds=timeout_seconds,
+            )
             # Tier 1 writes video only, so silence is simply not muxing.
             if keep_audio:
                 await _mux_source_audio(in_path, out_path)
@@ -571,12 +950,39 @@ def _cli_main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="skip person segmentation; blur the whole frame via ffmpeg",
     )
+    parser.add_argument(
+        "--mode",
+        choices=[CENSOR_MODE_PIXELATE, CENSOR_MODE_RESEARCH],
+        default=CENSOR_MODE_PIXELATE,
+        help="pixelate (caregiver-facing clips) or research (B2 corpus)",
+    )
+    parser.add_argument(
+        "--spans",
+        help="censor ONLY these second-ranges (e.g. '12.000-30.500,"
+             "300.000-321.000'); frames outside pass through raw "
+             "(finalize-time redaction, 2026-08-12)",
+    )
+    parser.add_argument(
+        "--fps",
+        type=float,
+        help="frame-index -> seconds rate for --spans gating (the "
+             "data-collection recorder encodes at 15fps, not clip_fps)",
+    )
     args = parser.parse_args(argv)
+    spans = None
+    if args.spans:
+        spans = []
+        for part in args.spans.split(","):
+            a, _, b = part.partition("-")
+            spans.append((float(a), float(b)))
     try:
         if args.full_frame:
             asyncio.run(_censor_full_frame(args.in_path, args.out_path))
         else:
-            _censor_person_mask_sync(args.in_path, args.out_path)
+            _censor_person_mask_sync(
+                args.in_path, args.out_path, mode=args.mode,
+                spans=spans, fps_override=args.fps,
+            )
     except Exception:  # noqa: BLE001 — any failure = nonzero exit
         import traceback
 

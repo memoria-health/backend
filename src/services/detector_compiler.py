@@ -34,13 +34,15 @@ no video involved at compile time.
 
 from __future__ import annotations
 
-import logging
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from uuid import uuid4
 
 from google import genai
+
+from src.services.genai_client import get_client
 from google.genai import types as genai_types
 from openai import AsyncOpenAI
 
@@ -149,11 +151,25 @@ caregiver's wording that conflicts with them.
    the room where something usually happens, or proximity to an object
    are never sufficient on their own. Say so explicitly.
 
-3. NAME THE COMPETING ACTIVITIES. List the things a person in a home is
-   most likely to be doing that could be mistaken for this behaviour,
-   and state that each one means FALSE. Always consider a laptop or
-   computer, a phone or tablet, reading, eating, cleaning, and talking
-   to someone.
+3. NAME THE COMPETING ACTIVITIES -- BUT ONLY THE ONES THAT TAKE THE SAME
+   FACULTY. A competing activity is one that CANNOT be done at the same
+   time as this behaviour because it needs the same attention. Watching
+   a screen needs the eyes, so a laptop, a phone, a tablet or a book
+   competes with it. Eating, drinking, holding a conversation, or having
+   the television on in the background do NOT need the eyes, so they
+   CO-OCCUR and must NOT make it false.
+
+   Ask: could a person plausibly do both at once? If yes, it co-occurs
+   and is irrelevant. If no, it competes and means FALSE. List only the
+   competing ones, and say plainly that co-occurring activities do not
+   change the answer.
+
+   Getting this wrong in either direction has cost us. Omitting LAPTOP
+   from Watching TV's competing list fired 5 events in 25 minutes at a
+   man working at his desk (2026-07-29). Then listing EATING as
+   competing fired 3 events in 19 minutes at a man who sat watching
+   television and eating -- the detector went false for 80 straight
+   seconds while nothing changed, and the episode expired (2026-08-06).
 
 4. NEVER RELY ON WHAT THE MODEL CANNOT KNOW. Do not refer to a person's
    habits, routine, usual spot, schedule, or medical history. The model
@@ -175,9 +191,38 @@ caregiver's wording that conflicts with them.
 """
 
 
+# Severity at or above which a reactive detector gets the INCLUSIVE prompt.
+#
+# Mirrors `_EMERGENCY_SEVERITY` in detection/scheduling/scheduler.py, which
+# gates the cost exemptions. One concept — "this is high-stakes enough that a
+# miss matters more than a false alarm" — so the two must not drift. Not
+# imported, because scheduling importing the compiler (or vice versa) would be
+# a cycle; test_detector_categories.py asserts they stay equal instead.
+INCLUSIVE_BIAS_SEVERITY = 80
+
+# Categories whose members are high-stakes by default, used ONLY when a caller
+# has not supplied severity yet. Not a treatment rule — a compatibility shim so
+# pre-severity callers keep the exact behaviour they had.
+_LEGACY_HIGH_STAKES_CATEGORIES = frozenset({"safety"})
+
+
+def _is_high_stakes(*, category: str, severity: int | None) -> bool:
+    """Whether a reactive detector gets the INCLUSIVE prompt.
+
+    Severity decides when we have it. When we do not (older call sites,
+    fixtures), fall back to the pre-2026-08-05 category check so nothing
+    silently changes strictness — the failure mode we care about is a
+    high-stakes detector quietly becoming conservative and missing events.
+    """
+    if severity is not None:
+        return severity >= INCLUSIVE_BIAS_SEVERITY
+    return category in _LEGACY_HIGH_STAKES_CATEGORIES
+
+
 def _meta_prompt(
     *, identifier: str, name: str, description: str, user_text: str,
-    absence: bool, category: str,
+    absence: bool, category: str, severity: int | None = None,
+    is_sustained: bool = False,
 ) -> str:
     """The instructions the compiler sends to the LLM. `identifier` is
     interpolated everywhere the runtime block needs the stable key.
@@ -186,11 +231,24 @@ def _meta_prompt(
       - absence → conservative: only a clear positive
         counts, so a real miss surfaces the absence alert instead of being
         swallowed.
-      - reactive + safety  → inclusive: a missed emergency is far worse than a
-        false alarm, so fire on borderline signs.
-      - reactive + routine → conservative: a false alarm is just noise, so only
-        a clear, sustained occurrence fires (this is the "watching TV fired on a
-        glance" fix). The LLM is told to calibrate strictness to the stakes.
+      - reactive + high severity → inclusive: a missed emergency is far worse
+        than a false alarm, so fire on borderline signs.
+      - reactive + low severity  → conservative: a false alarm is just noise, so
+        only a clear, sustained occurrence fires (this is the "watching TV fired
+        on a glance" fix). The LLM is told to calibrate strictness to the stakes.
+
+    STAKES IS `severity`, NOT `category` (2026-08-05). This used to read
+    `category == "safety"`, which worked only while there were two categories
+    and "safety" doubled as "high stakes". With four semantic categories
+    (safety / routine / behaviour / care) that conflation breaks: filing a 3am
+    wandering detector under `behaviour` would silently hand it the strict
+    prompt and it would start missing things. Category is now labelling only;
+    severity carries the stakes, the same contract the scheduler already uses
+    for its cost exemptions.
+
+    `severity` is None for older callers that have not been threaded through
+    yet; those fall back to the previous category check so behaviour is
+    unchanged rather than silently loosened.
     """
     if absence:
         detected_guidance = (
@@ -201,29 +259,40 @@ def _meta_prompt(
             "would wrongly suppress that alert."
         )
         example = _FEW_SHOT_EXAMPLE_CONSERVATIVE
-    elif category == "safety":
+    elif _is_high_stakes(category=category, severity=severity):
         detected_guidance = (
-            "FIRST weigh the stakes: this is a SAFETY/health detector, so a "
-            "missed event could be an emergency. Be GENEROUS — use INCLUSIVE "
-            "criteria so borderline or partial signs still fire; set FALSE only "
-            "when you're confident nothing concerning happened."
+            "FIRST weigh the stakes: this is a HIGH-STAKES health or safety "
+            "detector, so a missed event could be an emergency. Be GENEROUS — "
+            "use INCLUSIVE criteria so borderline or partial signs still fire; "
+            "set FALSE only when you're confident nothing concerning happened."
         )
         example = _FEW_SHOT_EXAMPLE_INCLUSIVE
     else:
         detected_guidance = (
             "FIRST weigh the stakes: this is a ROUTINE, non-emergency behaviour, "
             "so a false alarm is just noise the caregiver must dismiss. Be "
-            "CONSERVATIVE — set TRUE only on a CLEAR, SUSTAINED, deliberate "
-            "occurrence; a fleeting glance, an incidental or momentary instance, "
-            "or anything ambiguous → FALSE. Use your judgment to calibrate how "
-            "strict to be: the more disruptive a false alarm would be, the "
-            "higher the bar."
+            "CONSERVATIVE about EVIDENCE, never about duration. Decide the "
+            "behaviour's natural time-scale first. If it is inherently "
+            "MOMENTARY (an action over in seconds — a sip, a pill, a doorway "
+            "pass), ONE clearly-visible occurrence anywhere in the clip is "
+            "TRUE; brevity alone is NEVER grounds for FALSE — the bar is that "
+            "the physical evidence is unambiguously on film. (Live lesson "
+            "2026-08-14: criteria that demanded 'sustained' made the model "
+            "describe a person drinking from a glass at confidence 0.9 and "
+            "still answer false.) If it is inherently a SUSTAINED state, "
+            "require clear, deliberate engagement for most of the clip; a "
+            "fleeting glance or incidental instant of it → FALSE. In both "
+            "cases anything ambiguous, occluded, or unclear → FALSE, and "
+            "calibrate strictness to how disruptive a false alarm would be."
         )
         example = _FEW_SHOT_EXAMPLE_ROUTINE_REACTIVE
 
     return (
         "You are configuring a computer-vision detector that runs on "
-        "short (~11s) clips from a wall-mounted home security camera.\n\n"
+        "short (~11s) clips from a wall-mounted home security camera. "
+        "Clips are analyzed roughly every 10 seconds, so a brief action "
+        "typically appears in exactly ONE clip and may start or end "
+        "mid-clip.\n\n"
         f"{_HARD_RULES}\n"
         "The caregiver wants a new detector with this description:\n"
         f"  Name:        {name!r}\n"
@@ -244,10 +313,51 @@ def _meta_prompt(
         f"not happening; 0.3–0.6 = ambiguous; 0.7+ = clearly happening.>\n\n"
         f"  {identifier}_reasoning: 1 short sentence explaining your "
         f"judgment, citing what you specifically saw.\n\n"
-        f"Match the rigor of this example:\n\n"
+        f"  {identifier}_confirm_need: high or low. <COMPILE-TIME metadata, "
+        f"NOT part of the runtime instructions — it configures server-side "
+        f"double-checking. Answer 'high' when this detector's visual "
+        f"evidence is error-prone: subtle or small-scale motion, interaction "
+        f"with a small handheld object (cup, pill, utensil, phone), or a "
+        f"visually busy context where similar-looking actions are common. "
+        f"Answer 'low' when the action is large-scale and unmistakable. Add "
+        f"one short reason after the word.>\n\n"
+        + (
+            # The detection/state split for sustained behaviours
+            # (Aryaman 2026-08-07). `_detected` above is ENTRY evidence
+            # — it may stay strict about engagement. `_state_active` is
+            # CONTINUATION, and it must NOT inherit that strictness:
+            # the backend latches an ongoing episode on this field, so
+            # criteria that flap with momentary attention re-open and
+            # re-alert one continuous session (measured: 3 TV alerts in
+            # 18 min on 2026-08-06).
+            f"  {identifier}_state_active: boolean. <SESSION-IN-PROGRESS "
+            f"criteria. This field answers a DIFFERENT, looser question "
+            f"than {identifier}_detected: not 'is the person actively "
+            f"engaged right now' but 'is this state plausibly still in "
+            f"progress'. Write it as: TRUE while the state's physical "
+            f"preconditions visibly hold; simultaneous other activities "
+            f"(using a laptop or phone, eating, chatting, glancing away) "
+            f"NEVER make it false. FALSE only on genuine EXIT evidence — "
+            f"name the 2-3 concrete exit conditions for this specific "
+            f"behaviour (e.g. the equipment or activity focus is gone/"
+            f"off, or no person is present). When unsure whether the "
+            f"state ended, TRUE — the backend applies its own exit "
+            f"hysteresis on top.>\n\n"
+            if is_sustained else ""
+        )
+        + f"Match the rigor of this example:\n\n"
         f"{example}\n\n"
-        "Total length under ~1500 characters. Return ONLY the three-field "
-        "instruction block — no preamble, no markdown, no quotes around it."
+        + (
+            "Total length under ~1900 characters. Return ONLY the "
+            "instruction block (the four runtime fields plus the "
+            "confirm_need line) — no preamble, no markdown, no quotes "
+            "around it."
+            if is_sustained else
+            "Total length under ~1600 characters. Return ONLY the "
+            "instruction block (the three runtime fields plus the "
+            "confirm_need line) — no preamble, no markdown, no quotes "
+            "around it."
+        )
     )
 
 
@@ -263,6 +373,34 @@ class CompiledDetector:
     identifier: str
     prompt_fragment: str
     schema_json: dict[str, dict[str, str]]
+    # Compiler's evidence-risk verdict ("high" | "low" | None): does this
+    # detector's evidence warrant the within-clip confirm re-votes?
+    # Consumed by compiler_v2.apply_confirm_need; never shipped in the
+    # runtime fragment. None = the model omitted/garbled the line → the
+    # caller keeps today's default eventing (Aryaman 2026-08-14:
+    # confirmation should follow evidence risk — small-object interaction,
+    # subtle motion, confounding context — not be a blanket default).
+    confirm_need: str | None = None
+
+
+def _split_confirm_need(fragment: str, identifier: str) -> tuple[str, str | None]:
+    """Peel the compile-time confirm_need line off a cleaned fragment.
+
+    The line is eventing metadata and must never reach the runtime
+    prompt. Absent or garbled → (fragment unchanged, None): a parse miss
+    can only land on today's default behavior, never on a silently
+    unguarded detector.
+    """
+    pat = re.compile(
+        rf"^[ \t]*\**{re.escape(identifier)}_confirm_need\**:\s*[\"'`]?"
+        rf"(high|low)\b.*$",
+        re.M | re.I,
+    )
+    m = pat.search(fragment)
+    if not m:
+        return fragment, None
+    stripped = (fragment[: m.start()] + fragment[m.end():]).strip()
+    return stripped, m.group(1).lower()
 
 
 def _gen_identifier() -> str:
@@ -273,22 +411,43 @@ def _gen_identifier() -> str:
     return f"custom_{uuid4().hex[:8]}"
 
 
-def _schema_for(identifier: str) -> dict[str, dict[str, str]]:
+def _schema_for(
+    identifier: str, *, is_sustained: bool = False,
+) -> dict[str, dict[str, str]]:
     """Standard {id}_detected/_confidence/_reasoning trio. Matches the
     schema the existing preset detectors use, so the dashboard's
     AnalysisRow renderer picks up custom detectors with no changes.
+
+    SUSTAINED detectors additionally carry `{id}_state_active` — the
+    detection/state split (Aryaman 2026-08-07). `_detected` is ENTRY
+    evidence: strict, engagement-shaped, what proves the state began.
+    `_state_active` is CONTINUATION: is the state plausibly still in
+    progress, where only genuine exit evidence (the TV off, the person
+    gone) answers false. The split exists because one boolean was
+    forced to be both: Watching TV compiled attention criteria
+    ("laptop → FALSE"), per-tick detection measured instantaneous
+    attention, attention flaps — three alerts in 18 minutes on Aug 6
+    for one continuous session, then record_only as the overcorrection.
+    The backend's episode machinery latches on continuation and votes
+    entry on `_detected`; both are stateless per-tick questions, so no
+    prior state ever needs to reach the prompt.
     """
-    return {
+    schema = {
         f"{identifier}_detected":   {"type": "boolean"},
         f"{identifier}_confidence": {"type": "number"},
         f"{identifier}_reasoning":  {"type": "string"},
     }
+    if is_sustained:
+        schema[f"{identifier}_state_active"] = {"type": "boolean"}
+    return schema
 
 
 _BACKTICK_FENCE_RE = re.compile(r"^```[a-zA-Z]*\s*|\s*```$", re.MULTILINE)
 
 
-def _clean_fragment(raw: str, identifier: str) -> str:
+def _clean_fragment(
+    raw: str, identifier: str, *, is_sustained: bool = False,
+) -> str:
     """Strip code fences, trim, and validate the output references the
     expected identifier. If the model wrapped the response in ```…```
     blocks (it sometimes does, despite the "no markdown" instruction),
@@ -302,17 +461,27 @@ def _clean_fragment(raw: str, identifier: str) -> str:
             f"compiled prompt does not reference '{identifier}_detected'; "
             f"got: {cleaned[:200]}…"
         )
+    # A sustained fragment without the continuation field would ship a
+    # state detector whose episode latch silently falls back to the
+    # flapping entry boolean — the exact failure the split removes. Fail
+    # the compile (→ next provider / "Compile failed" badge) instead.
+    if is_sustained and f"{identifier}_state_active" not in cleaned:
+        raise ValueError(
+            f"sustained compile missing '{identifier}_state_active'; "
+            f"got: {cleaned[:200]}…"
+        )
     return cleaned
 
 
 async def _compile_with_gemini(
     *, identifier: str, name: str, description: str, user_text: str,
     absence: bool, category: str, settings: Settings,
+    is_sustained: bool = False,
 ) -> str:
     """One Gemini call. Returns the cleaned prompt_fragment string."""
     if not settings.gemini_api_key:
         raise RuntimeError("NEMARA_GEMINI_API_KEY not configured")
-    client = genai.Client(api_key=settings.gemini_api_key)
+    client = get_client(settings.gemini_api_key)
     response = await client.aio.models.generate_content(
         model=settings.gemini_model,
         contents=[
@@ -325,6 +494,7 @@ async def _compile_with_gemini(
                     user_text=user_text,
                     absence=absence,
                     category=category,
+                    is_sustained=is_sustained,
                 ))],
             ),
         ],
@@ -336,12 +506,13 @@ async def _compile_with_gemini(
     raw = (response.text or "").strip()
     if not raw:
         raise RuntimeError("gemini returned empty compile response")
-    return _clean_fragment(raw, identifier)
+    return _clean_fragment(raw, identifier, is_sustained=is_sustained)
 
 
 async def _compile_with_openai(
     *, identifier: str, name: str, description: str, user_text: str,
     absence: bool, category: str, settings: Settings,
+    is_sustained: bool = False,
 ) -> str:
     """One OpenAI call. Returns the cleaned prompt_fragment string.
 
@@ -361,13 +532,14 @@ async def _compile_with_openai(
                 user_text=user_text,
                 absence=absence,
                 category=category,
+                is_sustained=is_sustained,
             )},
         ],
     )
     raw = (response.choices[0].message.content or "").strip()
     if not raw:
         raise RuntimeError("openai returned empty compile response")
-    return _clean_fragment(raw, identifier)
+    return _clean_fragment(raw, identifier, is_sustained=is_sustained)
 
 
 async def compile_custom_detector(
@@ -380,6 +552,7 @@ async def compile_custom_detector(
     settings: Settings,
     identifier: str | None = None,
     refinements: list[str] | None = None,
+    is_sustained: bool = False,
 ) -> CompiledDetector:
     """Compile a caregiver's natural-language description into a
     runtime-ready (identifier, prompt_fragment, schema_json) triple.
@@ -416,16 +589,19 @@ async def compile_custom_detector(
         fragment = await _compile_with_openai(
             identifier=identifier, name=name, description=description,
             user_text=user_text, absence=absence, category=category,
-            settings=settings,
+            settings=settings, is_sustained=is_sustained,
         )
+        fragment, confirm_need = _split_confirm_need(fragment, identifier)
         log.info(
-            "detector_compiler.openai_ok identifier=%s name=%r fragment_chars=%d",
-            identifier, name, len(fragment),
+            "detector_compiler.openai_ok identifier=%s name=%r "
+            "fragment_chars=%d confirm_need=%s",
+            identifier, name, len(fragment), confirm_need,
         )
         return CompiledDetector(
             identifier=identifier,
             prompt_fragment=fragment,
-            schema_json=_schema_for(identifier),
+            schema_json=_schema_for(identifier, is_sustained=is_sustained),
+            confirm_need=confirm_need,
         )
     except Exception as openai_err:
         log.warning(
@@ -437,16 +613,19 @@ async def compile_custom_detector(
         fragment = await _compile_with_gemini(
             identifier=identifier, name=name, description=description,
             user_text=user_text, absence=absence, category=category,
-            settings=settings,
+            settings=settings, is_sustained=is_sustained,
         )
+        fragment, confirm_need = _split_confirm_need(fragment, identifier)
         log.info(
-            "detector_compiler.gemini_ok identifier=%s name=%r fragment_chars=%d",
-            identifier, name, len(fragment),
+            "detector_compiler.gemini_ok identifier=%s name=%r "
+            "fragment_chars=%d confirm_need=%s",
+            identifier, name, len(fragment), confirm_need,
         )
         return CompiledDetector(
             identifier=identifier,
             prompt_fragment=fragment,
-            schema_json=_schema_for(identifier),
+            schema_json=_schema_for(identifier, is_sustained=is_sustained),
+            confirm_need=confirm_need,
         )
     except Exception as gemini_err:
         log.error(
@@ -469,16 +648,6 @@ async def compile_custom_detector(
 # compile still happens in the background on Create, as before.
 
 
-# Continuous ("state") detector hysteresis buckets → seconds. The model
-# picks a bucket by the activity; we map to seconds and clamp to a sane band
-# so a bad inference can't make a detector never re-fire. Retune centrally
-# here. Default bucket when the model omits/garbles it: "moderate".
-_GAP_BUCKET_SECONDS: dict[str, int] = {
-    "brief": 60,        # ~1 min — pacing / restlessness / agitation: a short lull = new
-    "moderate": 300,    # ~5 min — eating, on the phone, reading
-    "extended": 900,    # ~15 min — watching TV, sleeping, sitting: bridge brief breaks
-}
-_DEFAULT_GAP_BUCKET = "moderate"
 
 
 @dataclass(frozen=True)
@@ -486,12 +655,16 @@ class InferredConfig:
     # Alerting spine (2026-07-26).
     alert_trigger: str               # "leading"|"trailing"|"duration"|"absence"
     is_sustained: bool               # instant vs sustained
-    category: str                    # "safety" | "routine"
+    category: str                    # safety | routine | behaviour | care
     icon_name: str
     sensitivity: str                 # "low" | "standard" | "high"
     schedule: dict | None = field(default=None)  # None unless alert_trigger=schedule
+    # How much a MISS costs, 0-100, judged INDEPENDENTLY of category.
+    # Drives the compile bias (>= INCLUSIVE_BIAS_SEVERITY), the
+    # scheduler's emergency exemptions and pack priority. 50 = the
+    # catalog default (dims.py), used when the model gave nothing usable.
+    severity: int = 50
     # Set only when is_sustained: the rising-edge episode gap (seconds).
-    episode_gap_seconds: int | None = field(default=None)
     # Set only when alert_trigger == "duration": the "too long" threshold.
     duration_seconds: int | None = field(default=None)
     # Alert-meaning name nudge (2026-07-28): absence names must be
@@ -528,32 +701,72 @@ def _infer_meta_prompt(*, name: str | None, prompt: str) -> str:
         "10am'. Non-occurrence is only knowable at the window's end, so any "
         "'doesn't / hasn't happened by <time>' request is 'absence'. (A "
         "positive 'tell me WHEN she does X' is just 'leading' — use the active "
-        "window for the timing, not this.)\n\n"
-        "STEP 2 — `is_sustained`: true if the thing unfolds over a stretch "
-        "(watching TV, pacing, eating, bathing, agitation, lying still); false "
-        "if it's instantaneous (a fall, choking, arriving, leaving). "
-        "'trailing' and 'duration' are always sustained.\n\n"
+        "window for the timing, not this.)\n"
+        "  - 'record_only': the caregiver wants to SEE this on the timeline, "
+        "not be TOLD about it. An ordinary daily state that is never an "
+        "emergency and never needs a notification — watching TV, sitting, "
+        "reading, sleeping, moving about the house. Ask: would a phone alert "
+        "for this, every time it happened, be useful or annoying? If "
+        "annoying, it is 'record_only'. Prefer this for any routine state "
+        "unless the caregiver actually asked to be alerted.\n\n"
+        "STEP 2 — `is_sustained`: this flag controls the EPISODE LATCH. "
+        "When true, consecutive sightings collapse into ONE episode with an "
+        "entry and an exit — the system reports the episode, not each "
+        "sighting. Set true ONLY when the caregiver cares about the episode "
+        "as a whole: an agitation spell, a TV session, lying still too long. "
+        "Set false when each occurrence should count separately, EVEN IF the "
+        "action physically takes time — sips of water, meals, bathroom "
+        "visits are INSTANCES, and latching them would merge the caregiver's "
+        "count into one. If the request says count / how many / how often, "
+        "is_sustained is false. Instantaneous events (a fall, choking, "
+        "arriving) are always false. 'trailing' and 'duration' are always "
+        "sustained. CONTEXT: the system analyzes video in ~10-second "
+        "chunks. An action that fits inside one chunk (a sip, standing "
+        "up) is an INSTANCE — not sustained, counted per occurrence. An "
+        "activity spanning many consecutive chunks (watching TV, "
+        "sleeping, pacing) IS sustained — chunks latch into one episode. "
+        "For record_only this choice sets the REPORTING UNIT: sustained "
+        "records duration (minutes/sessions per day), not-sustained "
+        "records a count (times per day). 'Count how much TV' is "
+        "sustained (you count minutes); 'count sips of water' is not "
+        "(you count instances).\n\n"
         "JSON fields:\n"
-        '  "alert_trigger": "leading" | "trailing" | "duration" | "absence"\n'
+        '  "alert_trigger": "leading" | "trailing" | "duration" | "absence" | "record_only"\n'
         '  "is_sustained": true | false\n'
         '  "duration_seconds": integer seconds — REQUIRED when '
         'alert_trigger="duration" (else null). Convert the stated time '
         '("10 minutes" -> 600, "an hour" -> 3600). Null if no length is given.\n'
-        '  "episode_gap": "brief" | "moderate" | "extended" | null. REQUIRED '
-        'when is_sustained (null otherwise): how long the activity must be '
-        'ABSENT before a return counts as a NEW, separate event.\n'
-        '     - "brief" (~1 min): pacing / restlessness / agitation.\n'
-        '     - "moderate" (~5 min): eating, on the phone, reading.\n'
-        '     - "extended" (~15 min): watching TV, sleeping, sitting — a brief '
-        'break (e.g. a bathroom trip) should NOT split the session.\n'
-        '  "category": "safety" | "routine".\n'
-        '     - "safety" = could be an emergency or cause harm if missed: '
-        'falls, wandering / leaving the house, fire / stove / hazards, choking, '
-        'aggression or injury, prolonged no-movement, medication missed. '
-        'When bodily harm or a health risk is plausible, choose "safety".\n'
-        '     - "routine" = everyday, non-emergency behaviour where a false '
-        'alarm is merely annoying noise: watching TV, using a phone or tablet, '
-        'a visitor arriving, eating a snack, reading, sitting on the couch.\n'
+        '  "category": "safety" | "routine" | "behaviour" | "care".\n'
+        '     This is a LABEL for how the caregiver thinks about the event. It '
+        'does NOT decide how urgently we treat it — "severity" below does that, '
+        'and you judge the two INDEPENDENTLY. A high-severity "behaviour" '
+        'detector is normal and correct.\n'
+        '     - "safety" = physical danger or a health emergency: falls, '
+        'wandering / leaving the house, fire / stove / hazards, choking, '
+        'injury, prolonged no-movement.\n'
+        '     - "routine" = the rhythm of an ordinary day, and whether it '
+        'held: meals, sleep and waking, medication taken, getting up and '
+        'about, time out of bed.\n'
+        '     - "behaviour" = how the person seems in themselves: '
+        'restlessness, agitation, pacing, sundowning, distress, calling out, '
+        'repetitive actions, time spent alone.\n'
+        '     - "care" = something a person needs help WITH, or the presence '
+        'and absence of that help: assistance to the bathroom, company at '
+        'meals, a visitor arriving, long stretches with nobody around.\n'
+        '     Pick the one a family member would use to describe it. If a '
+        'detector could be two, prefer the one naming what is OBSERVED over '
+        'the one naming why it matters — "pacing at night" is behaviour even '
+        'though it may signal a safety risk.\n'
+        '  "severity": integer 0-100 — how much a MISS costs, judged on its '
+        'own, independent of category.\n'
+        '     - 80-100 = a miss could mean harm: falls, wandering outside, '
+        'fire, choking, no movement for hours, a medication that must not be '
+        'skipped. Detectors at or above 80 are compiled with INCLUSIVE '
+        'criteria so borderline signs still fire.\n'
+        '     - 40-79 = worth knowing promptly but not an emergency: skipped '
+        'a meal, up much later than usual, sustained agitation.\n'
+        '     - 0-39 = context, not alarm: watching TV, reading, a visitor, '
+        'sitting on the couch.\n'
         '  "suggested_name": a short display name stating what the ALERT '
         "MEANS. Event titles read 'Possible <name>', so for "
         'alert_trigger="absence" the name MUST be phrased as the MISS '
@@ -594,7 +807,9 @@ def _coerce_inferred(raw: dict) -> InferredConfig:
     Unknown enum values fall back to safe defaults; out-of-set icons
     fall back to 'eye'."""
     alert_trigger = raw.get("alert_trigger")
-    if alert_trigger not in ("leading", "trailing", "duration", "absence"):
+    if alert_trigger not in (
+        "leading", "trailing", "duration", "absence", "record_only",
+    ):
         alert_trigger = "leading"
     is_sustained = bool(raw.get("is_sustained"))
     # trailing / duration are sustained by definition; absence is neither.
@@ -604,8 +819,22 @@ def _coerce_inferred(raw: dict) -> InferredConfig:
         is_sustained = False
 
     category = raw.get("category")
-    if category not in ("safety", "routine"):
+    if category not in ("safety", "routine", "behaviour", "care"):
+        # Unrecognised -> safety. Deliberately the cautious default: an
+        # over-labelled detector is a cosmetic error, and severity (not this
+        # field) decides how it is actually treated.
         category = "safety"
+    # Severity is judged independently of category and decides treatment:
+    # the compile bias, the scheduler's emergency exemptions, pack priority.
+    # A non-numeric or out-of-range answer falls back to the catalog default
+    # (dims.py uses 50) rather than to an extreme — guessing "emergency"
+    # would make every malformed response run the inclusive prompt, and
+    # guessing 0 would make a real emergency conservative.
+    raw_severity = raw.get("severity")
+    severity: int = 50
+    if isinstance(raw_severity, (int, float)) and not isinstance(raw_severity, bool):
+        severity = max(0, min(100, int(raw_severity)))
+
     sensitivity = raw.get("sensitivity")
     if sensitivity not in ("low", "standard", "high"):
         sensitivity = "standard"
@@ -637,13 +866,6 @@ def _coerce_inferred(raw: dict) -> InferredConfig:
     # Sustained detectors always get a gap (default bucket if the model
     # omitted/garbled it) so they can never be left without a rising-edge
     # window. None for instant / schedule.
-    episode_gap_seconds: int | None = None
-    if is_sustained:
-        bucket = raw.get("episode_gap")
-        episode_gap_seconds = _GAP_BUCKET_SECONDS.get(
-            bucket if isinstance(bucket, str) else "",
-            _GAP_BUCKET_SECONDS[_DEFAULT_GAP_BUCKET],
-        )
 
     # Duration threshold: only for the duration trigger; null if not stated
     # (the review screen then prompts for it — never guessed).
@@ -678,9 +900,8 @@ def _coerce_inferred(raw: dict) -> InferredConfig:
         ),
         alert_trigger=alert_trigger,
         is_sustained=is_sustained,
-        category=category, icon_name=icon,
+        category=category, severity=severity, icon_name=icon,
         sensitivity=sensitivity, schedule=schedule,
-        episode_gap_seconds=episode_gap_seconds,
         when_scope=when_scope, where_hint=where_hint,
         duration_seconds=duration_seconds,
     )
@@ -695,7 +916,7 @@ def _parse_json_lenient(raw: str) -> dict:
 async def _infer_with_gemini(*, name: str | None, prompt: str, settings: Settings) -> dict:
     if not settings.gemini_api_key:
         raise RuntimeError("NEMARA_GEMINI_API_KEY not configured")
-    client = genai.Client(api_key=settings.gemini_api_key)
+    client = get_client(settings.gemini_api_key)
     response = await client.aio.models.generate_content(
         model=settings.gemini_model,
         contents=[genai_types.Content(
@@ -780,7 +1001,7 @@ async def summarize_detector_prompt(
     the fragment it describes. Returns None on ANY failure — the UI
     hides the card; a summary must never block or break a compile."""
     try:
-        client = genai.Client(api_key=settings.gemini_api_key)
+        client = get_client(settings.gemini_api_key)
         response = await client.aio.models.generate_content(
             model=settings.gemini_model,
             contents=[genai_types.Content(
@@ -799,6 +1020,6 @@ async def summarize_detector_prompt(
             if ln.strip()
         ]
         return lines[:5] or None
-    except Exception:  # noqa: BLE001 — summary is best-effort by contract
+    except Exception:
         log.warning("detector_compiler.summarize_failed", exc_info=True)
         return None

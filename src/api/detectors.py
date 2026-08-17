@@ -12,14 +12,15 @@ attempts.
 import asyncio
 import base64
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import select, update
 
 from src.api.deps import CaregiverAuth, SessionDep, SettingsDep
+from src.api.rate_limit import RateLimit, RateLimitPolicy
 from src.db.camera import Camera
 from src.db.camera_detector import CameraDetector
 from src.db.detector import Detector
@@ -51,6 +52,15 @@ from src.settings import Settings
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1", tags=["detector"])
+
+# Creating a detector compiles a plan through the VLM, and every tick it
+# then schedules is a paid call. Detectors are user-creatable with no
+# per-account cap, so a compromised account could drive spend without
+# bound (audit M1). 30/minute is far above real use — a caregiver adds a
+# handful, once — while capping automated creation.
+CREATE_DETECTOR_RATE_LIMIT = RateLimitPolicy(
+    name="detectors_create", limit=30, window_seconds=60,
+)
 
 
 # ── Wandering exit-door picker ──────────────────────────────────────
@@ -103,7 +113,7 @@ async def detect_doors_endpoint(
     taps elsewhere to override); the choice is saved via `set-wandering-door`."""
     try:
         image = base64.b64decode(body.image_base64, validate=True)
-    except Exception:  # noqa: BLE001
+    except Exception:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="invalid image_base64",
@@ -192,7 +202,7 @@ async def set_camera_wandering_door(
         cd = CameraDetector(
             camera_id=camera_id,
             detector_id=det.id,
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(UTC),
             door_config=door_config,
         )
         session.add(cd)
@@ -384,7 +394,7 @@ async def add_detectors_from_library(
         if d.identifier
     }
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     created: list[Detector] = []
     skipped: list[str] = []
     for i, key in enumerate(requested):
@@ -488,7 +498,6 @@ async def infer_detector(
         schedule_config=(
             ScheduleConfig(**inferred.schedule) if inferred.schedule else None
         ),
-        episode_gap_seconds=inferred.episode_gap_seconds,
         plan=_compose_plan(
             name=body.name or "", prompt=body.prompt,
             alert_trigger=inferred.alert_trigger,
@@ -515,7 +524,7 @@ def _fmt_time(hhmm: str) -> str:
         h, m = int(h_str), int(m_str)
         suffix = "AM" if h < 12 else "PM"
         return f"{h % 12 or 12}:{m:02d} {suffix}"
-    except Exception:  # noqa: BLE001
+    except Exception:
         return hhmm
 
 
@@ -594,7 +603,7 @@ def _compose_plan(
             watches=watches, fires=fires, checks=checks,
             listens=bool(dims.get("needs_audio")),
         )
-    except Exception:  # noqa: BLE001 — preview must never block creation
+    except Exception:
         log.debug("detector plan composition failed", exc_info=True)
         return None
 
@@ -603,6 +612,7 @@ def _compose_plan(
     "/patients/{patient_id}/detectors",
     response_model=DetectorResponse,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(RateLimit(CREATE_DETECTOR_RATE_LIMIT))],
 )
 async def create_detector(
     patient_id: UUID,
@@ -651,7 +661,7 @@ async def create_detector(
             detail="patient_not_found",
         )
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     # where_rooms is the canonical room scope (None = every room).
     resolved_rooms = body.where_rooms
     det = Detector(
@@ -663,6 +673,11 @@ async def create_detector(
         category=body.category.value,
         source="custom",
         alert_trigger=body.alert_trigger.value,
+        # For record_only, is_sustained is the REPORTING UNIT chosen at
+        # infer (10s-chunk context in the prompt): sustained = duration
+        # (TV minutes), not sustained = instance count (sips). No blanket
+        # override — a forced false here made 40 min of TV read as ~240
+        # "instances" (one per analysis chunk).
         is_sustained=body.is_sustained,
         duration_seconds=(
             body.duration_seconds
@@ -687,7 +702,6 @@ async def create_detector(
             body.schedule_config.model_dump() if body.schedule_config else None
         ),
         # Null unless sustained; the rising-edge episode gap.
-        episode_gap_seconds=body.episode_gap_seconds,
     )
     await detector_repo.insert(session, det)
 
@@ -747,7 +761,7 @@ async def _compile_and_update_detector(
         compiled = await compile_custom_detector(
             name=name, description=description,
             user_text=user_text, absence=absence, category=category,
-            settings=settings,
+            settings=settings, is_sustained=is_sustained,
             identifier=identifier, refinements=refinements,
         )
     except Exception as e:
@@ -765,6 +779,13 @@ async def _compile_and_update_detector(
         dims = compiler_v2.classify_custom_dims(
             name=name, user_text=user_text, is_sustained=is_sustained,
             category=category,
+        )
+        # Confirm gate by evidence risk, not by default: the compile
+        # call judged this detector's confusability; "low" lifts the
+        # instant-custom re-vote default (and ONLY that — see
+        # apply_confirm_need).
+        dims["eventing"] = compiler_v2.apply_confirm_need(
+            dims.get("eventing"), compiled.confirm_need,
         )
     except compiler_v2.DetectorRejected as e:
         log.error(
@@ -791,7 +812,7 @@ async def _compile_and_update_detector(
                 prompt_fragment=compiled.prompt_fragment,
                 schema_json=compiled.schema_json,
                 user_criteria=criteria,
-                updated_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(UTC),
                 **dims,
             )
         )
@@ -827,6 +848,43 @@ async def patch_detector(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="detector_not_found",
         )
+
+    # ON must mean "running somewhere" (Aryaman 2026-08-07).
+    #
+    # `is_on` is only one of three conditions the runtime checks — the
+    # third is a row in `cameras_detectors` (see detection/registry.py).
+    # Nothing tied them together, so a detector could be switched on
+    # while scoped to a room no camera has, and it ran on nothing while
+    # the app rendered it armed. That is exactly what happened to
+    # `sleep` overnight on 2026-08-06: scoped ["Bedroom"], the only
+    # camera's room named "Aryaman Bedroom", 3270 ticks, zero output,
+    # and no signal anywhere that a whole night had been lost.
+    #
+    # So refuse the write instead of self-healing it. A toggle that
+    # silently means nothing is worse than one that fails and says why:
+    # the caregiver picks a real room and turns it on again, and the
+    # state the app shows is the state the runtime is in.
+    #
+    # Only when the patient HAS cameras, though. Before the first one is
+    # paired every detector resolves to nothing, and that is onboarding,
+    # not breakage — detectors are set up alongside pairing, an
+    # all-rooms scope picks up each camera as it arrives (the reconciler
+    # runs on camera create), and refusing there would block the normal
+    # first-run flow to catch a problem that cannot exist yet.
+    turning_on = fields.get("is_on") is True
+    if turning_on or (rescope_rooms and det.is_on):
+        in_scope = await camera_detector_repo.cameras_in_scope(
+            session, det.patient_id,
+            source=det.source, where_rooms=det.where_rooms,
+            detector_id=det.id,
+        )
+        if not in_scope and await camera_detector_repo.patient_has_cameras(
+            session, det.patient_id,
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="detector_scope_matches_no_camera",
+            )
     # Replace the camera assignments to match the new room set (atomic:
     # deselected rooms stop, newly-selected rooms start). Custom detectors
     # only — presets (esp. wandering) carry per-camera door_config on their
@@ -842,13 +900,24 @@ async def patch_detector(
         await camera_detector_repo.set_detector_rooms(
             session, det.id, det.patient_id, fields["where_rooms"],
         )
-    if rescope_rooms:
+    if rescope_rooms or turning_on:
         # Re-derive links from the new where_rooms for ALL sources. For
         # presets this is the door_config-safe path set_detector_rooms
         # can't provide: the reconciler only inserts missing / deletes
         # stale links, never rewrites kept rows, so per-camera wandering
-        # door_config survives a rescope. NOT run on plain is_on toggles
-        # (rescope_rooms is False there) — the hot path stays link-free.
+        # door_config survives a rescope.
+        #
+        # ALSO on the is_on -> true transition (2026-08-07). This used to
+        # skip toggles to "keep the hot path link-free", which made ON a
+        # claim the runtime never checked: a detector whose links had
+        # drifted — camera renamed after scoping, room deleted, a row
+        # edited by hand — stayed dead no matter how many times the
+        # caregiver toggled it, because the only thing that rebuilt links
+        # was editing the rooms. A toggle is a human action a few times a
+        # day, not a hot path; paying one reconcile makes ON mean what it
+        # says. The guard above has already refused the write if the
+        # scope resolves to no camera, so this can only ever be filling
+        # in links that should already exist.
         await camera_detector_repo.sync_links_for_patient(
             session, det.patient_id,
         )
@@ -930,16 +999,14 @@ async def refine_detector(
         new_trigger = str(getattr(reinf.alert_trigger, "value", reinf.alert_trigger))
         new_sustained = bool(reinf.is_sustained)
         new_duration = reinf.duration_seconds if new_trigger == "duration" else None
-        new_gap = reinf.episode_gap_seconds if new_sustained else None
         new_schedule = reinf.schedule if new_trigger == "absence" else None
         new_when = reinf.when_scope        # None if nothing usable was inferred
         new_where_hint = reinf.where_hint  # None if no place was named
-    except Exception:  # noqa: BLE001 — trigger re-inference is best-effort
+    except Exception:
         log.debug("refine: trigger re-inference failed; keeping current trigger", exc_info=True)
         new_trigger = det.alert_trigger
         new_sustained = det.is_sustained
         new_duration = det.duration_seconds
-        new_gap = det.episode_gap_seconds
         new_schedule = det.schedule_config
         new_when = None
         new_where_hint = None
@@ -987,10 +1054,11 @@ async def refine_detector(
                 absence=_is_absence(new_trigger),
                 category=det.category,
                 settings=settings,
+                is_sustained=det.is_sustained,
                 identifier=det.identifier,
                 refinements=refinements,
             )
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="detector_preview_unavailable",
@@ -1017,7 +1085,6 @@ async def refine_detector(
             "alert_trigger": new_trigger,
             "is_sustained": new_sustained,
             "duration_seconds": new_duration,
-            "episode_gap_seconds": new_gap,
             "schedule_config": new_schedule,
             "when_scope": when_scope,
             "where_rooms": where_rooms,

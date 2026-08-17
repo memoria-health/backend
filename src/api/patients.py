@@ -84,9 +84,10 @@ async def create_patient(
     """Create a patient under the current caregiver.
 
     Auto-seeds preset detectors via `services.onboarding.seed_detectors_for_patient`
-    in the same transaction. The set is age-based: under-18 patients get the
-    child set (Falls / Climbing / Distress); 18+ or unknown birthday get the
-    older-adult set (Falls / Agitation / Wandering / Medication adherence).
+    in the same transaction. The set is age-based: 18+ or unknown birthday get
+    the older-adult set (Falls / Agitation / Wandering / Medication adherence);
+    under-18 patients get only the both-cohort safety net (Falls) — the child
+    preset set was deleted 2026-08-16 (adult-only product).
     """
     now = datetime.now(timezone.utc)
     p = Patient(

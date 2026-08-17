@@ -256,6 +256,24 @@ def _select_primary(
 _EPISODE_LOOKBACK_SECONDS = 12 * 3600
 
 
+def _continuation_field(det: "Detector", detected_field: str) -> str:
+    """The analyses field that keeps a sustained episode ALIVE.
+
+    `<identifier>_state_active` when the detector's schema declares it
+    (the detection/state split: entry is voted on the strict
+    `_detected`, continuation latches on the loose state question),
+    else the detected field — presets and pre-split customs keep their
+    exact prior behaviour. Duck-typed on `.identifier`/`.schema_json`
+    so unit tests can pass a SimpleNamespace.
+    """
+    ident = getattr(det, "identifier", None)
+    if not ident:
+        return detected_field
+    state_field = f"{ident}_state_active"
+    schema = getattr(det, "schema_json", None) or {}
+    return state_field if state_field in schema else detected_field
+
+
 async def _episode_boundary(
     session: AsyncSession,
     *,
@@ -422,14 +440,27 @@ async def maybe_promote_analysis(
 
         # Criticality split (Aryaman 2026-07-28, from the soak's first
         # false fire — Watching TV attributed to a visiting aunt):
-        # NON-CRITICAL patient detectors (category=routine) FAIL-QUIET —
-        # they fire only when identity POSITIVELY confirms the patient in
-        # the clip, so a visitor's routine never lands on the patient's
-        # record. SAFETY detectors keep FAIL-LOUD semantics (fire unless
-        # the patient is confirmed elsewhere — the upstream skip): a fall
-        # must never be missed because a face wasn't visible.
+        # NON-CRITICAL patient detectors FAIL-QUIET — they fire only when
+        # identity POSITIVELY confirms the patient in the clip, so a
+        # visitor's routine never lands on the patient's record. SAFETY
+        # detectors keep FAIL-LOUD semantics (fire unless the patient is
+        # confirmed elsewhere — the upstream skip): a fall must never be
+        # missed because a face wasn't visible.
+        #
+        # Keyed on NOT-SAFETY, never on an enumeration of the quiet
+        # categories (2026-08-08). This read `category == "routine"`, and
+        # when 2026-08-05 added `behaviour` and `care` the gate silently
+        # stopped covering them — the compiler's identical
+        # stakes-vs-category conflation was fixed the SAME DAY, but this
+        # copy was missed. Found by soak: four "Laptop work" (behaviour)
+        # events fired with identity_patient_in_clip=false, one of them
+        # on a clip whose scene call read "the room is empty throughout"
+        # (people_count=0) while the crop call — cropped to a stale
+        # track — narrated a seated person into an empty room. A new
+        # category added tomorrow must default to fail-quiet, not to
+        # bypassing identity.
         if (det.subject_scope == "patient"
-                and det.category == "routine"
+                and det.category != "safety"
                 and not _is_truthy_bool(
                     detector_fields.get("identity_patient_in_clip"))):
             skipped.append(f"{ident}(patient_unconfirmed)")
@@ -464,7 +495,19 @@ async def maybe_promote_analysis(
             boundary = await _episode_boundary(
                 session,
                 patient_id=patient_id,
-                detected_field=detected_field,
+                # CONTINUATION is judged on the state field when the
+                # detector has one (detection/state split, 2026-08-07):
+                # `_detected` is strict ENTRY evidence and flaps with
+                # momentary attention, so an episode latched on it
+                # "ends" every time the person glances at a laptop —
+                # measured as 3 Watching-TV alerts in 18 minutes for
+                # one continuous session. `_state_active` answers the
+                # looser question the latch actually needs (is the
+                # session plausibly still in progress), so the episode
+                # survives the flapping and one entry event covers the
+                # whole sitting. Detectors without the field (all
+                # presets, pre-split customs) keep the old behaviour.
+                detected_field=_continuation_field(det, detected_field),
                 now=occurred_at,
                 exit_gap_seconds=exit_gap,
             )
@@ -682,6 +725,19 @@ async def _insert_event(
         review_notes=None,
         reviewed_at=None,
         created_at=datetime.now(timezone.utc),
+        # Event gate: stamp the hold IN THE INSERT, not afterwards.
+        # `events` is in the supabase_realtime publication, so the row is
+        # broadcast to the caregiver app the moment it commits. Stamping
+        # 'pending' in a later UPDATE left a window — small, but the whole
+        # point of the gate is that the family never sees a false alarm —
+        # where the row was published with gate_state NULL and the RLS
+        # policy therefore treated it as visible. Setting it here means a
+        # gated event is never visible to a caregiver at any instant.
+        # Null for every patient with the gate off, which is all of them.
+        gate_state="pending" if patient.event_gate_enabled else None,
+        gate_held_at=(
+            datetime.now(timezone.utc) if patient.event_gate_enabled else None
+        ),
     )
     session.add(row)
     await session.flush()

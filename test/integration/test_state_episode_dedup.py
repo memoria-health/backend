@@ -47,7 +47,7 @@ async def _add_state_detector(session: AsyncSession, patient_id) -> Detector:
         # Deliberately set to a value the code must IGNORE: if anything
         # still read this column, the 600s here would change the timings
         # the tests below assert against the 300s routine exit gap.
-        always_on=False, episode_gap_seconds=600,
+        always_on=False,
     )
     session.add(det)
     await session.flush()

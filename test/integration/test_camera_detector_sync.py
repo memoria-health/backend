@@ -303,3 +303,143 @@ async def test_picker_edit_survives_sync(
     assert cam_a not in await _camera_ids_linked_to(session, falls)
     assert cam_b in await _camera_ids_linked_to(session, falls)
 
+
+
+# ─── (7) ON must mean "running somewhere" ────────────────────────────
+#
+# `is_on` is only one of three conditions the runtime checks; the third
+# is a `cameras_detectors` row (detection/registry.py). Nothing tied
+# them together, so a detector could be switched on while scoped to a
+# room no camera has — armed in the app, running on nothing. Live for a
+# full night on 2026-08-06: `sleep` scoped ["Bedroom"] against a camera
+# whose room was "Aryaman Bedroom", 3270 ticks, zero output, no signal.
+
+
+async def test_turning_on_a_detector_scoped_to_no_camera_is_refused(
+    client: AsyncClient, session: AsyncSession, auth_user,
+) -> None:
+    """The toggle fails loudly instead of lying.
+
+    A caregiver can then pick a real room and turn it on again; what the
+    app shows is what the runtime is doing. Self-healing to all-rooms
+    was the alternative and is worse: it silently runs a bedroom
+    detector in the kitchen."""
+    headers, pid = await _setup_patient(client, auth_user)
+    dets = await _detectors_by_name(client, headers, pid)
+    falls = dets["Falls"]["id"]
+    await _create_camera(client, headers, pid, "Aryaman Bedroom")
+
+    # The exact shape that cost a night: a room name no camera has.
+    await _scope_preset(session, falls, ["Bedroom"])
+    await client.patch(
+        f"/v1/detectors/{falls}", headers=headers, json={"is_on": False},
+    )
+
+    r = await client.patch(
+        f"/v1/detectors/{falls}", headers=headers, json={"is_on": True},
+    )
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"] == "detector_scope_matches_no_camera"
+
+    # And it really is still off — the refusal is not cosmetic.
+    row = (
+        await session.execute(
+            text("SELECT is_on FROM detectors WHERE id = :d"), {"d": falls},
+        )
+    ).scalar_one()
+    assert row is False
+
+
+async def test_turning_on_reconciles_links_so_it_actually_runs(
+    client: AsyncClient, session: AsyncSession, auth_user,
+) -> None:
+    """Pressing ON compiles.
+
+    The toggle used to skip link reconciliation to 'keep the hot path
+    link-free', so a detector whose links had drifted stayed dead no
+    matter how many times it was toggled — only editing the rooms
+    rebuilt them. Here the links are deleted behind the API's back (the
+    drift a rename or a hand-edited row produces) and the toggle alone
+    has to bring them back."""
+    headers, pid = await _setup_patient(client, auth_user)
+    dets = await _detectors_by_name(client, headers, pid)
+    falls = dets["Falls"]["id"]
+    cam = await _create_camera(client, headers, pid, "Bedroom")
+    assert cam in await _camera_ids_linked_to(session, falls)
+
+    await session.execute(
+        text("DELETE FROM cameras_detectors WHERE detector_id = :d"), {"d": falls},
+    )
+    await session.commit()
+    assert await _camera_ids_linked_to(session, falls) == set()
+
+    r = await client.patch(
+        f"/v1/detectors/{falls}", headers=headers, json={"is_on": True},
+    )
+    assert r.status_code == 200, r.text
+    assert cam in await _camera_ids_linked_to(session, falls)
+
+
+async def test_a_scoped_detector_still_turns_on_when_the_room_exists(
+    client: AsyncClient, session: AsyncSession, auth_user,
+) -> None:
+    """The guard must not block the ordinary case — an explicit scope
+    that names a room the patient actually has."""
+    headers, pid = await _setup_patient(client, auth_user)
+    dets = await _detectors_by_name(client, headers, pid)
+    falls = dets["Falls"]["id"]
+    cam = await _create_camera(client, headers, pid, "Bedroom")
+    await _scope_preset(session, falls, ["Bedroom"])
+
+    r = await client.patch(
+        f"/v1/detectors/{falls}", headers=headers, json={"is_on": True},
+    )
+    assert r.status_code == 200, r.text
+    assert cam in await _camera_ids_linked_to(session, falls)
+
+
+async def test_rescoping_a_live_detector_to_a_dead_room_is_refused(
+    client: AsyncClient, session: AsyncSession, auth_user,
+) -> None:
+    """The other way into the same dead state: leave it on and move the
+    scope somewhere no camera lives."""
+    headers, pid = await _setup_patient(client, auth_user)
+    dets = await _detectors_by_name(client, headers, pid)
+    falls = dets["Falls"]["id"]
+    await _create_camera(client, headers, pid, "Bedroom")
+
+    r = await client.patch(
+        f"/v1/detectors/{falls}", headers=headers,
+        json={"where_rooms": ["Attic"]},
+    )
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"] == "detector_scope_matches_no_camera"
+
+
+async def test_toggling_on_before_any_camera_is_paired_is_allowed(
+    client: AsyncClient, session: AsyncSession, auth_user,
+) -> None:
+    """Onboarding is not breakage.
+
+    Before the first camera exists every detector resolves to zero
+    cameras, exactly like a broken scope does. The difference is that
+    this one self-heals: an all-rooms scope picks up each camera as it
+    is paired, because camera create runs the reconciler. Refusing here
+    would block the ordinary first-run flow to prevent a problem that
+    cannot exist yet — caught by test_patch_toggle_is_on when the guard
+    was first written without this carve-out."""
+    headers, pid = await _setup_patient(client, auth_user)
+    dets = await _detectors_by_name(client, headers, pid)
+    falls = dets["Falls"]["id"]
+
+    await client.patch(
+        f"/v1/detectors/{falls}", headers=headers, json={"is_on": False},
+    )
+    r = await client.patch(
+        f"/v1/detectors/{falls}", headers=headers, json={"is_on": True},
+    )
+    assert r.status_code == 200, r.text
+
+    # And it wires itself up the moment a camera arrives.
+    cam = await _create_camera(client, headers, pid, "Bedroom")
+    assert cam in await _camera_ids_linked_to(session, falls)

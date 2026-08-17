@@ -37,7 +37,7 @@ from sqlalchemy import select, text
 
 from src.db.camera import Camera
 from src.db.session import get_engine
-from src.services.identity.identity_client import IdentityClient
+from src.services.identity.identity_router import IdentityRouter
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncConnection, async_sessionmaker
@@ -117,14 +117,16 @@ class DetectorWorker:
         # GPU-host identity service's /state; the backend does zero
         # video identity processing. Fail-open on an unreachable
         # service is the sidecar's contract.
-        self._reid = IdentityClient(
+        # IdentityRouter, not IdentityClient: a home is served by whichever
+        # GPU node the roster assigned it to, so the endpoint is per-patient
+        # rather than global. A single client pointed at one URL silently
+        # returns no identity at all for every home on any other node.
+        # The router is a drop-in — `label_clip` already carries patient_id.
+        self._reid = IdentityRouter(
             sessionmaker=sessionmaker,
             settings=settings,
         )
-        log.info(
-            "identity provider: sidecar url=%s",
-            settings.identity_state_url,
-        )
+        log.info("identity provider: router (per-patient, roster-resolved)")
         self._rooms: dict[str, RoomWorker] = {}
         self._lock = asyncio.Lock()
         self._started = False

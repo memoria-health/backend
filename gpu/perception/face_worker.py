@@ -207,6 +207,21 @@ class FaceWorker:
             if kind == "ready":
                 self.provider = info
                 self._fail_streak = 0
+                # PID file for the supervisor's orphan reaper
+                # (2026-08-15 worker-pool review finding 1): a
+                # SIGKILLed/segfaulted parent leaves this child alive
+                # holding VRAM, and daemon= cleanup never runs on hard
+                # death. The restart loop kills exactly this PID before
+                # relaunching — scoped reaping that can't touch a
+                # sibling worker's live child.
+                pidfile = os.environ.get("NEMARA_FACE_PIDFILE", "")
+                if pidfile and self._proc is not None:
+                    try:
+                        with open(pidfile, "w") as fh:
+                            fh.write(str(self._proc.pid))
+                    except OSError:
+                        log.warning("face_worker.pidfile_write_failed %s",
+                                    pidfile)
                 log.info("face_worker.ready provider=%s", info)
                 return info
             self.stop()

@@ -139,6 +139,13 @@ jobs:
           file: gpu/Dockerfile
           platforms: linux/amd64
           push: true
+          # NO attestations. buildx defaults provenance ON, which wraps the
+          # image in an OCI index carrying an unknown/unknown attestation
+          # manifest — RunPod's older dockerd cannot pull that index, the
+          # pull fails silently and the container never starts (2026-08-12,
+          # two pods burned diagnosing it). Plain single-manifest image only.
+          provenance: false
+          sbom: false
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ steps.tag.outputs.value }}
             ${{ env.REGISTRY }}/${{ env.IMAGE }}:latest

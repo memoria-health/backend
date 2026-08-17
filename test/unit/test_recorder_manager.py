@@ -96,6 +96,7 @@ def _settings(max_concurrent: int = 8) -> SimpleNamespace:
         b2_app_key="a",
         b2_bucket="memoria-data",
         data_collection_max_concurrent=max_concurrent,
+        data_collection_redaction_enabled=False,
     )
 
 
@@ -354,37 +355,6 @@ async def test_aclose_finalizes_in_flight_sessions_on_shutdown(tmp_path) -> None
 
 
 @pytest.mark.asyncio
-async def test_privacy_check_at_upload_boundary_drops_clip(tmp_path) -> None:
-    """Defense-in-depth: if privacy flips on between session-finalize and
-    the upload, the upload-boundary re-check drops the clip — uploader is
-    never called, temps still cleaned."""
-    clock = _Clock()
-    uploader = _FakeUploader()
-
-    async def _privacy_on(_camera_id) -> bool:
-        return True
-
-    mgr = RecorderManager(
-        settings=_settings(),
-        temp_dir=tmp_path,
-        encoder_factory=_Factory(),
-        muxer=_FakeMuxer(),
-        uploader=uploader,
-        clock=clock,
-        utcnow=lambda: _UTC,
-        roll_seconds=900.0,
-        linger_seconds=45.0,
-        retry_base_delay=0.0,
-        sleep=_noop_sleep,
-        privacy_check=_privacy_on,
-    )
-    await _run_one_session(mgr, clock)
-
-    assert uploader.calls == []  # privacy guard blocked the upload
-    assert list(tmp_path.iterdir()) == []  # temps still cleaned
-
-
-@pytest.mark.asyncio
 async def test_b2_not_configured_skips_upload_but_cleans_up(tmp_path) -> None:
     clock = _Clock()
     uploader = _FakeUploader()
@@ -396,3 +366,47 @@ async def test_b2_not_configured_skips_upload_but_cleans_up(tmp_path) -> None:
 
     assert uploader.calls == []  # never attempted without creds
     assert list(tmp_path.iterdir()) == []  # still cleaned up
+
+
+@pytest.mark.asyncio
+async def test_ctx_none_never_starts_a_session(tmp_path) -> None:
+    mgr = _make_manager(tmp_path)
+    await mgr.on_tick(uuid4(), True, ctx=None)  # collect=True is moot
+    assert mgr.active_count == 0
+
+
+@pytest.mark.asyncio
+async def test_ctx_none_advances_an_open_session_to_finalize(tmp_path) -> None:
+    """Failed ticks (camera row vanished, DB pool exhausted) drive the
+    recorder with ctx=None. An open session must linger out and
+    finalize on those ticks — the pre-fix behavior (skip the recorder
+    entirely) left it RECORDING forever, holding its cap slot and its
+    encoder while every frame kept being fed."""
+    clock = _Clock()
+    muxer = _FakeMuxer()
+    mgr = _make_manager(tmp_path, muxer=muxer, clock=clock)
+    cam = uuid4()
+    await mgr.on_tick(cam, True, ctx=_ctx())  # recording
+    mgr.feed_video(cam, 320, 240, _blob())
+
+    await mgr.on_tick(cam, False, ctx=None)  # tick failed → linger
+    clock.advance(46.0)  # > linger_seconds
+    await mgr.on_tick(cam, False, ctx=None)  # tick failed → finalize
+
+    await mgr.drain()
+    assert mgr.active_count == 0
+    assert len(muxer.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_ctx_none_cannot_extend_a_recording(tmp_path) -> None:
+    """collect=True with no ctx is contradictory (the tick evaluated
+    nothing) — it must be treated as collect=False, not as evidence to
+    keep recording."""
+    clock = _Clock()
+    mgr = _make_manager(tmp_path, clock=clock)
+    cam = uuid4()
+    await mgr.on_tick(cam, True, ctx=_ctx())
+    await mgr.on_tick(cam, True, ctx=None)  # forced to advance-only
+    rec = mgr._sessions[cam]
+    assert rec.state.name != "RECORDING"

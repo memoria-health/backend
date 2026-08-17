@@ -119,6 +119,68 @@ def rooms_mean_all(rooms: Sequence[str] | None) -> bool:
     return any((r or "").strip().upper() == "ALL ROOMS" for r in rooms)
 
 
+async def patient_has_cameras(
+    session: AsyncSession, patient_id: UUID,
+) -> bool:
+    """Whether this patient has any camera at all.
+
+    Separates "this detector's scope is broken" from "nothing is paired
+    yet". Both resolve to zero cameras; only the first is a mistake
+    worth blocking a toggle over."""
+    return (
+        await session.execute(
+            select(Camera.id).where(Camera.patient_id == patient_id).limit(1)
+        )
+    ).first() is not None
+
+
+async def cameras_in_scope(
+    session: AsyncSession,
+    patient_id: UUID,
+    *,
+    source: str,
+    where_rooms: Sequence[str] | None,
+    detector_id: UUID | None = None,
+) -> set[UUID]:
+    """The cameras a detector with this scope would actually run on.
+
+    The same three rules `sync_links_for_patient` derives links from,
+    factored out so a caller can ASK the question before writing a state
+    that depends on the answer:
+
+      - all-rooms scope        → every camera of the patient
+      - explicit where_rooms   → cameras whose `room` matches, exactly
+      - null-scoped custom     → its CURRENT links (the caregiver's
+                                 opt-in set; the reconciler never grows
+                                 or prunes these)
+
+    Exists because a detector can be `is_on = true` while this set is
+    EMPTY, which means it is switched on and running nowhere. Live for a
+    full night on 2026-08-06: `sleep` was scoped `["Bedroom"]` while the
+    only camera's room was "Aryaman Bedroom", so it produced zero fields
+    across 3270 ticks while the app showed it armed. A room rename after
+    scoping, or deleting the last camera in a scoped room, reach the
+    same dead state — the value being wrong is not the point, the point
+    is that nothing could tell.
+    """
+    if source != "preset" and where_rooms is None:
+        if detector_id is None:
+            return set()
+        rows = (
+            await session.execute(
+                select(CameraDetector.camera_id).where(
+                    CameraDetector.detector_id == detector_id,
+                )
+            )
+        ).scalars().all()
+        return set(rows)
+
+    stmt = select(Camera.id).where(Camera.patient_id == patient_id)
+    if not rooms_mean_all(where_rooms):
+        stmt = stmt.where(Camera.room.in_(list(where_rooms or ())))
+    return set((await session.execute(stmt)).scalars().all())
+
+
 async def set_detector_rooms(
     session: AsyncSession,
     detector_id: UUID,

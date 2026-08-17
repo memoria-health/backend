@@ -113,6 +113,78 @@ def test_single_awake_tick_is_absorbed() -> None:
     assert out["sleep_onset"] == _N + timedelta(minutes=1)
 
 
+# ── bug 4: an awakening needs EVIDENCE, not just elapsed time (08-06) ─
+#
+# Ground truth for the 2026-08-06 night: asleep ~01:56, woke ~07:30 and
+# used a phone in bed for ~8 minutes, dozed again, got out of bed 07:55.
+# The model saw all of it — 30 consecutive ticks of "looking at a glowing
+# smartphone", plus a bedside lamp being switched on. The summarizer threw
+# every one of them away because 8 minutes < WAKE_MIN_SECONDS, and instead
+# reported a 0-minute awakening invented by one hallucinated crossing.
+
+def test_a_short_awakening_with_visible_evidence_is_reported() -> None:
+    """8 minutes of `awake_in_bed` is under the 10-minute wake criterion,
+    but the criterion exists to absorb AMBIGUOUS movement. A person the
+    model can see is on a device is not ambiguous, and no amount of
+    waiting makes it more certain."""
+    ticks = (
+        _enter()
+        + _run(1, 120, True)
+        + _run(120, 128, False, "awake_in_bed")      # 8 min < WAKE_MIN_SECONDS
+        + _run(128, 300, True)
+        + _leave(300)
+    )
+    out = summarize_night(ticks, window_end=_END)
+    assert out["disturbances"] == 1
+    assert out["awakenings"][0]["duration_minutes"] == 8
+
+
+def test_a_lone_hallucinated_leaving_bed_does_not_fabricate_an_awakening() -> None:
+    """05:49:27 on the 08-06 night: one tick claimed "got out of bed and
+    abruptly collapsed to the floor" while he lay asleep under the covers,
+    with normal sleep ticks either side. Because a crossing CLOSES the
+    occupancy span, the runs either side became two runs and the flicker
+    rule — which lives inside a span — never saw the break at all."""
+    ticks = (
+        _enter()
+        + _run(1, 120, True)
+        + _leave(120)                                # single false crossing
+        + _run(120.5, 300, True)
+        + _leave(300)
+    )
+    out = summarize_night(ticks, window_end=_END)
+    assert out["disturbances"] == 0
+    assert out["duration_minutes"] > 290
+
+
+def test_two_evidenced_awake_ticks_are_still_absorbed() -> None:
+    """The evidence rule must not make a two-tick misread into a wake-up;
+    a hallucinated tick is exactly what it has to survive."""
+    ticks = (
+        _enter()
+        + _run(1, 120, True)
+        + _run(120, 121, False, "awake_in_bed")      # 2 ticks
+        + _run(121, 300, True)
+        + _leave(300)
+    )
+    out = summarize_night(ticks, window_end=_END)
+    assert out["disturbances"] == 0
+
+
+def test_unevidenced_awake_ticks_still_need_the_full_duration() -> None:
+    """`asleep=False, activity=none` is an ABSENCE of a sleep call, not a
+    sighting of wakefulness. It keeps the conservative 10-minute rule."""
+    ticks = (
+        _enter()
+        + _run(1, 120, True)
+        + _run(120, 128, False, "none")              # 8 min, no evidence
+        + _run(128, 300, True)
+        + _leave(300)
+    )
+    out = summarize_night(ticks, window_end=_END)
+    assert out["disturbances"] == 0
+
+
 # ── bug 3: a missed re-entry crossing must not kill the night ────────
 
 def test_night_survives_a_missed_reentry_crossing() -> None:
@@ -222,10 +294,17 @@ def test_activity_state_timeline_time_weighted() -> None:
         s(120, "LR", "sitting", 0.2),
     ]
     out = summarize_day(ticks, window_end=base + timedelta(minutes=150))
+    # `sitting` is the LEGACY label, kept alongside the 2026-08-07
+    # still/moving split so historical ticks keep their minutes rather
+    # than silently vanishing from the record.
     assert out["state_minutes"] == {
-        "lying": 60.0, "sitting": 60.0, "standing": 0.0, "active": 30.0,
+        "lying": 60.0, "sitting": 60.0, "sitting_still": 0.0,
+        "sitting_moving": 0.0, "standing": 0.0, "active": 30.0,
     }
     assert out["active_fraction"] == 0.2
     assert out["room_transitions"] == 1
     assert out["labeled_minutes"] == 150.0
     assert out["label_ticks"] == 3
+    # Posture-derived measures: legacy `sitting` counts as sedentary.
+    assert out["sedentary_minutes"] == 120.0
+    assert out["upright_minutes"] == 30.0

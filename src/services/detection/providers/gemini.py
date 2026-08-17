@@ -11,6 +11,8 @@ fields (`speech_heard` + `speech_transcript`) to the prompt + schema
 from collections.abc import Sequence
 
 from google import genai
+
+from src.services.genai_client import get_client
 from google.genai import types as genai_types
 
 from src.services.detection.prompt import (
@@ -40,6 +42,65 @@ _SPEECH_FIELDS = {
     "speech_heard":      {"type": "boolean"},
     "speech_transcript": {"type": "string"},
 }
+
+# The fields a verdict is allowed to rest on, in the order the model
+# must produce them. Everything not named here (people_present, every
+# detector verdict) follows, keeping its own relative order.
+#
+# `description` sits last of these deliberately: it justifies what was
+# detected, so it wants the evidence above it, but it must still land
+# before any verdict — a narrative written AFTER the labels is a
+# rationalisation of them, which is the failure mode the 2026-08-06
+# rework set out to remove.
+_EVIDENCE_ORDER = (
+    "heard",
+    "audio_source",
+    "speech_heard",
+    "speech_transcript",
+    "seen",
+    "description",
+)
+
+
+def _evidence_first_ordering(properties: dict) -> list[str]:
+    """Property order for the response schema: evidence first, then —
+    within each detector's own field group — reasoning BEFORE verdict.
+
+    The second half is the field-level twin of the first (2026-08-08).
+    Structured output emits fields in this order, and every fragment
+    declares `<ident>_detected` before `<ident>_reasoning` — so the
+    model was committing the boolean as one constrained token and
+    writing its "reasoning" afterwards, as justification of a verdict
+    already locked. That is the documented failure mode of constrained
+    decoding (10-30% reasoning degradation, arXiv:2408.02442; verified
+    on Gemini specifically by the alphabetical-ordering study the SDK
+    docs cite), and it is why every FP's reasoning read as a confident
+    narrative of something that never happened: the text existed to
+    defend the token, not to derive it.
+
+    Grouping is by shared prefix (key minus its last `_segment`), so
+    `fall_reasoning` precedes `fall_detected`/`fall_confidence`,
+    `custom_X_reasoning` precedes its verdict, and groups with no
+    reasoning field (people_present/people_count) keep their declared
+    order untouched. Group order itself is unchanged — only the order
+    WITHIN a detector moves.
+    """
+    lead = [k for k in _EVIDENCE_ORDER if k in properties]
+    rest = [k for k in properties if k not in set(lead)]
+    groups: dict[str, list[str]] = {}
+    group_order: list[str] = []
+    for k in rest:
+        prefix = k.rsplit("_", 1)[0]
+        if prefix not in groups:
+            groups[prefix] = []
+            group_order.append(prefix)
+        groups[prefix].append(k)
+    out = list(lead)
+    for prefix in group_order:
+        ks = groups[prefix]
+        out.extend(k for k in ks if k.endswith("_reasoning"))
+        out.extend(k for k in ks if not k.endswith("_reasoning"))
+    return out
 
 
 def _media_resolution(value: str) -> genai_types.MediaResolution | None:
@@ -122,9 +183,37 @@ async def gemini_provider(
     properties = {**built.schema_properties, **_SPEECH_FIELDS}
     required = built.schema_required + ["speech_heard", "speech_transcript"]
 
+    # EVIDENCE BEFORE VERDICT IS AN ORDERING CLAIM, SO IT HAS TO BE
+    # ORDERED (2026-08-07).
+    #
+    # BASE_PROMPT opens with "FILLING THEM IN THE ORDER GIVEN" and the
+    # whole 2026-08-06 rework depends on it: `heard` and `seen` are the
+    # ONLY places speech and objects may be established, and a detector
+    # that needs a cup at a mouth must find it written above or answer
+    # FALSE. That is a constraint on GENERATION ORDER — it only binds if
+    # the evidence fields are actually emitted first.
+    #
+    # Nothing made them. A JSON schema's `properties` is a map, and
+    # without `property_ordering` the model may emit fields in any
+    # order, so the rule was a sentence in the prompt with no mechanism
+    # under it. Measured live: a tick where `seen` read "holding a
+    # smartphone in both hands while looking down at it" and the
+    # description agreed, while the drinking-water verdict claimed the
+    # subject "picked up a blue plastic bottle, raised it to his mouth"
+    # — at confidence 1.0. The model saw correctly, described correctly,
+    # and contradicted itself, because the verdict was not downstream of
+    # anything.
+    #
+    # Stated explicitly rather than leaning on dict insertion order:
+    # `_SPEECH_FIELDS` is merged in AFTER the detector fields, so plain
+    # insertion order would have emitted the transcript last — the
+    # audio half of the same bug, for the detectors that read speech.
+    # Everything the model is allowed to treat as evidence goes first,
+    # then the narrative, then every verdict.
     response_schema = genai_types.Schema(
         type=genai_types.Type.OBJECT,
         required=required,
+        property_ordering=_evidence_first_ordering(properties),
         properties={
             name: genai_types.Schema(
                 type=_map_type(field["type"]),
@@ -134,7 +223,7 @@ async def gemini_provider(
         },
     )
 
-    client = genai.Client(api_key=settings.gemini_api_key)
+    client = get_client(settings.gemini_api_key)
     # `VideoMetadata.fps` is protobuf-typed (numeric, but the proto
     # may reject Python floats); cast to int before passing.
     video_metadata = (

@@ -34,16 +34,42 @@ import pytest_asyncio
 from httpx import ASGITransport
 from sqlalchemy.ext.asyncio import AsyncSession
 
+# Env overrides MUST precede the src imports: get_settings() is
+# @lru_cache(maxsize=1) and the src.main import tree touches settings
+# at import time, freezing whatever the developer .env holds. (An
+# older comment here claimed Settings was rebuilt per call — that
+# stopped being true when the cache landed.)
+#
+# NEMARA_RESEND_API_KEY: blanking it disarms every email path (they
+# all no-op on an empty key); email tests monkeypatch the sender.
+os.environ["NEMARA_RESEND_API_KEY"] = ""
+# NEMARA_INTERNAL_SERVICE_KEY (2026-08-17): the GPU-fleet work put a
+# real key into the developer .env (nodes need it), which flipped
+# every /internal-style route in the test app from "unset + env=test
+# → allow" to enforcing a key the tests don't send. Blank it so the
+# suite exercises the same local/test path it always did.
+os.environ["NEMARA_INTERNAL_SERVICE_KEY"] = ""
+
 from src.db.session import get_engine, get_sessionmaker
 from src.main import create_app
 from src.settings import get_settings
 
-# Real env vars beat the `.env` file in pydantic-settings, and
-# `get_settings()` builds a fresh Settings per call — so blanking the
-# key here disarms every email path (they all no-op on an empty key)
-# for the whole suite. Tests that exercise email behavior monkeypatch
-# the sender explicitly.
-os.environ["NEMARA_RESEND_API_KEY"] = ""
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limits():
+    """Clear rate-limit counters between tests.
+
+    The limiters are per-process and per-minute, so without this the
+    pairing tests exhaust the budget and every later test in the run
+    gets a 429 unrelated to what it asserts. Resetting (rather than
+    disabling the limiter under NEMARA_ENV=test) keeps the production
+    code path exercised by the integration suite.
+    """
+    from src.api.rate_limit import reset_all_rate_limits
+
+    reset_all_rate_limits()
+    yield
+    reset_all_rate_limits()
 
 
 @pytest_asyncio.fixture(autouse=True)

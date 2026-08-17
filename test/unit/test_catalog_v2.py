@@ -33,7 +33,6 @@ def test_load_bearing_dims_pinned() -> None:
     assert d["agitation"].needs_audio is True                   # tone matters
     assert d["possible_intruder"].subject_scope == "anyone"     # concealment, not identity
     assert d["fall"].subject_scope == "patient"                 # Aryaman: patient-scoped
-    assert d["child_device_usage"].requires_motion is False
     # The distance-degradation class carries its perpetual warning.
     assert d["env_hazard_glass"].degradation_warning == "distance_class"
 

@@ -26,7 +26,7 @@ NOTE: `people_present` is NOT here — it's the always-on block synthesised in
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 
 # ══════════════════════════════════════════════════════════════════
 # Prompt fragments
@@ -98,19 +98,52 @@ _SLEEP_PROMPT_FRAGMENT = (
 # as sleep: labels ride motion ticks, silence persists the last state
 # (a posture change is physically a motion event), and the daily
 # summarizer time-weights the timeline. record_only — never an event.
+# POSTURE DOES NOT DECIDE THIS (2026-08-07, measured live).
+#
+# The fragment already said "exercising in ANY posture including seated
+# weights or floor exercises" and still returned `sitting` — at
+# confidence 1.0 — for continuous overhead arm raises, with `seen`
+# correctly reading "their arms are raised above their head for the
+# duration" and the reasoning saying "sitting passively with their arm
+# raised". Adding more instruction in that direction had already been
+# tried; the model was not missing the rule, it was taking an exit.
+#
+# The exit was "regardless of small hand/arm movements" on `sitting`.
+# It let repeated whole-arm exercise be filed as a small hand movement
+# and stop the analysis there. So the fix is to REMOVE the escape
+# hatch, not to restate the rule: `sitting` now requires the body to be
+# at rest, and the tie-break is stated explicitly in the direction that
+# matters.
+#
+# Why that direction: chair-based exercise is the prescribed
+# intervention for frail older adults precisely because standing and
+# walking are not available to them. Filing it as sedentary does not
+# just cost precision — it erases the only exercise that cohort does,
+# and the aggregate then reports lethargy, which is the alarming
+# reading rather than the safe one.
 _ACTIVITY_PROMPT_FRAGMENT = (
     "activity_detected: boolean. TRUE if the person is PHYSICALLY ACTIVE "
-    "— walking, exercising (including seated exercises like lifting "
-    "weights or stretching), doing chores, or otherwise physically "
-    "engaged in a task. FALSE if they are lying down, sitting passively "
-    "(reading, watching TV, using a phone — small hand movements do NOT "
-    "count as activity), or standing still.\n"
-    "activity_state: string, exactly one of: 'lying', 'sitting' "
-    "(seated and NOT physically exercising, regardless of small hand/arm "
-    "movements), 'standing' (upright but not going anywhere), 'active' "
-    "(walking, exercising in ANY posture including seated weights or "
-    "floor exercises, chores, physically engaged tasks). Pick the state "
-    "that best describes MOST of the clip.\n"
+    "— walking, exercising, doing chores, or otherwise physically "
+    "engaged in a task. Exercise COUNTS WHEREVER IT HAPPENS, including "
+    "sitting down: repeated arm raises, leg lifts, stretching, marching "
+    "in a chair, or using weights or a band while seated are ACTIVE. "
+    "FALSE if they are lying down, sitting at rest (reading, watching "
+    "TV, using a phone), or standing still.\n"
+    "activity_state: string, exactly one of: 'lying', 'sitting_still', "
+    "'sitting_moving', 'standing', 'active'.\n"
+    "  - 'sitting_still': seated and the body is at rest. Small "
+    "incidental hand movement still counts as still — typing, holding a "
+    "phone, turning a page.\n"
+    "  - 'sitting_moving': seated, but the arms, legs or trunk are "
+    "MOVING REPEATEDLY. Report what the body is doing; do NOT try to "
+    "decide whether it is exercise or conversation. Overhead arm "
+    "raises, leg lifts, marching in a chair, stretching, using a band "
+    "or weights, AND animated gesturing all belong here.\n"
+    "  - 'standing': upright but not going anywhere.\n"
+    "  - 'active': walking, chores, or whole-body movement while "
+    "upright.\n"
+    "Being seated does not by itself make the state 'sitting_still'. "
+    "Pick the state that best describes MOST of the clip.\n"
     "activity_confidence: number 0-1.\n"
     "activity_reasoning: 1 short sentence describing the activity level."
 )
@@ -351,254 +384,76 @@ _MEDICATION_PROMPT_FRAGMENT = (
 )
 
 
-_CLIMBING_PROMPT_FRAGMENT = (
-    "climbing_detected: boolean. TRUE if a child is climbing onto something "
-    "they shouldn't — pulling up onto furniture (sofa back, table, kitchen "
-    "counter, shelf, windowsill, railing), scaling a crib rail or safety gate, "
-    "or already standing / perched on an elevated surface in a way that risks "
-    "a fall. The climbing motion OR the child clearly perched on the elevated "
-    "surface must be visible in the clip.\n"
-    "\n"
-    "Set FALSE if any of:\n"
-    "  - the child is sitting, standing, or playing normally on the floor;\n"
-    "  - an adult is holding or lifting the child;\n"
-    "  - the child is seated in a high chair, crib, or stroller in normal use;\n"
-    "  - no child is visible;\n"
-    "  - you only hear sounds without seeing the climbing.\n"
-    "\n"
-    "climbing_confidence: number 0–1. 0 = no climbing. 0.3–0.6 = ambiguous "
-    "(child near furniture but not clearly climbing). 0.7+ = clearly climbing "
-    "onto or perched on an elevated surface.\n"
-    "climbing_reasoning: 1 short sentence describing what you saw (e.g. "
-    "'toddler pulled up onto the coffee table at 5s', 'child sitting on the "
-    "floor playing — no climbing', 'no child visible')."
-)
 
-_DISTRESS_PROMPT_FRAGMENT = (
-    "distress_detected: boolean. TRUE if a child shows sustained distress "
-    "across the clip — crying, wailing, or visibly upset (scrunched / red "
-    "face, flailing, reaching out while crying) for multiple seconds. Here, "
-    "'child' means anyone who appears to be roughly 16 years old or younger — "
-    "if a person could plausibly be 16 or under, treat them as a child, and "
-    "only rule them out when they clearly look like an adult. Audio "
-    "(crying / wailing) is SUPPORTING evidence that can corroborate a visual "
-    "judgment, but audio alone is NEVER sufficient — if the child is visually "
-    "calm, off-camera, or not visible, set FALSE.\n"
-    "\n"
-    "Set FALSE if any of:\n"
-    "  - the child is calm, playing, laughing, or sleeping;\n"
-    "  - the upset is a single brief moment rather than sustained;\n"
-    "  - no child is visible.\n"
-    "\n"
-    "distress_confidence: number 0–1. 0 = calm / no child. 0.3–0.6 = some "
-    "fussing but ambiguous. 0.7+ = clear sustained distress; raise within the "
-    "band when crying audio corroborates the visual signal.\n"
-    "distress_reasoning: 1 short sentence (e.g. 'child crying and reaching out "
-    "for ~8s, audio wailing', 'child playing happily — calm', 'audible fussing "
-    "but no child visible — not distress', 'no child visible')."
-)
 
 # ── New library prompts (14) — starting points, field-tune like any prompt ──
 
-_CHILD_CRIB_EXIT_PROMPT_FRAGMENT = (
-    "child_crib_exit_detected: boolean. TRUE only if a child is climbing OUT "
-    "OF A CRIB specifically — pulling up and over the crib rail, throwing a leg "
-    "over, or already straddling / perched on top of the crib rail in a way "
-    "that risks falling out. The crib (a barred or solid-sided baby bed with "
-    "high rails) must be identifiable, and the over-the-rail motion or the "
-    "child perched on the rail must be visible in the clip.\n"
-    "\n"
-    "Set FALSE if any of:\n"
-    "  - the bed is a regular bed, toddler bed, sofa, or any non-crib surface — "
-    "this detector is ONLY for cribs;\n"
-    "  - the child is lying, sitting, or standing inside the crib normally;\n"
-    "  - an adult is lifting the child in or out;\n"
-    "  - no crib or no child is visible.\n"
-    "\n"
-    "child_crib_exit_confidence: number 0–1. 0 = no crib exit. 0.3–0.6 = child "
-    "active at the crib rail but not clearly going over. 0.7+ = clearly "
-    "climbing over / perched on the crib rail.\n"
-    "child_crib_exit_reasoning: 1 short sentence (e.g. 'toddler threw a leg "
-    "over the crib rail at 6s', 'child standing in crib but not climbing out', "
-    "'no crib visible')."
-)
 
-_CHILD_CORD_ENTANGLEMENT_PROMPT_FRAGMENT = (
-    "child_cord_entanglement_detected: boolean. TRUE only if a cord-like "
-    "object — a blind / curtain pull cord, a window-shade string, an electrical "
-    "or charger cord, a drawstring, or similar — is wrapped around, looped "
-    "over, or pulled taut against a child's NECK. The cord and its contact "
-    "with the neck must be visible.\n"
-    "\n"
-    "Set FALSE if any of:\n"
-    "  - the child merely holds, plays with, or stands near a cord with no neck "
-    "contact;\n"
-    "  - the cord is around a hand, wrist, or torso but not the neck;\n"
-    "  - no child is visible, or the scene is too far / unclear to see a cord "
-    "at the neck.\n"
-    "\n"
-    "This is a high-stakes but visually subtle event — when a cord is plausibly "
-    "at the neck but you cannot be certain, use a middle confidence rather than "
-    "forcing TRUE or FALSE.\n"
-    "\n"
-    "child_cord_entanglement_confidence: number 0–1. 0 = no cord at neck. "
-    "0.3–0.6 = a cord near the neck but contact unclear. 0.7+ = a cord clearly "
-    "around / taut against the neck.\n"
-    "child_cord_entanglement_reasoning: 1 short sentence (e.g. 'blind cord "
-    "looped around the toddler's neck at 4s', 'child holding a charger cord, "
-    "not near the neck', 'no child visible')."
-)
 
-_CHILD_STAIRS_PROMPT_FRAGMENT = (
-    "child_stairs_detected: boolean. TRUE only if a young child is at a "
-    "staircase unsupervised — climbing up or down stairs, or standing / "
-    "crawling at the very top or edge of a staircase where a fall down the "
-    "stairs is the risk. A staircase (a run of steps) and the child on or at "
-    "the edge of it must be visible.\n"
-    "\n"
-    "Set FALSE if any of:\n"
-    "  - an adult is with the child on or at the stairs;\n"
-    "  - the child is near a single step, threshold, or low ledge — not a "
-    "staircase;\n"
-    "  - the child is elsewhere in the room, not at the stairs;\n"
-    "  - no staircase or no child is visible.\n"
-    "\n"
-    "child_stairs_confidence: number 0–1. 0 = not at stairs. 0.3–0.6 = near a "
-    "staircase but not clearly on / at the edge. 0.7+ = clearly on the stairs "
-    "or at the top edge unsupervised.\n"
-    "child_stairs_reasoning: 1 short sentence (e.g. 'toddler crawling up the "
-    "stairs alone at 7s', 'child at the top of the stairs with no adult', "
-    "'adult carrying child on stairs — not flagged', 'no stairs visible')."
-)
 
-_CHILD_HAZARD_REACH_PROMPT_FRAGMENT = (
-    "child_hazard_reach_detected: boolean. This detector covers EXACTLY THREE "
-    "hazards and nothing else: (1) a KNIFE or other obvious sharp blade, (2) an "
-    "electrical OUTLET / wall socket, (3) a STOVE / cooktop / oven. Set TRUE "
-    "only if a young child is reaching for, grabbing, or touching one of these "
-    "three specific hazards. Ignore every other object — this detector does NOT "
-    "cover any other hazard.\n"
-    "\n"
-    "Set FALSE if any of:\n"
-    "  - the child is reaching for anything that is NOT a knife, an electrical "
-    "outlet, or a stove;\n"
-    "  - an adult is supervising and within arm's reach;\n"
-    "  - the child is near one of the three hazards but not reaching for or "
-    "touching it;\n"
-    "  - no child is visible, or you cannot clearly identify the object as a "
-    "knife, outlet, or stove.\n"
-    "\n"
-    "child_hazard_reach_confidence: number 0–1. 0 = no reach for any of the "
-    "three hazards. 0.3–0.6 = reaching toward that area but the hazard or "
-    "intent is ambiguous. 0.7+ = clearly reaching for / touching a knife, an "
-    "outlet, or a stove.\n"
-    "child_hazard_reach_reasoning: 1 short sentence naming WHICH of the three "
-    "hazards (e.g. 'toddler reached for a knife on the counter at 5s', 'child "
-    "poking fingers at a wall outlet', 'child near the table but not reaching "
-    "for a knife / outlet / stove', 'no child visible')."
-)
 
-_CHILD_HEAD_IMPACT_PROMPT_FRAGMENT = (
-    "child_head_impact_detected: boolean. TRUE only if a child's HEAD "
-    "specifically takes an impact — the head strikes the floor, furniture, a "
-    "wall, or another hard surface, or an object strikes the child's head. The "
-    "impact must be to the head, and the strike must be visible in the clip.\n"
-    "\n"
-    "Set FALSE if any of:\n"
-    "  - the impact is to the body, limbs, or bottom but NOT the head;\n"
-    "  - the child bumps something gently with no real impact;\n"
-    "  - the child falls but the head clearly does not hit anything;\n"
-    "  - no child is visible, or the contact is off-camera / too unclear to "
-    "confirm a head impact.\n"
-    "\n"
-    "child_head_impact_confidence: number 0–1. 0 = no head impact. 0.3–0.6 = a "
-    "knock that might have involved the head but it is unclear. 0.7+ = the head "
-    "clearly struck a surface or was struck.\n"
-    "child_head_impact_reasoning: 1 short sentence (e.g. 'child's head hit the "
-    "table edge at 3s', 'toddler fell but landed on hands, head did not hit', "
-    "'no child visible')."
-)
 
-_CHILD_WANDERING_PROMPT_FRAGMENT = (
-    "child_wandering_detected: boolean. TRUE only if, within this clip, you SEE "
-    "a child walk through a doorway and LEAVE the room UNSUPERVISED — the child "
-    "was inside the room earlier in the clip, and by the end they have gone out "
-    "through a doorway and stayed out, with no adult accompanying them. Only "
-    "OUTBOUND exits count. Here, 'child' means anyone who appears to be roughly "
-    "16 years old or younger — if a person could plausibly be 16 or under, "
-    "treat them as a child, and only rule them out when they clearly look like "
-    "an adult.\n"
-    "\n"
-    "Set FALSE if any of:\n"
-    "  - the child only approaches, touches, opens, or looks toward the door but "
-    "does not actually walk through;\n"
-    "  - the child was outside and walked IN (entering doesn't count, only "
-    "leaving does);\n"
-    "  - an adult goes with the child or is leading them out;\n"
-    "  - the child leaves and returns within the same clip;\n"
-    "  - the child walks out of frame somewhere that isn't a clearly visible "
-    "doorway;\n"
-    "  - no child is visible.\n"
-    "\n"
-    "child_wandering_confidence: number 0–1. 0 = no exit seen. 0.3–0.6 = "
-    "ambiguous (child near the door, exit unclear). 0.7+ = clearly walked out "
-    "through a doorway, unaccompanied, and did not come back.\n"
-    "child_wandering_reasoning: 1 short sentence (e.g. 'toddler walked out the "
-    "doorway alone at 9s and did not return', 'child approached the door but did "
-    "not go through', 'child left with an adult — not flagged', 'no child "
-    "visible')."
-)
 
-_CHILD_DEVICE_USAGE_PROMPT_FRAGMENT = (
-    "child_device_usage_detected: boolean. TRUE only if a child is using a phone "
-    "or tablet for a SUSTAINED stretch of this clip — holding and looking at / "
-    "interacting with a handheld smartphone or tablet for MOST of the clip "
-    "(roughly 8 of its ~11 seconds), not just a brief glance. Here, 'child' "
-    "means anyone who appears to be roughly 16 years old or younger — if a "
-    "person could plausibly be 16 or under, treat them as a child, and only "
-    "rule them out when they clearly look like an adult.\n"
-    "\n"
-    "Because each clip is only ~11 seconds, 'prolonged' here means sustained "
-    "across most of THIS clip: the child is on the device for the majority of "
-    "the seconds you can see, rather than momentarily picking it up.\n"
-    "\n"
-    "Set FALSE if any of:\n"
-    "  - the child only briefly glances at, picks up, or hands over a device;\n"
-    "  - the device is a TV, laptop, game controller, or a toy phone — this is "
-    "specifically a handheld phone or tablet;\n"
-    "  - an adult is holding the device, or it is sitting unused;\n"
-    "  - the child is mostly doing something else during the clip;\n"
-    "  - no child or no device is visible.\n"
-    "\n"
-    "child_device_usage_confidence: number 0–1. 0 = no device use. 0.3–0.6 = a "
-    "child with a phone/tablet but only briefly or unclear. 0.7+ = a child "
-    "clearly engaged with a phone/tablet for most of the clip.\n"
-    "child_device_usage_reasoning: 1 short sentence (e.g. 'child watched a tablet "
-    "held in both hands for ~9s', 'child glanced at a phone then put it down', "
-    "'adult was holding the phone, not the child', 'no device visible')."
-)
 
 _CALLING_FOR_HELP_PROMPT_FRAGMENT = (
-    "calling_for_help_detected: boolean. TRUE only if the person on camera is "
-    "clearly calling for help — shouting 'help', 'somebody help', calling out a "
-    "caregiver's name in distress, or crying out that they have fallen, are "
-    "hurt, or cannot get up. BOTH a distressed delivery AND help-seeking "
-    "content should be evident.\n"
+    # REWRITTEN 2026-08-06 (Aryaman). The old rule required "BOTH a distressed
+    # delivery AND help-seeking content". Measured against the eval set, that
+    # cost us the only true positive we have: the model transcribed "Help me"
+    # correctly, attributed it to the person on camera correctly, and then
+    # declined because "the delivery is calm and monotone, lacking the
+    # distressed tone required". That is the exact failure we cannot ship — a
+    # frail, weak, winded or semi-conscious person who has fallen says "help
+    # me" QUIETLY. Requiring audible panic optimises for a demo and fails the
+    # patient.
+    #
+    # The discriminator is not TONE, it is whether they are SUMMONING someone
+    # versus CONVERSING. "Help me" called out to the room is a summons; "can
+    # you help me with this" said into a laptop is conversation. Tone is now
+    # only corroboration, never a requirement.
+    "calling_for_help_detected: boolean. TRUE if the person on camera ASKS "
+    "FOR HELP, in the literal sense — words that request help or rescue for "
+    "themselves, in ANY language:\n"
+    "  - 'help', 'help me', 'somebody help', 'I need help';\n"
+    "  - 'I've fallen', 'I can't get up', 'I'm hurt', 'I can't breathe';\n"
+    "  - the same request in another language — judge the MEANING of what "
+    "was transcribed, never the language it is in.\n"
+    "\n"
+    "Delivery does NOT matter. Calm, weak, breathless, quiet or matter-of-"
+    "fact all count exactly as much as a shout — a person who has fallen and "
+    "is exhausted often cannot raise their voice. Never require distress.\n"
+    "\n"
+    "Do NOT extend this to attention-seeking in general. Calling a person's "
+    "name, calling out to the room, or asking whether anyone is there is NOT "
+    "a request for help on its own — people call to each other constantly.\n"
+
     "\n"
     "Set FALSE if any of:\n"
-    "  - ordinary conversation, a normal phone call, or calling someone for a "
-    "routine reason (no distress);\n"
-    "  - the voice likely comes from a TV / radio / phone / device, or cannot "
-    "be attributed to the person on camera;\n"
-    "  - sounds of distress with no discernible call for help;\n"
-    "  - no person is visible, or the audio is too unclear to judge.\n"
+    "  - the word appears inside ORDINARY CONVERSATION rather than as an "
+    "appeal — discussing a task, helping someone else, a work or social call "
+    "('can you help me with this file', 'I helped her yesterday'). The test "
+    "is whether they are calling someone TO them, here, now;\n"
+    "  - `heard` contains no request for help at all — the words are about "
+    "something else, or are someone helping with a task;\n"
+    "  - nothing intelligible was transcribed. If `heard` is UNINTELLIGIBLE "
+    "or SILENCE you have no words to judge, so this is FALSE — do not infer "
+    "an appeal from tone, noise, or the person's posture alone.\n"
     "\n"
-    "calling_for_help_confidence: number 0–1. 0 = no call for help. 0.3–0.6 = a "
-    "raised or distressed voice but the help-seeking content is unclear. 0.7+ = "
-    "an unmistakable call for help.\n"
-    "calling_for_help_reasoning: 1 short sentence (e.g. 'person on the floor "
-    "shouted \"help, I've fallen\" at 5s', 'loud but ordinary phone "
-    "conversation', 'no person visible')."
+    "\n"
+    "`audio_source` CORROBORATES, it never vetoes. If the words are an "
+    "explicit request for help, report TRUE even when you judged the source "
+    "to be a device or another room, and lower the confidence instead. "
+    "Getting the source wrong is easy on a distant microphone: on "
+    "2026-08-06 a real, correctly-transcribed 'Help me / Help me / Please "
+    "help me' was thrown away as 'coming from a device'. A phone playing "
+    "the word is a rare annoyance; a suppressed real call is the one "
+    "failure this detector must never produce.\n"
+    "calling_for_help_confidence: number 0–1. 0 = no appeal. 0.3–0.6 = words "
+    "that MIGHT be an appeal but could be conversation. 0.7+ = a clear "
+    "appeal to be come to or helped, whatever the tone.\n"
+    "calling_for_help_reasoning: 1 short sentence quoting the words from "
+    "`heard` that decided it (e.g. 'said \"help me\" twice while on the "
+    "floor', 'said \"can you help me\" while working at a laptop — "
+    "conversation, not a summons', 'audio_source=device')."
 )
 
 _CHOKING_PROMPT_FRAGMENT = (
@@ -853,7 +708,11 @@ class CatalogEntry:
     name: str
     icon_name: str
     description: str
-    category: str       # "safety" | "routine"
+    # Semantic label only — what KIND of thing this is, for wording,
+    # colour and filtering. How urgently it is treated is `severity`
+    # (catalog_v2.DIMS), which gates the scheduler's exemptions and the
+    # compile bias. See schemas/detector.py:DetectorCategory.
+    category: str       # safety | routine | behaviour | care
     cohort: str         # "child" | "adult" | "both"
     recommended: bool   # the library's "Recommended" UI group — only `fall`
     prompt_fragment: str
@@ -944,7 +803,7 @@ CATALOG: tuple[CatalogEntry, ...] = (
     CatalogEntry(
         key="agitation", name="Agitation", icon_name="figure.walk.motion",
         description="Pacing or restless body language sustained over time.",
-        category="safety", is_sustained=True, cohort="adult",
+        category="behaviour", is_sustained=True, cohort="adult",
         recommended=False, seeded=True, prompt_fragment=_AGITATION_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
@@ -997,71 +856,7 @@ CATALOG: tuple[CatalogEntry, ...] = (
         promotion_threshold=0.70,
         detected_field="medication_taken",
     ),
-    CatalogEntry(
-        key="climbing", name="Climbing", icon_name="figure.climbing",
-        description="Climbing onto furniture or elevated surfaces.",
-        category="safety", is_sustained=True, cohort="child",
-        recommended=False, seeded=True, prompt_fragment=_CLIMBING_PROMPT_FRAGMENT,
-        promotion_threshold=0.70,
-    ),
-    CatalogEntry(
-        key="distress", name="Distress", icon_name="exclamationmark.bubble",
-        description="Sustained crying or visible distress.",
-        category="safety", is_sustained=True, cohort="child",
-        recommended=False, seeded=True, prompt_fragment=_DISTRESS_PROMPT_FRAGMENT,
-        promotion_threshold=0.70,
-    ),
     # ── child library (not recommended) ──
-    CatalogEntry(
-        key="child_crib_exit", name="Crib exit", icon_name="bed.double",
-        description="A child climbing out of a crib over the rail.",
-        category="safety", cohort="child",
-        recommended=False, prompt_fragment=_CHILD_CRIB_EXIT_PROMPT_FRAGMENT,
-        promotion_threshold=0.70,
-    ),
-    CatalogEntry(
-        key="child_cord_entanglement", name="Cord / blind risk", icon_name="scribble",
-        description="A cord or blind string around a child's neck.",
-        category="safety", cohort="child",
-        recommended=False, prompt_fragment=_CHILD_CORD_ENTANGLEMENT_PROMPT_FRAGMENT,
-        promotion_threshold=0.70,
-    ),
-    CatalogEntry(
-        key="child_stairs", name="Near stairs", icon_name="figure.stairs",
-        description="A child at a staircase unsupervised.",
-        category="safety", cohort="child",
-        recommended=False, prompt_fragment=_CHILD_STAIRS_PROMPT_FRAGMENT,
-        promotion_threshold=0.70,
-    ),
-    CatalogEntry(
-        key="child_hazard_reach", name="Reaching for a hazard",
-        icon_name="exclamationmark.triangle",
-        description="A child reaching for a knife, an outlet, or a stove (only these three).",
-        category="safety", cohort="child",
-        recommended=False, prompt_fragment=_CHILD_HAZARD_REACH_PROMPT_FRAGMENT,
-        promotion_threshold=0.70,
-    ),
-    CatalogEntry(
-        key="child_head_impact", name="Head impact", icon_name="brain.head.profile",
-        description="An impact specifically to a child's head.",
-        category="safety", cohort="child",
-        recommended=False, prompt_fragment=_CHILD_HEAD_IMPACT_PROMPT_FRAGMENT,
-        promotion_threshold=0.70,
-    ),
-    CatalogEntry(
-        key="child_wandering", name="Wandering", icon_name="door.left.hand.open",
-        description="A child leaving the room through a doorway unsupervised.",
-        category="safety", cohort="child",
-        recommended=False, prompt_fragment=_CHILD_WANDERING_PROMPT_FRAGMENT,
-        promotion_threshold=0.70,
-    ),
-    CatalogEntry(
-        key="child_device_usage", name="Electronic device usage", icon_name="ipad",
-        description="A child using a phone or tablet for a sustained period.",
-        category="routine", cohort="child",
-        recommended=False, prompt_fragment=_CHILD_DEVICE_USAGE_PROMPT_FRAGMENT,
-        promotion_threshold=0.70,
-    ),
     # ── adult library (not recommended) ──
     CatalogEntry(
         key="calling_for_help", name="Calling for help",
@@ -1161,7 +956,7 @@ def _validate_catalog() -> None:
         seen_keys.add(e.key)
         if e.cohort not in ("child", "adult", "both"):
             raise ValueError(f"[catalog] {e.key}: bad cohort {e.cohort!r}")
-        if e.category not in ("safety", "routine"):
+        if e.category not in ("safety", "routine", "behaviour", "care"):
             raise ValueError(f"[catalog] {e.key}: bad category {e.category!r}")
         if e.alert_trigger not in ("leading", "trailing", "duration", "absence", "record_only"):
             raise ValueError(f"[catalog] {e.key}: bad alert_trigger {e.alert_trigger!r}")
@@ -1189,7 +984,7 @@ def is_minor(date_of_birth: date | None) -> bool:
     is treated as NOT a minor — preserving the prior adult-default behaviour."""
     if date_of_birth is None:
         return False
-    today = datetime.now(timezone.utc).date()
+    today = datetime.now(UTC).date()
     age = today.year - date_of_birth.year - (
         (today.month, today.day) < (date_of_birth.month, date_of_birth.day)
     )

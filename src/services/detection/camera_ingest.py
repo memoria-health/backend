@@ -39,7 +39,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from src.db.camera import Camera
 from src.db.caregiver import Caregiver
 from src.db.patient import Patient
-from src.services import clip_archival, email, push, review_gate
+from src.services import clip_archival, email, event_gate, push
 from src.services.detection.analyses_store import add_analysis
 from src.services.detection.audio_buffer import AudioBuffer
 from src.services.detection.event_promotion import maybe_promote_analysis
@@ -55,6 +55,7 @@ from src.services.detection.motion_cache import MotionCache
 from src.services.detection.patient_presence import PatientPresence
 from src.services.identity import trace
 from src.services.identity.track_ledger import TrackLedger
+from src.services.detection import sensitivity
 from src.services.detection.mp4_remux import Mp4RemuxError, frames_to_mp4
 from src.services.detection.providers.gemini import gemini_provider
 from src.services.detection.providers.types import ProviderResult
@@ -79,7 +80,7 @@ from src.services.detection.registry import (
 from src.services.detection.state_machine import apply_tick_update
 from src.repos.face_embedding_repo import has_ready_enrollment
 from src.services.identity.result import IdentityResult
-from src.services.identity.identity_client import IdentityClient
+from src.services.identity.identity_client import IdentityProvider
 from src.services.data_collection.gate import should_collect
 from src.services.data_collection.session import RecorderCtx
 from src.services import room_classifier
@@ -150,12 +151,6 @@ class _RecorderDecision:
     ctx: "RecorderCtx | None" = None
     lead_frames: list | None = None
     lead_audio: bytes | None = None
-    # Room-derived privacy for THIS camera (cameras.privacy_enabled, read
-    # off the camera row once it loads — per-camera model, 2026-07-27).
-    # When True the drive ABORTS any in-flight session instead of taking
-    # the linger→finalize→upload route, so pre-privacy footage is dropped
-    # on the device rather than uploaded.
-    privacy: bool = False
 
 
 def compute_reid_mode(
@@ -209,7 +204,7 @@ class CameraIngest:
         motion_cache: MotionCache,
         patient_presence: "PatientPresence | None" = None,
         settings: "Settings",
-        reid: IdentityClient,
+        reid: IdentityProvider,
         livekit_identity: str | None = None,
         recorder: "RecorderManager | None" = None,
     ) -> None:
@@ -434,6 +429,32 @@ class CameraIngest:
                         task.cancel()
                 await asyncio.gather(*bg, return_exceptions=True)
         self._motion_cache.drop(self.camera_id)
+        # Detach the media buffers so THIS ingest stops pinning ~100 MB
+        # the moment it stops. A stopped ingest can stay referenced (a
+        # done-callback, the parent's dict during teardown), and before
+        # this swap each such orphan held a full retention window of 2K
+        # JPEGs + audio until the GC got around to the whole object.
+        #
+        # SWAP, do not clear in place: an in-flight `archive_event`
+        # post-roll (up to 15 s out) and a `room_classifier.kick` still
+        # read the OLD buffer objects they were handed. They keep their
+        # reference and see whatever frames existed when we stopped;
+        # the old buffer frees naturally when the last of them finishes
+        # (seconds, bounded). Clearing in place would silently truncate
+        # those clips' post-roll — reviewed and rejected 2026-08-15.
+        # No writers race the swap: the video/audio consumer tasks are
+        # cancelled by the caller before stop() runs, and the tick loop
+        # above is already down.
+        self.frame_buffer = FrameBuffer(
+            window_seconds=self.frame_buffer._window_seconds,
+            target_fps=self.frame_buffer.target_fps,
+        )
+        self.audio_buffer = AudioBuffer(
+            window_seconds=self.audio_buffer._window_seconds,
+            sample_rate=self.audio_buffer.sample_rate,
+            num_channels=self.audio_buffer.num_channels,
+        )
+        self.ingress_meter = IngressMeter()
 
     async def _tick_loop(self) -> None:
         # Fire-and-forget: every `tick_seconds`, kick off a tick as its
@@ -743,10 +764,11 @@ class CameraIngest:
         """Run one tick, then drive the data-collection recorder.
 
         The recorder is driven in a `finally` so EVERY tick path —
-        including the early-return short-circuits below — gets a chance
-        to advance an open recording session toward its linger/finalize.
-        `_drive_recorder` is a no-op unless the feature is wired and the
-        tick got far enough to know which patient it's for.
+        including the early-return short-circuits and outright failures
+        below — gets a chance to advance an open recording session
+        toward its linger/finalize. A tick that died before building a
+        ctx drives the recorder in advance-only mode (see
+        `RecorderManager.on_tick`).
         """
         decision = _RecorderDecision()
         try:
@@ -756,15 +778,15 @@ class CameraIngest:
 
     async def _drive_recorder(self, decision: "_RecorderDecision") -> None:
         """Hand the per-tick decision to the recorder. Never raises into
-        the tick — recording must never affect detection."""
-        if self._recorder is None or decision.ctx is None:
+        the tick — recording must never affect detection.
+
+        Runs even when `decision.ctx` is None (the tick died before its
+        DB rows loaded): the recorder treats that as advance-only, so
+        an open session still walks toward linger/finalize instead of
+        recording forever off a camera whose ticks are all failing."""
+        if self._recorder is None:
             return
         try:
-            if decision.privacy:
-                # Privacy on → drop any in-flight clip immediately, no
-                # mux/upload. Idempotent no-op when nothing is recording.
-                await self._recorder.abort_camera(self.camera_id)
-                return
             await self._recorder.on_tick(
                 self.camera_id,
                 decision.collect,
@@ -859,11 +881,6 @@ class CameraIngest:
                 gate="person",
                 confidence=None,
             )
-            # Privacy is known the moment the camera row loads — set it
-            # now so EVERY tick path (including early returns) aborts an
-            # open session rather than letting it linger toward upload.
-            # Per-camera (cameras.privacy_enabled) since 2026-07-27.
-            decision.privacy = cam.privacy_enabled
 
             # Room classifier trigger (room-derived privacy, 2026-07-27):
             # a camera that has frames flowing but no room verdict yet is
@@ -900,6 +917,30 @@ class CameraIngest:
                 cam.ai_paused,
                 patient.cameras_paused,
             )
+
+            # ── read phase ends here (tick session split, 2026-08-15) ──
+            # Prefetch the few lookups the rest of the tick needs, then
+            # RELEASE the connection before any heavy work. This tick
+            # used to hold one pooled connection idle-in-transaction
+            # across the mp4 build, the identity call, and the ~28s
+            # Gemini call — at 2 in-flight ticks × N cameras that
+            # exhausted the 20+20 pool the moment latency stretched
+            # (the 2026-08-14 pre-OOM spiral). After close() the session
+            # transparently re-acquires a connection for the short write
+            # transactions below; every row read above lives on as plain
+            # detached attributes. Net extra read cost: one EXISTS per
+            # tick (the vlm choice is 60s-cached, the tz is cached on
+            # self after the first tick).
+            enrollment_ready = await has_ready_enrollment(
+                session, self.patient_id,
+            )
+            vlm_choice = await resolve_vlm_provider(
+                session, patient.caregiver_id, self._settings,
+            )
+            caregiver_local_tz = await self._resolve_caregiver_tz(
+                session, patient,
+            )
+            await session.close()
 
             # User-facing "off" short-circuit. A camera's OWN flags
             # suppress the LLM call:
@@ -1493,7 +1534,7 @@ class CameraIngest:
                 and self._patient_presence is not None
                 and self._patient_presence.confirmed_elsewhere(self.camera_id)
             ):
-                if await has_ready_enrollment(session, self.patient_id):
+                if enrollment_ready:
                     state_after = await apply_tick_update(
                         session,
                         camera_id=self.camera_id,
@@ -1558,11 +1599,9 @@ class CameraIngest:
             # per-tick query). `run_vlm` runs that provider and falls back
             # through the rest of the chain so a single provider's outage /
             # rate-limit can't blind the family. Gemini gets native video;
-            # openai / openrouter share the frame-sampling path. See
-            # services/detection/vlm_routing.py.
-            vlm_choice = await resolve_vlm_provider(
-                session, patient.caregiver_id, self._settings,
-            )
+            # openai / dashscope share the frame-sampling path. See
+            # services/detection/vlm_routing.py. `vlm_choice` was resolved
+            # in the read phase above, before the connection was released.
 
             # Scene/person calls always run on the CLEAN clip. The motion
             # overlay (red tint) is a RAPID-lane recipe property only: the
@@ -1618,9 +1657,7 @@ class CameraIngest:
                         self._patient_presence.confirmed_elsewhere(self.camera_id)
                         if self._patient_presence else False
                     ),
-                    local_now=datetime.now(
-                        await self._resolve_caregiver_tz(session, patient)
-                    ),
+                    local_now=datetime.now(caregiver_local_tz),
                 )
                 plans = pack_calls(due_set, settings=self._settings)
                 log.info(
@@ -1869,9 +1906,6 @@ class CameraIngest:
             # present (live 2026-07-26). The union above is the value
             # the tick actually gates on — record that, always.
             result.detector_fields["people_present"] = gate_people_present
-            # W3: feed the LLM's presence verdict back to the lock (one
-            # tick of lag vs a 45 s grace — fine) and stash lock state.
-            self._identity_lock.note_scene_presence(bool(result.people_present))
             result.detector_fields.update(self._identity_lock.stash_fields())
 
             # Data-collection recorder decision — READ-ONLY over the
@@ -1880,7 +1914,6 @@ class CameraIngest:
             # above as the session lead-in. Never alters detection; the
             # actual recording happens in the RoomWorker-owned recorder.
             collect = should_collect(
-                camera_privacy_enabled=cam.privacy_enabled,
                 data_collection_enabled=patient.data_collection_enabled,
                 motion_in_clip=motion_in_clip,
                 gate_people_present=gate_people_present,
@@ -1901,6 +1934,9 @@ class CameraIngest:
                 # audio window WAS written to the side-file — which desynced
                 # A/V by ~window seconds. Record live-forward only; a paced
                 # lead-in replay is a future improvement.
+                # (Tick-time sensitivity screening removed 2026-08-14 —
+                # finalize-time redaction is the sole net; it re-screens
+                # the whole clip in chunks and needs no tick verdicts.)
 
             # W2 evidence admissibility (identity-persistence, 2026-07-19,
             # mechanism corrected per review F3): a degraded window —
@@ -1931,8 +1967,11 @@ class CameraIngest:
                 # the log line rather than leaving it unbound.
                 no_people_count_log = cam.no_people_count
             else:
-                # State machine update. Same session, one commit at
-                # the end.
+                # State machine update. First statement of the tick's
+                # WRITE transaction — the session re-acquires a pooled
+                # connection here (released after the read phase) and
+                # the single commit below lands the row, the state
+                # transition, and any promotion together.
                 state_after = await apply_tick_update(
                     session,
                     camera_id=self.camera_id,
@@ -2005,16 +2044,48 @@ class CameraIngest:
             # by Apple's push endpoint.
             if promotion.fired:
                 fired_ids = [ev.id for ev in promotion.fired]
-                # Review gate: when patients.require_review is OFF (default)
-                # this dispatches push+email exactly as before; ON holds the
-                # alerts for a reviewer verdict (60s auto-release). Additive.
-                asyncio.create_task(
-                    review_gate.route_events(
+                # Event gate: when patients.event_gate_enabled is OFF
+                # (the default, and true for every patient today) this
+                # dispatches push+email exactly as before. ON holds the
+                # alert for an OPERATOR verdict, with an unconditional 60s
+                # auto-release. Not the caregiver `events.reviewed`
+                # feature — see src/services/event_gate.py.
+                #
+                # The hold is AWAITED, not spawned. Clip archival below
+                # decides whether to fast-path the operator's pre-roll by
+                # reading `gate_state='pending'`, so that state has to be
+                # committed before the archival task starts. Spawning both
+                # concurrently made it a race, and archival won it every
+                # time — the operator got a page with no clip. Two local
+                # round trips; everything slow still runs off-tick.
+                # Wrapped: neither statement in `hold_gated` was guarded,
+                # and this runs INLINE, ahead of the clip-archival loop
+                # below. A DB fault here would otherwise abandon the whole
+                # tick's fan-out — no routing AND no clips — where before
+                # the gate existed it would only have cost push/email.
+                # On failure, fall back to treating everything as free:
+                # dispatching an alert we could not gate is the right
+                # direction, since the gate may only ever remove alerts.
+                try:
+                    gated, free = await event_gate.hold_gated(
                         sessionmaker=self._sessionmaker,
                         event_ids=fired_ids,
                         settings=self._settings,
+                    )
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "event_gate.hold_failed cam=%s — dispatching ungated",
+                        self.camera_id,
+                    )
+                    gated, free = [], list(fired_ids)
+                asyncio.create_task(
+                    event_gate.route_events(
+                        sessionmaker=self._sessionmaker,
+                        gated=gated,
+                        free=free,
+                        settings=self._settings,
                     ),
-                    name=f"review-route-{self.camera_id}",
+                    name=f"event-gate-route-{self.camera_id}",
                 )
                 # Clip archival: reuse the MP4 we already built for
                 # the LLM as the pre-event clip; spawn one task per

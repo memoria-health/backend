@@ -14,7 +14,7 @@ Provider routing:
           to what they detect.
 
 Audio constraint: a needs_audio call that lands on a frame-sampling
-provider (openai/openrouter/dashscope receive frames, not video) loses
+provider (openai/dashscope receive frames, not video) loses
 its sound. The fallback is allowed (locked decision) but the tick is
 MARKED: `sched_degraded_audio=true`.
 
@@ -34,13 +34,44 @@ Merge semantics:
 Ledger: vlm_input/output_tokens = SUM across all calls this tick (the
 main-path spend, same key as flag-off); `sched_calls` breaks it down
 per call for the soak's cost accounting.
+
+Concurrency (2026-08-07): the provider calls run CONCURRENTLY, in
+three phases — build artifacts, gather the calls, merge in plan order.
+
+They used to run in one sequential loop, which made a tick cost the
+SUM of its calls. Measured on the live soak: ~7s per call, three calls
+due, so a 21.7s tick against a 10s cadence. `camera_ingest` allows 2
+generations in flight plus one 16s queue slot, so a permanently
+oversubscribed pipeline shed 25.2% of ticks (33 of 131 in 25 min) —
+and shedding is blind to what a tick carries. On 2026-08-07 05:46 a
+real fall landed in a 19s hole left by two shed ticks: the clip before
+showed the patient standing, the clip after showed them already on the
+floor, and `fall` correctly answered "no fall observed" both times.
+
+The calls were ALREADY independent — `af0b1ec` unbundled them so no
+detector's verdict could contaminate another's, and nothing in the
+loop read another call's result. So this is latency-only: same calls,
+same tokens, same answers. A tick becomes as slow as its SLOWEST call
+rather than the sum.
+
+Why three phases rather than gathering the whole loop body:
+  - Artifact building (person-crop remux, `tint_window`) is ffmpeg and
+    numpy on big native frames. It has OOM-killed the worker before
+    (soak 2026-07-14), so it stays SEQUENTIAL — only the network waits
+    overlap.
+  - Merging stays sequential and in PLAN ORDER, so `sched_calls`,
+    `best_by_ident` tie-breaks and the token totals are byte-identical
+    to the sequential version regardless of which call returns first.
+    A nondeterministic ledger would have made this morning's debugging
+    impossible.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Awaitable, Callable, Sequence
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Sequence
 
 from src.services.detection.providers.types import ProviderResult
 from src.services.detection.rapid_call import RAPID_MOTION_SPEC, rapid_seizure_spec
@@ -66,7 +97,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 # Providers that receive extracted frames, not native video — no audio.
-_FRAME_SAMPLING_PROVIDERS = frozenset({"openai", "openrouter", "dashscope"})
+_FRAME_SAMPLING_PROVIDERS = frozenset({"openai", "dashscope"})
 
 # Overlay-channel prompt swaps: a detector whose row prompt describes the
 # clean clip gets its validated overlay variant on RAPID calls (the P0
@@ -101,6 +132,25 @@ def _score(fields: dict, ident: str) -> tuple[int, float]:
     detected = bool(fields.get(f"{ident}_detected"))
     conf = float(fields.get(f"{ident}_confidence") or 0.0)
     return (1 if detected else 0, conf)
+
+
+@dataclass
+class _PreparedCall:
+    """One plan whose artifact is built and which is ready to be sent.
+
+    The seam between phase 1 (sequential, memory-bound) and phase 2
+    (concurrent, network-bound). A plan that gated out or whose
+    artifact failed never becomes one of these — that is the old
+    `continue`.
+    """
+
+    plan: CallPlan
+    specs: list
+    idents: list[str]
+    mp4: bytes
+    artifact_fps: int
+    overlay_specs: list | None
+    degraded_artifact: bool
 
 
 async def run_scheduled_calls(
@@ -153,6 +203,11 @@ async def run_scheduled_calls(
 
     scene_result: ProviderResult | None = None
     scene_provider = "gemini"
+
+    # ── Phase 1: artifacts (SEQUENTIAL — ffmpeg/numpy, memory-bound) ──
+    # A plan that gates out or fails to build simply never reaches the
+    # prepared list, which is the old `continue`.
+    prepared: list[_PreparedCall] = []
 
     for plan in plans:
         specs = [d.spec for d in plan.detectors]
@@ -265,58 +320,81 @@ async def run_scheduled_calls(
             degraded_this_call = True
             degraded_calls += 1
 
-        # ── Provider ─────────────────────────────────────────────
-        try:
-            if plan.tier == "flash":
-                flash_update: dict = {
-                    "gemini_model": settings.rapid_model,
-                    "gemini_video_fps": str(artifact_fps),
-                }
-                flash_settings = settings.model_copy(update=flash_update)
-                result = await flash_provider(
-                    mp4=mp4, detectors=(overlay_specs or specs),
-                    log_tag=log_tag,
-                    settings=flash_settings,
-                    patient_in_clip=identity.patient_in_clip,
-                    # Only the overlay channel tints its crop, so only it
-                    # gets the provider's red-tint note.
-                    motion_overlay=(plan.channel == "overlay"),
-                )
-                used_provider = "gemini"
-            else:
-                # Crop artifacts must actually be LOOKED AT: run_vlm's
-                # frame-reuse hands frame-sampling providers Re-ID's
-                # extraction of the ORIGINAL full clip, which would
-                # silently replace the crop we just built (T3/T4
-                # review F2). A reuse-disabled identity surrogate
-                # forces those providers to decode the passed mp4;
-                # patient_bbox is dropped too — full-frame coords are
-                # meaningless on a crop. Scene / degraded-to-scene
-                # calls keep the real identity (parity).
-                call_identity = identity
-                if mp4 is not scene_mp4:
-                    call_identity = replace(
-                        identity,
-                        extracted_frames=None,
-                        per_frame_bboxes=None,
-                        sample_fps=None,
-                        patient_bbox=None,
-                    )
-                used_provider, result = await run_main_vlm(
-                    choice=vlm_choice,
-                    mp4=mp4, detectors=specs, identity=call_identity,
-                    log_tag=log_tag, settings=settings,
-                )
-        except Exception as exc:  # noqa: BLE001 — per-call isolation
+        prepared.append(_PreparedCall(
+            plan=plan, specs=specs, idents=idents, mp4=mp4,
+            artifact_fps=artifact_fps, overlay_specs=overlay_specs,
+            degraded_artifact=degraded_this_call,
+        ))
+
+    # ── Phase 2: provider calls (CONCURRENT) ─────────────────────────
+    # `return_exceptions=True` so one crop call 503'ing cannot cancel
+    # its siblings — the per-call isolation contract is unchanged, it
+    # just moves to the merge below. Order of `outcomes` matches
+    # `prepared`, which is plan order.
+    async def _call(pc: "_PreparedCall") -> tuple[str, ProviderResult]:
+        plan = pc.plan
+        if plan.tier == "flash":
+            flash_update: dict = {
+                "gemini_model": settings.rapid_model,
+                "gemini_video_fps": str(pc.artifact_fps),
+            }
+            flash_settings = settings.model_copy(update=flash_update)
+            result = await flash_provider(
+                mp4=pc.mp4, detectors=(pc.overlay_specs or pc.specs),
+                log_tag=log_tag,
+                settings=flash_settings,
+                patient_in_clip=identity.patient_in_clip,
+                # Only the overlay channel tints its crop, so only it
+                # gets the provider's red-tint note.
+                motion_overlay=(plan.channel == "overlay"),
+            )
+            return "gemini", result
+        # Crop artifacts must actually be LOOKED AT: run_vlm's
+        # frame-reuse hands frame-sampling providers Re-ID's
+        # extraction of the ORIGINAL full clip, which would
+        # silently replace the crop we just built (T3/T4
+        # review F2). A reuse-disabled identity surrogate
+        # forces those providers to decode the passed mp4;
+        # patient_bbox is dropped too — full-frame coords are
+        # meaningless on a crop. Scene / degraded-to-scene
+        # calls keep the real identity (parity).
+        call_identity = identity
+        if pc.mp4 is not scene_mp4:
+            call_identity = replace(
+                identity,
+                extracted_frames=None,
+                per_frame_bboxes=None,
+                sample_fps=None,
+                patient_bbox=None,
+            )
+        return await run_main_vlm(
+            choice=vlm_choice,
+            mp4=pc.mp4, detectors=pc.specs, identity=call_identity,
+            log_tag=log_tag, settings=settings,
+        )
+
+    outcomes: list[Any] = list(await asyncio.gather(
+        *(_call(pc) for pc in prepared), return_exceptions=True,
+    ))
+
+    # ── Phase 3: merge (SEQUENTIAL, PLAN ORDER) ──────────────────────
+    # Iterating `prepared` rather than completion order is what keeps
+    # the ledger, the token totals and every best-answer tie-break
+    # identical to the pre-2026-08-07 sequential executor.
+    for pc, outcome in zip(prepared, outcomes):
+        plan, specs, idents, mp4 = pc.plan, pc.specs, pc.idents, pc.mp4
+        artifact_fps = pc.artifact_fps
+        if isinstance(outcome, BaseException):
             if _is_scene(plan):
                 # No scene answer = no tick, exactly like today.
-                raise
+                raise outcome
             call_errors.append(plan.plan_key)
             log.warning(
                 "%s sched call failed key=%s detectors=%s err=%s",
-                log_tag, plan.plan_key, idents, exc,
+                log_tag, plan.plan_key, idents, outcome,
             )
             continue
+        used_provider, result = outcome
 
         if plan.needs_audio and used_provider in _FRAME_SAMPLING_PROVIDERS:
             degraded_audio = True
@@ -324,6 +402,20 @@ async def run_scheduled_calls(
         usage = result.usage or {}
         total_in += int(usage.get("input", 0))
         total_out += int(usage.get("output", 0))
+        # Per-call evidence (2026-08-07). Every call generates its own
+        # `seen`/`heard` describing ITS OWN artifact, but the row-level
+        # copy is the scene call's (the shared-block rule below), so
+        # a crop call's verdict was being stored beside a DIFFERENT
+        # call's description of DIFFERENT pixels. A whole morning of
+        # "the verdict contradicts `seen`" analysis was invalid because
+        # of that — the contradiction was two calls looking at two
+        # artifacts. Riding the evidence on the ledger entry makes a
+        # verdict checkable against the evidence from its own call.
+        evidence = {
+            k: str(result.detector_fields[k])[:500]
+            for k in ("seen", "heard")
+            if result.detector_fields.get(k)
+        }
         call_ledger.append({
             "key": plan.plan_key,
             "detectors": idents,
@@ -331,7 +423,8 @@ async def run_scheduled_calls(
             "model": result.model,
             "input_tokens": int(usage.get("input", 0)),
             "output_tokens": int(usage.get("output", 0)),
-            **({"degraded_artifact": True} if degraded_this_call else {}),
+            **evidence,
+            **({"degraded_artifact": True} if pc.degraded_artifact else {}),
         })
 
         # ── Merge ────────────────────────────────────────────────

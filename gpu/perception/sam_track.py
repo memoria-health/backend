@@ -20,13 +20,20 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+import threading
 from typing import Iterator
 
 import numpy as np
 
 log = logging.getLogger("perception.track")
 
+# Process-singleton predictor. The 2026-08-15/16 concurrency campaign
+# is CLOSED: two passes overlapping in one process corrupt tracking at
+# a layer below Python (private instances, lock probes, and global-state
+# stubs were all falsified — see docs/plans/2026-08-16-cross-camera-batching.md §1),
+# so workers run single-flight and one instance per process is correct.
 _SAM = None
+_SAM_BUILD_LOCK = threading.Lock()
 
 
 def _np(x):
@@ -38,7 +45,11 @@ def _np(x):
 def get_sam(ckpt_path: str):
     """Process-singleton native SAM 3.1 multiplex video predictor."""
     global _SAM
-    if _SAM is None:
+    if _SAM is not None:
+        return _SAM
+    with _SAM_BUILD_LOCK:
+        if _SAM is not None:
+            return _SAM
         import inspect
 
         from sam3.model_builder import build_sam3_multiplex_video_predictor
@@ -53,7 +64,7 @@ def get_sam(ckpt_path: str):
         )
         _SAM = pred
         log.info("sam_track.loaded ckpt=%s", ckpt_path)
-    return _SAM
+        return _SAM
 
 
 def mask_bbox(m: np.ndarray) -> tuple[float, float, float, float] | None:

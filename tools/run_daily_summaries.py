@@ -112,6 +112,28 @@ def _as_utc(ts: datetime | None) -> datetime | None:
     return ts.replace(tzinfo=timezone.utc)
 
 
+def _bind(ts: datetime) -> datetime:
+    """Naive-UTC window bound -> OFFSET-AWARE, for binding into SQL.
+
+    `captured_at` is `timestamptz`. A NAIVE datetime bound against it is
+    interpreted in the CLIENT's local zone, not UTC — so on an IST machine
+    the whole night window silently slid 5h30m earlier and every night was
+    truncated at 06:30 local. Measured on one connection, same night:
+
+        captured_at < naive 2026-08-06 06:30    -> 6659 rows (stops 06:29 IST)
+        captured_at < '2026-08-06 06:30:00+00'  -> 7981 rows (stops 10:11 IST)
+
+    Proven end to end by running this tool in two places: the IST host
+    reported a 274-minute night, the UTC container 359 minutes, from the
+    same rows. Nothing flagged it, because the truncated last tick sits
+    well before `window_end` and so looks like an observed wake.
+
+    This is the read-side twin of the bug `_as_utc` documents on the write
+    side; that one was fixed, this one was not.
+    """
+    return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+
+
 def _naive(ts: datetime) -> datetime:
     """DB timestamptz (offset-aware) -> naive-UTC, the summarizers'
     working convention. analyses.captured_at comes back aware; mixing
@@ -136,7 +158,7 @@ async def _run(night_date: date) -> None:
             t1 = _utc_naive(night_date + timedelta(days=1), _NIGHT_END_H, tz)
             window_end = min(t1, now_naive)
             rows = (await s.execute(
-                _TICKS_SQL, {"t0": t0, "t1": t1, "pid": pid},
+                _TICKS_SQL, {"t0": _bind(t0), "t1": _bind(t1), "pid": pid},
             )).all()
             by_cam: dict[str, list] = {}
             for r in rows:
@@ -206,7 +228,7 @@ async def _run(night_date: date) -> None:
             d1 = _utc_naive(night_date + timedelta(days=1), 0, tz)
             day_end = min(d1, now_naive)
             rows = (await s.execute(
-                _TICKS_SQL, {"t0": d0, "t1": d1, "pid": pid},
+                _TICKS_SQL, {"t0": _bind(d0), "t1": _bind(d1), "pid": pid},
             )).all()
             act: list = []
             for r in rows:
