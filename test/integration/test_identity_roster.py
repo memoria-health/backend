@@ -450,3 +450,72 @@ async def test_unaddressable_base_url_is_refused(
         )
     ).scalar()
     assert seen == 0
+
+
+@pytest.mark.asyncio
+async def test_corpse_rows_are_reaped_after_seven_days(
+    client: AsyncClient, session: AsyncSession, auth_user
+) -> None:
+    """A node dark for days is a terminated pod: one live poll releases
+    any homes it still held (step 2) and reaps its row (step 2b) — both
+    in the same poll. A merely-sleeping node (dark 1 hour) keeps its
+    identity. The reaper's NOT-IN guard exists for FK safety: it can
+    never delete a row a patient still references at delete time."""
+    caregiver_id, email = auth_user
+    await _clear(session)
+    await _mk_caregiver(session, caregiver_id, email)
+    pid = await _mk_patient(session, caregiver_id)
+
+    # Direct SQL, not API polls: registering via /roster would also CLAIM
+    # unassigned patients (the local DB has real ones), stealing the port
+    # this test pins by hand and attaching homes to the corpse.
+    await session.execute(
+        text(
+            "INSERT INTO public.identity_nodes "
+            "  (node_id, base_url, capacity, last_seen_at) VALUES "
+            "  ('node-corpse',  'http://node-corpse',  1, now() - interval '8 days'), "
+            "  ('node-nap',     'http://node-nap',     1, now() - interval '1 hour'), "
+            "  ('node-holding', 'http://node-holding', 1, now() - interval '8 days') "
+            "ON CONFLICT (node_id) DO UPDATE SET "
+            "  last_seen_at = excluded.last_seen_at"
+        )
+    )
+    # node-holding keeps a home pinned to it; corpse + nap hold nothing.
+    await session.execute(
+        text(
+            "UPDATE public.patients SET identity_node_id = 'node-holding', "
+            "identity_port = 8012 WHERE id = :p"
+        ),
+        {"p": pid},
+    )
+    await session.commit()
+
+    # One live poll: step 2 releases node-holding's home (8 days stale),
+    # then step 2b reaps both 8-day rows. (cap must be >= 1 to pass
+    # request validation; node-live's side-effect claim is irrelevant.)
+    await _poll(client, "node-live", cap=1)
+    rows = {
+        r[0]
+        for r in (
+            await session.execute(
+                text(
+                    "SELECT node_id FROM public.identity_nodes "
+                    " WHERE node_id LIKE 'node-%'"
+                )
+            )
+        ).all()
+    }
+    assert "node-corpse" not in rows
+    assert "node-nap" in rows
+    # Released-then-reaped in the same poll; its patient is unassigned
+    # (or already re-claimed by a live node), never FK-orphaned.
+    assert "node-holding" not in rows
+    holder = (
+        await session.execute(
+            text(
+                "SELECT identity_node_id FROM public.patients WHERE id = :p"
+            ),
+            {"p": pid},
+        )
+    ).scalar()
+    assert holder != "node-holding"

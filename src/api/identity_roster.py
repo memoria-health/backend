@@ -168,6 +168,25 @@ async def post_roster(
         )
     ).rowcount or 0
 
+    # 2b. Reap corpse rows. A briefly-absent node keeps its row (see the
+    #     comment above) — but a node dark for DAYS is a terminated pod,
+    #     never a partition, and its row is registry clutter (21 of them
+    #     had accumulated by 2026-08-17, purged by hand; this makes that
+    #     hand-purge unnecessary forever). Holding-no-homes is implied:
+    #     step 2 released any homes long before the corpse window ends.
+    await session.execute(
+        text(
+            "DELETE FROM public.identity_nodes "
+            " WHERE node_id <> :self "
+            "   AND last_seen_at < now() - interval '7 days' "
+            "   AND node_id NOT IN ("
+            "     SELECT identity_node_id FROM public.patients "
+            "      WHERE identity_node_id IS NOT NULL"
+            "   )"
+        ),
+        {"self": body.node_id},
+    )
+
     # 3. Claim up to remaining capacity from the unassigned pool.
     #
     #    FOR UPDATE SKIP LOCKED is what makes two nodes polling at the same
