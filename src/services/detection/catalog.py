@@ -817,7 +817,7 @@ CATALOG: tuple[CatalogEntry, ...] = (
     # post-pilot (docs/plans/2026-07-28-pilot-master-worklist.md).
     CatalogEntry(
         key="wandering", name="Wandering", icon_name="door.left.hand.open",
-        description="Main door opening — front entry only.",
+        description="Main door opening, front entry only.",
         category="safety", cohort="adult",
         recommended=False, seeded=True, prompt_fragment=_WANDERING_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
@@ -868,7 +868,7 @@ CATALOG: tuple[CatalogEntry, ...] = (
     ),
     CatalogEntry(
         key="choking", name="Choking", icon_name="lungs",
-        description="Signs of choking — hands to the throat, unable to breathe.",
+        description="Signs of choking: hands to the throat, unable to breathe.",
         category="safety", cohort="adult",
         recommended=False, prompt_fragment=_CHOKING_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
@@ -893,7 +893,7 @@ CATALOG: tuple[CatalogEntry, ...] = (
     # ── both cohorts (not recommended) ──
     CatalogEntry(
         key="emergency", name="General Emergency", icon_name="cross.case",
-        description="Severe emergencies — unconsciousness, serious bleeding, seizure.",
+        description="Severe emergencies: unconsciousness, serious bleeding, seizure.",
         category="safety", cohort="both",
         recommended=False, prompt_fragment=_EMERGENCY_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
@@ -906,17 +906,17 @@ CATALOG: tuple[CatalogEntry, ...] = (
         promotion_threshold=0.70,
     ),
     CatalogEntry(
-        key="env_hazard_glass", name="Environmental hazard — Glass",
+        key="env_hazard_glass", name="Broken glass",
         icon_name="wineglass",
-        description="Broken glass / scattered shards.",
+        description="Broken glass or scattered shards on the floor.",
         category="safety", cohort="both",
         recommended=False, prompt_fragment=_ENV_HAZARD_GLASS_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
     CatalogEntry(
-        key="env_hazard_water", name="Environmental hazard — Spilled water",
+        key="env_hazard_water", name="Spilled water",
         icon_name="drop",
-        description="Water or liquid spilled on the floor — a slip hazard.",
+        description="Water or liquid spilled on the floor, a slip hazard.",
         category="safety", cohort="both",
         recommended=False, prompt_fragment=_ENV_HAZARD_WATER_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
