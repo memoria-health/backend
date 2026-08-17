@@ -297,8 +297,7 @@ def orphan_group_line(events: list, tz: tzinfo) -> dict:
         "category": first.category,
         "severity": None,
         "kind": "point",
-        "line": {"primary": primary, "meta": "detector removed",
-                 "status": status},
+        "line": {"primary": primary, "meta": None, "status": status},
         "strip": None,
         "review_event_id": review_id,
     }
