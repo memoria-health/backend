@@ -25,6 +25,31 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.db.session import get_sessionmaker
 from src.services.identity import fleet_watch as fw_mod
 from src.services.identity.fleet_watch import FleetWatch
+import pytest_asyncio
+
+@pytest_asyncio.fixture(autouse=True)
+async def _restore_real_fleet(session: AsyncSession):
+    """Snapshot REAL home->node assignments and put them back after
+    every test. This suite shares the local database with a live
+    production fleet node; its _clear/park helpers detach or re-park
+    the real homes, and the node's next roster poll then re-claims
+    them with fresh ports from the bottom of the series. That was a
+    full day of 'the identity port died again' (2026-08-17) — every
+    pytest run was reshuffling production. Real rows = anything not
+    named by this suite."""
+    rows = [tuple(r) for r in (await session.execute(text(
+        "SELECT id, identity_node_id, identity_port FROM public.patients "
+        " WHERE identity_node_id IS NOT NULL "
+        "   AND identity_node_id NOT LIKE 'node-%' "
+        "   AND identity_node_id <> 'fleet-sentinel'"))).all()]
+    yield
+    for pid, node, port in rows:
+        await session.execute(text(
+            "UPDATE public.patients "
+            "   SET identity_node_id = :n, identity_port = :p "
+            " WHERE id = :i"), {"n": node, "p": port, "i": pid})
+    await session.commit()
+
 
 pytestmark = pytest.mark.asyncio
 
