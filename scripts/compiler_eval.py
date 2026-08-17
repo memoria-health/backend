@@ -38,60 +38,77 @@ from src.services.detector_compiler import infer_detector_config
 from src.settings import Settings
 
 # ── Eval set: built-in identifier → short, casual caregiver phrasings ──
-# Two per detector. Skipped: sleep / activity / setup_test (record-only
-# or internal — no caregiver would ask for them as alerts).
-PHRASES: dict[str, tuple[str, str]] = {
+# Three per detector: casual/declarative forms plus a strict imperative
+# "alert me when they …" form (the actual custom-create UX phrasing —
+# Aryaman 2026-08-17), all worded differently so rule fixes tuned on one
+# phrase are proven on the others. Skipped: sleep / activity /
+# setup_test (record-only or internal — no caregiver would ask for them
+# as alerts).
+PHRASES: dict[str, tuple[str, ...]] = {
     "fall": (
         "alert me if my dad falls",
         "grandma fell down",
+        "notify me when my mother falls over",
     ),
     "agitation": (
         "mom seems really agitated and restless",
         "tell me when dad gets worked up and paces around",
+        "alert me when she gets really restless and upset",
     ),
     "wandering": (
         "dad wandered out the front door",
         "alert me if mom leaves the house",
+        "let me know if he walks out of the apartment",
     ),
     "medication": (
         "mom didn't take her evening pills",
         "did grandpa take his meds",
+        "tell me when mom takes her medicine",
     ),
     "calling_for_help": (
         "grandma is calling out for help",
         "alert me if mom yells for help",
+        "notify me if grandpa shouts for help",
     ),
     "choking": (
         "grandpa is choking",
         "alert me if dad chokes on his food",
+        "alert me if grandma starts choking during meals",
     ),
     "meal_eaten": (
         "tell me when mom eats her lunch",
         "make sure dad eats his dinner",
+        "let me know when dad has eaten his breakfast",
     ),
     "stove_left_on": (
         "tell me if the stove gets left on",
         "the burner is still on and no one's in the kitchen",
+        "alert me when the oven stays on unattended",
     ),
     "emergency": (
         "something is seriously wrong with dad",
         "alert me if grandma is unconscious or bleeding",
+        "alert me if something bad happens to mom like she passes out",
     ),
     "possible_intruder": (
         "someone wearing a mask enters the house",
         "a stranger is in the house",
+        "alert me when an unfamiliar person shows up inside the house",
     ),
     "env_hazard_glass": (
         "a glass broke on the kitchen floor",
         "alert me if something shatters and leaves shards",
+        "alert me when they drop and break a glass",
     ),
     "env_hazard_water": (
         "water spilled on the kitchen floor",
         "someone knocked over a drink and it spilled",
+        "alert me when they spill water on the floor",
     ),
     "fire_smoke": (
         "I see smoke in the living room",
         "alert me if there's a fire",
+        "alert me if anything catches fire in the house",
     ),
 }
 

@@ -132,11 +132,18 @@ _ENV_SUBJECT = re.compile(
     r"water\s+(leak(s|ed|ing)?|running)|spill(s|ed|ing)?|"
     r"leak(s|ed|ing)?|puddle(s)?|shard(s)?|shatter(s|ed|ing)?|"
     r"broken\s+glass|glass\s+(break(s|ing)?|broke|shatter(s|ed|ing)?|"
-    r"smash\w*))\b", re.I,
+    r"smash\w*)|"
+    # Verb-object order too — "breaks a glass" / "drops a plate" is the
+    # same floor-hazard ask as "a glass breaks"; without this the branch
+    # depended on which order the LLM's suggested name happened to use.
+    r"(break(s|ing)?|broke|drop(s|ped|ping)?|smash(es|ed|ing)?|"
+    r"knock(s|ed|ing)?\s+over)\s+(a\s+|the\s+|her\s+|his\s+)?"
+    r"(glass|cup|mug|plate|dish|bowl|bottle|mirror|vase))\b", re.I,
 )
 _ANYONE_SUBJECT = re.compile(
     r"\b(visitor|stranger|intruder|anyone|any\s+person|someone\s+"
-    r"(new|unknown|else)|delivery|mask(ed)?)\b", re.I,
+    r"(new|unknown|else)|(unfamiliar|unknown|unrecognized)\s+"
+    r"(person|people|man|woman|face(s)?)|delivery|mask(ed)?)\b", re.I,
 )
 _AUDIO_EVIDENCE = re.compile(
     r"\b(call(s|ing)?\s+(out|for)|yell(s|ing)?|scream(s|ing)?|shout|"
@@ -199,7 +206,7 @@ _DISTANCE_CLASS = re.compile(
 # taking medication, grooming — fell through to `person_motion` and
 # `scene`, which is the one combination guaranteed to hallucinate.
 _BODY_SCALE_ACTION = re.compile(
-    r"\b(drink(s|ing)?|sip(s|ping)?|swallow(s|ing)?|eat(s|ing)?|"
+    r"\b(drink(s|ing)?|sip(s|ping)?|swallow(s|ing)?|eat(s|ing|en)?|"
     r"chew(s|ing)?|bite(s)?|feed(s|ing)?|"
     # Choking evidence is hands-to-throat and face colour — body scale,
     # exactly why the choking PRESET is bucket=person; a custom "grandpa
