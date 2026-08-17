@@ -221,7 +221,7 @@ def activity_line(ticks: list, tz: tzinfo) -> dict:
 
 def count_line(det, times: list, tz: tzinfo) -> dict:
     if not times:
-        return _entry(det, "record_count", "None today", None, "none", None)
+        return _entry(det, "record_count", "None", None, "none", None)
     n = len(times)
     return _entry(det, "record_count", f"{n} time{'' if n == 1 else 's'}",
                   None, "none",
@@ -258,7 +258,7 @@ def duration_line(det, tick_times: list, tz: tzinfo) -> dict:
     ticks are RECORDED timestamps, so merging runs (gap <= 60 s) into
     session spans is a clean map, not an inference."""
     if not tick_times:
-        return _entry(det, "record_duration", "None today", None, "none", None)
+        return _entry(det, "record_duration", "None", None, "none", None)
     spans: list[list[float]] = []
     run_start = prev = tick_times[0]
     for t in tick_times[1:]:
