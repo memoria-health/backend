@@ -192,3 +192,32 @@ def test_environment_asks_are_not_dragged_into_the_person_bucket() -> None:
     )
     assert dims["bucket"] == "scene"
     assert dims["subject_scope"] == "environment"
+
+
+def test_env_customs_emit_builtin_parity_cooldowns() -> None:
+    """Env-classified customs carry the same backstop spacing as the env
+    built-ins (Aryaman 2026-08-17): hazard prompts are event-phrased, so
+    the cooldown only caps a VLM that mistakes lingering aftermath for a
+    fresh event — 1800s hazards, 600s for the fire shape where frequent
+    re-alerts while it burns are correct. Non-env customs must NOT carry
+    the key at all: the row default (NULL -> 30s global) stays, and a
+    recompile never nulls a caregiver-tuned value."""
+    spill = classify_custom_dims(
+        name="Water spilled", user_text="alert me when they spill water",
+        is_sustained=False, category="safety",
+    )
+    assert spill["subject_scope"] == "environment"
+    assert spill["cooldown_seconds"] == 1800
+
+    fire = classify_custom_dims(
+        name="Fire", user_text="alert me if anything catches fire",
+        is_sustained=False, category="safety",
+    )
+    assert fire["subject_scope"] == "environment"
+    assert fire["cooldown_seconds"] == 600
+
+    fall = classify_custom_dims(
+        name="Falls", user_text="alert me if my dad falls",
+        is_sustained=False, category="safety",
+    )
+    assert "cooldown_seconds" not in fall

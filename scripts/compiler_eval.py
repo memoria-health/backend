@@ -20,9 +20,9 @@ Scored fields (custom output vs built-in ground truth):
     subject_scope, bucket, requires_motion, needs_audio, category,
     temporal shape (momentary / sustained / scheduled), severity band
     (emergency >= 80, high 50-79, low < 50).
-Cooldown is reported informationally: the custom path emits no
-per-detector cooldown (rows keep the 30s global default), while the
-env built-ins carry 1800s (action) / 600s (ongoing-emergency) spacing.
+Cooldown is reported informationally: env-classified customs emit the
+same backstop spacing as the env built-ins (1800s action hazards,
+600s fire-like); other customs keep the 30s global default.
 """
 
 from __future__ import annotations
@@ -194,6 +194,7 @@ async def compile_phrase(
         "severity": inferred.severity,
         "alert_trigger": inferred.alert_trigger,
         "suggested_name": inferred.suggested_name,
+        "cooldown_seconds": dims.get("cooldown_seconds"),
     }
 
 
@@ -244,10 +245,9 @@ async def run_eval(out_path: str | None) -> int:
             emit(f"   {detail}")
             if not ok:
                 misses.append(f)
-        cd = gt.cooldown_seconds
         emit(
-            f"   cooldown (info): builtin={cd or 'default'}s, "
-            "custom path emits none (30s global default)"
+            f"   cooldown (info): builtin={gt.cooldown_seconds or 'default'} "
+            f"custom={got['cooldown_seconds'] or 'default'}"
         )
         emit(f"   name suggestion: {got['suggested_name']!r}")
         emit()

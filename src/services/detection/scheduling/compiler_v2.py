@@ -155,6 +155,9 @@ _AUDIO_EVIDENCE = re.compile(
     # without audio would judge a shouting spell on picture alone.
     r"agitat(ed|es|ion|ing)?|distress(ed)?)", re.I,
 )
+_FIRE_EVENT = re.compile(
+    r"\b(fire|smoke|flame(s)?|burn(s|ing|t)?)\b", re.I,
+)
 _STILL_ACTIVITY = re.compile(
     r"\b(watch(es|ing)?\s+tv|on\s+(the\s+)?phone|read(s|ing)?|"
     r"sit(s|ting)?|sleep(s|ing)?|ly(ing|es)\s+(down|in\s+bed)|"
@@ -296,12 +299,20 @@ def classify_custom_dims(
     tick), never on a silently-dead detector."""
     hay = f"{name}\n{user_text}"
 
+    # Env-custom cooldown parity with the built-ins (Aryaman 2026-08-17):
+    # hazard prompts are event-phrased (hard rule 8), so this is only the
+    # backstop for a VLM that mistakes the lingering aftermath for a fresh
+    # event — 30 min for hazards, matching env_hazard_*; 10 min for the
+    # ongoing-emergency shape (fire), where re-alerting while it still
+    # burns is correct and should stay frequent.
+    cooldown: int | None = None
     if (
         _ENV_SUBJECT.search(hay)
         and not _STILL_ACTIVITY.search(hay)
         and not _EXIT_VERBS.search(hay)
     ):
         branch, subject, bucket = "environment", "environment", "scene"
+        cooldown = 600 if _FIRE_EVENT.search(hay) else 1800
     elif _STILL_ACTIVITY.search(hay):
         branch, subject, bucket = "person_still", "patient", "person"
     elif _BODY_SCALE_ACTION.search(hay):
@@ -334,7 +345,7 @@ def classify_custom_dims(
     # stakes), never from a user-stated duration.
     eventing = _entry_confidence_for(is_sustained, bucket, degradation, category)
 
-    return {
+    dims = {
         # Only person_motion vs not is read downstream (the motion floor);
         # environment/person_still collapse to requires_motion=False.
         "requires_motion": branch == "person_motion",
@@ -345,3 +356,8 @@ def classify_custom_dims(
         "eventing": eventing,
         "degradation_warning": degradation,
     }
+    # Key present only when set: non-env customs keep the row default
+    # (NULL → the 30s global), and a recompile never nulls a value.
+    if cooldown is not None:
+        dims["cooldown_seconds"] = cooldown
+    return dims

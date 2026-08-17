@@ -188,6 +188,17 @@ caregiver's wording that conflicts with them.
    be made out, require that the exact words be quoted in the reasoning
    before TRUE is allowed, and state that audio which may come from a
    television, radio, speaker, phone, or laptop does not count.
+
+8. AN ENVIRONMENT HAZARD IS AN EVENT, NOT A STATE. If the ask is about
+   a hazard appearing in the home (a spill, something breaking or
+   shattering, a leak, something falling and making a mess), write the
+   criteria to fire on the event HAPPENING during the clip — or on the
+   hazard appearing during the clip when the moment itself was missed.
+   State explicitly that the aftermath already present and unchanged
+   for the WHOLE clip is FALSE. One puddle must alert once, not on
+   every clip until somebody cleans it up. (An ongoing danger that is
+   itself the emergency — visible fire or smoke — is the exception:
+   still-burning IS the event, and stays TRUE.)
 """
 
 
@@ -499,8 +510,13 @@ async def _compile_with_gemini(
             ),
         ],
         # No response_schema — we want freeform text, not JSON.
+        # Thinking maxed (Aryaman 2026-08-17): compile/infer are one-off
+        # create-time calls where taxonomy correctness beats latency.
         config=genai_types.GenerateContentConfig(
             response_mime_type="text/plain",
+            thinking_config=genai_types.ThinkingConfig(
+                thinking_level=genai_types.ThinkingLevel.HIGH,
+            ),
         ),
     )
     raw = (response.text or "").strip()
@@ -524,6 +540,7 @@ async def _compile_with_openai(
     client = AsyncOpenAI(api_key=settings.openai_api_key)
     response = await client.chat.completions.create(
         model=settings.openai_compile_model,
+        reasoning_effort="high",
         messages=[
             {"role": "user", "content": _meta_prompt(
                 identifier=identifier,
@@ -943,7 +960,12 @@ async def _infer_with_gemini(*, name: str | None, prompt: str, settings: Setting
             role="user",
             parts=[genai_types.Part(text=_infer_meta_prompt(name=name, prompt=prompt))],
         )],
-        config=genai_types.GenerateContentConfig(response_mime_type="application/json"),
+        config=genai_types.GenerateContentConfig(
+            response_mime_type="application/json",
+            thinking_config=genai_types.ThinkingConfig(
+                thinking_level=genai_types.ThinkingLevel.HIGH,
+            ),
+        ),
     )
     raw = (response.text or "").strip()
     if not raw:
@@ -957,6 +979,7 @@ async def _infer_with_openai(*, name: str | None, prompt: str, settings: Setting
     client = AsyncOpenAI(api_key=settings.openai_api_key)
     response = await client.chat.completions.create(
         model=settings.openai_model,
+        reasoning_effort="high",
         messages=[{"role": "user", "content": _infer_meta_prompt(name=name, prompt=prompt)}],
         response_format={"type": "json_object"},
     )
