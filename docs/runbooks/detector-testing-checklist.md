@@ -202,7 +202,15 @@ semantics and the soak measures the product as it will ship.
 | S3 | Daily triage | per-detector FP tally + root-cause bucket (reuse the Jul-22 six-category FP taxonomy); verdict per detector: SHIP / TUNE (prompt or threshold) / PULL from library | ⬜ |
 | S4 | Staged TP spot-checks (after S2, ~30 min) | pour water on the floor on camera (action semantics: must fire on the pour, then NOT re-fire on the standing puddle within cooldown — both halves are the test); enacted choking + fall (established protocol); stove on ≥10 min unattended; possible_intruder with a mask | ⬜ |
 | S5 | Fire self-wake check | closed empty room, small real flame (candle) in view: does flicker wake the camera and fire the detector? This is the one place "detect as it happens" rests on an unverified assumption. Also try a fire VIDEO on a TV screen — that's the FP half | ⬜ |
-| S6 | Sleep verification rider | overnight during S2: night summary correctness + the home-screen data contract (widget reads without glitches) — closes the standing sleep item | ⬜ |
+| S6 | Sleep verification rider | overnight during S2: night summary correctness + the home-screen data contract (widget reads without glitches) — closes the standing sleep item. KNOWN LIMITATION to measure, not fix (Aryaman 2026-08-17): sleep is scene-bucket, NOT track-bound — a partner in the same bed who wakes first will likely be read as the patient's wake time, and partner movements as the patient's disturbances. Tonight is a natural test of exactly this; log what the summary claims vs what actually happened. Fix path exists (bind sleep ticks to the seated patient track, the mechanism activity already uses) — future work. | ⬜ |
+| S7 | Data-collection annotation audit (Aryaman 2026-08-17) | collection ON for the whole soak. Every staged S4 event is annotation ground truth: the recorder sidecar must carry a span at the right offset with promoted:true + the event id (R5, generalized to every detector class); for env actions the span must sit on the POUR, not the puddle. Also closes the recording-hole re-verify on the first occupied roll (clip contiguity, no 5-min gaps). One timestamped diary diffs against all three layers: activity timeline, journal events, sidecar spans. | ⬜ |
+
+Go-state (configured 2026-08-17 23:30, AI still PAUSED — the Go is the unpause):
+all 16 detectors on (13 library adds via the real from-library API — first live
+proof of the env cooldown seeding: glass/water 1800s, fire 600s), sleep
+when-scope 7 PM–12 PM, data_collection_enabled=true (decided_at stamped via
+PATCH), node serving, dash roster-following. Overview must be checked for
+"0 of 24" BEFORE unpausing — the clean read disappears at Go.
 
 Acceptance bars (proposal — confirm with Aryaman at S3): emergency-severity
 detectors (fall, choking, emergency, fire, calling_for_help) ≈ 0 FP/day
