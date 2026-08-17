@@ -111,4 +111,16 @@ services:
       - /app/.next
     depends_on:
       - backend
-    restart: on-failure
+    restart: "no"
+
+# Pin the project network OFF Docker's default 172.16/12 pool. Some Wi-Fi
+# networks hand the Mac a 172.20.x LAN IP — the same range Compose picks for
+# this project's default network by default — so the container sees the host
+# LAN IP as directly-connected and can't reach Supabase at NEMARA_SUPABASE_URL
+# ("No route to host"). An explicit non-172 subnet keeps the host LAN IP (and
+# thus the split-horizon Supabase URL) routable from inside the container.
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 10.89.0.0/24
