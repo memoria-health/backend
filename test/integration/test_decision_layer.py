@@ -362,3 +362,50 @@ async def test_behaviour_and_care_patient_customs_fail_quiet_too(
         )
         await session.commit()
         assert len(res2.fired) == 1, f"{category} blocked a confirmed patient"
+
+
+@pytest.mark.asyncio
+async def test_provisional_seat_does_not_promote_nonsafety(
+    client: AsyncClient, auth_user, session: AsyncSession,
+) -> None:
+    """The 2026-08-17 gate hole: `identity_patient_in_clip` is satisfied
+    by a PROVISIONAL seat (body-carry, face never verified). Non-safety
+    patient-scope detectors must additionally require confirmed tenure
+    (`identity_patient_confirmed`); rows missing the flag entirely keep
+    the older in_clip-only semantics (mixed-version rollout safety —
+    pinned by test_routine_patient_custom_fails_quiet_without_confirmed_
+    patient, which never sets the flag and still promotes)."""
+    patient_id, camera_id = await _setup_patient_with_camera(
+        client, auth_user, session,
+    )
+    ident = "custom_hydration"
+    await _add_detector(
+        session, patient_id, ident, is_sustained=False,
+        category="routine", subject_scope="patient",
+    )
+    await session.commit()
+    now = datetime.now(timezone.utc)
+
+    # Provisional seat: in clip, never face-confirmed → must NOT fire.
+    f = _fields(ident)
+    f["identity_patient_in_clip"] = True
+    f["identity_patient_confirmed"] = False
+    res = await maybe_promote_analysis(
+        session, patient_id=patient_id, camera_id=camera_id,
+        occurred_at=now, description="provisional tick",
+        detector_fields=f, settings=_V2,
+    )
+    await session.commit()
+    assert res.fired == []
+
+    # Confirmed tenure → promotes.
+    f2 = _fields(ident)
+    f2["identity_patient_in_clip"] = True
+    f2["identity_patient_confirmed"] = True
+    res2 = await maybe_promote_analysis(
+        session, patient_id=patient_id, camera_id=camera_id,
+        occurred_at=now + timedelta(seconds=30), description="confirmed tick",
+        detector_fields=f2, settings=_V2,
+    )
+    await session.commit()
+    assert len(res2.fired) == 1

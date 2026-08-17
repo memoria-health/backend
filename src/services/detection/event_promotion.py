@@ -459,10 +459,22 @@ async def maybe_promote_analysis(
         # track — narrated a seated person into an empty room. A new
         # category added tomorrow must default to fail-quiet, not to
         # bypassing identity.
+        # Confirmed-tenure requirement (2026-08-17, Aryaman): in_clip is
+        # satisfied by a PROVISIONAL seat (body-carry, face never
+        # verified), which let non-safety detectors fire on an
+        # unconfirmed identity. The confirmed flag = the seat was
+        # face-confirmed at least once since binding, so a confirmed-
+        # then-carried patient still promotes (no back-to-camera FN
+        # storm) while a never-confirmed guess never does. Rows written
+        # before the flag existed fall back to in_clip-only semantics
+        # (missing -> not blocking) so a mixed-version rollout can't
+        # silence every non-safety event.
         if (det.subject_scope == "patient"
                 and det.category != "safety"
-                and not _is_truthy_bool(
-                    detector_fields.get("identity_patient_in_clip"))):
+                and not (_is_truthy_bool(
+                             detector_fields.get("identity_patient_in_clip"))
+                         and _is_truthy_bool(detector_fields.get(
+                             "identity_patient_confirmed", True)))):
             skipped.append(f"{ident}(patient_unconfirmed)")
             continue
 

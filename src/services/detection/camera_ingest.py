@@ -1807,6 +1807,7 @@ class CameraIngest:
             # enrollment) — persist both so analyses rows stay debuggable.
             result.detector_fields["identity_attribution_ran"] = identity.attribution_ran
             result.detector_fields["identity_patient_in_clip"] = identity.patient_in_clip
+            result.detector_fields["identity_patient_confirmed"] = identity.patient_confirmed
             result.detector_fields["identity_confidence"] = round(identity.confidence, 4)
             result.detector_fields["identity_face_count"] = identity.face_count
             # W2 input-quality probes — per-tick admissibility evidence
