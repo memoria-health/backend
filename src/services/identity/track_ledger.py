@@ -498,10 +498,6 @@ class TrackLedger:
             identity,
             tracks=tuple(new_tracks),
             patient_in_clip=patient_in,
-            # In this arm a patient bind originates from a face-scored
-            # lock, so bound == face-confirmed tenure (the sidecar arm
-            # computes this from the seat's confirmed_at instead).
-            patient_confirmed=patient_in,
             patient_bbox=patient_bbox if patient_in else identity.patient_bbox,
             per_frame_bboxes=per_frame,
             confidence=confidence,

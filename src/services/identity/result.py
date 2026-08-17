@@ -58,14 +58,6 @@ class IdentityResult:
     confidence: float
     best_frame_index: int | None
     face_count: int
-    # Confirmed-tenure (2026-08-17, the provisional-seat gate hole): the
-    # seat behind patient_in_clip has been FACE-CONFIRMED at least once
-    # since it bound. patient_in_clip alone is satisfied by a purely
-    # provisional seat (body-carry, face never verified), which let
-    # non-safety detectors fire on an unconfirmed identity. Event
-    # promotion requires BOTH; crops/attribution keep using
-    # patient_in_clip so a provisional seat still crops correctly.
-    patient_confirmed: bool = False
     patient_bbox: tuple[float, float, float, float] | None = None
     people_present_reid: bool = False
     people_count_reid: int = 0

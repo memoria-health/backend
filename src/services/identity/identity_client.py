@@ -272,14 +272,6 @@ class IdentityClient:
         return IdentityResult(
             reid_ran=True,
             patient_in_clip=seat_tid is not None,
-            # Confirmed-tenure: face-confirmed at least once since the
-            # seat bound (confirmed_at survives provisional carry; a
-            # never-confirmed seat has none). See result.py.
-            patient_confirmed=(
-                seat_tid is not None
-                and seat is not None
-                and seat.get("confirmed_at") is not None
-            ),
             confidence=seat_score if seat_here else 0.0,
             best_frame_index=None,
             face_count=1 if (seat_here and seat_face) else 0,
