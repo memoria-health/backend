@@ -494,8 +494,11 @@ async def test_patch_cameras_paused_does_not_cascade_to_other_caregivers_cameras
 async def test_under_18_seeds_child_detectors(
     client: AsyncClient, auth_user
 ) -> None:
-    """A patient under 18 gets the child preset set (fall / climbing /
-    distress), not the older-adult agitation/wandering/medication set."""
+    """A patient under 18 seeds ONLY the both-cohort safety net (fall).
+    The child-only preset set (climbing/distress/child_*) was deleted
+    2026-08-16 — adult-only product, zero rows in any database — so a
+    minor must get neither those nor the older-adult
+    agitation/wandering/medication set."""
     headers = await _provision(client, auth_user)
     pid = (
         await client.post(
@@ -511,7 +514,7 @@ async def test_under_18_seeds_child_detectors(
     ).json()["id"]
     dets = (await client.get(f"/v1/patients/{pid}/detectors", headers=headers)).json()
     ids = {d["identifier"] for d in dets}
-    assert ids == {"fall", "climbing", "distress"}
+    assert ids == {"fall"}
 
 
 @pytest.mark.asyncio

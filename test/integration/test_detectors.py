@@ -348,6 +348,9 @@ async def test_library_lists_adult_cohort_with_already_added(
 
 @pytest.mark.asyncio
 async def test_library_lists_child_cohort(client: AsyncClient, auth_user) -> None:
+    """A minor's library after the 2026-08-16 child-cohort deletion
+    (adult-only product): fall present and seeded; the deleted child
+    entries gone entirely; adult-only entries still not offered."""
     uid, email = auth_user
     headers = {"Authorization": f"Bearer {mint_test_jwt(uid, email)}"}
     await client.post("/v1/me", headers=headers, json={"display_name": "Test"})
@@ -357,14 +360,11 @@ async def test_library_lists_child_cohort(client: AsyncClient, auth_user) -> Non
     r = await client.get(f"/v1/patients/{pid}/detectors/library", headers=headers)
     assert r.status_code == 200
     entries = {e["key"]: e for e in r.json()}
-    for key in ("fall", "climbing", "distress"):
-        assert entries[key]["already_added"] is True, key
-    # Only `fall` is recommended; climbing/distress are seeded-not-recommended.
+    assert entries["fall"]["already_added"] is True
     assert entries["fall"]["recommended"] is True
-    for key in ("climbing", "distress"):
-        assert entries[key]["recommended"] is False, key
-    assert "child_crib_exit" in entries
-    assert entries["child_crib_exit"]["already_added"] is False
+    # Deleted child cohort: absent, not merely unrecommended.
+    for key in ("climbing", "distress", "child_crib_exit"):
+        assert key not in entries, key
     # Adult-only entries not offered to a child patient.
     for key in ("wandering", "agitation", "medication"):
         assert key not in entries, key

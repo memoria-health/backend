@@ -77,7 +77,22 @@ async def _mk_patient(session: AsyncSession, cid: UUID, age_mins: int = 0) -> UU
 
 
 # One extra live node exists in every test: the sentinel below.
-SENTINEL_LIVE = 1
+async def _live_baseline(session: AsyncSession, settings) -> int:
+    """Live identity_nodes rows this suite did NOT create.
+
+    Historically a constant 1 (the parked-home sentinel) — but the local
+    Supabase is ALSO the database a real production fleet node heartbeats
+    into every ~10s (2026-08-17), so absolute nodes_live assertions must
+    measure the pre-existing live count instead of assuming it. Mirrors
+    check()'s exact liveness cutoff."""
+    return (await session.execute(
+        text(
+            "SELECT count(*) FROM public.identity_nodes "
+            " WHERE node_id NOT LIKE 'node-%' "
+            "   AND last_seen_at > now() - make_interval(secs => :s)"
+        ),
+        {"s": settings.identity_roster_stale_after_s},
+    )).scalar() or 0
 
 
 async def _clear(session: AsyncSession) -> None:
@@ -164,9 +179,10 @@ async def test_healthy_fleet_pages_nothing(
     pid = await _mk_patient(session, cid)
     await _assign(session, pid, "node-ok", seen_mins_ago=0)
 
+    baseline = await _live_baseline(session, settings)
     counts = await _watch(settings, get_sessionmaker()).check()
     assert counts == {"blind": 0, "overdue": 0, "nodes_down": 0,
-                      "nodes_live": 1 + SENTINEL_LIVE,
+                      "nodes_live": 1 + baseline,
                       "cameras_polled": 0, "cameras_occupied": 0,
                       "cameras_lagging": 0}
     assert pages.triggered == {}
@@ -242,9 +258,10 @@ async def test_dead_node_is_a_warning_not_a_critical(
     pid = await _mk_patient(session, cid, age_mins=60)
     await _assign(session, pid, "node-dead", seen_mins_ago=30)
 
+    baseline = await _live_baseline(session, settings)
     counts = await _watch(settings, get_sessionmaker()).check()
     assert counts["nodes_down"] == 1
-    assert counts["nodes_live"] == SENTINEL_LIVE
+    assert counts["nodes_live"] == baseline
     assert pages.triggered["identity-fleet:node-down:node-dead"]["severity"] == (
         "warning"
     )
@@ -274,10 +291,11 @@ async def test_recovery_resolves_the_incident(
 
     # The node comes back and re-claims.
     await _assign(session, pid, "node-flap", seen_mins_ago=0)
+    baseline = await _live_baseline(session, settings)
     counts = await watch.check()
 
     assert counts == {"blind": 0, "overdue": 0, "nodes_down": 0,
-                      "nodes_live": 1 + SENTINEL_LIVE,
+                      "nodes_live": 1 + baseline,
                       "cameras_polled": 0, "cameras_occupied": 0,
                       "cameras_lagging": 0}
     assert "identity-fleet:node-down:node-flap" in pages.resolved
