@@ -284,9 +284,14 @@ async def test_dead_node_is_a_warning_not_a_critical(
     await _assign(session, pid, "node-dead", seen_mins_ago=30)
 
     baseline = await _live_baseline(session, settings)
-    counts = await _watch(settings, get_sessionmaker()).check()
+    watch = _watch(settings, get_sessionmaker())
+    counts = await watch.check()
     assert counts["nodes_down"] == 1
     assert counts["nodes_live"] == baseline
+    # One stale cycle is a heartbeat gap, not an incident (every backend
+    # restart produces one) — the node-down page holds for a streak.
+    assert "identity-fleet:node-down:node-dead" not in pages.triggered
+    counts = await watch.check()
     assert pages.triggered["identity-fleet:node-down:node-dead"]["severity"] == (
         "warning"
     )
@@ -311,6 +316,7 @@ async def test_recovery_resolves_the_incident(
 
     watch = _watch(settings, get_sessionmaker())
     await watch.check()
+    await watch.check()  # second stale cycle crosses the streak bar
     assert "identity-fleet:node-down:node-flap" in pages.triggered
     assert "identity-fleet:unassigned-homes" in pages.triggered
 
