@@ -272,11 +272,44 @@ def duration_line(det, tick_times: list, tz: tzinfo) -> dict:
                   "none", _strip("midnight", spans, []))
 
 
+def orphan_group_line(events: list, tz: tzinfo) -> dict:
+    """Events whose detector was later DELETED still happened, and the
+    journal for THAT day must keep narrating them (Aryaman 2026-08-17:
+    "if a detector existed in the past, its events should still be
+    recorded for that day"). The event row stores its own title/icon/
+    category precisely to outlive its detector. Grouped by stored
+    title, one line per title per day; days after the deletion have no
+    events and therefore show nothing."""
+    first = events[0]
+    n = len(events)
+    status, review_id = _review_state(events)
+    if n == 1:
+        primary = f"At {_clock(first.occurred_at, tz)}"
+        if first.location:
+            primary += f", {first.location}"
+    else:
+        word = "Twice" if n == 2 else f"{n} times"
+        primary = f"{word}, first at {_clock(first.occurred_at, tz)}"
+    return {
+        "detector_id": None,
+        "title": first.title,
+        "icon": first.icon_name,
+        "category": first.category,
+        "severity": None,
+        "kind": "point",
+        "line": {"primary": primary, "meta": "detector removed",
+                 "status": status},
+        "strip": None,
+        "review_event_id": review_id,
+    }
+
+
 def build_entries(*, detectors: list, events_by_detector: dict, tz: tzinfo,
                   sleep_row: dict | None, activity_ticks: list,
                   detected_times_by_identifier: dict,
                   streak_days_by_detector: dict,
-                  coverage_hours: int = 24) -> list[dict]:
+                  coverage_hours: int = 24,
+                  orphan_events: list | None = None) -> list[dict]:
     """Route each detector to its taxonomy's builder. Pure — the
     endpoint does the queries, this does the shape.
 
@@ -319,6 +352,14 @@ def build_entries(*, detectors: list, events_by_detector: dict, tz: tzinfo,
             e = point_line(det, events, tz,
                            streak_days_by_detector.get(str(det.id)))
         entries.append(e)
+    # Orphaned events (detector deleted) — grouped by their stored
+    # title, appended after the living detectors. See orphan_group_line.
+    if orphan_events:
+        by_title: dict[str, list] = {}
+        for ev in orphan_events:
+            by_title.setdefault(ev.title or "Event", []).append(ev)
+        for evs in by_title.values():
+            entries.append(orphan_group_line(evs, tz))
     if coverage_hours == 0:
         for e in entries:
             quiet = (e["line"]["status"] == "ok"

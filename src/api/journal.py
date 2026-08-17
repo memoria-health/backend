@@ -71,6 +71,7 @@ async def get_journal(
         .order_by(Event.occurred_at)
     )).scalars().all()
     events_by_detector: dict[str, list] = {}
+    orphan_events: list = []
     for ev in events:
         # Reviewed-as-wrong events are confirmed false alarms: they stay
         # on the Events page, but the journal doesn't narrate them and
@@ -79,6 +80,10 @@ async def get_journal(
             continue
         if ev.detector_id is not None:
             events_by_detector.setdefault(str(ev.detector_id), []).append(ev)
+        else:
+            # Detector deleted after the event fired — the event's own
+            # stored title/icon/category carry it (journal_day.orphan_group_line).
+            orphan_events.append(ev)
 
     # Analysis ticks: activity states + per-identifier detected times for
     # record streams, in one pass. Modest row counts at a day's scale.
@@ -149,6 +154,7 @@ async def get_journal(
         detected_times_by_identifier=detected_times,
         streak_days_by_detector=streaks,
         coverage_hours=int(cov["n"]),
+        orphan_events=orphan_events,
     )
     return {
         "date": date,
