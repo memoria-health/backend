@@ -117,10 +117,16 @@ async def get_journal(
     # on a fully-watched IST day: the local day spans 18:30->18:30 UTC,
     # clipping two PARTIAL utc-hour buckets at the edges ("cameras
     # watched 25 of 24 hours", live 2026-08-17).
+    # provider='skipped' rows exist to record that the AI did NOT
+    # analyze (ai_paused / disabled ticks still write one per cadence
+    # for the debug feed + ingress health). Counting them as coverage
+    # showed "watched 16 of 24 hours" on a day the AI was paused
+    # throughout (live 2026-08-18). Only REAL analyses count.
     cov = (await session.execute(text("""
         select count(distinct date_trunc('hour', captured_at at time zone :tz))::int as n
         from analyses
         where patient_id = :p and captured_at >= :s and captured_at < :e
+          and provider <> 'skipped'
         """), {"p": patient_id, "s": start, "e": end,
                "tz": str(tz)})).mappings().one()
 

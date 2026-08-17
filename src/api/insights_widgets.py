@@ -380,6 +380,7 @@ async def widget_data(
                    (select count(distinct date_trunc('hour', a.captured_at))::int
                     from analyses a
                     where a.camera_id = c.id
+                      and a.provider <> 'skipped'
                       and a.captured_at >= now() - (:days * interval '1 day')) as hours
             from cameras c where not c.disabled and c.patient_id = any(:ids)
             order by hours desc limit 12
