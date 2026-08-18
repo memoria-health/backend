@@ -180,7 +180,7 @@ def series_bboxes(obs: "RemoteObservations", batch) -> dict[int, list]:
     for fi, rows in obs.rows_by_frame.items():
         if fi >= len(batch):
             continue
-        ts = float(batch[fi][0])
+        ts = float(batch[fi][1])  # ring entries are (idx, ts, frame)
         for row in rows:
             out.setdefault(int(row[4]), []).append(
                 (ts, (float(row[0]), float(row[1]),
