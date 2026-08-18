@@ -135,13 +135,8 @@ def _sign(body: str, secret: str) -> str:
     return hmac.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
 
 
-# ── record-only tick verdicts (soak tooling, 2026-08-18) ─────────────
-# Record-only detectors have no event to gate; their product surface is
-# a COUNT. The page that announces a positive tick carries one of these
-# tokens so the operator can rule on the count: deny stamps
-# `<ident>_verdict='rejected'` on the tick and count surfaces skip it.
-# Same secret and signer as event verdicts; the `rt` prefix makes the
-# two token kinds mutually unacceptable.
+# Record-only tick verdict tokens: rule on the COUNT, not an event.
+# Same signer as event verdicts; `rt` prefix keeps the kinds separate.
 
 TICK_TOKEN_TTL_S = 24 * 3600   # a count correction can wait overnight
 
@@ -293,13 +288,8 @@ async def route_events(
     # tick that fires two detectors pages about one and silently drops
     # the other, and settling the paged one would hide the unpaged one.
     #
-    # Urgency is SAFETY-ONLY (Aryaman 2026-08-18): the 60s auto-release
-    # exists so a fall reaches the family even with no operator awake —
-    # that invariant is untouched. Every other category now waits for a
-    # human verdict, however long that takes: a routine or behaviour
-    # event reaching the caregiver unverified is noise, not protection.
-    # A held non-safety event with no verdict stays 'pending' and
-    # visible in the ops /queue; it never times out into the app.
+    # Safety-only urgency: only safety events auto-release at 60s;
+    # everything else waits for a human verdict (visible in /queue).
     cats = {}
     if gated:
         async with sessionmaker() as session:

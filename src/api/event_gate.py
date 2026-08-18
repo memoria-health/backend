@@ -270,12 +270,8 @@ async def act_submit(
     return _html(_result_page(row, result=result))
 
 
-# ── record-only tick verdicts (same page machinery, 2026-08-18) ──────
-# No event exists for a record-only positive; these two routes rule on
-# the COUNT. GET renders, POST mutates (link previews cannot vote) —
-# the same discipline as the event verdict above, same signer, same
-# CSS, no confirm step (a count correction is reversible in the ledger,
-# unlike suppressing a safety alert).
+# Record-only tick verdicts: rule on the COUNT. GET renders, POST
+# mutates; no confirm step (a count correction is recoverable).
 
 
 @router.get("/tick/{token}", response_class=HTMLResponse)

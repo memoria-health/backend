@@ -365,16 +365,8 @@ async def _episode_already_fired(
     return (await session.execute(stmt)).scalar_one_or_none() is not None
 
 
-# ── Soak instrumentation: record-only occurrence paging ──────────────
-# (Aryaman 2026-08-18, during the built-in FP soak): record-only
-# detectors never promote or notify, so their false positives surface
-# only as silent Overview counts — the drinking-water confabulation
-# pair was found by SQL, not by a page. Behind a flag (off in prod),
-# OCCURRENCE-shaped record-only positives page the operator like gated
-# events do. State-LABELER record-onlys are excluded by name: sleep is
-# positive for a whole night and activity labels every occupied tick —
-# paging a continuous state is spam by construction, and both already
-# have verification instruments (sleep summary, D6 diary).
+# Record-only occurrence paging, behind settings.record_only_paging.
+# Sleep/activity excluded: continuous state labels, paging them is spam.
 _RECORD_ONLY_PAGE_EXCLUDE = frozenset({"sleep", "activity"})
 _RECORD_ONLY_PAGE_MIN_GAP_S = 300.0
 _record_only_last_page: dict[str, float] = {}
@@ -401,9 +393,7 @@ async def _maybe_page_record_only(
     last = _record_only_last_page.get(ident)
     if last is not None and now_mono - last < _RECORD_ONLY_PAGE_MIN_GAP_S:
         return
-    # Rising edge only: the previous tick that carried this field must
-    # not also be positive — consecutive-tick occurrences are one
-    # moment, not two. One indexed lookup, only on positive ticks.
+    # Rising edge only: consecutive positive ticks are one occurrence.
     prev = (await session.execute(
         select(Analysis.detector_fields[detected_field].astext)
         .where(
