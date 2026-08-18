@@ -13,6 +13,7 @@ other are squashed. Prevents a noisy 3-tick run of fall_detected=true
 from filing three separate events.
 """
 
+import asyncio
 import logging
 import time
 from collections.abc import Mapping, Sequence
@@ -407,38 +408,61 @@ async def _maybe_page_record_only(
     if prev == "true":
         return
     _record_only_last_page[ident] = now_mono
-    reasoning = detector_fields.get(f"{ident}_reasoning") or ""
+    reasoning = str(detector_fields.get(f"{ident}_reasoning") or "")
+    confidence = detector_fields.get(f"{ident}_confidence")
+    det_name, det_id = det.name, det.id
+    from src.db.session import get_sessionmaker
     from src.services.event_gate import tick_verdict_url
 
-    verdict_url = tick_verdict_url(
-        camera_id=camera_id, captured_at=occurred_at, ident=ident,
-        settings=settings,
-    )
-    ok = await pager.trigger_keyed(
-        settings=settings,
-        dedup_key=f"record-only:{det.id}:{occurred_at.isoformat()}",
-        summary=f"[record-only] {det.name}: {str(reasoning)[:120]}",
-        severity="info",
-        source="memoria-record-only-soak",
-        link_url=verdict_url,
-        details={
-            "detector": det.name,
-            "identifier": ident,
-            "reasoning": str(reasoning)[:400],
-            "confidence": detector_fields.get(f"{ident}_confidence"),
-            "verdict_url": verdict_url,
-            "note": (
-                "no event exists — this rules on the COUNT: accept "
-                "keeps the occurrence in Overview, deny removes it and "
-                "files a labeled false positive"
-            ),
-        },
-    )
-    if ok:
-        log.info(
-            "[record-only-page] %s (%s) paged — reasoning=%r",
-            det.name, ident, str(reasoning)[:80],
-        )
+    # Deferred: the caller's transaction may still roll back (a tick
+    # failure after promotion did, 2026-08-18, and the page pointed at
+    # a row that never committed). Re-verify the row, then page.
+    async def _page_after_commit() -> None:
+        await asyncio.sleep(3)
+        try:
+            async with get_sessionmaker()() as s:
+                exists = (await s.execute(
+                    select(Analysis.id).where(
+                        Analysis.camera_id == camera_id,
+                        Analysis.captured_at == occurred_at,
+                    ).limit(1)
+                )).scalar_one_or_none()
+            if exists is None:
+                log.info("[record-only-page] %s tick rolled back — no page",
+                         ident)
+                return
+            verdict_url = tick_verdict_url(
+                camera_id=camera_id, captured_at=occurred_at, ident=ident,
+                settings=settings,
+            )
+            ok = await pager.trigger_keyed(
+                settings=settings,
+                dedup_key=f"record-only:{det_id}:{occurred_at.isoformat()}",
+                summary=f"[record-only] {det_name}: {reasoning[:120]}",
+                severity="info",
+                source="memoria-record-only-soak",
+                link_url=verdict_url,
+                details={
+                    "detector": det_name,
+                    "identifier": ident,
+                    "reasoning": reasoning[:400],
+                    "confidence": confidence,
+                    "verdict_url": verdict_url,
+                    "note": (
+                        "no event exists — this rules on the COUNT: accept "
+                        "keeps the occurrence, deny removes it and files a "
+                        "labeled false positive"
+                    ),
+                },
+            )
+            if ok:
+                log.info("[record-only-page] %s (%s) paged — %r",
+                         det_name, ident, reasoning[:80])
+        except Exception:  # noqa: BLE001 — paging must never hurt a tick
+            log.exception("[record-only-page] %s failed", ident)
+
+    asyncio.create_task(
+        _page_after_commit(), name=f"record-only-page-{ident}")
 
 
 async def maybe_promote_analysis(
