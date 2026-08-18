@@ -514,6 +514,22 @@ async def frame(cam: str, name: str):
     return FileResponse(p, media_type="image/jpeg")
 
 
+_CROPS_DIR = Path(__file__).resolve().parents[1] / "out" / "live-crops"
+
+
+@app.get("/crops/{kind}")
+async def crop_artifact(kind: str):
+    f = _CROPS_DIR / f"latest_{kind}.mp4"
+    if kind not in ("full", "person") or not f.is_file():
+        return JSONResponse({"error": "none"}, status_code=404)
+    label = _CROPS_DIR / f"latest_{kind}.txt"
+    return FileResponse(f, media_type="video/mp4", headers={
+        "Cache-Control": "no-store",
+        "X-Age-S": str(round(time.time() - f.stat().st_mtime, 1)),
+        "X-Detectors": label.read_text() if label.is_file() else "",
+    })
+
+
 def _pctl(vals: list[float], p: float):
     if not vals:
         return None
@@ -1018,7 +1034,13 @@ Also: <span class="mono">episode_gap_seconds</span> is DEAD (still stored — 90
 <div id="idsvc" class="mut">connecting…</div>
 <div id="idtl" style="margin-top:8px"></div>
 <div id="idprobes" style="margin-top:10px;max-height:340px;overflow-y:auto"></div>
-<div id="idstreams" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px"></div></div>
+<div id="idstreams" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px"></div>
+<div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:8px">
+ <div><div class="mono mut" id="cropfullmeta" style="font-size:11px">gemini input · full: —</div>
+  <video id="cropfull" width="380" muted autoplay loop playsinline></video></div>
+ <div><div class="mono mut" id="croppersonmeta" style="font-size:11px">gemini input · person crop: —</div>
+  <video id="cropperson" width="380" muted autoplay loop playsinline></video></div>
+</div></div>
 <div class="card"><h2>Identity events — unsupervised journal <span class="mut" style="font-weight:400;font-size:12px">(every birth/death/lock, with the picture)</span></h2>
 <p class="mut" style="font-size:11.5px;margin:0 0 8px">The overnight record: one row per identity event, newest first, snapshot inline. <b>lock/moved</b> rows carry confirm-latency (track created → patient confirmed) — the number that must stay under a minute.</p>
 <div id="idconfstats" class="mono" style="font-size:12px;margin:0 0 8px"></div>
@@ -1384,6 +1406,19 @@ async function pollIdTimeline(){
   }catch(e){}
 }
 pollIdTimeline(); setInterval(pollIdTimeline, 10000);
+async function pollCrops(){
+  for(const k of ["full","person"]){
+    try{
+      const r=await fetch("/crops/"+k+"?t="+Date.now());
+      const m=document.getElementById("crop"+k+"meta");
+      if(!r.ok){m.textContent="gemini input · "+k+": (none this tick)";continue;}
+      m.textContent="gemini input · "+k+" · "+r.headers.get("X-Age-S")+"s ago · "+(r.headers.get("X-Detectors")||"");
+      const v=document.getElementById("crop"+k), old=v.src;
+      v.src=URL.createObjectURL(await r.blob()); if(old)URL.revokeObjectURL(old);
+    }catch(e){}
+  }
+}
+pollCrops(); setInterval(pollCrops, 8000);
 </script></div></body></html>"""
 
 

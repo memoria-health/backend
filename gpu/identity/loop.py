@@ -176,15 +176,18 @@ _TRACK_SEND_W_DEFAULT = 10 ** 9  # NATIVE ship resolution (Aryaman,
 def series_bboxes(obs: "RemoteObservations", batch) -> dict[int, list]:
     """tid -> [(frame_wall_ts, bbox), ...] for every observed frame —
     feeds the follow-crop series (2026-08-18)."""
+    # rows_by_frame keys are the pod-echoed ORIGINAL ring indexes
+    # (monotonic), not batch positions — map idx -> ts via the batch.
+    ts_by_idx = {e[0]: e[1] for e in batch}
     out: dict[int, list] = {}
     for fi, rows in obs.rows_by_frame.items():
-        if fi >= len(batch):
+        ts = ts_by_idx.get(fi)
+        if ts is None:
             continue
-        ts = float(batch[fi][1])  # ring entries are (idx, ts, frame)
         for row in rows:
             out.setdefault(int(row[4]), []).append(
-                (ts, (float(row[0]), float(row[1]),
-                      float(row[2]), float(row[3]))))
+                (float(ts), (float(row[0]), float(row[1]),
+                             float(row[2]), float(row[3]))))
     for v in out.values():
         v.sort(key=lambda e: e[0])
     return out
