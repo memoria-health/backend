@@ -232,3 +232,7 @@ Still open from this sprint: L4/5 capacity run (pin the occupied-camera
 ceiling); soak dashboard node lookup must follow the roster (was aimed
 at dead node C); backend liveness alarm; identity_nodes dead-row reaper
 (M3 batch); FleetWatch lag>tick alarm.
+
+SOAK CONFIG BOUNDARY (2026-08-18 ~14:15 IST): media_res high->medium,
+thinking high->medium (Aryaman, cost). FP/FN rates before vs after this
+point are not directly comparable.
