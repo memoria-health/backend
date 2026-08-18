@@ -129,6 +129,11 @@ async def trigger_keyed(
             "summary": summary[:1024],
             "source": source,
             "severity": severity,
+            # Distinct class per alert kind: PD's alert grouping keys on
+            # these; without them it merged fall alerts into an open
+            # record-only incident (live 2026-08-18, three silent falls).
+            "class": summary.split(":")[-1].strip()[:64],
+            "component": dedup_key.split(":")[0][:64],
             "custom_details": details or {},
         },
     }
