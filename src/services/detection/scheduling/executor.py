@@ -325,7 +325,7 @@ async def run_scheduled_calls(
             artifact_fps=artifact_fps, overlay_specs=overlay_specs,
             degraded_artifact=degraded_this_call,
         ))
-        if settings.artifact_dump_dir and mp4:
+        if getattr(settings, "artifact_dump_dir", "") and mp4:
             try:
                 import pathlib as _pl
                 import time as _time
