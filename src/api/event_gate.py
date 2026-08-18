@@ -327,7 +327,7 @@ async def tick_submit(
                                   and (:t)::timestamptz + interval '1 second'
               and detector_fields->>:vf is null
             returning id"""),
-        {"c": camera_id, "t": captured_at.isoformat(), "v": stamped,
+        {"c": camera_id, "t": captured_at, "v": stamped,
          "vf": f"{ident}_verdict", "vat": f"{ident}_verdict_at"},
     )).first()
     await session.commit()
@@ -353,7 +353,7 @@ async def _load_tick(session, camera_id, captured_at, ident) -> dict | None:
               and captured_at between (:t)::timestamptz - interval '1 second'
                                   and (:t)::timestamptz + interval '1 second'
             limit 1"""),
-        {"c": camera_id, "t": captured_at.isoformat(),
+        {"c": camera_id, "t": captured_at,
          "rf": f"{ident}_reasoning", "vf": f"{ident}_verdict"},
     )).first()
     if row is None:
