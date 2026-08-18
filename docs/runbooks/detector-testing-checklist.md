@@ -236,3 +236,4 @@ at dead node C); backend liveness alarm; identity_nodes dead-row reaper
 SOAK CONFIG BOUNDARY (2026-08-18 ~14:15 IST): media_res high->medium,
 thinking high->medium (Aryaman, cost). FP/FN rates before vs after this
 point are not directly comparable.
+CONFIG: 15:25 IST media_res back to HIGH (fall FPs: couch read as floor at medium). thinking stays medium, scene stays consolidated.
