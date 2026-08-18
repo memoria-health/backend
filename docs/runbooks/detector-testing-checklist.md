@@ -237,3 +237,4 @@ SOAK CONFIG BOUNDARY (2026-08-18 ~14:15 IST): media_res high->medium,
 thinking high->medium (Aryaman, cost). FP/FN rates before vs after this
 point are not directly comparable.
 CONFIG: 15:25 IST media_res back to HIGH (fall FPs: couch read as floor at medium). thinking stays medium, scene stays consolidated.
+ROOT CAUSE CLOSED (15:5x IST): PD alert grouping silently folded fall alerts into open incidents (proven by ordered probes). Fix: grouping OFF in PD service settings (Aryaman) + record-only incidents self-resolve after 15 min. Re-verify: staged fall with grouping off must page.

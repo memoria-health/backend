@@ -458,6 +458,14 @@ async def _maybe_page_record_only(
             if ok:
                 log.info("[record-only-page] %s (%s) paged — %r",
                          det_name, ident, reasoning[:80])
+                # Self-resolve: an open incident is grouping bait that
+                # swallowed fall alerts (2026-08-18); the verdict link
+                # outlives the incident (24h token).
+                await asyncio.sleep(900)
+                await pager.resolve_keyed(
+                    settings=settings,
+                    dedup_key=f"record-only:{det_id}:{occurred_at.isoformat()}",
+                )
         except Exception:  # noqa: BLE001 — paging must never hurt a tick
             log.exception("[record-only-page] %s failed", ident)
 
