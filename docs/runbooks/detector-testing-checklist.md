@@ -61,7 +61,7 @@ backend container only).
 | D3 | Reasoning-first + base-rate prompt | drinking-water FP rate collapsed, evidence coherent per-call | ✅ Aug 7-8 (2%→0.27%/tick) · week-watch 🟡 |
 | D4 | Sustained state split — entry / latch / concurrent / exit / re-latch | one event per episode; re-latch after >5 min gap | ✅ Aug 8 (TV + Laptop, all edges) · TV-exit edge 🟡 (same code path as laptop, never directly observed) |
 | D5 | Identity fail-quiet gate covers behaviour/care | next behaviour event has `identity_patient_in_clip=true`; unit test pins the category rule | ✅ unit · 🟡 live (absence-of-FP only) |
-| D6 | **Activity verification — the 3-layer plan** | see §1a | ⬜ **today's centrepiece** |
+| D6 | **Activity verification — the 3-layer plan** | see §1a | ✅ 08-18 guided soak: interior accuracy 100% on sit_still/arm-raises/gesturing/standing/walking, 91% lying (19 min, recline-vs-sit ambiguity); 0 sitting@1.0 during arm raises (the pre-split bug gone); 165 ticks/27.5 min = 0 shed; phase-boundary 'misses' were the labeler catching transitions more precisely than the buckets. Diary cross-check (layer 4) rides the rest of the day. |
 | D7 | VLM chain after OpenRouter removal | a compile (OpenAI-first) succeeds with the new key; routing tests green | 🟡 (unit green; new key probed 200; no end-to-end compile since key swap) |
 | D8 | Event gate round-trip | held → paged → verdict/auto-release → dispatch | ✅ Aug 5-7 live |
 
