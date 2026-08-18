@@ -52,6 +52,12 @@ RUN uv sync --frozen --no-dev --no-install-project
 COPY src ./src
 COPY supabase ./supabase
 COPY scripts ./scripts
+# Node-side identity package: embeddings.py re-exports its matching
+# math (`from identity.matching import ...`). Mirror the local
+# compose's PYTHONPATH=/app:/app/gpu — without this the app dies at
+# import in prod (2026-08-19 first v2 deploy).
+COPY gpu/identity ./gpu/identity
+ENV PYTHONPATH=/app:/app/gpu
 # README.md is referenced as the project's `readme` field in
 # pyproject.toml — hatchling fails the build step below if it's
 # absent. Cheap to include.
