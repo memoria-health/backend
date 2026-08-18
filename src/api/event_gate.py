@@ -368,7 +368,7 @@ async def _load(session, event_id: UUID, *, settings) -> dict | None:
                   coalesce(e.location, ''), e.gate_state,
                   greatest(0, :auto - extract(epoch from now()
                             - coalesce(e.gate_held_at, e.created_at)))::int,
-                  e.gate_clip_key
+                  e.gate_clip_key, e.category::text
            from events e join patients p on p.id = e.patient_id
            where e.id = :id"""),
         {"id": str(event_id), "auto": event_gate.AUTO_RELEASE_S})).first()
@@ -380,6 +380,7 @@ async def _load(session, event_id: UUID, *, settings) -> dict | None:
         # Just whether there IS one. The page points at our own proxy
         # route rather than a storage URL — see `act_clip`.
         "has_clip": bool(row[6]),
+        "urgent": row[7] == "safety",
     }
 
 
@@ -488,16 +489,20 @@ def _decision_page(row: dict, *, token: str) -> str:
         _header(row)
         + _clip(row, token=token)
         + f"<div class='narr'>{html.escape(row['narrative'])}</div>"
-        + f"<p class='sub'>Auto-sends to the caregiver in "
-          f"<span class='count' id='c'>{left}</span>s if you do nothing.</p>"
+        + (f"<p class='sub'>Auto-sends to the caregiver in "
+           f"<span class='count' id='c'>{left}</span>s if you do nothing.</p>"
+           if row.get("urgent")
+           else "<p class='sub'>Waits for your verdict — nothing is sent "
+                "until you decide.</p>")
         + f"<form method='post' action='{base}?action=suppress'>"
           "<button class='suppress'>Suppress — false alarm</button></form>"
         + f"<form method='post' action='{base}?action=release'>"
           "<button class='release'>Send now — this is real</button></form>"
         + "<p class='note'>Suppressing means the caregiver is never told "
           "about this alert.</p>"
-        + f"<script nonce='{_NONCE_SLOT}'>var n=" + str(left) + ",e=document.getElementById('c');"
-          "setInterval(function(){if(n>0){n--;e.textContent=n;}},1000);</script>"
+        + (f"<script nonce='{_NONCE_SLOT}'>var n=" + str(left) + ",e=document.getElementById('c');"
+           "setInterval(function(){if(n>0){n--;e.textContent=n;}},1000);</script>"
+           if row.get("urgent") else "")
     )
 
 

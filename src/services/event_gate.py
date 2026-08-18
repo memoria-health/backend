@@ -325,13 +325,13 @@ async def _page_for(
             row = (await session.execute(text(
                 """select e.title, coalesce(e.narrative, ''),
                           coalesce(nullif(p.preferred_name, ''), p.full_name),
-                          coalesce(e.location, '')
+                          coalesce(e.location, ''), e.category::text
                    from events e join patients p on p.id = e.patient_id
                    where e.id = :id"""), {"id": str(event_id)})).first()
         if row is None:
             log.warning("event_gate.page_skip reason=event_vanished id=%s", event_id)
             return
-        title, narrative, patient_name, room = row
+        title, narrative, patient_name, room, category = row
         summary = f"{patient_name}: {title}" + (f" ({room})" if room else "")
         await pager.trigger(
             settings=settings,
@@ -342,7 +342,9 @@ async def _page_for(
                 "patient": patient_name,
                 "room": room or "unknown",
                 "narrative": narrative,
-                "auto_release_seconds": AUTO_RELEASE_S,
+                **({"auto_release_seconds": AUTO_RELEASE_S}
+                   if category == "safety"
+                   else {"auto_release": "none — waits for verdict"}),
             },
         )
     except Exception:  # noqa: BLE001 — a paging failure must not strand the event
