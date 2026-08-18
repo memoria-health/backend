@@ -325,6 +325,17 @@ async def run_scheduled_calls(
             artifact_fps=artifact_fps, overlay_specs=overlay_specs,
             degraded_artifact=degraded_this_call,
         ))
+        if settings.artifact_dump_dir and mp4:
+            try:
+                import pathlib as _pl
+                import time as _time
+                _d = _pl.Path(settings.artifact_dump_dir)
+                _d.mkdir(parents=True, exist_ok=True)
+                _name = (f"{_time.strftime('%H%M%S')}_"
+                         f"{plan.crop}_{'-'.join(idents)[:80]}.mp4")
+                (_d / _name).write_bytes(mp4)
+            except Exception:  # noqa: BLE001 — a dump must never hurt a tick
+                log.exception("executor.artifact_dump_failed")
 
     # ── Phase 2: provider calls (CONCURRENT) ─────────────────────────
     # `return_exceptions=True` so one crop call 503'ing cannot cancel

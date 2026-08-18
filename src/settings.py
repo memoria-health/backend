@@ -392,6 +392,8 @@ class Settings(BaseSettings):
     scheduler_sample_every_k: int = Field(ge=1, le=60, default=1)
     # Page record-only positives (rising edge) for verification. Off in prod.
     record_only_paging: bool = Field(default=False)
+    # Dump every VLM artifact (exact Gemini input bytes) here. "" = off.
+    artifact_dump_dir: str = Field(default="")
     # Crowd hardening (D3): more than this many concurrent tracks ⇒ no
     # per-person crops this tick — every detector runs full-scene.
     scheduler_crowd_fallback_tracks: int = Field(ge=1, le=16, default=4)
