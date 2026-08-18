@@ -484,7 +484,9 @@ class CameraIngest:
                 # mode. The 3rd generation is no longer dropped — its
                 # WINDOW is frozen and runs when a slot frees (W1),
                 # because the action may live only in that window.
-                if len(self._inflight_ticks) >= 2:
+                if len(self._inflight_ticks) >= (
+                    self._settings.scheduler_tick_max_inflight
+                ):
                     self._pin_or_shed_tick()
                     continue
                 task = asyncio.create_task(

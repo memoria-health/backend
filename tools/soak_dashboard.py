@@ -318,6 +318,10 @@ async def data() -> JSONResponse:
         fired = [k[:-9] for k, v in f.items() if k.endswith("_detected") and v is True]
         tick = {
             "t": _local_hms(r.captured_at),
+            # Action→verdict: window end (captured_at) → row save. The
+            # per-call ms breakdown rides sched_calls[].ms.
+            "lag": round((r.created_at - r.captured_at).total_seconds(), 1)
+            if r.created_at else None,
             "cam": cam,
             "skip": f.get("skipped_reason") if r.provider == "skipped" else None,
             "motion": f.get("motion_src"),
@@ -1067,7 +1071,7 @@ function tickLine(t){
   if(t.skip==="tick_failed")
     return `<span class="crit">⛔ TICK FAILED · ${esc(t.err??"?")}: ${esc(t.emsg??"")}</span>${fps}`;
   if(t.skip) return `skipped · ${esc(t.skip)}${fps}`;
-  let b=`${t.woke?'<span class="ok">⚡ WOKE</span> ':""}motion=${esc(t.motion??"—")} people=${t.ppl?"YES":"no"} (via ${esc(t.psrc??"—")}) tracks=${t.tracks}`;
+  let b=`${t.woke?'<span class="ok">⚡ WOKE</span> ':""}${t.lag!=null?`<span class="${t.lag>20?"crit":t.lag>12?"warn":"ok"}">lag=${t.lag}s</span> `:""}motion=${esc(t.motion??"—")} people=${t.ppl?"YES":"no"} (via ${esc(t.psrc??"—")}) tracks=${t.tracks}`;
   if(t.amount!=null) b+=` track-motion=${t.amount}`;
   if(t.env!=null) b+=` env-motion=${t.env}`;
   if(t.calls.length) b+=` calls=[${t.calls.map(c=>
