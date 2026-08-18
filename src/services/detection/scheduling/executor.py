@@ -105,6 +105,7 @@ _FRAME_SAMPLING_PROVIDERS = frozenset({"openai", "dashscope"})
 # vice versa, is exactly the mismatch that caused prod seizure
 # overfiring). Detectors without an entry keep their own fragment; the
 # provider's tint note (motion_overlay=True) explains the red channel.
+_CROP_MAX_TRACK_AGE_S = 5.0
 _OVERLAY_SPECS = {"seizure": rapid_seizure_spec()}
 
 
@@ -295,6 +296,16 @@ async def run_scheduled_calls(
             ]
         elif plan.crop == "person" and plan.target_track_id is not None:
             track = tracks_by_id.get(plan.target_track_id)
+            # A stale box must not aim the crop: the 2026-08-18 exhibit
+            # was a person-crop of an empty TV console (track age >>
+            # clip window) that the model then confabulated actions
+            # into. Stale -> degrade to the full-frame artifact below.
+            if track is not None and track.age_s > _CROP_MAX_TRACK_AGE_S:
+                log.info(
+                    "executor.stale_track_crop_degraded track=%d age=%.1fs",
+                    track.track_id, track.age_s,
+                )
+                track = None
             crop_mp4 = None
             if track is not None:
                 crop_mp4 = await build_person_crop_mp4(

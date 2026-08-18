@@ -262,6 +262,7 @@ class IdentityClient:
                 bbox_space=BBOX_SPACE_NATIVE,
                 face_locked=face_locked,
                 pre_labeled=is_patient and not face_locked,
+                age_s=float(tv.get("age_s") or 0.0),
                 pre_label_source=(
                     "gallery" if (is_patient and not face_locked) else None
                 ),

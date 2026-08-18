@@ -80,6 +80,9 @@ class TrackObservation:
     smallface_events: int = 0
     # Best gallery match score on this track this clip (any quality).
     best_match_score: float = 0.0
+    # Seconds since this track's bbox was last updated by perception
+    # (0.0 = fresh/unknown). Stale boxes must not aim person crops.
+    age_s: float = 0.0
     # Grid `bbox_series` / `face_px_max` are measured on. Defaults to
     # EXTRACTED so the legacy in-process path keeps its exact
     # behaviour; the sidecar provider sets NATIVE explicitly.
