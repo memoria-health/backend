@@ -21,6 +21,9 @@ class TrackView:
     born_at: float
     last_seen: float
     batches_seen: int = 1
+    # Recent (wall_ts, bbox) samples, newest last — the follow-crop
+    # series (2026-08-18). Capped in apply(); ~15s of history.
+    series: tuple[tuple[float, Bbox], ...] = ()
 
     def age(self, *, now: float) -> float:
         return now - self.born_at
@@ -48,7 +51,9 @@ class CameraState:
         """Exactly one live person on this camera."""
         return len(self.live_ids) == 1
 
-    def apply(self, batch_tracks: dict[int, Bbox], *, now: float) -> TrackEvents:
+    def apply(self, batch_tracks: dict[int, Bbox], *, now: float,
+              batch_series: dict[int, list[tuple[float, Bbox]]] | None = None,
+              ) -> TrackEvents:
         """Fold one batch's pod output (tid -> newest bbox) into state.
 
         SWAP-NOT-MUTATE: a NEW dict is built and assigned in one
@@ -62,16 +67,21 @@ class CameraState:
         new_tracks: dict[int, TrackView] = {}
         for tid, bbox in batch_tracks.items():
             t = self.tracks.get(tid)
+            fresh = tuple((batch_series or {}).get(tid) or ())
             if t is None:
-                new_tracks[tid] = TrackView(
+                t = TrackView(
                     track_id=tid, bbox=bbox, born_at=now, last_seen=now,
+                    series=fresh[-45:],
                 )
                 births.append(tid)
             else:
                 t.bbox = bbox
                 t.last_seen = now
                 t.batches_seen += 1
-                new_tracks[tid] = t
+                t.series = tuple(
+                    e for e in (*t.series, *fresh) if now - e[0] <= 15.0
+                )[-45:]
+            new_tracks[tid] = t
         for tid in self.tracks:
             if tid not in batch_tracks:
                 deaths.append(tid)

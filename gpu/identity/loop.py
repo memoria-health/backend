@@ -173,6 +173,23 @@ _TRACK_SEND_W_DEFAULT = 10 ** 9  # NATIVE ship resolution (Aryaman,
                                # COUNT (TARGET_FPS) is the cost lever.
 
 
+def series_bboxes(obs: "RemoteObservations", batch) -> dict[int, list]:
+    """tid -> [(frame_wall_ts, bbox), ...] for every observed frame —
+    feeds the follow-crop series (2026-08-18)."""
+    out: dict[int, list] = {}
+    for fi, rows in obs.rows_by_frame.items():
+        if fi >= len(batch):
+            continue
+        ts = float(batch[fi][0])
+        for row in rows:
+            out.setdefault(int(row[4]), []).append(
+                (ts, (float(row[0]), float(row[1]),
+                      float(row[2]), float(row[3]))))
+    for v in out.values():
+        v.sort(key=lambda e: e[0])
+    return out
+
+
 def newest_bboxes(obs: RemoteObservations) -> dict[int, tuple]:
     """tid -> bbox from each track's newest observed frame."""
     out: dict[int, tuple[int, tuple]] = {}
@@ -765,7 +782,9 @@ class CameraLoop:
         obs, vetoed = apply_veto(obs, self.screen_map, now=time.monotonic())
 
         prev_boxes = {t: tv.bbox for t, tv in self.state.tracks.items()}
-        events = self.state.apply(newest_bboxes(obs), now=now)
+        events = self.state.apply(
+            newest_bboxes(obs), now=now,
+            batch_series=series_bboxes(obs, batch))
         if events.births or events.deaths:
             log.info(
                 "identity.tracks cam=%s births=%s deaths=%s live=%s",

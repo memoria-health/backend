@@ -134,7 +134,15 @@ def state(request: Request) -> JSONResponse:
             cam_id: {
                 "name": _HOME.name_of(cam_id),
                 "tracks": {
-                    tid: {"bbox": tv.bbox, "age_s": round(tv.age(now=time.time()), 1)}
+                    tid: {
+                        "bbox": tv.bbox,
+                        "age_s": round(tv.age(now=time.time()), 1),
+                        "seen_s": round(time.time() - tv.last_seen, 1),
+                        "bbox_series": [
+                            [round(ts, 3), list(bb)]
+                            for ts, bb in tv.series[-40:]
+                        ],
+                    }
                     for tid, tv in sp.state.tracks.items()
                 },
                 "solo": sp.state.solo,

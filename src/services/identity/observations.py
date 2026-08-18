@@ -60,7 +60,9 @@ class TrackObservation:
     track_id: int
     label: str
     confidence: float
-    bbox_series: tuple[tuple[int, tuple[float, float, float, float]], ...]
+    # Keys: node wall-clock ts (sidecar, follow-crop series) or
+    # legacy frame index (0 = single snapshot).
+    bbox_series: tuple[tuple[float, tuple[float, float, float, float]], ...]
     face_locked: bool
     pre_labeled: bool
     # Tallest usable face on this track, px on the `bbox_space` grid
@@ -80,8 +82,8 @@ class TrackObservation:
     smallface_events: int = 0
     # Best gallery match score on this track this clip (any quality).
     best_match_score: float = 0.0
-    # Seconds since this track's bbox was last updated by perception
-    # (0.0 = fresh/unknown). Stale boxes must not aim person crops.
+    # Seconds since perception LAST SAW this track (staleness, not
+    # lifetime — conflating them degraded every crop, 2026-08-18).
     age_s: float = 0.0
     # Grid `bbox_series` / `face_px_max` are measured on. Defaults to
     # EXTRACTED so the legacy in-process path keeps its exact

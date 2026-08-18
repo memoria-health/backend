@@ -337,14 +337,18 @@ async def run_scheduled_calls(
             degraded_artifact=degraded_this_call,
         ))
         if getattr(settings, "artifact_dump_dir", "") and mp4:
+            # Latest-only (2026-08-18, replaces the timestamped archive
+            # that ate 3GB/hr): one file per artifact kind, overwritten
+            # each tick — the soak dashboard renders these live.
             try:
                 import pathlib as _pl
-                import time as _time
                 _d = _pl.Path(settings.artifact_dump_dir)
                 _d.mkdir(parents=True, exist_ok=True)
-                _name = (f"{_time.strftime('%H%M%S')}_"
-                         f"{plan.crop}_{'-'.join(idents)[:80]}.mp4")
-                (_d / _name).write_bytes(mp4)
+                _tmp = _d / f".latest_{plan.crop}.tmp"
+                _tmp.write_bytes(mp4)
+                _tmp.rename(_d / f"latest_{plan.crop}.mp4")
+                (_d / f"latest_{plan.crop}.txt").write_text(
+                    ",".join(idents))
             except Exception:  # noqa: BLE001 — a dump must never hurt a tick
                 log.exception("executor.artifact_dump_failed")
 

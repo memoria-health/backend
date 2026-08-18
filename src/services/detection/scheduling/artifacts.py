@@ -53,6 +53,9 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+_FOLLOW_COVERAGE_S = 3.0   # max series-to-frame time gap before degrade
+_FOLLOW_EMA = 0.5          # window pan smoothing (1.0 = raw recenter)
+
 
 def person_crop_box(
     window: Sequence["FrameSnapshot"],
@@ -89,6 +92,80 @@ def person_crop_box(
     return union_box(scaled, ref.width, ref.height)
 
 
+def plan_follow_rects(
+    window: Sequence["FrameSnapshot"],
+    track: "TrackObservation",
+    *,
+    sample_width: int,
+) -> "list[tuple[int, int, int, int]] | None":
+    """One fixed-size rect PER FRAME, centered on the track's nearest
+    series box — a digital zoom that follows the person (2026-08-18,
+    replaces the static union: it framed furniture whenever the box was
+    stale and never followed within-clip movement).
+
+    Cross-machine clocks differ (series = node wall clock, frames =
+    backend monotonic), so alignment is by OFFSET FROM THE NEWEST entry
+    on each side. Fixed output size = the largest padded box, so the
+    encoder sees constant dimensions."""
+    if not window or not track.bbox_series:
+        return None
+    ref = window[-1]
+    extracted_w = bbox_extracted_width(
+        track, ref.width, sample_width=sample_width,
+    )
+    series = []
+    for ts, bbox in track.bbox_series:
+        b = scale_bbox_to_frame(
+            bbox, ref.width, ref.height, sample_width=extracted_w,
+        )
+        if b is not None:
+            series.append((float(ts), b))
+    if not series:
+        return None
+    s_end = series[-1][0]
+    w_end = window[-1].captured_at
+    # Nearest-in-time box per frame; a frame with no box within the
+    # coverage threshold degrades the WHOLE call (mixed framing inside
+    # one clip is worse than full-frame). Padded via the eval-validated
+    # union math on a single box (pad + min_side + clamp + even-align).
+    picked = []
+    for f in window:
+        off = w_end - f.captured_at
+        gap, best = min(
+            ((abs((s_end - e[0]) - off), e[1]) for e in series),
+            key=lambda g: g[0],
+        )
+        if gap > _FOLLOW_COVERAGE_S:
+            return None
+        r = union_box([best], ref.width, ref.height)
+        if r is None:
+            return None
+        picked.append(r)
+    cw = max(r[2] - r[0] for r in picked)
+    ch = max(r[3] - r[1] for r in picked)
+    cw, ch = min(cw, ref.width) & ~1, min(ch, ref.height) & ~1
+    rects = []
+    scx = scy = None
+    for r in picked:
+        cx, cy = (r[0] + r[2]) / 2, (r[1] + r[3]) / 2
+        # EMA pan: the box cadence (~3fps) is coarser than the frame
+        # rate; raw recentering teleports the window every few frames
+        # and paints global motion into the clip. Smoothing pans.
+        scx = cx if scx is None else scx + _FOLLOW_EMA * (cx - scx)
+        scy = cy if scy is None else scy + _FOLLOW_EMA * (cy - scy)
+        x0 = int(max(0, min(scx - cw / 2, ref.width - cw))) & ~1
+        y0 = int(max(0, min(scy - ch / 2, ref.height - ch))) & ~1
+        rects.append((x0, y0, x0 + cw, y0 + ch))
+    return rects
+
+
+def _crop_follow(window, rects):
+    out = []
+    for f, r in zip(window, rects):
+        out.extend(crop_i420([f], r))
+    return out
+
+
 async def build_person_crop_mp4(
     window: Sequence["FrameSnapshot"],
     *,
@@ -99,13 +176,13 @@ async def build_person_crop_mp4(
     pcm_sample_rate: int | None = None,
     pcm_num_channels: int | None = None,
 ) -> bytes | None:
-    """One track → one cropped MP4 at the recipe fps. None when no
-    usable crop could be built — the executor then degrades that call
-    (the detectors are not silently dropped)."""
-    box = person_crop_box(window, track=track, sample_width=sample_width)
-    if box is None:
+    """One track → one FOLLOWING cropped MP4 at the recipe fps. None
+    when no usable crop could be built — the executor then degrades
+    that call (the detectors are not silently dropped)."""
+    rects = plan_follow_rects(window, track, sample_width=sample_width)
+    if rects is None:
         return None
-    cropped = await asyncio.to_thread(crop_i420, window, box)
+    cropped = await asyncio.to_thread(_crop_follow, window, rects)
     if not cropped:
         return None
     try:
@@ -118,8 +195,8 @@ async def build_person_crop_mp4(
         )
     except (Mp4RemuxError, ValueError) as exc:
         log.warning(
-            "scheduling.person_crop remux failed track=%d box=%s err=%s",
-            track.track_id, box, exc,
+            "scheduling.person_crop remux failed track=%d rects=%d err=%s",
+            track.track_id, len(rects), exc,
         )
         return None
 
