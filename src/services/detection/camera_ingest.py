@@ -585,7 +585,9 @@ class CameraIngest:
                 ),
             ))
             return
-        if len(self._inflight_ticks) >= 2:
+        if len(self._inflight_ticks) >= (
+            self._settings.scheduler_tick_max_inflight
+        ):
             return
         self._queued_tick = None
         log.info(

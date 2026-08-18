@@ -860,7 +860,7 @@ CATALOG: tuple[CatalogEntry, ...] = (
     ),
     CatalogEntry(
         key="medication", name="Medication adherence", icon_name="pills",
-        description="Confirms the morning and evening pill routine at the kitchen counter.",
+        description="Confirms the person took their medication.",
         category="routine", cohort="adult",
         recommended=False, seeded=True, prompt_fragment=_MEDICATION_PROMPT_FRAGMENT,
         # ALL DAY (Aryaman 2026-07-28): presets never ship hardcoded

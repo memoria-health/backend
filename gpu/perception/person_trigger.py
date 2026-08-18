@@ -76,9 +76,11 @@ def enhance_ir(bgr):
     under their floors at night. Adaptive histogram equalization is the
     standard, well-evidenced pre-step for night detection (CLAHE+YOLO
     night-detection literature, 2026-08-18 review). IR frames have all
-    three channels equal, so equalize one and replicate. Applied ONLY
-    to grounding/trigger inputs — never to the EdgeTAM carry stream or
-    stored frames. NEMARA_IR_CLAHE=0 disables."""
+    three channels equal, so equalize one and replicate. Applied to
+    the whole detection batch including the EdgeTAM carry stream
+    (continuous.py enhances the batch — carry needs the same pixels it
+    grounded on); face crops still read RAW frames (server.py).
+    NEMARA_IR_CLAHE=0 disables."""
     global _clahe
     try:
         import cv2
@@ -150,7 +152,11 @@ def person_masks(bgr) -> "Optional[list]":
         if getattr(model, "task", "") != "segment":
             return None
         res = model.predict(
-            bgr, imgsz=_IMGSZ, conf=_CONF, classes=[0],
+            bgr, imgsz=_IMGSZ,
+            # Same night floor as person_boxes — this path missed the
+            # IR fix and ran the daylight floor after dark (review).
+            conf=_CONF_IR if (_IR_BOOST and is_ir(bgr)) else _CONF,
+            classes=[0],
             verbose=False, device=0, retina_masks=True,
         )
         m = res[0].masks

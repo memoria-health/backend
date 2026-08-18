@@ -6,11 +6,11 @@ ships the builders the CURRENT catalog needs when the flag turns on:
   scene / full-frame  → no builder here: the tick's existing window
                         mp4 (frames_to_mp4 over the buffered window)
                         IS the scene artifact.
-  person crop         → build_person_crop_mp4(): the track's swept
-                        union box (STATIC crop — the tint-then-crop /
-                        static-box law), cropped via I420 plane
-                        slicing, remuxed at the recipe fps. Carries
-                        audio when the call needs it.
+  person crop         → build_person_crop_mp4(): TRUE digital zoom —
+                        each frame cropped to its own EMA-smoothed
+                        series box (plan_follow_rects) and scaled to
+                        constant output dims, remuxed at the recipe
+                        fps. Carries audio when the call needs it.
   face crop           → DEFERRED to P6 with the FACE detectors: the
                         pipeline does not retain face boxes yet (only
                         face_px_max), and nothing in the default 24
@@ -160,14 +160,17 @@ def plan_follow_rects(
         sw = (r[2] - r[0]) if sw is None else sw + _FOLLOW_EMA * ((r[2] - r[0]) - sw)
         sh = (r[3] - r[1]) if sh is None else sh + _FOLLOW_EMA * ((r[3] - r[1]) - sh)
         # Expand this frame's box to the OUTPUT aspect (grow, never
-        # shrink) so the final resize is distortion-free zoom.
+        # shrink) so the final resize is distortion-free zoom. Clamp
+        # PROPORTIONALLY — per-axis clamping here broke the aspect and
+        # the resize stretched the person (review 2026-08-18).
         cw, ch = sw, sh
         if cw / ch < aspect:
             cw = ch * aspect
         else:
             ch = cw / aspect
-        cw = int(min(cw, ref.width)) & ~1
-        ch = int(min(ch, ref.height)) & ~1
+        scale = min(ref.width / cw, ref.height / ch, 1.0)
+        cw = int(cw * scale) & ~1
+        ch = int(ch * scale) & ~1
         cw, ch = max(cw, 2), max(ch, 2)
         x0 = int(max(0, min(scx - cw / 2, ref.width - cw))) & ~1
         y0 = int(max(0, min(scy - ch / 2, ref.height - ch))) & ~1

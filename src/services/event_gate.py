@@ -66,6 +66,15 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# Strong refs for fire-and-forget page/release tasks — the loop only
+# holds weak refs, so an unreferenced task can be GC'd mid-flight.
+_gate_tasks: set[asyncio.Task] = set()
+
+
+def _hold_task(task: asyncio.Task) -> None:
+    _gate_tasks.add(task)
+    task.add_done_callback(_gate_tasks.discard)
+
 AUTO_RELEASE_S = 60
 
 
@@ -303,17 +312,17 @@ async def route_events(
             event_id, cats.get(event_id),
             f"{AUTO_RELEASE_S}s" if urgent else "none (awaits verdict)",
         )
-        asyncio.create_task(
+        _hold_task(asyncio.create_task(
             _page_for(sessionmaker=sessionmaker, event_id=event_id, settings=settings),
             name=f"event-gate-page-{event_id}",
-        )
+        ))
         if urgent:
-            asyncio.create_task(
+            _hold_task(asyncio.create_task(
                 _auto_release(
                     sessionmaker=sessionmaker, event_id=event_id, settings=settings
                 ),
                 name=f"event-gate-auto-{event_id}",
-            )
+            ))
 
 
 async def _page_for(

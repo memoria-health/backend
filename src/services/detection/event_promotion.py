@@ -370,7 +370,12 @@ async def _episode_already_fired(
 # Sleep/activity excluded: continuous state labels, paging them is spam.
 _RECORD_ONLY_PAGE_EXCLUDE = frozenset({"sleep", "activity"})
 _RECORD_ONLY_PAGE_MIN_GAP_S = 300.0
-_record_only_last_page: dict[str, float] = {}
+# Keyed (patient_id, ident) — a bare-ident key let one patient's page
+# suppress another household's same-detector page (review 2026-08-18).
+_record_only_last_page: dict[tuple[str, str], float] = {}
+# Strong refs for fire-and-forget paging tasks: the loop only holds
+# weak refs, so an unreferenced 15-min task can be GC'd mid-flight.
+_page_tasks: set[asyncio.Task] = set()
 
 
 async def _maybe_page_record_only(
@@ -391,7 +396,8 @@ async def _maybe_page_record_only(
     if not _is_truthy_bool(detector_fields.get(detected_field)):
         return
     now_mono = time.monotonic()
-    last = _record_only_last_page.get(ident)
+    gap_key = (str(det.patient_id), ident)
+    last = _record_only_last_page.get(gap_key)
     if last is not None and now_mono - last < _RECORD_ONLY_PAGE_MIN_GAP_S:
         return
     # Rising edge only: consecutive positive ticks are one occurrence.
@@ -407,7 +413,7 @@ async def _maybe_page_record_only(
     )).scalar_one_or_none()
     if prev == "true":
         return
-    _record_only_last_page[ident] = now_mono
+    _record_only_last_page[gap_key] = now_mono
     reasoning = str(detector_fields.get(f"{ident}_reasoning") or "")
     confidence = detector_fields.get(f"{ident}_confidence")
     det_name, det_id = det.name, det.id
@@ -469,8 +475,10 @@ async def _maybe_page_record_only(
         except Exception:  # noqa: BLE001 — paging must never hurt a tick
             log.exception("[record-only-page] %s failed", ident)
 
-    asyncio.create_task(
+    task = asyncio.create_task(
         _page_after_commit(), name=f"record-only-page-{ident}")
+    _page_tasks.add(task)
+    task.add_done_callback(_page_tasks.discard)
 
 
 async def maybe_promote_analysis(

@@ -341,15 +341,18 @@ async def run_scheduled_calls(
             # Latest-only (2026-08-18, replaces the timestamped archive
             # that ate 3GB/hr): one file per artifact kind, overwritten
             # each tick — the soak dashboard renders these live.
-            try:
+            def _dump(mp4=mp4, crop=plan.crop, dets=",".join(idents)):
                 import pathlib as _pl
                 _d = _pl.Path(settings.artifact_dump_dir)
                 _d.mkdir(parents=True, exist_ok=True)
-                _tmp = _d / f".latest_{plan.crop}.tmp"
+                _tmp = _d / f".latest_{crop}.tmp"
                 _tmp.write_bytes(mp4)
-                _tmp.rename(_d / f"latest_{plan.crop}.mp4")
-                (_d / f"latest_{plan.crop}.txt").write_text(
-                    ",".join(idents))
+                _tmp.rename(_d / f"latest_{crop}.mp4")
+                (_d / f"latest_{crop}.txt").write_text(dets)
+            try:
+                # Off the event loop: an MB-scale sync write here stalls
+                # EVERY camera's tick, not just this one (review 2026-08-18).
+                await asyncio.to_thread(_dump)
             except Exception:  # noqa: BLE001 — a dump must never hurt a tick
                 log.exception("executor.artifact_dump_failed")
 
@@ -581,7 +584,16 @@ async def run_scheduled_calls(
 
         # ALL votes for ALL fired detectors go out concurrently —
         # sequential votes were adding n×call-latency to fire ticks
-        # (measured p95 55s+ under the full roster, 2026-08-18).
+        # (measured p95 55s+ under the full roster, 2026-08-18). The
+        # semaphore bounds the burst: a co-fire tick (meal+medication+
+        # drink = 9 votes) must not saturate the uplink under the
+        # primaries of the next overlapping tick.
+        _vote_sem = asyncio.Semaphore(4)
+
+        async def _sem_vote(*a):
+            async with _vote_sem:
+                return await _vote(*a)
+
         vote_jobs: list[tuple[str, Any]] = []
         confirm_kn: dict[str, tuple[int, int]] = {}
         for ident, (due, artifact, plan, art_fps) in winning_call.items():
@@ -591,7 +603,7 @@ async def run_scheduled_calls(
                 continue
             confirm_kn[ident] = (k, n)
             for i in range(n):
-                vote_jobs.append((ident, _vote(
+                vote_jobs.append((ident, _sem_vote(
                     ident, due, artifact, plan, art_fps, i, detected_key,
                 )))
         vote_results = await asyncio.gather(*(job for _, job in vote_jobs))
