@@ -14,6 +14,7 @@ from filing three separate events.
 """
 
 import logging
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -38,6 +39,7 @@ from src.services.detection.scheduling.decision import (
 if TYPE_CHECKING:
     from src.settings import Settings
 from src.services.detection import catalog
+from src.services import pager
 
 _log = logging.getLogger(__name__)
 
@@ -363,6 +365,83 @@ async def _episode_already_fired(
     return (await session.execute(stmt)).scalar_one_or_none() is not None
 
 
+# ── Soak instrumentation: record-only occurrence paging ──────────────
+# (Aryaman 2026-08-18, during the built-in FP soak): record-only
+# detectors never promote or notify, so their false positives surface
+# only as silent Overview counts — the drinking-water confabulation
+# pair was found by SQL, not by a page. Behind a flag (off in prod),
+# OCCURRENCE-shaped record-only positives page the operator like gated
+# events do. State-LABELER record-onlys are excluded by name: sleep is
+# positive for a whole night and activity labels every occupied tick —
+# paging a continuous state is spam by construction, and both already
+# have verification instruments (sleep summary, D6 diary).
+_RECORD_ONLY_PAGE_EXCLUDE = frozenset({"sleep", "activity"})
+_RECORD_ONLY_PAGE_MIN_GAP_S = 300.0
+_record_only_last_page: dict[str, float] = {}
+
+
+async def _maybe_page_record_only(
+    session: AsyncSession,
+    *,
+    det: "Detector",
+    ident: str,
+    camera_id: UUID,
+    occurred_at: datetime,
+    detector_fields: Mapping[str, Any],
+    settings: "Settings | None",
+) -> None:
+    if settings is None or not getattr(settings, "record_only_paging", False):
+        return
+    if ident in _RECORD_ONLY_PAGE_EXCLUDE:
+        return
+    detected_field = det.detected_field or f"{ident}_detected"
+    if not _is_truthy_bool(detector_fields.get(detected_field)):
+        return
+    now_mono = time.monotonic()
+    last = _record_only_last_page.get(ident)
+    if last is not None and now_mono - last < _RECORD_ONLY_PAGE_MIN_GAP_S:
+        return
+    # Rising edge only: the previous tick that carried this field must
+    # not also be positive — consecutive-tick occurrences are one
+    # moment, not two. One indexed lookup, only on positive ticks.
+    prev = (await session.execute(
+        select(Analysis.detector_fields[detected_field].astext)
+        .where(
+            Analysis.camera_id == camera_id,
+            Analysis.captured_at < occurred_at,
+            Analysis.detector_fields.has_key(detected_field),
+        )
+        .order_by(Analysis.captured_at.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+    if prev == "true":
+        return
+    _record_only_last_page[ident] = now_mono
+    reasoning = detector_fields.get(f"{ident}_reasoning") or ""
+    ok = await pager.trigger_keyed(
+        settings=settings,
+        dedup_key=f"record-only:{det.id}:{occurred_at.isoformat()}",
+        summary=f"[record-only] {det.name}: {str(reasoning)[:120]}",
+        severity="info",
+        source="memoria-record-only-soak",
+        details={
+            "detector": det.name,
+            "identifier": ident,
+            "reasoning": str(reasoning)[:400],
+            "confidence": detector_fields.get(f"{ident}_confidence"),
+            "note": (
+                "soak instrumentation — no event exists; verify and "
+                "resolve; falses go in the FP ledger"
+            ),
+        },
+    )
+    if ok:
+        log.info(
+            "[record-only-page] %s (%s) paged — reasoning=%r",
+            det.name, ident, str(reasoning)[:80],
+        )
+
+
 async def maybe_promote_analysis(
     session: AsyncSession,
     *,
@@ -436,6 +515,12 @@ async def maybe_promote_analysis(
         if det.alert_trigger in ("absence", "trailing", "record_only"):
             # record_only (sleep/activity): fields feed the summarizers,
             # never an event — and the scheduled runner ignores it too.
+            if det.alert_trigger == "record_only":
+                await _maybe_page_record_only(
+                    session, det=det, ident=ident, camera_id=camera_id,
+                    occurred_at=occurred_at, detector_fields=detector_fields,
+                    settings=settings,
+                )
             continue
 
         # Criticality split (Aryaman 2026-07-28, from the soak's first

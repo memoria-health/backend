@@ -390,6 +390,13 @@ class Settings(BaseSettings):
     scheduler_person_requires_track: bool = Field(default=False)
     # duty_cycle='sampled' detectors run every k-th tick. 1 = parity.
     scheduler_sample_every_k: int = Field(ge=1, le=60, default=1)
+    # Soak instrumentation (Aryaman 2026-08-18): occurrence-shaped
+    # record-only positives page PagerDuty on their rising edge so
+    # silent Overview-count FPs get human eyes (the drinking-water
+    # confabulation pair was found by SQL, not a page). State labelers
+    # (sleep/activity) are excluded in code. OFF by default — this is a
+    # verification lever, not product behavior.
+    record_only_paging: bool = Field(default=False)
     # Crowd hardening (D3): more than this many concurrent tracks ⇒ no
     # per-person crops this tick — every detector runs full-scene.
     scheduler_crowd_fallback_tracks: int = Field(ge=1, le=16, default=4)

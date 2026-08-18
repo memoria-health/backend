@@ -274,26 +274,31 @@ _AGITATION_PROMPT_FRAGMENT = (
     "There are two independent kinds of evidence. EITHER one alone is "
     "enough — but only when it is unambiguous:\n"
     "\n"
-    "PHYSICAL — clear, obvious physical distress, such as:\n"
-    "  - PACING in the clearest sense: repeatedly walking back and "
-    "forth in an agitated, purposeless way — NOT simply crossing the "
-    "room or walking over to do something;\n"
-    "  - frantic running or rushing about in evident distress;\n"
-    "  - frantic, disordered rummaging — agitatedly tearing through or "
-    "tossing things, NOT calm searching or tidying;\n"
-    "  - throwing objects, or banging / striking / slamming surfaces or "
-    "objects forcefully and angrily.\n"
-    "The action must clearly read as distress or anger. If it has an "
+    "PHYSICAL — explicit AGGRESSION, never mere restlessness "
+    "(recalibrated 2026-08-18: pacing, wandering about, and frantic "
+    "rummaging are NOT agitation and must never fire this detector):\n"
+    "  - throwing objects in anger;\n"
+    "  - banging / striking / slamming surfaces or objects forcefully "
+    "and angrily;\n"
+    "  - a physical altercation or fight with another person — "
+    "hitting, shoving, grabbing;\n"
+    "  - an outright angry outburst: fist-pounding, violent gesturing "
+    "at someone, visibly enraged body language directed at a person or "
+    "object.\n"
+    "The action must clearly read as anger or aggression. If it has an "
     "ordinary explanation — exercise, dancing, play, sport, swatting an "
-    "insect, normal chores, reaching for or carrying something, moving around the house — it is "
-    "NOT agitation.\n"
+    "insect, normal chores, reaching for or carrying something, moving "
+    "around the house, pacing, or restless fidgeting — it is NOT "
+    "agitation.\n"
     "\n"
-    "VERBAL — clear distress in BOTH tone and content, from the person "
-    "on camera:\n"
-    "  - TONE / affect: shouting, sharp, harsh, or hostile voice, or "
-    "sustained crying / groaning / yelling; AND\n"
-    "  - CONTENT: angry, hostile, or distressed words — cursing, "
-    "threats, distressed demands, or calls for help.\n"
+    "VERBAL — explicit hostility in BOTH tone and content, from the "
+    "person on camera:\n"
+    "  - TONE / affect: shouting, sharp, harsh, or hostile voice — a "
+    "raised angry voice, screaming at someone; AND\n"
+    "  - CONTENT: openly aggressive or hostile words — cursing at "
+    "someone, threats, a verbal fight, or an outright expression of "
+    "frustration or rage ('I can't take this', furious complaints "
+    "directed at a person).\n"
     "Both tone AND content must point to distress. Ordinary "
     "conversation does NOT count — a normal phone call, a minor "
     "argument or debate, or an animated explanation has a "
@@ -301,11 +306,11 @@ _AGITATION_PROMPT_FRAGMENT = (
     "distress.\n"
     "\n"
     "Set FALSE if any of:\n"
-    "  - the movement is ordinary or calm — walking to a destination, "
-    "doing chores, searching calmly, exercising, dancing, playing, or "
-    "swatting an insect;\n"
-    "  - there is motion but you cannot clearly tell it is distress "
-    "rather than ordinary activity;\n"
+    "  - the movement is ordinary, calm, or merely restless — walking, "
+    "pacing, doing chores, searching, rummaging, exercising, dancing, "
+    "playing, fidgeting, or swatting an insect;\n"
+    "  - there is motion but you cannot clearly tell it is aggression "
+    "rather than ordinary or restless activity;\n"
     "  - the only voice is ordinary conversation, argument, or "
     "explanation, or it likely comes from a TV / radio / phone / device "
     "or cannot be attributed to the person on camera;\n"
@@ -806,7 +811,7 @@ CATALOG: tuple[CatalogEntry, ...] = (
     ),
     CatalogEntry(
         key="agitation", name="Agitation", icon_name="figure.walk.motion",
-        description="Pacing or restless body language sustained over time.",
+        description="Explicit aggression: physical or verbal fighting, angry outbursts.",
         category="behaviour", is_sustained=True, cohort="adult",
         recommended=False, seeded=True, prompt_fragment=_AGITATION_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
@@ -881,6 +886,11 @@ CATALOG: tuple[CatalogEntry, ...] = (
         key="meal_eaten", name="Meal eaten", icon_name="fork.knife",
         description="Confirms the person ate a meal.",
         category="routine", cohort="adult",
+        # Sustained (2026-08-18, Aryaman): a meal is an EPISODE — the
+        # momentary shape re-fired every cooldown for the whole meal.
+        # One event at entry, latched until eating stops (episode exit
+        # gap), re-latches for the next meal.
+        is_sustained=True,
         recommended=False, prompt_fragment=_MEAL_EATEN_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
