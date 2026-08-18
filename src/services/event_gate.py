@@ -135,6 +135,66 @@ def _sign(body: str, secret: str) -> str:
     return hmac.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
 
 
+# ── record-only tick verdicts (soak tooling, 2026-08-18) ─────────────
+# Record-only detectors have no event to gate; their product surface is
+# a COUNT. The page that announces a positive tick carries one of these
+# tokens so the operator can rule on the count: deny stamps
+# `<ident>_verdict='rejected'` on the tick and count surfaces skip it.
+# Same secret and signer as event verdicts; the `rt` prefix makes the
+# two token kinds mutually unacceptable.
+
+TICK_TOKEN_TTL_S = 24 * 3600   # a count correction can wait overnight
+
+
+def mint_tick_token(
+    *, camera_id, captured_at, ident: str, settings: "Settings",
+) -> str | None:
+    secret = settings.event_gate_link_secret
+    if not secret:
+        return None
+    exp = int(time.time()) + TICK_TOKEN_TTL_S
+    body = f"rt.{camera_id}.{captured_at.timestamp()}.{ident}.{exp}"
+    return f"{body}.{_sign(body, secret)}"
+
+
+def verify_tick_token(token: str, *, settings: "Settings") -> tuple | None:
+    """(camera_id, captured_at, ident) or None for any failure."""
+    from datetime import datetime, timezone as _tz
+
+    secret = settings.event_gate_link_secret
+    if not secret or not token:
+        return None
+    body, _, signature = token.rpartition(".")
+    if not body or not hmac.compare_digest(_sign(body, secret), signature):
+        return None
+    parts = body.split(".")
+    # rt . camera_id . epoch-int . epoch-frac . ident . exp
+    if len(parts) != 6 or parts[0] != "rt":
+        return None
+    camera_id, epoch = parts[1], f"{parts[2]}.{parts[3]}"
+    ident, exp = parts[4], parts[5]
+    try:
+        if int(exp) < int(time.time()):
+            return None
+        captured_at = datetime.fromtimestamp(float(epoch), tz=_tz.utc)
+    except (ValueError, OSError):
+        return None
+    return camera_id, captured_at, ident
+
+
+def tick_verdict_url(
+    *, camera_id, captured_at, ident: str, settings: "Settings",
+) -> str | None:
+    token = mint_tick_token(
+        camera_id=camera_id, captured_at=captured_at, ident=ident,
+        settings=settings,
+    )
+    base = (settings.event_gate_public_base_url or "").rstrip("/")
+    if token is None or not base:
+        return None
+    return f"{base}/v1/event-gate/tick/{token}"
+
+
 def _verdict_url(*, event_id: UUID, settings: "Settings") -> str | None:
     token = mint_verdict_token(event_id=event_id, settings=settings)
     if token is None:
@@ -232,20 +292,38 @@ async def route_events(
     # One page and one timer PER held event. Batching them would mean a
     # tick that fires two detectors pages about one and silently drops
     # the other, and settling the paged one would hide the unpaged one.
+    #
+    # Urgency is SAFETY-ONLY (Aryaman 2026-08-18): the 60s auto-release
+    # exists so a fall reaches the family even with no operator awake —
+    # that invariant is untouched. Every other category now waits for a
+    # human verdict, however long that takes: a routine or behaviour
+    # event reaching the caregiver unverified is noise, not protection.
+    # A held non-safety event with no verdict stays 'pending' and
+    # visible in the ops /queue; it never times out into the app.
+    cats = {}
+    if gated:
+        async with sessionmaker() as session:
+            cats = dict((await session.execute(text(
+                "select id, category::text from events where id = any(:ids)"),
+                {"ids": [str(e) for e in gated]})).all())
     for event_id in gated:
+        urgent = cats.get(event_id) == "safety"
         log.info(
-            "event_gate.held event=%s auto_release_in=%ss", event_id, AUTO_RELEASE_S
+            "event_gate.held event=%s category=%s auto_release=%s",
+            event_id, cats.get(event_id),
+            f"{AUTO_RELEASE_S}s" if urgent else "none (awaits verdict)",
         )
         asyncio.create_task(
             _page_for(sessionmaker=sessionmaker, event_id=event_id, settings=settings),
             name=f"event-gate-page-{event_id}",
         )
-        asyncio.create_task(
-            _auto_release(
-                sessionmaker=sessionmaker, event_id=event_id, settings=settings
-            ),
-            name=f"event-gate-auto-{event_id}",
-        )
+        if urgent:
+            asyncio.create_task(
+                _auto_release(
+                    sessionmaker=sessionmaker, event_id=event_id, settings=settings
+                ),
+                name=f"event-gate-auto-{event_id}",
+            )
 
 
 async def _page_for(
@@ -425,6 +503,7 @@ class GateSweeper:
             rows = (await session.execute(text(
                 """update events set gate_state = 'auto'
                    where gate_state = 'pending'
+                     and category = 'safety'
                      and (gate_held_at is null
                           or gate_held_at < now() - make_interval(secs => :s))
                    returning id"""), {"s": AUTO_RELEASE_S})).all()

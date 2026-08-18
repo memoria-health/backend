@@ -270,6 +270,101 @@ async def act_submit(
     return _html(_result_page(row, result=result))
 
 
+# ── record-only tick verdicts (same page machinery, 2026-08-18) ──────
+# No event exists for a record-only positive; these two routes rule on
+# the COUNT. GET renders, POST mutates (link previews cannot vote) —
+# the same discipline as the event verdict above, same signer, same
+# CSS, no confirm step (a count correction is reversible in the ledger,
+# unlike suppressing a safety alert).
+
+
+@router.get("/tick/{token}", response_class=HTMLResponse)
+async def tick_page(
+    token: str, session: SessionDep, settings: SettingsDep
+) -> Response:
+    got = event_gate.verify_tick_token(token, settings=settings)
+    if got is None:
+        return _html(_expired_page(), status_code=status.HTTP_403_FORBIDDEN)
+    camera_id, captured_at, ident = got
+    row = await _load_tick(session, camera_id, captured_at, ident)
+    if row is None:
+        return _html(_gone_page("This tick no longer exists."),
+                     status_code=status.HTTP_404_NOT_FOUND)
+    if row["verdict"]:
+        return _html(f"<h2>Already settled: {html.escape(row['verdict'])}</h2>")
+    base = f"/v1/event-gate/tick/{html.escape(token, quote=True)}"
+    name = html.escape(ident.replace("_", " ").title())
+    return _html(
+        f"<h2>{name}</h2>"
+        f"<div class='narr'>{html.escape(row['reasoning'] or 'no reasoning recorded')}</div>"
+        "<p class='sub'>This is a COUNT, not an alert — nothing is sent "
+        "either way.</p>"
+        + f"<form method='post' action='{base}?action=reject'>"
+          "<button class='suppress'>Don't count — false positive</button></form>"
+        + f"<form method='post' action='{base}?action=accept'>"
+          "<button class='release'>Count it — this happened</button></form>"
+    )
+
+
+@router.post("/tick/{token}", response_class=HTMLResponse)
+async def tick_submit(
+    token: str, action: str, session: SessionDep, settings: SettingsDep,
+) -> Response:
+    got = event_gate.verify_tick_token(token, settings=settings)
+    if got is None:
+        return _html(_expired_page(), status_code=status.HTTP_403_FORBIDDEN)
+    if action not in {"accept", "reject"}:
+        raise HTTPException(status_code=400, detail="bad_action")
+    camera_id, captured_at, ident = got
+    stamped = "accepted" if action == "accept" else "rejected"
+    # First writer wins — the merge applies only while no verdict key
+    # exists, so a second tap cannot flip the first ruling.
+    updated = (await session.execute(text(
+        """update analyses
+              set detector_fields = detector_fields ||
+                  jsonb_build_object(
+                      (:vf)::text, (:v)::text,
+                      (:vat)::text, to_char(now() at time zone 'utc',
+                                            'YYYY-MM-DD"T"HH24:MI:SS"Z"'))
+            where camera_id = :c
+              and captured_at between (:t)::timestamptz - interval '1 second'
+                                  and (:t)::timestamptz + interval '1 second'
+              and detector_fields->>:vf is null
+            returning id"""),
+        {"c": camera_id, "t": captured_at.isoformat(), "v": stamped,
+         "vf": f"{ident}_verdict", "vat": f"{ident}_verdict_at"},
+    )).first()
+    await session.commit()
+    if updated is None:
+        row = await _load_tick(session, camera_id, captured_at, ident)
+        prior = (row or {}).get("verdict")
+        return _html(f"<h2>Already settled: {html.escape(prior or 'row missing')}</h2>")
+    log.info(
+        "event_gate.tick_verdict ident=%s verdict=%s tick=%s cam=%s",
+        ident, stamped, captured_at.isoformat(), camera_id,
+    )
+    return _html(
+        f"<h2>{'Counted' if stamped == 'accepted' else 'Removed from the count'}</h2>"
+        f"<p class='sub'>{html.escape(ident)} — {stamped}.</p>"
+    )
+
+
+async def _load_tick(session, camera_id, captured_at, ident) -> dict | None:
+    row = (await session.execute(text(
+        """select detector_fields->>:rf, detector_fields->>:vf
+             from analyses
+            where camera_id = :c
+              and captured_at between (:t)::timestamptz - interval '1 second'
+                                  and (:t)::timestamptz + interval '1 second'
+            limit 1"""),
+        {"c": camera_id, "t": captured_at.isoformat(),
+         "rf": f"{ident}_reasoning", "vf": f"{ident}_verdict"},
+    )).first()
+    if row is None:
+        return None
+    return {"reasoning": row[0], "verdict": row[1]}
+
+
 async def _load(session, event_id: UUID, *, settings) -> dict | None:
     row = (await session.execute(text(
         """select e.title, coalesce(e.narrative, ''),

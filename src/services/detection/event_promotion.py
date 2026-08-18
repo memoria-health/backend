@@ -418,20 +418,29 @@ async def _maybe_page_record_only(
         return
     _record_only_last_page[ident] = now_mono
     reasoning = detector_fields.get(f"{ident}_reasoning") or ""
+    from src.services.event_gate import tick_verdict_url
+
+    verdict_url = tick_verdict_url(
+        camera_id=camera_id, captured_at=occurred_at, ident=ident,
+        settings=settings,
+    )
     ok = await pager.trigger_keyed(
         settings=settings,
         dedup_key=f"record-only:{det.id}:{occurred_at.isoformat()}",
         summary=f"[record-only] {det.name}: {str(reasoning)[:120]}",
         severity="info",
         source="memoria-record-only-soak",
+        link_url=verdict_url,
         details={
             "detector": det.name,
             "identifier": ident,
             "reasoning": str(reasoning)[:400],
             "confidence": detector_fields.get(f"{ident}_confidence"),
+            "verdict_url": verdict_url,
             "note": (
-                "soak instrumentation — no event exists; verify and "
-                "resolve; falses go in the FP ledger"
+                "no event exists — this rules on the COUNT: accept "
+                "keeps the occurrence in Overview, deny removes it and "
+                "files a labeled false positive"
             ),
         },
     )

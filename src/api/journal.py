@@ -114,7 +114,11 @@ async def get_journal(
         if state:
             activity_ticks.append((r["captured_at"], state))
         for ident in record_idents:
-            if fields.get(f"{ident}_detected") is True:
+            # Operator-denied ticks (record-verdict page) leave the
+            # count — a denied occurrence is a labeled false positive,
+            # not a data point.
+            if (fields.get(f"{ident}_detected") is True
+                    and fields.get(f"{ident}_verdict") != "rejected"):
                 detected_times[ident].append(r["captured_at"])
 
     # Coverage: hours of the day with any analysis at all.
