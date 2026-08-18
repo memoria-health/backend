@@ -134,11 +134,23 @@ def state(request: Request) -> JSONResponse:
             cam_id: {
                 "name": _HOME.name_of(cam_id),
                 "tracks": {
-                    tid: {"bbox": tv.bbox, "age_s": round(tv.age(now=time.time()), 1)}
+                    tid: {
+                        "bbox": tv.bbox,
+                        "age_s": round(tv.age(now=time.time()), 1),
+                        "seen_s": round(time.time() - tv.last_seen, 1),
+                        "bbox_series": [
+                            [round(ts, 3), list(bb)]
+                            for ts, bb in tv.series[-120:]
+                        ],
+                    }
                     for tid, tv in sp.state.tracks.items()
                 },
                 "solo": sp.state.solo,
                 "lag_s": round(sp.lag_s, 2),
+                "latch": {
+                    k: (round(v, 2) if isinstance(v, float) else v)
+                    for k, v in getattr(sp, "latch_telemetry", {}).items()
+                },
                 "pod_ms": round(sp.pod_ms, 0),
                 "stage_ms": sp.stage_ms,     # measured per-batch stages
                 "probe_ms": sp.probe_ms,     # measured per-probe stages
@@ -326,9 +338,51 @@ INTAKE_FPS = 15.0    # consume the stream fully (~66ms strides); the
 INTAKE_MAX_W = 0     # native at intake (Aryaman 2026-07-26: resolution
                      # is not the cost lever; frame count is)
 MOTION_SAMPLE_S = 0.5   # motion-latch sampling cadence (CPU, ~free)
-MOTION_DIFF_THR = 3.0   # mean abs diff on a 64px gray thumbnail; static-
-                        # camera noise floor is ~1-2, a person entering
-                        # is well above — tune from motion_latched logs
+MOTION_DIFF_THR = 3.0   # mean abs diff threshold; static-camera noise
+                        # floor is ~1-2, a person entering is well above
+                        # — tune from motion_latched logs
+# Latch metric (2026-08-18): MAX over 4x4-px blocks of the 64x36 gray
+# thumbnail, same threshold — not the whole-frame mean. The global mean
+# is blind to small-area REAL motion and generous to light changes:
+# a hand waved vigorously 20ft away is ~4 thumbnail px x ~20 levels
+# ~= 0.05 global (50x under threshold, never latched), while a phone
+# screen lighting up re-exposes the whole IR frame and sailed over it
+# (Aryaman's bedroom, tonight). Per-block, the wave concentrates to
+# ~5.0 in its block and latches; IR grain is spatially uncorrelated,
+# so a 16-px block still averages it to ~1 sigma-ish — and a rare
+# grain latch costs one 4-frame existence poll, never a VLM call.
+# NEMARA_MOTION_LATCH=global restores the old whole-frame mean.
+MOTION_LATCH_MODE = os.environ.get("NEMARA_MOTION_LATCH", "block").strip().lower()
+
+
+MOTION_BLOCK_THR = float(os.environ.get("NEMARA_MOTION_BLOCK_THR", "3.5"))
+                        # block-MAX rides above the global-mean noise
+                        # floor (max over 144 blocks picks up the noise
+                        # tail), so it gets its own slightly higher bar.
+                        # A 20ft hand-wave measures ~10 in native units
+                        # — margin is on the signal side.
+
+
+def _latch_diff(thumb: "np.ndarray", prev: "np.ndarray") -> tuple[float, float]:
+    """(motion figure, threshold) between two 36x64 int16 thumbnails.
+
+    Movement-vs-light disambiguation (Aryaman 2026-08-18): a light
+    shift (phone glow, IR auto-gain re-exposure) is mostly
+    MULTIPLICATIVE and smooth — it scales brightness without moving
+    edges — so the previous thumbnail is GAIN-MATCHED to the current
+    one's mean before diffing (matched, never normalized to a fixed
+    target: fixed-target scaling amplified dark-scene grain ~2x in
+    calibration). Motion RELOCATES structure, which survives the gain
+    match and concentrates in one 4x4-px block; the whole-frame mean
+    diluted a 20ft hand-wave ~50x under threshold while a phone glow
+    sailed over it — exactly backwards for a bedroom.
+    """
+    if MOTION_LATCH_MODE == "global":
+        return float(np.abs(thumb - prev).mean()), MOTION_DIFF_THR
+    gain = float(thumb.mean()) / max(float(prev.mean()), 1.0)
+    d = np.abs(thumb.astype(np.float32) - prev.astype(np.float32) * gain)
+    # 4x4-px blocks: (36,64) -> (9,4,16,4) -> per-block means, take max.
+    return float(d.reshape(9, 4, 16, 4).mean(axis=(1, 3)).max()), MOTION_BLOCK_THR
 STREAM_CAPACITY = 2  # SDK frame queue bound (0 = unbounded — smooth but
                      # OOM-risky; the 2026-07-23 stable run used unbounded)
 
@@ -388,8 +442,23 @@ async def _read_video(track: rtc.Track, cam_loop: CameraLoop) -> None:
                     cv2.resize(bgr, (64, 36)), cv2.COLOR_BGR2GRAY,
                 ).astype(np.int16)
                 if prev_thumb is not None:
-                    diff = float(np.abs(thumb - prev_thumb).mean())
-                    if diff >= MOTION_DIFF_THR and not cam_loop.motion_pending:
+                    diff, thr = _latch_diff(thumb, prev_thumb)
+                    # Live calibration surface (2026-08-18): the latch
+                    # was tuned on synthetic thumbnails; these fields
+                    # ride /state so a real hand-wave's magnitude can be
+                    # read off the dashboard instead of guessed.
+                    _lt = getattr(cam_loop, "latch_telemetry", None)
+                    if _lt is None or now - _lt["peak_at"] > 15.0:
+                        cam_loop.latch_telemetry = {
+                            "last": diff, "peak15": diff, "peak_at": now,
+                            "thr": thr,
+                        }
+                    else:
+                        _lt["last"] = diff
+                        if diff >= _lt["peak15"]:
+                            _lt["peak15"] = diff
+                            _lt["peak_at"] = now
+                    if diff >= thr and not cam_loop.motion_pending:
                         cam_loop.motion_pending = True
                         log.info(
                             "identity.motion_latched cam=%s diff=%.1f",

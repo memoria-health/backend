@@ -73,6 +73,16 @@ _KEY_LAG = "identity-fleet:lag:"
 # rated 4 occupied cams/4090, surge 6-8, gone by 10).
 LAG_ALARM_CYCLES = 3
 
+# Consecutive cycles a home-holding node must read stale before the
+# node-down page fires (same streak pattern as the lag alarm). One stale
+# cycle is a ~90s heartbeat gap — which every backend restart produces,
+# because nodes heartbeat THROUGH the backend's roster endpoint — and
+# those pages auto-resolved a cycle later as pure flap (Aryaman
+# 2026-08-17: "they come so often... but it is momentary"). Two cycles
+# means >= ~3.5 min of true silence before anyone is told; the CRITICAL
+# homes-blind page keeps its own independent 300s grace regardless.
+NODE_DOWN_ALARM_CYCLES = 2
+
 
 class FleetWatch:
     """Polls the roster tables and pages when homes are actually blind."""
@@ -90,6 +100,8 @@ class FleetWatch:
         self._open: set[str] = set()
         # Per-camera consecutive over-tick-lag cycle counts (lag alarm).
         self._lag_streak: dict[str, int] = {}
+        # Per-node consecutive stale cycle counts (node-down alarm).
+        self._down_streak: dict[str, int] = {}
         # Set False after the first missing-table error so a not-yet-
         # applied occupancy delta costs one log line, not one per cycle.
         self._occupancy_ok = True
@@ -346,6 +358,7 @@ class FleetWatch:
 
     async def _page_nodes_down(self, down: list) -> None:
         seen: set[str] = set()
+        stale_ids: set[str] = set()
         for node_id, homes, age_s in down:
             # A stale node holding NO homes is a corpse, not an incident
             # — replaced test/fleet nodes leave rows behind until the
@@ -359,7 +372,17 @@ class FleetWatch:
                     node_id,
                 )
                 continue
+            stale_ids.add(node_id)
+            streak = self._down_streak.get(node_id, 0) + 1
+            self._down_streak[node_id] = streak
             key = f"{_KEY_NODE_DOWN}{node_id}"
+            if streak < NODE_DOWN_ALARM_CYCLES:
+                log.info(
+                    "identity.node_stale node=%s last_seen=%ss ago "
+                    "(cycle %d/%d) — holding page",
+                    node_id, age_s, streak, NODE_DOWN_ALARM_CYCLES,
+                )
+                continue
             seen.add(key)
             log.warning(
                 "identity.node_down node=%s homes_held=%d last_seen=%ss ago",
@@ -379,7 +402,10 @@ class FleetWatch:
                 details={"node_id": node_id, "homes_held": homes,
                          "last_seen_s_ago": age_s},
             )
-        # A node that came back resolves itself.
+        # A node that came back resolves itself — and clears its streak,
+        # so the next gap starts the count from zero.
+        for node_id in [n for n in self._down_streak if n not in stale_ids]:
+            self._down_streak.pop(node_id, None)
         for key in [k for k in self._open if k.startswith(_KEY_NODE_DOWN)]:
             if key not in seen:
                 await self._resolve(key)

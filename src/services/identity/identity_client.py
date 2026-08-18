@@ -253,7 +253,12 @@ class IdentityClient:
                 track_id=tid,
                 label=LABEL_PATIENT if is_patient else LABEL_UNKNOWN,
                 confidence=seat_score if is_patient else 0.0,
-                bbox_series=((0, bb),),
+                bbox_series=(tuple(
+                    (float(e[0]), tuple(float(v) for v in e[1]))
+                    for e in (tv.get("bbox_series") or ())
+                    if isinstance(e, (list, tuple)) and len(e) == 2
+                    and len(e[1]) == 4
+                ) or ((0, bb),)),
                 # The sidecar pushes frames at native resolution
                 # (`INTAKE_MAX_W = 0`) and hands these boxes back on
                 # that same grid. Saying so is what stops the crop /
@@ -262,6 +267,7 @@ class IdentityClient:
                 bbox_space=BBOX_SPACE_NATIVE,
                 face_locked=face_locked,
                 pre_labeled=is_patient and not face_locked,
+                age_s=float(tv.get("seen_s", tv.get("age_s")) or 0.0),
                 pre_label_source=(
                     "gallery" if (is_patient and not face_locked) else None
                 ),

@@ -141,6 +141,8 @@ async def test_ongoing_episode_is_suppressed(
     from sqlalchemy import select
     rows = (await session.execute(select(Event).where(Event.patient_id == patient_id))).scalars().all()
     assert len(rows) == 1
+    # The ongoing tick extends the episode's persisted end.
+    assert rows[0].ended_at == now
 
 
 @pytest.mark.asyncio

@@ -13,7 +13,9 @@ other are squashed. Prevents a noisy 3-tick run of fall_detected=true
 from filing three separate events.
 """
 
+import asyncio
 import logging
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -38,6 +40,7 @@ from src.services.detection.scheduling.decision import (
 if TYPE_CHECKING:
     from src.settings import Settings
 from src.services.detection import catalog
+from src.services import pager
 
 _log = logging.getLogger(__name__)
 
@@ -363,6 +366,121 @@ async def _episode_already_fired(
     return (await session.execute(stmt)).scalar_one_or_none() is not None
 
 
+# Record-only occurrence paging, behind settings.record_only_paging.
+# Sleep/activity excluded: continuous state labels, paging them is spam.
+_RECORD_ONLY_PAGE_EXCLUDE = frozenset({"sleep", "activity"})
+_RECORD_ONLY_PAGE_MIN_GAP_S = 300.0
+# Keyed (patient_id, ident) — a bare-ident key let one patient's page
+# suppress another household's same-detector page (review 2026-08-18).
+_record_only_last_page: dict[tuple[str, str], float] = {}
+# Strong refs for fire-and-forget paging tasks: the loop only holds
+# weak refs, so an unreferenced 15-min task can be GC'd mid-flight.
+_page_tasks: set[asyncio.Task] = set()
+
+
+async def _maybe_page_record_only(
+    session: AsyncSession,
+    *,
+    det: "Detector",
+    ident: str,
+    camera_id: UUID,
+    occurred_at: datetime,
+    detector_fields: Mapping[str, Any],
+    settings: "Settings | None",
+) -> None:
+    if settings is None or not getattr(settings, "record_only_paging", False):
+        return
+    if ident in _RECORD_ONLY_PAGE_EXCLUDE:
+        return
+    detected_field, _conf_field, _base = _promotion_spec_for(det)
+    if not _is_truthy_bool(detector_fields.get(detected_field)):
+        return
+    now_mono = time.monotonic()
+    gap_key = (str(det.patient_id), ident)
+    last = _record_only_last_page.get(gap_key)
+    if last is not None and now_mono - last < _RECORD_ONLY_PAGE_MIN_GAP_S:
+        return
+    # Rising edge only: consecutive positive ticks are one occurrence.
+    prev = (await session.execute(
+        select(Analysis.detector_fields[detected_field].astext)
+        .where(
+            Analysis.camera_id == camera_id,
+            Analysis.captured_at < occurred_at,
+            Analysis.detector_fields.has_key(detected_field),
+        )
+        .order_by(Analysis.captured_at.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+    if prev == "true":
+        return
+    _record_only_last_page[gap_key] = now_mono
+    reasoning = str(detector_fields.get(f"{ident}_reasoning") or "")
+    confidence = detector_fields.get(f"{ident}_confidence")
+    det_name, det_id = det.name, det.id
+    from src.db.session import get_sessionmaker
+    from src.services.event_gate import tick_verdict_url
+
+    # Deferred: the caller's transaction may still roll back (a tick
+    # failure after promotion did, 2026-08-18, and the page pointed at
+    # a row that never committed). Re-verify the row, then page.
+    async def _page_after_commit() -> None:
+        await asyncio.sleep(3)
+        try:
+            async with get_sessionmaker()() as s:
+                exists = (await s.execute(
+                    select(Analysis.id).where(
+                        Analysis.camera_id == camera_id,
+                        Analysis.captured_at == occurred_at,
+                    ).limit(1)
+                )).scalar_one_or_none()
+            if exists is None:
+                log.info("[record-only-page] %s tick rolled back — no page",
+                         ident)
+                return
+            verdict_url = tick_verdict_url(
+                camera_id=camera_id, captured_at=occurred_at, ident=ident,
+                settings=settings,
+            )
+            ok = await pager.trigger_keyed(
+                settings=settings,
+                dedup_key=f"record-only:{det_id}:{occurred_at.isoformat()}",
+                summary=f"[record-only] {det_name}: {reasoning[:120]}",
+                severity="info",
+                source="memoria-record-only-soak",
+                link_url=verdict_url,
+                details={
+                    "detector": det_name,
+                    "identifier": ident,
+                    "reasoning": reasoning[:400],
+                    "confidence": confidence,
+                    "verdict_url": verdict_url,
+                    "note": (
+                        "no event exists — this rules on the COUNT: accept "
+                        "keeps the occurrence, deny removes it and files a "
+                        "labeled false positive"
+                    ),
+                },
+            )
+            if ok:
+                log.info("[record-only-page] %s (%s) paged — %r",
+                         det_name, ident, reasoning[:80])
+                # Self-resolve: an open incident is grouping bait that
+                # swallowed fall alerts (2026-08-18); the verdict link
+                # outlives the incident (24h token).
+                await asyncio.sleep(900)
+                await pager.resolve_keyed(
+                    settings=settings,
+                    dedup_key=f"record-only:{det_id}:{occurred_at.isoformat()}",
+                )
+        except Exception:  # noqa: BLE001 — paging must never hurt a tick
+            log.exception("[record-only-page] %s failed", ident)
+
+    task = asyncio.create_task(
+        _page_after_commit(), name=f"record-only-page-{ident}")
+    _page_tasks.add(task)
+    task.add_done_callback(_page_tasks.discard)
+
+
 async def maybe_promote_analysis(
     session: AsyncSession,
     *,
@@ -436,6 +554,12 @@ async def maybe_promote_analysis(
         if det.alert_trigger in ("absence", "trailing", "record_only"):
             # record_only (sleep/activity): fields feed the summarizers,
             # never an event — and the scheduled runner ignores it too.
+            if det.alert_trigger == "record_only":
+                await _maybe_page_record_only(
+                    session, det=det, ident=ident, camera_id=camera_id,
+                    occurred_at=occurred_at, detector_fields=detector_fields,
+                    settings=settings,
+                )
             continue
 
         # Criticality split (Aryaman 2026-07-28, from the soak's first
@@ -519,6 +643,14 @@ async def maybe_promote_analysis(
                 session, detector_id=det.id, patient_id=patient_id,
                 since=boundary,
             ):
+                # Keep the episode's end fresh: ended_at converges on
+                # the last positive tick with no exit-gap bookkeeping.
+                await session.execute(
+                    Event.__table__.update()
+                    .where(Event.detector_id == det.id,
+                           Event.patient_id == patient_id,
+                           Event.occurred_at >= boundary)
+                    .values(ended_at=occurred_at))
                 _log.info(
                     "[event_promotion] %s episode ongoing since %s "
                     "(exit gap %ds) — no new event",

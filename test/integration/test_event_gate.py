@@ -436,3 +436,68 @@ def test_gate_clip_is_spawned_not_awaited_before_the_caregiver_clip() -> None:
     )
     # And it must not be awaited inline anywhere.
     assert "await _gate_fast_path()" not in src
+
+
+# ── record-only tick verdicts ────────────────────────────────────────
+
+
+def test_tick_token_round_trips() -> None:
+    from datetime import datetime, timezone
+
+    s = _settings()
+    cam = str(uuid4())
+    at = datetime(2026, 8, 18, 7, 0, 0, 123456, tzinfo=timezone.utc)
+    tok = event_gate.mint_tick_token(
+        camera_id=cam, captured_at=at, ident="custom_ab12", settings=s)
+    got = event_gate.verify_tick_token(tok, settings=s)
+    assert got == (cam, at, "custom_ab12")
+    # An event token must not verify as a tick token, nor vice versa.
+    ev_tok = event_gate.mint_verdict_token(event_id=uuid4(), settings=s)
+    assert event_gate.verify_tick_token(ev_tok, settings=s) is None
+    assert event_gate.verify_verdict_token(tok, settings=s) is None
+
+
+async def test_tick_reject_stamps_the_analysis_row(
+    client, session, auth_user, settings,
+) -> None:
+    from datetime import datetime, timezone
+
+    from sqlalchemy import text as sa_text
+
+    cam_id, at = uuid4(), datetime.now(timezone.utc)
+    cid, email = auth_user
+    await session.execute(sa_text(
+        """insert into caregivers (id, email, display_name) values (:c, :e, 'T')
+           on conflict do nothing"""), {"c": str(cid), "e": email})
+    await session.execute(sa_text(
+        """insert into patients (id, caregiver_id, full_name, preferred_name, relation)
+           values (:p, :c, 'Tick Test', 'Tick', 'parent')"""),
+        {"p": str(pid := uuid4()), "c": str(cid)})
+    await session.execute(sa_text(
+        """insert into cameras (id, patient_id, display_id, room, api_key_hash)
+           values (:id, :p, 91, 'Test', 'x')"""),
+        {"id": str(cam_id), "p": str(pid)})
+    await session.execute(sa_text(
+        """insert into analyses (camera_id, patient_id, caregiver_id, provider,
+                                 description, detector_fields, captured_at,
+                                 people_present, motion_in_clip, state_after)
+           values (:c, :p, :cg, 'gemini', 'test',
+                   '{"custom_ab12_detected": true,
+                     "custom_ab12_reasoning": "sipped"}'::jsonb, :t, true, true, 'open')"""),
+        {"c": str(cam_id), "p": str(pid), "cg": str(cid), "t": at})
+    await session.commit()
+
+    tok = event_gate.mint_tick_token(
+        camera_id=cam_id, captured_at=at, ident="custom_ab12",
+        settings=settings)
+    page = await client.get(f"/v1/event-gate/tick/{tok}")
+    assert page.status_code == 200 and "sipped" in page.text
+    act = await client.post(f"/v1/event-gate/tick/{tok}?action=reject")
+    assert act.status_code == 200 and "Removed" in act.text
+    v = (await session.execute(sa_text(
+        "select detector_fields->>'custom_ab12_verdict' from analyses "
+        "where camera_id=:c"), {"c": str(cam_id)})).scalar_one()
+    assert v == "rejected"
+    # Second tap cannot flip the ruling.
+    act2 = await client.post(f"/v1/event-gate/tick/{tok}?action=accept")
+    assert "Already settled" in act2.text

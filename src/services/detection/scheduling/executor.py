@@ -70,6 +70,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Sequence
 
@@ -105,6 +106,7 @@ _FRAME_SAMPLING_PROVIDERS = frozenset({"openai", "dashscope"})
 # vice versa, is exactly the mismatch that caused prod seizure
 # overfiring). Detectors without an entry keep their own fragment; the
 # provider's tint note (motion_overlay=True) explains the red channel.
+_CROP_MAX_TRACK_AGE_S = 5.0
 _OVERLAY_SPECS = {"seizure": rapid_seizure_spec()}
 
 
@@ -295,6 +297,16 @@ async def run_scheduled_calls(
             ]
         elif plan.crop == "person" and plan.target_track_id is not None:
             track = tracks_by_id.get(plan.target_track_id)
+            # A stale box must not aim the crop: the 2026-08-18 exhibit
+            # was a person-crop of an empty TV console (track age >>
+            # clip window) that the model then confabulated actions
+            # into. Stale -> degrade to the full-frame artifact below.
+            if track is not None and track.age_s > _CROP_MAX_TRACK_AGE_S:
+                log.info(
+                    "executor.stale_track_crop_degraded track=%d age=%.1fs",
+                    track.track_id, track.age_s,
+                )
+                track = None
             crop_mp4 = None
             if track is not None:
                 crop_mp4 = await build_person_crop_mp4(
@@ -325,6 +337,24 @@ async def run_scheduled_calls(
             artifact_fps=artifact_fps, overlay_specs=overlay_specs,
             degraded_artifact=degraded_this_call,
         ))
+        if getattr(settings, "artifact_dump_dir", "") and mp4:
+            # Latest-only (2026-08-18, replaces the timestamped archive
+            # that ate 3GB/hr): one file per artifact kind, overwritten
+            # each tick — the soak dashboard renders these live.
+            def _dump(mp4=mp4, crop=plan.crop, dets=",".join(idents)):
+                import pathlib as _pl
+                _d = _pl.Path(settings.artifact_dump_dir)
+                _d.mkdir(parents=True, exist_ok=True)
+                _tmp = _d / f".latest_{crop}.tmp"
+                _tmp.write_bytes(mp4)
+                _tmp.rename(_d / f"latest_{crop}.mp4")
+                (_d / f"latest_{crop}.txt").write_text(dets)
+            try:
+                # Off the event loop: an MB-scale sync write here stalls
+                # EVERY camera's tick, not just this one (review 2026-08-18).
+                await asyncio.to_thread(_dump)
+            except Exception:  # noqa: BLE001 — a dump must never hurt a tick
+                log.exception("executor.artifact_dump_failed")
 
     # ── Phase 2: provider calls (CONCURRENT) ─────────────────────────
     # `return_exceptions=True` so one crop call 503'ing cannot cancel
@@ -373,8 +403,13 @@ async def run_scheduled_calls(
             log_tag=log_tag, settings=settings,
         )
 
+    async def _timed(pc):
+        t0 = time.monotonic()
+        out = await _call(pc)
+        return ((time.monotonic() - t0) * 1000.0, out)
+
     outcomes: list[Any] = list(await asyncio.gather(
-        *(_call(pc) for pc in prepared), return_exceptions=True,
+        *(_timed(pc) for pc in prepared), return_exceptions=True,
     ))
 
     # ── Phase 3: merge (SEQUENTIAL, PLAN ORDER) ──────────────────────
@@ -394,7 +429,7 @@ async def run_scheduled_calls(
                 log_tag, plan.plan_key, idents, outcome,
             )
             continue
-        used_provider, result = outcome
+        call_ms, (used_provider, result) = outcome
 
         if plan.needs_audio and used_provider in _FRAME_SAMPLING_PROVIDERS:
             degraded_audio = True
@@ -421,6 +456,7 @@ async def run_scheduled_calls(
             "detectors": idents,
             "provider": used_provider,
             "model": result.model,
+            "ms": int(call_ms),
             "input_tokens": int(usage.get("input", 0)),
             "output_tokens": int(usage.get("output", 0)),
             **evidence,
@@ -489,58 +525,94 @@ async def run_scheduled_calls(
     # the tick.
     confirm_ledger: dict[str, dict] = {}
     if getattr(settings, "detection_v2_decision_enabled", False):
+
+        async def _vote(ident, due, artifact, plan, art_fps, i, detected_key):
+            """One confirm vote → (in_tokens, out_tokens, agreed).
+            Errors are non-confirming votes, never tick failures."""
+            try:
+                if plan.tier == "flash":
+                    # Votes must see what the original call saw —
+                    # same model, same fps (P4 review finding 3: a
+                    # 4fps vote on an 8fps rapid artifact is a
+                    # systematically blind re-check), and on overlay
+                    # artifacts the same prompt variant + tint note.
+                    vote_update: dict = {
+                        "gemini_model": settings.rapid_model,
+                        "gemini_video_fps": str(art_fps),
+                    }
+                    vote_spec = due.spec
+                    if plan.channel == "overlay":
+                        vote_spec = _OVERLAY_SPECS.get(ident, due.spec)
+                    fs = settings.model_copy(update=vote_update)
+                    res = await flash_provider(
+                        mp4=artifact, detectors=[vote_spec],
+                        log_tag=f"{log_tag} confirm:{ident}:{i}",
+                        settings=fs, patient_in_clip=identity.patient_in_clip,
+                        motion_overlay=(plan.channel == "overlay"),
+                    )
+                else:
+                    # Confirm votes may run a STRONGER model than the
+                    # primary pass (Aryaman 2026-08-18: lite screens,
+                    # flash confirms) — spend-on-fires only.
+                    cs = settings
+                    if getattr(settings, "confirm_model", ""):
+                        cs = settings.model_copy(
+                            update={"gemini_model": settings.confirm_model},
+                        )
+                    _, res = await run_main_vlm(
+                        choice=vlm_choice, mp4=artifact,
+                        detectors=[due.spec],
+                        identity=replace(
+                            identity, extracted_frames=None,
+                            per_frame_bboxes=None, sample_fps=None,
+                            patient_bbox=None,
+                        ),
+                        log_tag=f"{log_tag} confirm:{ident}:{i}",
+                        settings=cs,
+                    )
+            except Exception:  # noqa: BLE001 — a vote, not a tick
+                log.warning(
+                    "%s confirm call failed ident=%s vote=%d",
+                    log_tag, ident, i,
+                )
+                return 0, 0, False
+            u = res.usage or {}
+            return (
+                int(u.get("input", 0)), int(u.get("output", 0)),
+                bool(res.detector_fields.get(detected_key)),
+            )
+
+        # ALL votes for ALL fired detectors go out concurrently —
+        # sequential votes were adding n×call-latency to fire ticks
+        # (measured p95 55s+ under the full roster, 2026-08-18). The
+        # semaphore bounds the burst: a co-fire tick (meal+medication+
+        # drink = 9 votes) must not saturate the uplink under the
+        # primaries of the next overlapping tick.
+        _vote_sem = asyncio.Semaphore(4)
+
+        async def _sem_vote(*a):
+            async with _vote_sem:
+                return await _vote(*a)
+
+        vote_jobs: list[tuple[str, Any]] = []
+        confirm_kn: dict[str, tuple[int, int]] = {}
         for ident, (due, artifact, plan, art_fps) in winning_call.items():
             k, n = due.dims.confirm_k, due.dims.confirm_n
             detected_key, _conf_key = detection_keys_for(ident)
             if n <= 0 or not merged_fields.get(detected_key):
                 continue
-            votes = 0
-            spend_in = spend_out = 0
+            confirm_kn[ident] = (k, n)
             for i in range(n):
-                try:
-                    if plan.tier == "flash":
-                        # Votes must see what the original call saw —
-                        # same model, same fps (P4 review finding 3: a
-                        # 4fps vote on an 8fps rapid artifact is a
-                        # systematically blind re-check), and on overlay
-                        # artifacts the same prompt variant + tint note.
-                        vote_update: dict = {
-                            "gemini_model": settings.rapid_model,
-                            "gemini_video_fps": str(art_fps),
-                        }
-                        vote_spec = due.spec
-                        if plan.channel == "overlay":
-                            vote_spec = _OVERLAY_SPECS.get(ident, due.spec)
-                        fs = settings.model_copy(update=vote_update)
-                        res = await flash_provider(
-                            mp4=artifact, detectors=[vote_spec],
-                            log_tag=f"{log_tag} confirm:{ident}:{i}",
-                            settings=fs, patient_in_clip=identity.patient_in_clip,
-                            motion_overlay=(plan.channel == "overlay"),
-                        )
-                    else:
-                        _, res = await run_main_vlm(
-                            choice=vlm_choice, mp4=artifact,
-                            detectors=[due.spec],
-                            identity=replace(
-                                identity, extracted_frames=None,
-                                per_frame_bboxes=None, sample_fps=None,
-                                patient_bbox=None,
-                            ),
-                            log_tag=f"{log_tag} confirm:{ident}:{i}",
-                            settings=settings,
-                        )
-                except Exception:  # noqa: BLE001 — a vote, not a tick
-                    log.warning(
-                        "%s confirm call failed ident=%s vote=%d",
-                        log_tag, ident, i,
-                    )
-                    continue
-                u = res.usage or {}
-                spend_in += int(u.get("input", 0))
-                spend_out += int(u.get("output", 0))
-                if bool(res.detector_fields.get(detected_key)):
-                    votes += 1
+                vote_jobs.append((ident, _sem_vote(
+                    ident, due, artifact, plan, art_fps, i, detected_key,
+                )))
+        vote_results = await asyncio.gather(*(job for _, job in vote_jobs))
+        for ident, (k, n) in confirm_kn.items():
+            rs = [r for (vid, _), r in zip(vote_jobs, vote_results)
+                  if vid == ident]
+            votes = sum(1 for _, _, agreed in rs if agreed)
+            spend_in = sum(r[0] for r in rs)
+            spend_out = sum(r[1] for r in rs)
             total_in += spend_in
             total_out += spend_out
             passed = votes >= k
@@ -549,6 +621,7 @@ async def run_scheduled_calls(
                 "input_tokens": spend_in, "output_tokens": spend_out,
             }
             if not passed:
+                detected_key, _conf_key = detection_keys_for(ident)
                 merged_fields[detected_key] = False
                 merged_fields[f"{ident}_confirm_suppressed"] = True
                 log.info(

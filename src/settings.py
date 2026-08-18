@@ -78,6 +78,10 @@ class Settings(BaseSettings):
     # a no-op — a 3.5-lite outage had nowhere to go but the next
     # provider. A different tier is the whole point of the hop.
     gemini_fallback_model: str = Field(default="gemini-3.1-flash-lite")
+    # k-of-N confirm votes run this model instead of gemini_model when
+    # set ("" = same model). Lite screens, a stronger tier confirms —
+    # spend only on fires. Env: NEMARA_CONFIRM_MODEL.
+    confirm_model: str = Field(default="")
     gemini_video_fps: str = Field(default="4")
     # Per-frame token budget Gemini spends on each image/video frame — the real
     # "how much detail does the VLM see" dial (independent of the pixels we
@@ -390,6 +394,10 @@ class Settings(BaseSettings):
     scheduler_person_requires_track: bool = Field(default=False)
     # duty_cycle='sampled' detectors run every k-th tick. 1 = parity.
     scheduler_sample_every_k: int = Field(ge=1, le=60, default=1)
+    # Page record-only positives (rising edge) for verification. Off in prod.
+    record_only_paging: bool = Field(default=False)
+    # Dump every VLM artifact (exact Gemini input bytes) here. "" = off.
+    artifact_dump_dir: str = Field(default="")
     # Crowd hardening (D3): more than this many concurrent tracks ⇒ no
     # per-person crops this tick — every detector runs full-scene.
     scheduler_crowd_fallback_tracks: int = Field(ge=1, le=16, default=4)
@@ -702,6 +710,11 @@ class Settings(BaseSettings):
     # queued tick's moment is never mostly evicted (review F5), and
     # bounds the frozen payload's lifetime.
     scheduler_tick_queue_max_age_s: float = Field(ge=0, default=15.0)
+    # In-flight tick generations per camera. 2 = the 2026-07-18
+    # resource contract; 3 absorbs gen latency ≈ cadence without
+    # queueing (Aryaman 2026-08-18: no queued or shed ticks). Each
+    # slot pins one ~11s frame window (~130MB).
+    scheduler_tick_max_inflight: int = Field(ge=1, le=4, default=2)
     # W2 — input-quality admissibility floors. A tick below any floor
     # is "degraded": analysis still runs (the LLM reads blur far
     # better than YOLO) but the tick cannot testify toward EMPTINESS —

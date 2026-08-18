@@ -42,6 +42,14 @@ class DetectorDims:
     evidence_unit: str = "verdict"
     duty_cycle: str = "every_eligible_tick"
     degradation_warning: str = "none"
+    # Point-shape re-fire spacing seeded onto the row at creation; None
+    # keeps the global default (30s). Env taxonomy (Aryaman 2026-08-17):
+    # glass/water are ACTION detectors (the prompt fires on the event
+    # happening in-clip, never on the lingering state), so this is only
+    # a spam backstop for a VLM that mistakes a standing puddle/shards
+    # for a fresh incident; fire is deliberately state-phrased and
+    # re-alerts each cooldown while still burning.
+    cooldown_seconds: int | None = None
 
 DIMS: dict[str, DetectorDims] = {
     # ── Seeded presets ──────────────────────────────────────────────
@@ -82,11 +90,14 @@ DIMS: dict[str, DetectorDims] = {
     "possible_intruder": DetectorDims(True, "anyone", "scene", 78),
     "env_hazard_glass":  DetectorDims(False, "environment", "scene", 62,
                                       duty_cycle="thinned",
-                                      degradation_warning="distance_class"),
+                                      degradation_warning="distance_class",
+                                      cooldown_seconds=1800),
     "env_hazard_water":  DetectorDims(False, "environment", "scene", 56,
                                       duty_cycle="thinned",
-                                      degradation_warning="distance_class"),
-    "fire_smoke":        DetectorDims(False, "environment", "scene", 98),
+                                      degradation_warning="distance_class",
+                                      cooldown_seconds=1800),
+    "fire_smoke":        DetectorDims(False, "environment", "scene", 98,
+                                      cooldown_seconds=600),
     # ── Internal ────────────────────────────────────────────────────
     "setup_test":        DetectorDims(True, "anyone", "scene", 200),
 }

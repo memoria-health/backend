@@ -46,6 +46,7 @@ class EventResponse(BaseModel):
     icon_name: IconName
     title: Title
     location: Location
+    ended_at: datetime | None = None
     occurred_at: datetime
     has_clip: bool
     narrative: Narrative

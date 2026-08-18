@@ -30,9 +30,69 @@ log = logging.getLogger("perception")
 _WEIGHTS = os.environ.get("NEMARA_TRIGGER_WEIGHTS", "yolo26x.pt")
 _IMGSZ = int(os.environ.get("NEMARA_TRIGGER_IMGSZ", "1280"))
 _CONF = float(os.environ.get("NEMARA_TRIGGER_CONF", "0.45"))
+# Night-mode confidence floor (2026-08-18, Aryaman's bedroom): IR
+# grayscale at distance sits right under the daylight floor — a seated
+# person 20ft away flickered between detected and not, and every miss
+# at a ground tick killed the track (the birth/death carousel, 3 ids in
+# 40s). Detection floors are the SAFE thing to lower at night: worst
+# case is a phantom candidate the next ground kills; today's worst case
+# is a real person going invisible. Identity/seat thresholds are NOT
+# touched — a looser ID bar in a two-sleeper bedroom is the dangerous
+# lever. NEMARA_IR_BOOST=0 disables all night adjustments.
+_CONF_IR = float(os.environ.get("NEMARA_TRIGGER_CONF_IR", "0.32"))
+_IR_BOOST = os.environ.get("NEMARA_IR_BOOST", "1").strip().lower() not in (
+    "0", "false", "off",
+)
 
 _model = None
 _dead = False
+
+
+def is_ir(bgr) -> bool:
+    """True when the frame is IR/night mode: grayscale replicated into
+    BGR, so the channels agree everywhere. Subsampled — ~free."""
+    try:
+        sub = bgr[::16, ::16].astype("int16")
+        spread = float(
+            abs(sub[..., 0] - sub[..., 1]).mean()
+            + abs(sub[..., 1] - sub[..., 2]).mean()
+        )
+        return spread < 2.0
+    except Exception:  # noqa: BLE001 — never let the probe kill a tick
+        return False
+
+
+_IR_CLAHE = os.environ.get("NEMARA_IR_CLAHE", "1").strip().lower() not in (
+    "0", "false", "off",
+)
+_clahe = None
+
+
+def enhance_ir(bgr):
+    """CLAHE contrast enhancement for IR frames, detection input only.
+
+    IR's core problem is COMPRESSED CONTRAST (gray-on-gray person at
+    distance), which is why detectors trained on daylight data sit
+    under their floors at night. Adaptive histogram equalization is the
+    standard, well-evidenced pre-step for night detection (CLAHE+YOLO
+    night-detection literature, 2026-08-18 review). IR frames have all
+    three channels equal, so equalize one and replicate. Applied to
+    the whole detection batch including the EdgeTAM carry stream
+    (continuous.py enhances the batch — carry needs the same pixels it
+    grounded on); face crops still read RAW frames (server.py).
+    NEMARA_IR_CLAHE=0 disables."""
+    global _clahe
+    try:
+        import cv2
+
+        if _clahe is None:
+            _clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        g = _clahe.apply(bgr[..., 0])
+        import numpy as np
+
+        return np.repeat(g[..., None], 3, axis=2)
+    except Exception:  # noqa: BLE001 — enhancement must never kill a tick
+        return bgr
 
 
 def _load():
@@ -57,8 +117,12 @@ def person_boxes(bgr) -> "Optional[list]":
     if _dead:
         return None
     try:
+        # Frames arrive PRE-enhanced under IR (continuous enhances the
+        # whole batch once at tick entry) — only the conf floor is
+        # night-adjusted here; re-running CLAHE would over-equalize.
+        conf = _CONF_IR if (_IR_BOOST and is_ir(bgr)) else _CONF
         res = _load().predict(
-            bgr, imgsz=_IMGSZ, conf=_CONF, classes=[0],
+            bgr, imgsz=_IMGSZ, conf=conf, classes=[0],
             verbose=False, device=0,
         )
         out = []
@@ -88,7 +152,11 @@ def person_masks(bgr) -> "Optional[list]":
         if getattr(model, "task", "") != "segment":
             return None
         res = model.predict(
-            bgr, imgsz=_IMGSZ, conf=_CONF, classes=[0],
+            bgr, imgsz=_IMGSZ,
+            # Same night floor as person_boxes — this path missed the
+            # IR fix and ran the daylight floor after dark (review).
+            conf=_CONF_IR if (_IR_BOOST and is_ir(bgr)) else _CONF,
+            classes=[0],
             verbose=False, device=0, retina_masks=True,
         )
         m = res[0].masks

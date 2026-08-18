@@ -13,7 +13,7 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Query, status
-from sqlalchemy import select, text
+from sqlalchemy import or_, select, text
 
 from src.api.deps import CaregiverAuth, SessionDep
 from src.db.event import Event
@@ -63,14 +63,22 @@ async def get_journal(
     detectors = list(await detector_repo.list_for_patient(
         session, patient_id, caregiver_id=auth.id))
 
-    # The day's events, grouped per detector.
+    # The day's events, grouped per detector. Gate-held and
+    # operator-rejected events are invisible to the caregiver
+    # everywhere (events list, home report) — the journal must match,
+    # or a rejected alert surfaces here as a review chip whose tap
+    # finds nothing (Aryaman, soak day 1: rejected both pager events,
+    # Overview still showed them "for review").
     events = (await session.execute(
         select(Event)
         .where(Event.patient_id == patient_id,
-               Event.occurred_at >= start, Event.occurred_at < end)
+               Event.occurred_at >= start, Event.occurred_at < end,
+               or_(Event.gate_state.is_(None),
+                   Event.gate_state.notin_(("pending", "rejected"))))
         .order_by(Event.occurred_at)
     )).scalars().all()
     events_by_detector: dict[str, list] = {}
+    orphan_events: list = []
     for ev in events:
         # Reviewed-as-wrong events are confirmed false alarms: they stay
         # on the Events page, but the journal doesn't narrate them and
@@ -79,6 +87,10 @@ async def get_journal(
             continue
         if ev.detector_id is not None:
             events_by_detector.setdefault(str(ev.detector_id), []).append(ev)
+        else:
+            # Detector deleted after the event fired — the event's own
+            # stored title/icon/category carry it (journal_day.orphan_group_line).
+            orphan_events.append(ev)
 
     # Analysis ticks: activity states + per-identifier detected times for
     # record streams, in one pass. Modest row counts at a day's scale.
@@ -102,15 +114,32 @@ async def get_journal(
         if state:
             activity_ticks.append((r["captured_at"], state))
         for ident in record_idents:
-            if fields.get(f"{ident}_detected") is True:
+            # Operator-denied ticks (record-verdict page) leave the
+            # count — a denied occurrence is a labeled false positive,
+            # not a data point.
+            if (fields.get(f"{ident}_detected") is True
+                    and fields.get(f"{ident}_verdict") != "rejected"):
                 detected_times[ident].append(r["captured_at"])
 
     # Coverage: hours of the day with any analysis at all.
+    # Hours the AI actually analyzed (analyses rows only exist when a
+    # tick ran — camera-online-but-paused contributes nothing), bucketed
+    # in the CAREGIVER's timezone. Truncating in UTC counted 25 buckets
+    # on a fully-watched IST day: the local day spans 18:30->18:30 UTC,
+    # clipping two PARTIAL utc-hour buckets at the edges ("cameras
+    # watched 25 of 24 hours", live 2026-08-17).
+    # provider='skipped' rows exist to record that the AI did NOT
+    # analyze (ai_paused / disabled ticks still write one per cadence
+    # for the debug feed + ingress health). Counting them as coverage
+    # showed "watched 16 of 24 hours" on a day the AI was paused
+    # throughout (live 2026-08-18). Only REAL analyses count.
     cov = (await session.execute(text("""
-        select count(distinct date_trunc('hour', captured_at))::int as n
+        select count(distinct date_trunc('hour', captured_at at time zone :tz))::int as n
         from analyses
         where patient_id = :p and captured_at >= :s and captured_at < :e
-        """), {"p": patient_id, "s": start, "e": end})).mappings().one()
+          and provider <> 'skipped'
+        """), {"p": patient_id, "s": start, "e": end,
+               "tz": str(tz)})).mappings().one()
 
     # Days-since streaks for quiet point detectors.
     last_rows = (await session.execute(text("""
@@ -142,6 +171,7 @@ async def get_journal(
         detected_times_by_identifier=detected_times,
         streak_days_by_detector=streaks,
         coverage_hours=int(cov["n"]),
+        orphan_events=orphan_events,
     )
     return {
         "date": date,

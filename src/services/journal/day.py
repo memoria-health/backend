@@ -13,8 +13,8 @@ rows here. Rules that live in this file:
   - Activity (pinned definition): moving = standing + active minutes
     from the summarizer's state vocabulary; a block renders where a
     30-minute bucket holds >= 10 moving minutes; solid blocks only.
-  - Episodes have no persisted end time yet, so they render as marks —
-    never fabricated spans.
+  - Episodes render as spans when ended_at is persisted; never
+    fabricated — no end recorded means a mark.
   - No summary sentence anywhere.
 """
 
@@ -117,17 +117,28 @@ def point_line(det, events: list, tz: tzinfo, streak_days: int | None) -> dict:
 # ── sustained episodes (alerting) ────────────────────────────────────
 
 def episode_line(det, events: list, tz: tzinfo) -> dict:
-    """Episode ends aren't persisted yet, so episodes render as marks
-    at their start time — never fabricated spans."""
+    """Episodes with a persisted end render as spans; ends are never
+    fabricated — an event without ended_at stays a mark."""
     if not events:
         return _entry(det, "episode", f"No {det.name.lower()}", None, "ok", None)
     status, review_id = _review_state(events)
     n = len(events)
     meta = f"{_clock(events[0].occurred_at, tz)}, {events[0].location}"
-    marks = [hour_x(ev.occurred_at, tz) for ev in events]
+    spans, marks = [], []
+    for ev in events:
+        ended = getattr(ev, "ended_at", None)
+        if ended and ended > ev.occurred_at:
+            x0, x1 = hour_x(ev.occurred_at, tz), hour_x(ended, tz)
+            spans.append([x0, 24.0 if x1 < x0 else x1])  # midnight clamp
+        else:
+            marks.append(hour_x(ev.occurred_at, tz))
+    if n == 1 and spans:
+        mins = int((events[0].ended_at - events[0].occurred_at).total_seconds() // 60)
+        if mins >= 1:
+            meta = f"{meta}, {mins} min"
     return _entry(det, "episode",
                   f"{n} episode{'' if n == 1 else 's'}", meta, status,
-                  _strip("midnight", [], marks), review_id)
+                  _strip("midnight", spans, marks), review_id)
 
 
 # ── absence (deadline) — an event IS the miss ────────────────────────
@@ -221,7 +232,7 @@ def activity_line(ticks: list, tz: tzinfo) -> dict:
 
 def count_line(det, times: list, tz: tzinfo) -> dict:
     if not times:
-        return _entry(det, "record_count", "None today", None, "none", None)
+        return _entry(det, "record_count", "None", None, "none", None)
     n = len(times)
     return _entry(det, "record_count", f"{n} time{'' if n == 1 else 's'}",
                   None, "none",
@@ -258,7 +269,7 @@ def duration_line(det, tick_times: list, tz: tzinfo) -> dict:
     ticks are RECORDED timestamps, so merging runs (gap <= 60 s) into
     session spans is a clean map, not an inference."""
     if not tick_times:
-        return _entry(det, "record_duration", "None today", None, "none", None)
+        return _entry(det, "record_duration", "None", None, "none", None)
     spans: list[list[float]] = []
     run_start = prev = tick_times[0]
     for t in tick_times[1:]:
@@ -272,11 +283,43 @@ def duration_line(det, tick_times: list, tz: tzinfo) -> dict:
                   "none", _strip("midnight", spans, []))
 
 
+def orphan_group_line(events: list, tz: tzinfo) -> dict:
+    """Events whose detector was later DELETED still happened, and the
+    journal for THAT day must keep narrating them (Aryaman 2026-08-17:
+    "if a detector existed in the past, its events should still be
+    recorded for that day"). The event row stores its own title/icon/
+    category precisely to outlive its detector. Grouped by stored
+    title, one line per title per day; days after the deletion have no
+    events and therefore show nothing."""
+    first = events[0]
+    n = len(events)
+    status, review_id = _review_state(events)
+    if n == 1:
+        primary = f"At {_clock(first.occurred_at, tz)}"
+        if first.location:
+            primary += f", {first.location}"
+    else:
+        word = "Twice" if n == 2 else f"{n} times"
+        primary = f"{word}, first at {_clock(first.occurred_at, tz)}"
+    return {
+        "detector_id": None,
+        "title": first.title,
+        "icon": first.icon_name,
+        "category": first.category,
+        "severity": None,
+        "kind": "point",
+        "line": {"primary": primary, "meta": None, "status": status},
+        "strip": None,
+        "review_event_id": review_id,
+    }
+
+
 def build_entries(*, detectors: list, events_by_detector: dict, tz: tzinfo,
                   sleep_row: dict | None, activity_ticks: list,
                   detected_times_by_identifier: dict,
                   streak_days_by_detector: dict,
-                  coverage_hours: int = 24) -> list[dict]:
+                  coverage_hours: int = 24,
+                  orphan_events: list | None = None) -> list[dict]:
     """Route each detector to its taxonomy's builder. Pure — the
     endpoint does the queries, this does the shape.
 
@@ -319,6 +362,14 @@ def build_entries(*, detectors: list, events_by_detector: dict, tz: tzinfo,
             e = point_line(det, events, tz,
                            streak_days_by_detector.get(str(det.id)))
         entries.append(e)
+    # Orphaned events (detector deleted) — grouped by their stored
+    # title, appended after the living detectors. See orphan_group_line.
+    if orphan_events:
+        by_title: dict[str, list] = {}
+        for ev in orphan_events:
+            by_title.setdefault(ev.title or "Event", []).append(ev)
+        for evs in by_title.values():
+            entries.append(orphan_group_line(evs, tz))
     if coverage_hours == 0:
         for e in entries:
             quiet = (e["line"]["status"] == "ok"

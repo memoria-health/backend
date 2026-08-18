@@ -78,20 +78,13 @@ jobs:
           NEMARA_SUPABASE_PUBLISHABLE_KEY: ci-publishable-placeholder
           NEMARA_SUPABASE_JWT_SECRET: ci-jwt-secret-placeholder-at-least-32-chars
           NEMARA_SUPABASE_SERVICE_ROLE_KEY: ci-service-role-placeholder
-        # Five test/unit files are integration tests wearing a unit label:
-        # they open real connections to the local Supabase Postgres. CI has
-        # no database, so they are excluded HERE ONLY — `make test` still
-        # runs them against real infra on every dev machine. If a new
-        # DB-backed test lands in test/unit it will fail this gate loudly,
-        # which is the correct pressure to either mock it or move it to
-        # test/integration.
+        # test/unit is DB-free by contract (2026-08-17: the five DB-backed
+        # files that used to be excluded here moved to test/integration,
+        # where they belong). CI has no database, so a new DB-backed test
+        # landing in test/unit fails this gate loudly — the correct
+        # pressure to either mock it or put it in test/integration.
         run: >
           uv run pytest test/unit -q
-          --ignore test/unit/test_face_embedding_repo.py
-          --ignore test/unit/test_state_machine.py
-          --ignore test/unit/test_state_machine_no_online_write.py
-          --ignore test/unit/test_active_camera.py
-          --ignore test/unit/test_event_gate.py
 
   build:
     needs: test

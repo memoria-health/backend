@@ -188,6 +188,17 @@ caregiver's wording that conflicts with them.
    be made out, require that the exact words be quoted in the reasoning
    before TRUE is allowed, and state that audio which may come from a
    television, radio, speaker, phone, or laptop does not count.
+
+8. AN ENVIRONMENT HAZARD IS AN EVENT, NOT A STATE. If the ask is about
+   a hazard appearing in the home (a spill, something breaking or
+   shattering, a leak, something falling and making a mess), write the
+   criteria to fire on the event HAPPENING during the clip — or on the
+   hazard appearing during the clip when the moment itself was missed.
+   State explicitly that the aftermath already present and unchanged
+   for the WHOLE clip is FALSE. One puddle must alert once, not on
+   every clip until somebody cleans it up. (An ongoing danger that is
+   itself the emergency — visible fire or smoke — is the exception:
+   still-burning IS the event, and stays TRUE.)
 """
 
 
@@ -499,8 +510,13 @@ async def _compile_with_gemini(
             ),
         ],
         # No response_schema — we want freeform text, not JSON.
+        # Thinking maxed (Aryaman 2026-08-17): compile/infer are one-off
+        # create-time calls where taxonomy correctness beats latency.
         config=genai_types.GenerateContentConfig(
             response_mime_type="text/plain",
+            thinking_config=genai_types.ThinkingConfig(
+                thinking_level=genai_types.ThinkingLevel.HIGH,
+            ),
         ),
     )
     raw = (response.text or "").strip()
@@ -524,6 +540,7 @@ async def _compile_with_openai(
     client = AsyncOpenAI(api_key=settings.openai_api_key)
     response = await client.chat.completions.create(
         model=settings.openai_compile_model,
+        reasoning_effort="high",
         messages=[
             {"role": "user", "content": _meta_prompt(
                 identifier=identifier,
@@ -695,13 +712,21 @@ def _infer_meta_prompt(*, name: str | None, prompt: str) -> str:
         "  - 'duration': once something has gone on TOO LONG — 'if the stove's "
         "been on more than 10 minutes', 'if she's on the floor over 5 "
         "minutes', 'prolonged stillness'. Put the stated length in "
-        "duration_seconds.\n"
+        "duration_seconds. An appliance 'left on' or 'still on' while "
+        "unattended is a duration ask even when no length is stated — the "
+        "concern is the persisting state, not the moment of switch-on "
+        "(leave duration_seconds null for the user to fill). Visible fire "
+        "or smoke is NEVER 'duration' — even phrased as 'catches fire' or "
+        "'is burning', waiting any length of time before alerting is wrong; "
+        "it is 'leading'.\n"
         "  - 'absence': the thing did NOT happen within its window — 'if she "
         "doesn't take her meds by 5pm', 'alert me if she hasn't gotten up by "
         "10am'. Non-occurrence is only knowable at the window's end, so any "
         "'doesn't / hasn't happened by <time>' request is 'absence'. (A "
         "positive 'tell me WHEN she does X' is just 'leading' — use the active "
-        "window for the timing, not this.)\n"
+        "window for the timing, not this. 'Make sure she does X' with no "
+        "deadline is also 'leading' on the activity itself, not 'trailing' "
+        "and not 'absence' — there is no window to evaluate a miss against.)\n"
         "  - 'record_only': the caregiver wants to SEE this on the timeline, "
         "not be TOLD about it. An ordinary daily state that is never an "
         "emergency and never needs a notification — watching TV, sitting, "
@@ -743,13 +768,15 @@ def _infer_meta_prompt(*, name: str | None, prompt: str) -> str:
         'detector is normal and correct.\n'
         '     - "safety" = physical danger or a health emergency: falls, '
         'wandering / leaving the house, fire / stove / hazards, choking, '
-        'injury, prolonged no-movement.\n'
+        'injury, prolonged no-movement, calling out FOR HELP or in distress '
+        '(the ask is about danger, not mood).\n'
         '     - "routine" = the rhythm of an ordinary day, and whether it '
         'held: meals, sleep and waking, medication taken, getting up and '
         'about, time out of bed.\n'
         '     - "behaviour" = how the person seems in themselves: '
-        'restlessness, agitation, pacing, sundowning, distress, calling out, '
-        'repetitive actions, time spent alone.\n'
+        'restlessness, agitation, pacing, sundowning, '
+        'repetitive actions, muttering or calling out with no plea for help, '
+        'time spent alone.\n'
         '     - "care" = something a person needs help WITH, or the presence '
         'and absence of that help: assistance to the bathroom, company at '
         'meals, a visitor arriving, long stretches with nobody around.\n'
@@ -758,15 +785,25 @@ def _infer_meta_prompt(*, name: str | None, prompt: str) -> str:
         'the one naming why it matters — "pacing at night" is behaviour even '
         'though it may signal a safety risk.\n'
         '  "severity": integer 0-100 — how much a MISS costs, judged on its '
-        'own, independent of category.\n'
-        '     - 80-100 = a miss could mean harm: falls, wandering outside, '
-        'fire, choking, no movement for hours, a medication that must not be '
-        'skipped. Detectors at or above 80 are compiled with INCLUSIVE '
-        'criteria so borderline signs still fire.\n'
-        '     - 40-79 = worth knowing promptly but not an emergency: skipped '
-        'a meal, up much later than usual, sustained agitation.\n'
-        '     - 0-39 = context, not alarm: watching TV, reading, a visitor, '
-        'sitting on the couch.\n'
+        'own, independent of category. Calibrate against the harm of the '
+        'event ITSELF, not against how much the caregiver cares — every '
+        'request here matters to them, so "they asked, so it must be 90" '
+        'inflates everything.\n'
+        '     - 80-100 = a missed alert could be immediately '
+        'life-threatening, where minutes matter: a fall, choking, '
+        'unconsciousness, visible fire or smoke, calling out for help. '
+        'Detectors at or above 80 are compiled with INCLUSIVE criteria so '
+        'borderline signs still fire.\n'
+        '     - 50-79 = a real hazard or significant concern, worth prompt '
+        'attention but not by itself a medical emergency: leaving the house '
+        'or wandering out, an unattended stove left on, an unfamiliar or '
+        'masked person, broken glass or a spill waiting to be slipped on, '
+        'sustained agitation or distress.\n'
+        '     - 0-49 = the rhythm of daily life, context rather than alarm: '
+        'meals and eating, the medication routine (including a missed or '
+        'skipped dose), watching TV, reading, a visitor, sitting on the '
+        'couch. (A missed dose alert still reaches the caregiver through '
+        'its schedule window — routine severity does not silence it.)\n'
         '  "suggested_name": a short display name stating what the ALERT '
         "MEANS. Event titles read 'Possible <name>', so for "
         'alert_trigger="absence" the name MUST be phrased as the MISS '
@@ -923,7 +960,12 @@ async def _infer_with_gemini(*, name: str | None, prompt: str, settings: Setting
             role="user",
             parts=[genai_types.Part(text=_infer_meta_prompt(name=name, prompt=prompt))],
         )],
-        config=genai_types.GenerateContentConfig(response_mime_type="application/json"),
+        config=genai_types.GenerateContentConfig(
+            response_mime_type="application/json",
+            thinking_config=genai_types.ThinkingConfig(
+                thinking_level=genai_types.ThinkingLevel.HIGH,
+            ),
+        ),
     )
     raw = (response.text or "").strip()
     if not raw:
@@ -937,6 +979,7 @@ async def _infer_with_openai(*, name: str | None, prompt: str, settings: Setting
     client = AsyncOpenAI(api_key=settings.openai_api_key)
     response = await client.chat.completions.create(
         model=settings.openai_model,
+        reasoning_effort="high",
         messages=[{"role": "user", "content": _infer_meta_prompt(name=name, prompt=prompt)}],
         response_format={"type": "json_object"},
     )

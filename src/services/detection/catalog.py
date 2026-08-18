@@ -274,26 +274,31 @@ _AGITATION_PROMPT_FRAGMENT = (
     "There are two independent kinds of evidence. EITHER one alone is "
     "enough — but only when it is unambiguous:\n"
     "\n"
-    "PHYSICAL — clear, obvious physical distress, such as:\n"
-    "  - PACING in the clearest sense: repeatedly walking back and "
-    "forth in an agitated, purposeless way — NOT simply crossing the "
-    "room or walking over to do something;\n"
-    "  - frantic running or rushing about in evident distress;\n"
-    "  - frantic, disordered rummaging — agitatedly tearing through or "
-    "tossing things, NOT calm searching or tidying;\n"
-    "  - throwing objects, or banging / striking / slamming surfaces or "
-    "objects forcefully and angrily.\n"
-    "The action must clearly read as distress or anger. If it has an "
+    "PHYSICAL — explicit AGGRESSION, never mere restlessness "
+    "(recalibrated 2026-08-18: pacing, wandering about, and frantic "
+    "rummaging are NOT agitation and must never fire this detector):\n"
+    "  - throwing objects in anger;\n"
+    "  - banging / striking / slamming surfaces or objects forcefully "
+    "and angrily;\n"
+    "  - a physical altercation or fight with another person — "
+    "hitting, shoving, grabbing;\n"
+    "  - an outright angry outburst: fist-pounding, violent gesturing "
+    "at someone, visibly enraged body language directed at a person or "
+    "object.\n"
+    "The action must clearly read as anger or aggression. If it has an "
     "ordinary explanation — exercise, dancing, play, sport, swatting an "
-    "insect, normal chores, reaching for or carrying something, moving around the house — it is "
-    "NOT agitation.\n"
+    "insect, normal chores, reaching for or carrying something, moving "
+    "around the house, pacing, or restless fidgeting — it is NOT "
+    "agitation.\n"
     "\n"
-    "VERBAL — clear distress in BOTH tone and content, from the person "
-    "on camera:\n"
-    "  - TONE / affect: shouting, sharp, harsh, or hostile voice, or "
-    "sustained crying / groaning / yelling; AND\n"
-    "  - CONTENT: angry, hostile, or distressed words — cursing, "
-    "threats, distressed demands, or calls for help.\n"
+    "VERBAL — explicit hostility in BOTH tone and content, from the "
+    "person on camera:\n"
+    "  - TONE / affect: shouting, sharp, harsh, or hostile voice — a "
+    "raised angry voice, screaming at someone; AND\n"
+    "  - CONTENT: openly aggressive or hostile words — cursing at "
+    "someone, threats, a verbal fight, or an outright expression of "
+    "frustration or rage ('I can't take this', furious complaints "
+    "directed at a person).\n"
     "Both tone AND content must point to distress. Ordinary "
     "conversation does NOT count — a normal phone call, a minor "
     "argument or debate, or an animated explanation has a "
@@ -301,11 +306,11 @@ _AGITATION_PROMPT_FRAGMENT = (
     "distress.\n"
     "\n"
     "Set FALSE if any of:\n"
-    "  - the movement is ordinary or calm — walking to a destination, "
-    "doing chores, searching calmly, exercising, dancing, playing, or "
-    "swatting an insect;\n"
-    "  - there is motion but you cannot clearly tell it is distress "
-    "rather than ordinary activity;\n"
+    "  - the movement is ordinary, calm, or merely restless — walking, "
+    "pacing, doing chores, searching, rummaging, exercising, dancing, "
+    "playing, fidgeting, or swatting an insect;\n"
+    "  - there is motion but you cannot clearly tell it is aggression "
+    "rather than ordinary or restless activity;\n"
     "  - the only voice is ordinary conversation, argument, or "
     "explanation, or it likely comes from a TV / radio / phone / device "
     "or cannot be attributed to the person on camera;\n"
@@ -483,15 +488,21 @@ _CHOKING_PROMPT_FRAGMENT = (
 
 _MEAL_EATEN_PROMPT_FRAGMENT = (
     "meal_eaten_detected: boolean. TRUE only if the person is clearly eating a "
-    "meal — seated at a table or with a plate / bowl of food, repeatedly "
-    "bringing food to their mouth with a utensil or hand over the clip. The "
-    "eating action must be visible.\n"
+    "meal, which requires BOTH, visible in the SAME clip:\n"
+    "  1. FOOD IS VISIBLE — a plate, bowl, or identifiable food item you can "
+    "actually see; and\n"
+    "  2. the person repeatedly brings that visible food to their mouth with "
+    "a utensil or hand.\n"
+    "If you cannot point to the food in the frame, the answer is FALSE no "
+    "matter what the hand or mouth is doing.\n"
     "\n"
     "Set FALSE if any of:\n"
+    "  - hand-to-mouth or finger-in-mouth motion with NO visible food — "
+    "nail-biting, licking a finger, touching the lips, yawning (this fired "
+    "falsely on exactly this, 2026-08-18);\n"
     "  - the person only drinks a beverage, or handles food without eating it;\n"
     "  - someone is merely setting the table, cooking, or cleaning up — not "
     "eating;\n"
-    "  - a single ambiguous hand-to-mouth motion with no visible food;\n"
     "  - no person is visible.\n"
     "\n"
     "meal_eaten_confidence: number 0–1. 0 = not eating. 0.3–0.6 = possibly "
@@ -584,48 +595,52 @@ _POSSIBLE_INTRUDER_PROMPT_FRAGMENT = (
 )
 
 _ENV_HAZARD_GLASS_PROMPT_FRAGMENT = (
-    "env_hazard_glass_detected: boolean. TRUE only if there is BROKEN GLASS in "
-    "the scene — a shattered glass, bottle, dish, mirror, or window, with "
-    "visible shards / fragments scattered on the floor or a surface, or the act "
-    "of glass shattering during the clip. The broken glass / shards must be "
-    "visible.\n"
+    "env_hazard_glass_detected: boolean. TRUE only if glass BREAKS DURING THIS "
+    "CLIP — a glass, bottle, dish, mirror, or window shattering on camera, or "
+    "shards appearing during the clip that were not there at the start. This "
+    "detects the breakage EVENT, not the lingering aftermath.\n"
     "\n"
     "Set FALSE if any of:\n"
+    "  - shards / broken glass already present and unchanged for the WHOLE "
+    "clip (a pre-existing mess is not a new breakage);\n"
     "  - intact glassware, windows, or mirrors (whole, unbroken glass is "
     "normal);\n"
     "  - a spill of liquid with no broken glass;\n"
     "  - reflections or glare that are not actually broken glass;\n"
-    "  - nothing resembling glass shards is visible.\n"
+    "  - nothing resembling glass breaking or shards is visible.\n"
     "\n"
-    "env_hazard_glass_confidence: number 0–1. 0 = no broken glass. 0.3–0.6 = "
-    "something on the floor that might be shards but is unclear. 0.7+ = clearly "
-    "broken glass / scattered shards.\n"
-    "env_hazard_glass_reasoning: 1 short sentence (e.g. 'a glass shattered on "
-    "the floor at 5s, shards scattered', 'intact glasses on the table — nothing "
-    "broken', 'no broken glass visible')."
+    "env_hazard_glass_confidence: number 0–1. 0 = no glass broke. 0.3–0.6 = "
+    "something may have broken or shards may have appeared, but it is unclear. "
+    "0.7+ = glass clearly broke during the clip.\n"
+    "env_hazard_glass_reasoning: 1 short sentence (e.g. 'a glass fell and "
+    "shattered on the floor at 5s', 'shards visible but unchanged the whole "
+    "clip, pre-existing', 'no broken glass visible')."
 )
 
 _ENV_HAZARD_WATER_PROMPT_FRAGMENT = (
-    "env_hazard_water_detected: boolean. TRUE only if WATER (or another clear "
-    "liquid) is SPILLED on the floor — a visible puddle or wet patch on the "
-    "floor, or a spill happening during the clip — creating a slip hazard. The "
-    "spilled liquid on the floor must be visible.\n"
+    "env_hazard_water_detected: boolean. TRUE only if a SPILL HAPPENS DURING "
+    "THIS CLIP — water (or another liquid) being spilled, knocked over, "
+    "dropped, or actively spreading across the floor on camera, creating a "
+    "slip hazard. This detects the spill EVENT, not a puddle that was already "
+    "there.\n"
     "\n"
     "Set FALSE if any of:\n"
+    "  - a puddle / wet patch already present and unchanged for the WHOLE "
+    "clip (a pre-existing spill is not a new one);\n"
     "  - liquid contained in a glass, cup, bottle, sink, or tub (not spilled on "
     "the floor);\n"
     "  - a normal wet / shiny floor finish, rug, or mat that is not an actual "
     "spill;\n"
     "  - broken glass with no liquid (that is the glass hazard, not this "
     "one);\n"
-    "  - no spilled liquid on the floor is visible.\n"
+    "  - no spill happening is visible.\n"
     "\n"
-    "env_hazard_water_confidence: number 0–1. 0 = no spill. 0.3–0.6 = a patch "
-    "on the floor that might be a spill but is unclear. 0.7+ = a clear puddle / "
-    "spilled liquid on the floor.\n"
+    "env_hazard_water_confidence: number 0–1. 0 = no spill happened. 0.3–0.6 = "
+    "liquid may have spilled during the clip but it is unclear. 0.7+ = a spill "
+    "clearly happened during the clip.\n"
     "env_hazard_water_reasoning: 1 short sentence (e.g. 'a glass of water "
-    "spilled, leaving a puddle on the kitchen floor at 6s', 'shiny floor but no "
-    "actual spill', 'no spill visible')."
+    "tipped over at 6s, spreading across the kitchen floor', 'wet patch "
+    "visible but unchanged the whole clip, pre-existing', 'no spill visible')."
 )
 
 _FIRE_SMOKE_PROMPT_FRAGMENT = (
@@ -802,7 +817,7 @@ CATALOG: tuple[CatalogEntry, ...] = (
     ),
     CatalogEntry(
         key="agitation", name="Agitation", icon_name="figure.walk.motion",
-        description="Pacing or restless body language sustained over time.",
+        description="Explicit aggression: physical or verbal fighting, angry outbursts.",
         category="behaviour", is_sustained=True, cohort="adult",
         recommended=False, seeded=True, prompt_fragment=_AGITATION_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
@@ -817,7 +832,7 @@ CATALOG: tuple[CatalogEntry, ...] = (
     # post-pilot (docs/plans/2026-07-28-pilot-master-worklist.md).
     CatalogEntry(
         key="wandering", name="Wandering", icon_name="door.left.hand.open",
-        description="Main door opening — front entry only.",
+        description="Main door opening, front entry only.",
         category="safety", cohort="adult",
         recommended=False, seeded=True, prompt_fragment=_WANDERING_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
@@ -845,7 +860,7 @@ CATALOG: tuple[CatalogEntry, ...] = (
     ),
     CatalogEntry(
         key="medication", name="Medication adherence", icon_name="pills",
-        description="Confirms the morning and evening pill routine at the kitchen counter.",
+        description="Confirms the person took their medication.",
         category="routine", cohort="adult",
         recommended=False, seeded=True, prompt_fragment=_MEDICATION_PROMPT_FRAGMENT,
         # ALL DAY (Aryaman 2026-07-28): presets never ship hardcoded
@@ -868,7 +883,7 @@ CATALOG: tuple[CatalogEntry, ...] = (
     ),
     CatalogEntry(
         key="choking", name="Choking", icon_name="lungs",
-        description="Signs of choking — hands to the throat, unable to breathe.",
+        description="Signs of choking: hands to the throat, unable to breathe.",
         category="safety", cohort="adult",
         recommended=False, prompt_fragment=_CHOKING_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
@@ -877,6 +892,11 @@ CATALOG: tuple[CatalogEntry, ...] = (
         key="meal_eaten", name="Meal eaten", icon_name="fork.knife",
         description="Confirms the person ate a meal.",
         category="routine", cohort="adult",
+        # Sustained (2026-08-18, Aryaman): a meal is an EPISODE — the
+        # momentary shape re-fired every cooldown for the whole meal.
+        # One event at entry, latched until eating stops (episode exit
+        # gap), re-latches for the next meal.
+        is_sustained=True,
         recommended=False, prompt_fragment=_MEAL_EATEN_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
@@ -893,7 +913,7 @@ CATALOG: tuple[CatalogEntry, ...] = (
     # ── both cohorts (not recommended) ──
     CatalogEntry(
         key="emergency", name="General Emergency", icon_name="cross.case",
-        description="Severe emergencies — unconsciousness, serious bleeding, seizure.",
+        description="Severe emergencies: unconsciousness, serious bleeding, seizure.",
         category="safety", cohort="both",
         recommended=False, prompt_fragment=_EMERGENCY_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
@@ -906,23 +926,23 @@ CATALOG: tuple[CatalogEntry, ...] = (
         promotion_threshold=0.70,
     ),
     CatalogEntry(
-        key="env_hazard_glass", name="Environmental hazard — Glass",
+        key="env_hazard_glass", name="Broken glass",
         icon_name="wineglass",
-        description="Broken glass / scattered shards.",
+        description="A glass, dish, mirror, or window breaking, leaving shards.",
         category="safety", cohort="both",
         recommended=False, prompt_fragment=_ENV_HAZARD_GLASS_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
     CatalogEntry(
-        key="env_hazard_water", name="Environmental hazard — Spilled water",
+        key="env_hazard_water", name="Spilled water",
         icon_name="drop",
-        description="Water or liquid spilled on the floor — a slip hazard.",
+        description="A drink or liquid spilling onto the floor, a slip hazard.",
         category="safety", cohort="both",
         recommended=False, prompt_fragment=_ENV_HAZARD_WATER_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
     CatalogEntry(
-        key="fire_smoke", name="Fire / smoke", icon_name="flame",
+        key="fire_smoke", name="Fire Hazard", icon_name="flame",
         description="Visible flames or smoke.",
         category="safety", cohort="both",
         recommended=False, prompt_fragment=_FIRE_SMOKE_PROMPT_FRAGMENT,

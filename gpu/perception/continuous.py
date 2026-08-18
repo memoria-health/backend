@@ -63,6 +63,39 @@ _TRACK_W = int(os.environ.get("NEMARA_EDGE_TRACK_W", "640"))
 # slower to catch a NEW person → keep modest until occupancy-triggered
 # re-ground lands.
 _REGROUND_EVERY = int(os.environ.get("NEMARA_EDGE_REGROUND", "5"))
+# Night-mode (IR) detection floor for SAM3 grounding — see
+# _observe_locked. Kill switch shared with person_trigger.
+_IR_PERSON_THR = float(os.environ.get("NEMARA_IR_PERSON_THR", "0.30"))
+# Night-mode id-association floor (2026-08-18, same night as the
+# detection floors): IR masks of a lying/blanketed person are blobby
+# and vary ground-to-ground, so the daylight 0.30 IoU bar renumbered
+# the SAME person on nearly every ground (live: 8 ids in 70s while
+# continuously visible). A wrong id-carry between two people needs
+# their masks to OVERLAP across a ~5s gap — rare in a bedroom, and the
+# identity layer's own scoring still gates who counts as the patient.
+_IR_REMAP_IOU = float(os.environ.get("NEMARA_IR_REMAP_IOU", "0.10"))
+# Night-mode existence grace (2026-08-18, Aryaman's spec: "once a
+# person is detected, try at all costs to keep their track"). Under IR
+# a single ground can blink on a still lying person even with the
+# night floor + CLAHE; daytime doctrine ("ground is authoritative on
+# existence") then erases a person EdgeTAM still holds. IR only: an
+# EMPTY ground keeps the carry alive for up to this many consecutive
+# empty grounds; any ground that finds someone resets the count; the
+# carry can still die on its own (mask decays to nothing). Phantom
+# cost is bounded: a wrongly-carried mask survives at most
+# grace x reground_every ticks (~1 min) before the daytime rule
+# reasserts. 0 disables.
+_IR_GROUND_GRACE = int(os.environ.get("NEMARA_IR_GROUND_GRACE", "4"))
+_IR_BOOST = os.environ.get("NEMARA_IR_BOOST", "1").strip().lower() not in (
+    "0", "false", "off",
+)
+
+
+def _pt():
+    """person_trigger, imported lazily (module import order: this file
+    loads before the trigger's YOLO weights are wanted)."""
+    from perception import person_trigger
+    return person_trigger
 # Debug: if set, dump per-frame mask overlays for each tick to this dir so we
 # can SEE what EdgeTAM's mask does (follow the person, or drift to the sofa).
 _DEBUG_DIR = os.environ.get("NEMARA_EDGE_DEBUG_DIR", "")
@@ -246,6 +279,13 @@ class CameraSession:
         self.tick = 0
         self.last_ground = -(10 ** 9)
         self.next_id = 1
+        # Per-tick IR flag + consecutive-empty-ground count for the IR
+        # existence grace. Transient by design: not serialized into
+        # session_state, so a worker hop resets the streak — the grace
+        # gets slightly MORE lenient under stateless dispatch, never
+        # tighter, and the mask-decay exit still bounds a phantom.
+        self._ir = False
+        self._empty_ground_streak = 0
         # Session epoch: track ids are only meaningful WITHIN one
         # session lifetime — a server restart resets next_id and
         # recycles numbers (live 2026-07-25: "how was I born again as
@@ -356,6 +396,10 @@ class CameraSession:
                 )
                 for f in ctx
             ]
+        # (2026-08-18, same night, superseding the ground-only CLAHE:
+        # the whole IR batch is now enhanced once at _observe_locked
+        # entry, so ctx is already enhanced — a second pass here would
+        # over-equalize.)
         # Frame 0's masks are the ONLY thing this function uses, so ask
         # for exactly that. The old shape opened a propagation stream
         # and broke at the first yield — by which point SAM3 had already
@@ -392,8 +436,9 @@ class CameraSession:
         matching behavior."""
         seeded: "dict[int, np.ndarray]" = {}
         used_ids: "set[int]" = set()
+        floor = _IR_REMAP_IOU if getattr(self, "_ir", False) else _REMAP_IOU
         for m in masks:
-            best_id, best_iou = None, _REMAP_IOU
+            best_id, best_iou = None, floor
             for pid, pm in self.last_masks.items():
                 if pid in used_ids:
                     continue
@@ -593,6 +638,27 @@ class CameraSession:
         """One tick. Returns {frame_pos: {track_id: (bbox_xyxy, mask)}} with
         STABLE track ids across ticks. NEMARA_TRACKER=sam3 routes to SAM3's
         own whole-clip tracker; default 'edgetam' = SAM3-ground+EdgeTAM-carry."""
+        # Night-mode ground floor (2026-08-18): under IR the caller's
+        # daylight person_thr sat above what a still, distant person
+        # scores, and "ground is authoritative on existence" then killed
+        # real tracks every reground (Aryaman's bedroom: 3 ids in 40s,
+        # then invisible while present). Same rationale + kill switch as
+        # person_trigger: lowering DETECTION floors at night is safe —
+        # a phantom dies at the next ground; an invisible person is the
+        # failure that matters.
+        self._ir = bool(_IR_BOOST and frames and _pt().is_ir(frames[-1]))
+        if self._ir:
+            person_thr = min(person_thr, _IR_PERSON_THR)
+            # Enhance the WHOLE batch, not just grounding inputs
+            # (2026-08-18, the 5s-death live test): the carry is what
+            # must HOLD a still person, and EdgeTAM watching raw
+            # low-contrast pixels lost the mask within a tick or two of
+            # motion stopping — grounds kept re-finding on enhanced
+            # frames while the carry kept losing on raw ones. Every
+            # consumer of this batch now sees the same enhanced pixels,
+            # so masks stay geometry-consistent tick to tick.
+            if getattr(_pt(), "_IR_CLAHE", True):
+                frames = [_pt().enhance_ir(f) for f in frames]
         if _TRACKER == "sam3":
             return self._track_native(frames, person_thr, sam_pred)
         reground = (
@@ -615,6 +681,25 @@ class CameraSession:
             if seed is None:
                 seed = self._ground(frames, person_thr, sam_pred)
             self.last_ground = self.tick
+            # IR existence grace (see _IR_GROUND_GRACE): an empty
+            # ground under IR carries the held person instead of
+            # erasing them, up to the grace budget.
+            if seed:
+                self._empty_ground_streak = 0
+            elif (
+                self._ir and self.last_masks
+                and self._empty_ground_streak < _IR_GROUND_GRACE
+            ):
+                self._empty_ground_streak += 1
+                seed = dict(self.last_masks)
+                mode = "ground_grace"
+                log.info(
+                    "continuous.ir_ground_grace cam=%s tick=%d "
+                    "streak=%d/%d — empty ground, carrying %d track(s)",
+                    self.camera_id, self.tick,
+                    self._empty_ground_streak, _IR_GROUND_GRACE,
+                    len(self.last_masks),
+                )
         else:
             seed = dict(self.last_masks)
             mode = "carry"
@@ -636,11 +721,34 @@ class CameraSession:
         # EdgeTAM (sticky by design) carries a departed person's mask forever
         # — the "green box on the empty sofa" phantom. A ground is
         # authoritative on existence: if SAM3 says nobody's here, nobody is.
+        new_masks: "dict[int, np.ndarray]" = {}
         if out:
             last_pos = max(out)
-            self.last_masks = {
+            new_masks = {
                 tid: mm for tid, (_bb, mm) in out[last_pos].items() if mm.any()
             }
+        if new_masks:
+            self.last_masks = new_masks
+            self._empty_ground_streak = 0
+        elif (
+            self._ir and self.last_masks
+            and self._empty_ground_streak < _IR_GROUND_GRACE
+        ):
+            # IR carry-loss grace (2026-08-18, the 4s-death mode): the
+            # same budget also covers EdgeTAM's mask decaying to nothing
+            # mid-carry on a low-contrast IR target — the tick that
+            # killed the track in the live test was a CARRY, not a
+            # ground. Keep the last good masks; the count-disagreement
+            # trigger forces a reground next tick, which either re-finds
+            # the person (streak resets) or exhausts the budget.
+            self._empty_ground_streak += 1
+            log.info(
+                "continuous.ir_carry_grace cam=%s tick=%d streak=%d/%d "
+                "— empty result, holding %d track(s)",
+                self.camera_id, self.tick,
+                self._empty_ground_streak, _IR_GROUND_GRACE,
+                len(self.last_masks),
+            )
         else:
             self.last_masks = {}
 

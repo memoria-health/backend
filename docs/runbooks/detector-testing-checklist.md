@@ -61,7 +61,7 @@ backend container only).
 | D3 | Reasoning-first + base-rate prompt | drinking-water FP rate collapsed, evidence coherent per-call | ✅ Aug 7-8 (2%→0.27%/tick) · week-watch 🟡 |
 | D4 | Sustained state split — entry / latch / concurrent / exit / re-latch | one event per episode; re-latch after >5 min gap | ✅ Aug 8 (TV + Laptop, all edges) · TV-exit edge 🟡 (same code path as laptop, never directly observed) |
 | D5 | Identity fail-quiet gate covers behaviour/care | next behaviour event has `identity_patient_in_clip=true`; unit test pins the category rule | ✅ unit · 🟡 live (absence-of-FP only) |
-| D6 | **Activity verification — the 3-layer plan** | see §1a | ⬜ **today's centrepiece** |
+| D6 | **Activity verification — the 3-layer plan** | see §1a | ✅ 08-18 guided soak: interior accuracy 100% on sit_still/arm-raises/gesturing/standing/walking, 91% lying (19 min, recline-vs-sit ambiguity); 0 sitting@1.0 during arm raises (the pre-split bug gone); 165 ticks/27.5 min = 0 shed; phase-boundary 'misses' were the labeler catching transitions more precisely than the buckets. Diary cross-check (layer 4) rides the rest of the day. |
 | D7 | VLM chain after OpenRouter removal | a compile (OpenAI-first) succeeds with the new key; routing tests green | 🟡 (unit green; new key probed 200; no end-to-end compile since key swap) |
 | D8 | Event gate round-trip | held → paged → verdict/auto-release → dispatch | ✅ Aug 5-7 live |
 
@@ -185,6 +185,38 @@ data collection so rolls accumulate → 4. B1 gate → 5. D6 activity soak
 (user present) → 6. B2, B4-B8 → 7. I2 web smoke → 8. B3 (rolls ready by
 now) → 9. F1-F3 if daylight remains → 10. M1-M5.
 
+## 6. Built-in FP soak (designed 2026-08-17 — env stance settled, unblocked)
+
+Aryaman's framing: "not as worried about TP as FP — we might need a massive
+run." Env taxonomy is now pinned (action detectors for glass/water, state
+for fire, duration for stove — commit bcc1651), so every built-in has final
+semantics and the soak measures the product as it will ship.
+
+**Design: one enable-everything passive soak, triaged daily.**
+
+| id | step | detail | status |
+|---|---|---|---|
+| S0 | Prereqs | AI unpaused on all cams; identity node serving the home (green box on soak dash); audio flowing (calling_for_help is audio-dependent) | ⬜ |
+| S1 | Enable ALL adult built-ins via the app library | fall, agitation, wandering, medication, calling_for_help, choking, meal_eaten, stove_left_on, emergency, possible_intruder, glass, water, fire — plus existing customs stay on. App-side add doubles as a library/UI pass | ⬜ |
+| S2 | Passive soak, 48h of normal living | no staging; every fired event is a presumed FP unless Aryaman logged a real occurrence. Cost ≈ occupied-rate (~$0.50/occupied-hr — the extra detectors are schema fields on calls already happening, not extra calls) | ⬜ |
+| S3 | Daily triage | per-detector FP tally + root-cause bucket (reuse the Jul-22 six-category FP taxonomy); verdict per detector: SHIP / TUNE (prompt or threshold) / PULL from library | ⬜ |
+| S4 | Staged TP spot-checks (after S2, ~30 min) | pour water on the floor on camera (action semantics: must fire on the pour, then NOT re-fire on the standing puddle within cooldown — both halves are the test); enacted choking + fall (established protocol); stove on ≥10 min unattended; possible_intruder with a mask | ⬜ |
+| S5 | Fire self-wake check | closed empty room, small real flame (candle) in view: does flicker wake the camera and fire the detector? This is the one place "detect as it happens" rests on an unverified assumption. Also try a fire VIDEO on a TV screen — that's the FP half | ⬜ |
+| S6 | Sleep verification rider | overnight during S2: night summary correctness + the home-screen data contract (widget reads without glitches) — closes the standing sleep item. KNOWN LIMITATION to measure, not fix (Aryaman 2026-08-17): sleep is scene-bucket, NOT track-bound — a partner in the same bed who wakes first will likely be read as the patient's wake time, and partner movements as the patient's disturbances. Tonight is a natural test of exactly this; log what the summary claims vs what actually happened. Fix path exists (bind sleep ticks to the seated patient track, the mechanism activity already uses) — future work. | ⬜ |
+| S7 | Data-collection annotation audit (Aryaman 2026-08-17) | collection ON for the whole soak. Every staged S4 event is annotation ground truth: the recorder sidecar must carry a span at the right offset with promoted:true + the event id (R5, generalized to every detector class); for env actions the span must sit on the POUR, not the puddle. Also closes the recording-hole re-verify on the first occupied roll (clip contiguity, no 5-min gaps). One timestamped diary diffs against all three layers: activity timeline, journal events, sidecar spans. | ⬜ |
+
+Go-state (configured 2026-08-17 23:30, AI still PAUSED — the Go is the unpause):
+all 16 detectors on (13 library adds via the real from-library API — first live
+proof of the env cooldown seeding: glass/water 1800s, fire 600s), sleep
+when-scope 7 PM–12 PM, data_collection_enabled=true (decided_at stamped via
+PATCH), node serving, dash roster-following. Overview must be checked for
+"0 of 24" BEFORE unpausing — the clean read disappears at Go.
+
+Acceptance bars (proposal — confirm with Aryaman at S3): emergency-severity
+detectors (fall, choking, emergency, fire, calling_for_help) ≈ 0 FP/day
+each — a false page is the product killing itself; sub-emergency ≤ 1 FP/day
+each; anything worse gets TUNE or PULL, not a shrug.
+
 ## 2026-08-13 — GPU load test + optimization sprint (F-series continuation)
 
 DONE. Full record: docs/architecture/identity-gpu-architecture.md. Headline: at 3
@@ -200,3 +232,9 @@ Still open from this sprint: L4/5 capacity run (pin the occupied-camera
 ceiling); soak dashboard node lookup must follow the roster (was aimed
 at dead node C); backend liveness alarm; identity_nodes dead-row reaper
 (M3 batch); FleetWatch lag>tick alarm.
+
+SOAK CONFIG BOUNDARY (2026-08-18 ~14:15 IST): media_res high->medium,
+thinking high->medium (Aryaman, cost). FP/FN rates before vs after this
+point are not directly comparable.
+CONFIG: 15:25 IST media_res back to HIGH (fall FPs: couch read as floor at medium). thinking stays medium, scene stays consolidated.
+ROOT CAUSE CLOSED (15:5x IST): PD alert grouping silently folded fall alerts into open incidents (proven by ordered probes). Fix: grouping OFF in PD service settings (Aryaman) + record-only incidents self-resolve after 15 min. Re-verify: staged fall with grouping off must page.

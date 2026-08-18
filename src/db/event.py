@@ -63,6 +63,10 @@ class Event(Base):
     # needed censoring and censoring failed, so it was discarded rather
     # than uploaded raw. (Historical rows: legacy privacy-mode
     # suppression.)
+    # Sustained episodes: last positive tick seen (extends while the
+    # episode runs; final value = the falling edge). Null for instants.
+    ended_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None)
     clip_suppressed: Mapped[bool] = mapped_column(
         Boolean, server_default=text("false"), default=False,
     )

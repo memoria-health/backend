@@ -119,19 +119,44 @@ def validate_schema_fields(schema_json: dict) -> None:
 
 # ── 3. Dims classification (conservative keyword rules) ──────────
 
+# Hazard NOUNS and hazard EVENTS both live here. Morphology matters:
+# real caregivers write in the past tense ("water spilled", "a glass
+# broke"), so each verb carries its s/ed/ing forms — the bare-stem
+# `spill` missed "spilled" and sent a floor-hazard ask to the patient
+# branch (compiler eval 2026-08-17). Glass is deliberately NOT matched
+# bare: "drinks a glass of water" is a body-scale person ask, so glass
+# only counts alongside breakage language (broke/shatter/shards).
 _ENV_SUBJECT = re.compile(
     r"\b(stove|oven|burner|kettle|faucet|tap|sink|door|window|gate|"
-    r"fridge|freezer|light(s)?|lamp|tv\s+left\s+on|fire|smoke|water\s+"
-    r"(leak|running)|spill)\b", re.I,
+    r"fridge|freezer|light(s)?|lamp|tv\s+left\s+on|fire|smoke|"
+    r"water\s+(leak(s|ed|ing)?|running)|spill(s|ed|ing)?|"
+    r"leak(s|ed|ing)?|puddle(s)?|shard(s)?|shatter(s|ed|ing)?|"
+    r"broken\s+glass|glass\s+(break(s|ing)?|broke|shatter(s|ed|ing)?|"
+    r"smash\w*)|"
+    # Verb-object order too — "breaks a glass" / "drops a plate" is the
+    # same floor-hazard ask as "a glass breaks"; without this the branch
+    # depended on which order the LLM's suggested name happened to use.
+    r"(break(s|ing)?|broke|drop(s|ped|ping)?|smash(es|ed|ing)?|"
+    r"knock(s|ed|ing)?\s+over)\s+(a\s+|the\s+|her\s+|his\s+)?"
+    r"(glass|cup|mug|plate|dish|bowl|bottle|mirror|vase))\b", re.I,
 )
 _ANYONE_SUBJECT = re.compile(
     r"\b(visitor|stranger|intruder|anyone|any\s+person|someone\s+"
-    r"(new|unknown|else)|delivery|mask(ed)?)\b", re.I,
+    r"(new|unknown|else)|(unfamiliar|unknown|unrecognized)\s+"
+    r"(person|people|man|woman|face(s)?)|delivery|mask(ed)?)\b", re.I,
 )
 _AUDIO_EVIDENCE = re.compile(
     r"\b(call(s|ing)?\s+(out|for)|yell(s|ing)?|scream(s|ing)?|shout|"
     r"cry(ing)?|says?\b|saying|asks?\b|asking|talk(s|ing)?|moan(s|ing)?|"
-    r"groan(s|ing)?|verbal|repeat(s|ing)?\s+(words|questions)|swear)", re.I,
+    r"groan(s|ing)?|verbal|repeat(s|ing)?\s+(words|questions)|swear|"
+    # Agitation/distress asks: the state is substantially VOCAL (moaning,
+    # muttering, repeated questions) — the built-in agitation detector
+    # carries needs_audio=True for the same reason, and a custom compiled
+    # without audio would judge a shouting spell on picture alone.
+    r"agitat(ed|es|ion|ing)?|distress(ed)?)", re.I,
+)
+_FIRE_EVENT = re.compile(
+    r"\b(fire|smoke|flame(s)?|burn(s|ing|t)?)\b", re.I,
 )
 _STILL_ACTIVITY = re.compile(
     r"\b(watch(es|ing)?\s+tv|on\s+(the\s+)?phone|read(s|ing)?|"
@@ -143,8 +168,17 @@ _STILL_ACTIVITY = re.compile(
 # ask, not a door-state check (P5 review F4: env branch gates on
 # motion OUTSIDE person boxes post-soak, which would skip exactly the
 # tick that matters).
+#
+# 'leave' only counts with a PLACE or a direction, mirroring how 'left'
+# always did: bare `leav(e|es|ing)` also matched the transitive sense —
+# "shatters and LEAVES shards", "leaves the water running" — and that
+# vetoed the environment branch on a floor-hazard ask (compiler eval
+# 2026-08-17). A leaving-the-house ask always names where or which way.
 _EXIT_VERBS = re.compile(
-    r"\b(leav(e|es|ing)|left\s+(the\s+)?(house|home|room|building)|"
+    r"\b(leav(e|es|ing)\s+(through|out|via|for)\b|"
+    r"leav(e|es|ing)\s+(the\s+|her\s+|his\s+|their\s+)?"
+    r"(house|home|room|building|apartment|bed)\b|"
+    r"left\s+(the\s+)?(house|home|room|building)|"
     r"exit(s|ing)?|walk(s|ing)?\s+out|wander(s|ing)?|go(es|ing)?\s+"
     r"out(side)?|knock(s|ing)?)\b", re.I,
 )
@@ -175,8 +209,13 @@ _DISTANCE_CLASS = re.compile(
 # taking medication, grooming — fell through to `person_motion` and
 # `scene`, which is the one combination guaranteed to hallucinate.
 _BODY_SCALE_ACTION = re.compile(
-    r"\b(drink(s|ing)?|sip(s|ping)?|swallow(s|ing)?|eat(s|ing)?|"
+    r"\b(drink(s|ing)?|sip(s|ping)?|swallow(s|ing)?|eat(s|ing|en)?|"
     r"chew(s|ing)?|bite(s)?|feed(s|ing)?|"
+    # Choking evidence is hands-to-throat and face colour — body scale,
+    # exactly why the choking PRESET is bucket=person; a custom "grandpa
+    # is choking" must land in the same crop. `meds` is the everyday
+    # word for medication ("did he take his meds") the formal stems miss.
+    r"chok(e|es|ed|ing)|meds|"
     r"medicat(e|es|ion)|pill(s)?|tablet(s)?|dose|inhaler|"
     r"brush(es|ing)?\s+(teeth|hair)|shav(e|es|ing)|groom(s|ing)?|"
     r"wip(e|es|ing)|rub(s|bing)?|touch(es|ing)?\s+(face|mouth|head)|"
@@ -260,12 +299,20 @@ def classify_custom_dims(
     tick), never on a silently-dead detector."""
     hay = f"{name}\n{user_text}"
 
+    # Env-custom cooldown parity with the built-ins (Aryaman 2026-08-17):
+    # hazard prompts are event-phrased (hard rule 8), so this is only the
+    # backstop for a VLM that mistakes the lingering aftermath for a fresh
+    # event — 30 min for hazards, matching env_hazard_*; 10 min for the
+    # ongoing-emergency shape (fire), where re-alerting while it still
+    # burns is correct and should stay frequent.
+    cooldown: int | None = None
     if (
         _ENV_SUBJECT.search(hay)
         and not _STILL_ACTIVITY.search(hay)
         and not _EXIT_VERBS.search(hay)
     ):
         branch, subject, bucket = "environment", "environment", "scene"
+        cooldown = 600 if _FIRE_EVENT.search(hay) else 1800
     elif _STILL_ACTIVITY.search(hay):
         branch, subject, bucket = "person_still", "patient", "person"
     elif _BODY_SCALE_ACTION.search(hay):
@@ -298,7 +345,7 @@ def classify_custom_dims(
     # stakes), never from a user-stated duration.
     eventing = _entry_confidence_for(is_sustained, bucket, degradation, category)
 
-    return {
+    dims = {
         # Only person_motion vs not is read downstream (the motion floor);
         # environment/person_still collapse to requires_motion=False.
         "requires_motion": branch == "person_motion",
@@ -309,3 +356,8 @@ def classify_custom_dims(
         "eventing": eventing,
         "degradation_warning": degradation,
     }
+    # Key present only when set: non-env customs keep the row default
+    # (NULL → the 30s global), and a recompile never nulls a value.
+    if cooldown is not None:
+        dims["cooldown_seconds"] = cooldown
+    return dims

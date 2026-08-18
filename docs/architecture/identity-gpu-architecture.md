@@ -108,11 +108,14 @@ YOLO-trigger→forced-reground self-heal closing in one tick.
    2026-08-16): the restart's image pull can exceed the roster's 90s
    staleness window, so the sweeper may release the node's homes to
    whoever polls next — after any PATCH, verify home assignments and
-   re-pin any that moved. Also: a room stopped on one node does not
-   un-publish its tailnet port there, and `tailscale serve` state can
-   thin out across reconciliations — if a room's port stops answering
-   while its process logs look healthy, bump the room's
-   `identity_port` in the DB; the restart re-serves it.
+   re-pin any that moved. Also (2026-08-17, root-caused): if a room's
+   port stops answering while its process logs look healthy, check the
+   DB FIRST — the roster may have re-ported the home (release+reclaim
+   assigns fresh ports from the bottom of the series) and the room is
+   healthy at its NEW port. The recurring cause was the integration
+   suite detaching real homes on a shared local DB; the suites now
+   snapshot and restore real assignments (_restore_real_fleet), so
+   local pytest runs no longer reshuffle production.
 4. Homes follow the roster; manual moves must move `identity_port`
    WITH the home (the roster only assigns ports to unassigned homes).
 5. Experiment nodes additionally get `NEMARA_DEV_CODE=1`: every

@@ -257,12 +257,13 @@ async def list_wandering_doors(
 #     or rapid whose identifier is custom_<hex>.
 _CAVEAT_BUCKETS = frozenset({"fine_motion", "rapid"})
 # Small-motion (seizure) / small-object (medication, stove) presets whose
-# accuracy genuinely degrades with distance + lighting. NOT choking: it's a
-# whole-person distress event (bucket="person", degradation_warning="none"),
-# so the "reads small, fine details" notice misdescribes it — its caveat was
-# manual, never a derived property.
+# accuracy genuinely degrades with distance + lighting. Choking added
+# 2026-08-17 (Aryaman): the notice was reworded from "reads small, fine
+# details" to a plain accuracy-not-guaranteed expectation, which fits
+# choking's subtle-presentation reality even though it is a whole-person
+# event (its earlier exclusion was about the old wording, not the risk).
 _CAVEAT_IDENTIFIERS = frozenset({
-    "seizure", "medication", "stove_left_on",
+    "seizure", "medication", "stove_left_on", "choking",
 })
 
 

@@ -318,6 +318,10 @@ async def data() -> JSONResponse:
         fired = [k[:-9] for k, v in f.items() if k.endswith("_detected") and v is True]
         tick = {
             "t": _local_hms(r.captured_at),
+            # Action→verdict: window end (captured_at) → row save. The
+            # per-call ms breakdown rides sched_calls[].ms.
+            "lag": round((r.created_at - r.captured_at).total_seconds(), 1)
+            if r.created_at else None,
             "cam": cam,
             "skip": f.get("skipped_reason") if r.provider == "skipped" else None,
             "motion": f.get("motion_src"),
@@ -512,6 +516,22 @@ async def frame(cam: str, name: str):
     if not str(p).startswith(str(_FRAMES_DIR.resolve())) or not p.is_file():
         return JSONResponse({"error": "not found"}, status_code=404)
     return FileResponse(p, media_type="image/jpeg")
+
+
+_CROPS_DIR = Path(__file__).resolve().parents[1] / "out" / "live-crops"
+
+
+@app.get("/crops/{kind}")
+async def crop_artifact(kind: str):
+    f = _CROPS_DIR / f"latest_{kind}.mp4"
+    if kind not in ("full", "person") or not f.is_file():
+        return JSONResponse({"error": "none"}, status_code=404)
+    label = _CROPS_DIR / f"latest_{kind}.txt"
+    return FileResponse(f, media_type="video/mp4", headers={
+        "Cache-Control": "no-store",
+        "X-Age-S": str(round(time.time() - f.stat().st_mtime, 1)),
+        "X-Detectors": label.read_text() if label.is_file() else "",
+    })
 
 
 def _pctl(vals: list[float], p: float):
@@ -1018,7 +1038,11 @@ Also: <span class="mono">episode_gap_seconds</span> is DEAD (still stored — 90
 <div id="idsvc" class="mut">connecting…</div>
 <div id="idtl" style="margin-top:8px"></div>
 <div id="idprobes" style="margin-top:10px;max-height:340px;overflow-y:auto"></div>
-<div id="idstreams" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px"></div></div>
+<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-start;margin-top:8px">
+<div id="idstreams" style="display:flex;gap:8px;flex-wrap:wrap"></div>
+ <div><div class="mono mut" id="croppersonmeta" style="font-size:11px">gemini input · person crop: —</div>
+  <video id="cropperson" width="300" muted autoplay loop playsinline></video></div>
+</div></div>
 <div class="card"><h2>Identity events — unsupervised journal <span class="mut" style="font-weight:400;font-size:12px">(every birth/death/lock, with the picture)</span></h2>
 <p class="mut" style="font-size:11.5px;margin:0 0 8px">The overnight record: one row per identity event, newest first, snapshot inline. <b>lock/moved</b> rows carry confirm-latency (track created → patient confirmed) — the number that must stay under a minute.</p>
 <div id="idconfstats" class="mono" style="font-size:12px;margin:0 0 8px"></div>
@@ -1047,7 +1071,7 @@ function tickLine(t){
   if(t.skip==="tick_failed")
     return `<span class="crit">⛔ TICK FAILED · ${esc(t.err??"?")}: ${esc(t.emsg??"")}</span>${fps}`;
   if(t.skip) return `skipped · ${esc(t.skip)}${fps}`;
-  let b=`${t.woke?'<span class="ok">⚡ WOKE</span> ':""}motion=${esc(t.motion??"—")} people=${t.ppl?"YES":"no"} (via ${esc(t.psrc??"—")}) tracks=${t.tracks}`;
+  let b=`${t.woke?'<span class="ok">⚡ WOKE</span> ':""}${t.lag!=null?`<span class="${t.lag>20?"crit":t.lag>12?"warn":"ok"}">lag=${t.lag}s</span> `:""}motion=${esc(t.motion??"—")} people=${t.ppl?"YES":"no"} (via ${esc(t.psrc??"—")}) tracks=${t.tracks}`;
   if(t.amount!=null) b+=` track-motion=${t.amount}`;
   if(t.env!=null) b+=` env-motion=${t.env}`;
   if(t.calls.length) b+=` calls=[${t.calls.map(c=>
@@ -1384,6 +1408,19 @@ async function pollIdTimeline(){
   }catch(e){}
 }
 pollIdTimeline(); setInterval(pollIdTimeline, 10000);
+async function pollCrops(){
+  for(const k of ["person"]){
+    try{
+      const r=await fetch("/crops/"+k+"?t="+Date.now());
+      const m=document.getElementById("crop"+k+"meta");
+      if(!r.ok){m.textContent="gemini input · "+k+": (none this tick)";continue;}
+      m.textContent="gemini input · "+k+" · "+r.headers.get("X-Age-S")+"s ago · "+(r.headers.get("X-Detectors")||"");
+      const v=document.getElementById("crop"+k), old=v.src;
+      v.src=URL.createObjectURL(await r.blob()); if(old)URL.revokeObjectURL(old);
+    }catch(e){}
+  }
+}
+pollCrops(); setInterval(pollCrops, 8000);
 </script></div></body></html>"""
 
 

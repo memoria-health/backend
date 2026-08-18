@@ -557,3 +557,21 @@ async def test_ledger_carries_each_calls_own_evidence(monkeypatch) -> None:
     assert by_key[("medication",)]["seen"] == "crop: hands holding phone"
     # Row-level `seen` still the scene call's (caregiver-facing rule).
     assert out.detector_fields["seen"] == "wide: person at desk"
+
+
+@pytest.mark.asyncio
+async def test_stale_track_degrades_crop_to_scene(monkeypatch) -> None:
+    """A track whose bbox is older than the clip window must not aim a
+    person crop (the 2026-08-18 empty-console exhibit) — the call rides
+    the scene artifact instead."""
+    plans = _plans(_due("fall"), _due("medication", bucket="person", targets=(9,)))
+    vlm = _ScriptedVLM([
+        ("gemini", {"fall_detected": False}, None),
+        ("gemini", {"medication_detected": False}, None),
+    ])
+    ident = _identity((9,))
+    from dataclasses import replace as _r
+    ident = _r(ident, tracks=tuple(_r(t, age_s=42.0) for t in ident.tracks))
+    out = await _run(plans, vlm, identity=ident, monkeypatch=monkeypatch)
+    assert vlm.calls[1]["mp4"] == b"scene"
+    assert out.sched_fields["sched_degraded_artifacts"] == 1
