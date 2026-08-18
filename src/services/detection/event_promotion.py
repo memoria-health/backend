@@ -394,7 +394,7 @@ async def _maybe_page_record_only(
         return
     if ident in _RECORD_ONLY_PAGE_EXCLUDE:
         return
-    detected_field = det.detected_field or f"{ident}_detected"
+    detected_field, _conf_field, _base = _promotion_spec_for(det)
     if not _is_truthy_bool(detector_fields.get(detected_field)):
         return
     now_mono = time.monotonic()

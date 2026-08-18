@@ -17,9 +17,14 @@ from src.api import insights_widgets as iw
 
 # ── filter builder (pure) ────────────────────────────────────────────
 
+_GATE = "coalesce(gate_state,'none') not in ('pending','rejected')"
+
+
 def test_terms_filter_with_detector_only() -> None:
     det = str(uuid4())
-    assert iw._terms_filter([], detector=det) == f"(true and detector_id = '{det}')"
+    assert iw._terms_filter([], detector=det) == (
+        f"((true and {_GATE}) and detector_id = '{det}')"
+    )
 
 
 def test_terms_filter_combines_terms_and_detector() -> None:
@@ -35,7 +40,9 @@ def test_terms_filter_alias_applies_to_detector() -> None:
 
 
 def test_terms_filter_without_detector_unchanged() -> None:
-    assert iw._terms_filter([]) == "true"
+    # Gate visibility rides every events query (2026-08-18): rejected/
+    # pending events are invisible to caregivers in ALL widget counts.
+    assert iw._terms_filter([]) == f"(true and {_GATE})"
 
 
 # ── endpoint scope checks ────────────────────────────────────────────

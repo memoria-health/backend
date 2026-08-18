@@ -13,7 +13,7 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Query, status
-from sqlalchemy import select, text
+from sqlalchemy import or_, select, text
 
 from src.api.deps import CaregiverAuth, SessionDep
 from src.db.event import Event
@@ -63,11 +63,18 @@ async def get_journal(
     detectors = list(await detector_repo.list_for_patient(
         session, patient_id, caregiver_id=auth.id))
 
-    # The day's events, grouped per detector.
+    # The day's events, grouped per detector. Gate-held and
+    # operator-rejected events are invisible to the caregiver
+    # everywhere (events list, home report) — the journal must match,
+    # or a rejected alert surfaces here as a review chip whose tap
+    # finds nothing (Aryaman, soak day 1: rejected both pager events,
+    # Overview still showed them "for review").
     events = (await session.execute(
         select(Event)
         .where(Event.patient_id == patient_id,
-               Event.occurred_at >= start, Event.occurred_at < end)
+               Event.occurred_at >= start, Event.occurred_at < end,
+               or_(Event.gate_state.is_(None),
+                   Event.gate_state.notin_(("pending", "rejected"))))
         .order_by(Event.occurred_at)
     )).scalars().all()
     events_by_detector: dict[str, list] = {}

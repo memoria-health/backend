@@ -73,6 +73,14 @@ def _terms_filter(terms: list[str], alias: str = "",
                 f"or {a}category::text ilike '%{esc}%')"
             )
         base = "(" + " or ".join(parts) + ")"
+    # Gate visibility rides EVERY events query through this filter
+    # (2026-08-18, soak day 1): pending/operator-rejected events are
+    # hidden from caregivers everywhere else, and widget counts that
+    # included them showed events whose tap-through finds nothing.
+    base = (
+        f"({base} and coalesce({a}gate_state,'none') "
+        "not in ('pending','rejected'))"
+    )
     if detector is None:
         return base
     return f"({base} and {a}detector_id = '{detector}')"
@@ -433,6 +441,7 @@ async def widget_data(
             select p.id, p.full_name as patient, count(e.id)::int as events
             from patients p left join events e on e.patient_id = p.id
               and e.occurred_at >= now() - (:days * interval '1 day')
+              and coalesce(e.gate_state,'none') not in ('pending','rejected')
               {f'and {NIGHT}' if night else ''}
               {f"and e.detector_id = '{det}'" if det else ''}
             where p.id = any(:ids)
