@@ -13,8 +13,8 @@ rows here. Rules that live in this file:
   - Activity (pinned definition): moving = standing + active minutes
     from the summarizer's state vocabulary; a block renders where a
     30-minute bucket holds >= 10 moving minutes; solid blocks only.
-  - Episodes have no persisted end time yet, so they render as marks —
-    never fabricated spans.
+  - Episodes render as spans when ended_at is persisted; never
+    fabricated — no end recorded means a mark.
   - No summary sentence anywhere.
 """
 
@@ -117,17 +117,28 @@ def point_line(det, events: list, tz: tzinfo, streak_days: int | None) -> dict:
 # ── sustained episodes (alerting) ────────────────────────────────────
 
 def episode_line(det, events: list, tz: tzinfo) -> dict:
-    """Episode ends aren't persisted yet, so episodes render as marks
-    at their start time — never fabricated spans."""
+    """Episodes with a persisted end render as spans; ends are never
+    fabricated — an event without ended_at stays a mark."""
     if not events:
         return _entry(det, "episode", f"No {det.name.lower()}", None, "ok", None)
     status, review_id = _review_state(events)
     n = len(events)
     meta = f"{_clock(events[0].occurred_at, tz)}, {events[0].location}"
-    marks = [hour_x(ev.occurred_at, tz) for ev in events]
+    spans, marks = [], []
+    for ev in events:
+        ended = getattr(ev, "ended_at", None)
+        if ended and ended > ev.occurred_at:
+            x0, x1 = hour_x(ev.occurred_at, tz), hour_x(ended, tz)
+            spans.append([x0, 24.0 if x1 < x0 else x1])  # midnight clamp
+        else:
+            marks.append(hour_x(ev.occurred_at, tz))
+    if n == 1 and spans:
+        mins = int((events[0].ended_at - events[0].occurred_at).total_seconds() // 60)
+        if mins >= 1:
+            meta = f"{meta}, {mins} min"
     return _entry(det, "episode",
                   f"{n} episode{'' if n == 1 else 's'}", meta, status,
-                  _strip("midnight", [], marks), review_id)
+                  _strip("midnight", spans, marks), review_id)
 
 
 # ── absence (deadline) — an event IS the miss ────────────────────────
