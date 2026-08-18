@@ -627,6 +627,14 @@ async def maybe_promote_analysis(
                 session, detector_id=det.id, patient_id=patient_id,
                 since=boundary,
             ):
+                # Keep the episode's end fresh: ended_at converges on
+                # the last positive tick with no exit-gap bookkeeping.
+                await session.execute(
+                    Event.__table__.update()
+                    .where(Event.detector_id == det.id,
+                           Event.patient_id == patient_id,
+                           Event.occurred_at >= boundary)
+                    .values(ended_at=occurred_at))
                 _log.info(
                     "[event_promotion] %s episode ongoing since %s "
                     "(exit gap %ds) — no new event",
