@@ -140,7 +140,7 @@ def state(request: Request) -> JSONResponse:
                         "seen_s": round(time.time() - tv.last_seen, 1),
                         "bbox_series": [
                             [round(ts, 3), list(bb)]
-                            for ts, bb in tv.series[-40:]
+                            for ts, bb in tv.series[-120:]
                         ],
                     }
                     for tid, tv in sp.state.tracks.items()

@@ -71,7 +71,7 @@ class CameraState:
             if t is None:
                 t = TrackView(
                     track_id=tid, bbox=bbox, born_at=now, last_seen=now,
-                    series=fresh[-45:],
+                    series=fresh[-120:],
                 )
                 births.append(tid)
             else:
@@ -80,7 +80,7 @@ class CameraState:
                 t.batches_seen += 1
                 t.series = tuple(
                     e for e in (*t.series, *fresh) if now - e[0] <= 15.0
-                )[-45:]
+                )[-120:]
             new_tracks[tid] = t
         for tid in self.tracks:
             if tid not in batch_tracks:
