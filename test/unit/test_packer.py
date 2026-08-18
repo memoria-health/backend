@@ -52,41 +52,31 @@ def _idents(plan) -> list[str]:
     return [d.spec.identifier for d in plan.detectors]
 
 
-def test_scene_call_caps_at_four_severity_first() -> None:
-    """The wide call was uncapped until 2026-08-06, so every enabled
-    detector rode one flash-lite call — 8 of them on the 08-05 night, which
-    is where that night's false positives came from. Measured: the same
-    model, clip, audio and criteria got 7/7 calling-for-help negatives right
-    as a single-detector call and fired on all of them when bundled.
-
-    Severity-first chunking matters as much as the cap: the highest-stakes
-    members must ride the first chunk rather than being diluted by the tail
-    of routine ones."""
+def test_scene_call_is_consolidated_severity_ordered() -> None:
+    """Scene uncapped 2026-08-18 (cost): one call, one video upload.
+    Severity ordering still holds so the highest stakes lead the prompt."""
     scene = [_due(f"s{i}", severity=i) for i in range(6)]
     person = _due("medication", bucket="person", targets=(1,), severity=20)
     plans = _pack(*scene, person)
 
     wide = [p for p in plans if p.crop == "full"]
-    assert len(wide) == 2                          # 6 members -> 4 + 2
-    assert [len(p.detectors) for p in wide] == [4, 2]
-    assert all(len(p.detectors) <= 4 for p in wide)
-    # highest severity first, and never split across the chunk boundary
-    assert [d.dims.severity for d in wide[0].detectors] == [5, 4, 3, 2]
+    assert len(wide) == 1
+    assert [d.dims.severity for d in wide[0].detectors] == [5, 4, 3, 2, 1, 0]
     assert plans[0].crop == "full" and plans[0].fps == 4
 
     crop = [p for p in plans if p.crop == "person"]
     assert len(crop) == 1 and crop[0].target_track_id == 1
 
 
-def test_crop_bucket_caps_at_three_severity_first() -> None:
+def test_crop_bucket_caps_at_four_severity_first() -> None:
     dets = [
         _due(f"p{i}", bucket="person", targets=(7,), severity=sev)
-        for i, sev in enumerate([10, 90, 40, 70])
+        for i, sev in enumerate([10, 90, 40, 70, 55])
     ]
     plans = _pack(*dets)
     assert len(plans) == 3                           # guaranteed scene + 2 chunks
     assert _idents(plans[0]) == []                   # the always-emitted scene anchor
-    assert _idents(plans[1]) == ["p1", "p3", "p2"]   # 90, 70, 40
+    assert _idents(plans[1]) == ["p1", "p3", "p4", "p2"]   # 90, 70, 55, 40
     assert _idents(plans[2]) == ["p0"]               # 10 overflows
     assert all(p.target_track_id == 7 for p in plans[1:])
 

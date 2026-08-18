@@ -52,12 +52,11 @@ if TYPE_CHECKING:
 # and every member reads the same confabulation — which is how an English
 # conversation about a headache was reported as "Ayudame".
 #
-# 4 is a compromise, not a measurement: isolation is what tests clean, but a
-# call per detector multiplies the frame bill by the detector count. Splitting
-# severity-first means the highest-stakes members ride the first chunk and are
-# never diluted by the long tail of routine ones.
-_SCENE_KEY_CAP: int | None = 4
-_CROP_CAP = 3
+# Scene uncapped again 2026-08-18 (Aryaman, cost): one scene call instead of
+# N re-uploads of the same video. The bundling-FP risk above is accepted and
+# watched in the soak; crop calls keep a cap.
+_SCENE_KEY_CAP: int | None = None
+_CROP_CAP = 4
 
 
 @dataclass(frozen=True)
