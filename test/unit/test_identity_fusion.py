@@ -11,6 +11,8 @@ The replay tests below use the ACTUAL numbers from both incidents'
 logs; the seat/harvest tests pin the gating defenses.
 """
 
+from uuid import UUID
+
 from identity.fusion import SightingHistory
 from identity.harvest import harvest_eligible
 from identity.seat import Candidate, Seat, update_seat
@@ -61,9 +63,12 @@ def test_back_of_head_garbage_cannot_dilute():
 
 # ── seat gating ──────────────────────────────────────────────────────
 
+_P = UUID("11111111-1111-1111-1111-111111111111")
+
+
 def _cand(tid=6, score=0.43, anchor="face", provisional=True):
     return Candidate(
-        camera_id="a", track_id=tid, score=score, anchor=anchor,
+        camera_id="a", track_id=tid, patient_id=_P, score=score, anchor=anchor,
         provisional=provisional,
     )
 

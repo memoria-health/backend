@@ -118,17 +118,23 @@ def state(request: Request) -> JSONResponse:
         return JSONResponse({"detail": "unauthorized"}, status_code=401)
     if _HOME is None:
         return JSONResponse({"contract": STATE_CONTRACT, "ready": False})
-    seat = _HOME.seat
     return JSONResponse({
         "contract": STATE_CONTRACT,
         "ready": True,
-        "seat": None if seat is None else {
-            "camera": seat.camera_id,
-            "camera_name": _HOME.name_of(seat.camera_id),
-            "track": seat.track_id,
-            "score": round(seat.score, 3), "anchor": seat.anchor,
-            "face_confirmed": seat.face_confirmed,
-            "since": seat.since, "confirmed_at": seat.confirmed_at,
+        # One entry per LOCATED resident, keyed by patient uuid. A
+        # resident who is absent from this map is not located — which
+        # consumers must read as "unknown", never as another resident's
+        # seat and never as a room default.
+        "seats": {
+            str(pid): {
+                "camera": seat.camera_id,
+                "camera_name": _HOME.name_of(seat.camera_id),
+                "track": seat.track_id,
+                "score": round(seat.score, 3), "anchor": seat.anchor,
+                "face_confirmed": seat.face_confirmed,
+                "since": seat.since, "confirmed_at": seat.confirmed_at,
+            }
+            for pid, seat in list(_HOME.seats.items())
         },
         "cameras": {
             cam_id: {
@@ -193,10 +199,9 @@ async def _timeline_sampler() -> None:
         try:
             if _HOME is None:
                 continue
-            seat = _HOME.seat
             row = {}
             for cam_id, sp in _HOME.cameras.items():
-                if seat is not None and seat.camera_id == cam_id:
+                if _HOME.seat_on(cam_id) is not None:
                     row[cam_id] = "patient"
                 elif sp.state.tracks:
                     row[cam_id] = "people"
@@ -662,25 +667,70 @@ async def _run_livekit(
             log.exception("identity.walk_failed")
 
 
-# ── Face gallery (persistent DB enrollment) ──────────────────────────
-async def _load_face_matrix(patient_id: UUID) -> np.ndarray:
+# ── Face galleries + coverage (persistent DB enrollment) ─────────────
+async def _load_room_identity(
+    room: str,
+) -> tuple[dict[UUID, np.ndarray], dict[str, list[UUID]]]:
+    """Who this room's cameras watch, and each of their face galleries.
+
+    A camera publishes into exactly ONE room, so `cameras.livekit_room`
+    is the whole membership question — a shared lounge covering two
+    residents is one camera in one room, and BOTH residents' galleries
+    have to be loaded here or the second one can never be recognized.
+
+    Coverage is read per camera rather than per room because the two
+    differ: a room can hold a private bedroom camera (one resident) and
+    a shared lounge camera (two), and asking the bedroom camera about
+    the second resident would only add a losing comparison.
+
+    Returns ({patient_id: (N,512) gallery}, {camera_id8: [patient_id]}).
+    A resident with no ready enrollment is kept in coverage but gets no
+    gallery — `IdentityHome.covered` drops them from the question.
+    """
     sm = get_sessionmaker()
+    coverage: dict[str, list[UUID]] = {}
+    galleries: dict[UUID, np.ndarray] = {}
     async with sm() as session:
-        rows = await face_embedding_repo.list_ready_for_patient_unscoped(
-            session, patient_id,
-        )
-    embs = [embedding_from_bytes(r.embedding) for r in rows]
-    if not embs:
-        log.warning("identity.face_gallery_empty patient=%s", patient_id)
-        return np.zeros((0, 512), dtype=np.float32)
-    return np.stack(embs).astype(np.float32)
+        from sqlalchemy import text as _sql_text
+
+        rows = (await session.execute(
+            _sql_text(
+                "SELECT substr(c.id::text, 1, 8) AS c8, cp.patient_id "
+                "  FROM public.cameras c "
+                "  JOIN public.camera_patients cp ON cp.camera_id = c.id "
+                " WHERE c.livekit_room = :room"
+            ),
+            {"room": room},
+        )).all()
+        for c8, pid in rows:
+            coverage.setdefault(c8, []).append(pid)
+        for pid in {pid for _c8, pid in rows}:
+            embs = [
+                embedding_from_bytes(r.embedding)
+                for r in await face_embedding_repo
+                .list_ready_for_patient_unscoped(session, pid)
+            ]
+            if embs:
+                galleries[pid] = np.stack(embs).astype(np.float32)
+            else:
+                log.warning("identity.face_gallery_empty patient=%s", pid)
+    return galleries, coverage
 
 
-async def _refresh_gallery(home: IdentityHome) -> None:
+async def _refresh_gallery(home: IdentityHome, room: str) -> None:
+    """Re-read enrollment AND coverage on a timer.
+
+    This is also how a camera newly shared with a second resident takes
+    effect: the next refresh sees the extra `camera_patients` row and
+    the node starts asking about that person. No restart, no roster
+    round-trip.
+    """
     while True:
         await asyncio.sleep(GALLERY_REFRESH_S)
         try:
-            home.face_matrix = await _load_face_matrix(home.patient_id)
+            home.face_galleries, home.coverage = (
+                await _load_room_identity(room)
+            )
         except Exception:                     # noqa: BLE001
             log.exception("identity.gallery_refresh_failed")
 
@@ -698,24 +748,22 @@ async def _amain(args: argparse.Namespace) -> None:
         os.environ.get("NEMARA_LIVEKIT_API_SECRET")
         or settings.livekit_api_secret
     )
-    patient_id = UUID(args.patient)
-
     sam = SamServiceClient(
         base_url=args.pod_url, timeout_s=25.0,
         expected_face_model="buffalo_l",
     )
     # DB may still be starting (post-reboot: Docker up before Supabase —
-    # the 2026-07-24 outage). Start with an empty gallery rather than
-    # dying; the 60s refresher heals it as soon as the DB answers.
+    # the 2026-07-24 outage). Start with no galleries rather than dying;
+    # the 60s refresher heals it as soon as the DB answers.
     try:
-        face_matrix = await _load_face_matrix(patient_id)
+        face_galleries, coverage = await _load_room_identity(args.room)
     except Exception:                         # noqa: BLE001
         log.exception(
-            "identity.gallery_load_failed at startup — starting with an "
-            "EMPTY face gallery; the %ds refresher will retry",
+            "identity.gallery_load_failed at startup — starting with NO "
+            "face galleries; the %ds refresher will retry",
             int(GALLERY_REFRESH_S),
         )
-        face_matrix = np.zeros((0, 512), dtype=np.float32)
+        face_galleries, coverage = {}, {}
     cam_names: dict = {}
     try:
         from sqlalchemy import text as _sql_text
@@ -790,26 +838,29 @@ async def _amain(args: argparse.Namespace) -> None:
         )
 
     home = IdentityHome(
-        patient_id=patient_id,
         sam=sam,
         pods=pods,
         body_gallery=CrossClipBodyGallery(settings=settings),
-        face_matrix=face_matrix,
+        face_galleries=face_galleries,
+        coverage=coverage,
         journal=EventJournal(Path("out/identity_soak")),
         cam_names=cam_names,
     )
     home.last_pod_ok = time.time()   # watchdog baseline: boot counts
     _HOME = home
     log.info(
-        "identity.up room=%s pod=%s gallery=%d refs — http://localhost:%d/",
-        args.room, args.pod_url, len(home.face_matrix), args.port,
+        "identity.up room=%s pod=%s residents=%d galleries=%s — "
+        "http://localhost:%d/",
+        args.room, args.pod_url, len(home.face_galleries),
+        {str(p)[:8]: len(g) for p, g in home.face_galleries.items()},
+        args.port,
     )
     await asyncio.gather(
         _run_livekit(
             url, _mint_token(key, secret, args.room), home,
             only_cam=args.only_cam,
         ),
-        _refresh_gallery(home),
+        _refresh_gallery(home, args.room),
         _timeline_sampler(),
         _pod_progress_watchdog(home),
     )
@@ -818,10 +869,10 @@ async def _amain(args: argparse.Namespace) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--room", required=True, help="LiveKit room, patient_<id>")
-    ap.add_argument(
-        "--patient", default="75a30940-b5e2-4608-afa3-b31a1e1fcda6",
-        help="patient UUID (face enrollment gallery)",
-    )
+    # NO --patient (removed 2026-08-20). The room's cameras name the
+    # residents to load, via `cameras.livekit_room` -> `camera_patients`,
+    # because a camera can watch more than one person and a single
+    # command-line patient could only ever describe one of them.
     ap.add_argument("--pod-url", default="http://localhost:8000")
     ap.add_argument("--only-cam", default="",
                     help="substring filter: subscribe ONLY matching cameras "

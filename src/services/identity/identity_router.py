@@ -12,15 +12,25 @@ other patient misses `_cam_entry`, gets `IdentityResult.empty()`, and is
 therefore never bound to a track — no PATIENT label, no ledger bind, identity
 suppression permanently bypassed. No error, no log, no verdict, forever.
 
-This class resolves `patient_id -> identity_nodes.base_url` from the roster
-and delegates to a per-node client.
+This class resolves `camera -> identity_nodes.base_url` from the roster and
+delegates to a per-node client.
+
+WHY BY CAMERA AND NOT BY PATIENT (2026-08-20)
+---------------------------------------------
+It used to resolve by patient, which held only while every camera watched
+exactly one person. A camera watching two residents publishes into ONE room
+and so lives in ONE process; routing the second resident's ticks by their own
+patient id sends them to a process that has never seen that camera, which
+returns no verdict and fails open. The camera's stored `livekit_room` is the
+address of the process that actually has the video, and it is used here as an
+address only — nothing about who anyone is.
 
 DROP-IN BY DESIGN
 -----------------
-`label_clip` already takes `patient_id` and, before this, ignored it. So the
-router implements the same surface `CameraIngest` already calls and nothing
-downstream changes: `worker.py` constructs this instead of `IdentityClient`,
-and `RoomWorker`/`CameraIngest` are untouched.
+`label_clip` already takes `camera_id`. So the router implements the same
+surface `CameraIngest` already calls and nothing downstream changes:
+`worker.py` constructs this instead of `IdentityClient`, and
+`RoomWorker`/`CameraIngest` are untouched.
 """
 
 from __future__ import annotations
@@ -59,8 +69,9 @@ class IdentityRouter:
         # base_url -> client. One httpx pool per node, reused across every
         # room on that node.
         self._clients: dict[str, IdentityClient] = {}
-        # patient_id -> (expires_at, base_url | None). None is cached too:
-        # an unassigned patient should not re-query the roster every tick.
+        # camera_id -> (expires_at, base_url | None). None is cached too:
+        # a camera no process holds should not re-query the roster every
+        # tick.
         self._routes: dict[str, tuple[float, str | None]] = {}
         # camera_id -> base_url, remembered from the last label_clip so that
         # `timing()` — which only receives a camera_id — can reach the same
@@ -83,8 +94,24 @@ class IdentityRouter:
             log.info("identity.router node_client_opened url=%s", base_url)
         return c
 
-    async def _base_url_for(self, patient_id: UUID | str) -> str | None:
-        key = str(patient_id)
+    async def _base_url_for(self, camera_id: UUID | str) -> str | None:
+        """The node process that actually has this camera's video.
+
+        Keyed on the CAMERA, not on the patient the tick is about. A
+        camera publishes into exactly one LiveKit room and exactly one
+        identity process subscribes to that room, so a camera watching
+        two residents is decoded once, in one place. Asking "which
+        process serves patient B" would send B's ticks to a process
+        that has never seen the shared camera, which returns no verdict
+        and fails open — silently, and forever, since a camera that is
+        simply absent looks identical to a service that is down.
+
+        `cameras.livekit_room` is that address, stored, and it is read
+        here as an address only: no part of this resolves who anyone
+        is. The room name embeds a patient uuid for historical reasons
+        and nothing downstream is allowed to read meaning into that.
+        """
+        key = str(camera_id)
         hit = self._routes.get(key)
         now = time.monotonic()
         if hit is not None and hit[0] > now:
@@ -101,12 +128,15 @@ class IdentityRouter:
                             # node-level URL alone reaches exactly one home
                             # and silently starves the rest.
                             "SELECT n.base_url, p.identity_port "
-                            "  FROM public.patients p "
+                            "  FROM public.cameras c "
+                            "  JOIN public.patients p "
+                            "    ON c.livekit_room = 'patient_' || p.id::text "
                             "  JOIN public.identity_nodes n "
                             "    ON n.node_id = p.identity_node_id "
-                            " WHERE p.id = :pid AND p.identity_port IS NOT NULL"
+                            " WHERE c.id = :cid "
+                            "   AND p.identity_port IS NOT NULL"
                         ),
-                        {"pid": key},
+                        {"cid": key},
                     )
                 ).first()
             if row is not None:
@@ -115,24 +145,23 @@ class IdentityRouter:
             # Fail OPEN, like every other identity path: a database blip must
             # not stop detection. Distinguished from "unassigned" below,
             # because they mean very different things operationally.
-            log.exception("identity.router route_lookup_failed patient=%s", key)
+            log.exception("identity.router route_lookup_failed camera=%s", key)
             # Cache the miss briefly so a sustained outage does not add a
             # query per camera per tick.
             self._routes[key] = (now + _ROUTE_CACHE_S, None)
             return None
 
         if url is None:
-            # Nobody is watching this home. Distinct from "the node is down",
+            # No process holds this camera. Distinct from "the node is down",
             # which surfaces as state_unreachable from the client.
-            log.warning("identity.router unassigned patient=%s", key)
+            log.warning("identity.router unassigned camera=%s", key)
         self._routes[key] = (now + _ROUTE_CACHE_S, url)
         return url
 
     # ── IdentityClient surface ─────────────────────────────────────────
     async def label_clip(self, **kwargs: Any) -> IdentityResult:
-        patient_id = kwargs.get("patient_id")
         camera_id = kwargs.get("camera_id")
-        base_url = await self._base_url_for(patient_id) if patient_id else None
+        base_url = await self._base_url_for(camera_id) if camera_id else None
         if base_url is None:
             # No node serves this home. Fail open — the same shape the client
             # returns when the service is unreachable — so safety detectors

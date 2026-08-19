@@ -15,6 +15,12 @@ Contract obligations (mapped from the live consumer surface):
   Seat anchor "face"/face_confirmed → face bind; body-gallery anchor →
   pool bind (`pre_labeled=True, pre_label_source="gallery"`), the same
   trust level the pool gallery had in the legacy brain.
+- ONE PATIENT'S ANSWER, ASKED BY NAME (state-v2, 2026-08-20). A camera
+  can watch several residents, so `/state` returns a seat per located
+  person and this client reads only the entry for `patient_id`. Every
+  other resident's track is reported UNKNOWN for this tick — never
+  "verified other", so a shared camera can never make identity
+  suppression fire for someone it merely failed to recognize.
 - Fail-open is sacred: ANY failure (service down, timeout, not-ready,
   unknown camera) returns `IdentityResult.empty()` (`reid_ran=False`),
   which bypasses identity-based suppression exactly like a legacy
@@ -170,6 +176,25 @@ class IdentityClient:
         return out or None
 
     @staticmethod
+    def _seat_for(state: dict, patient_id: "UUID | str") -> dict | None:
+        """THIS patient's seat, or None.
+
+        Strict lookup by design. A camera can watch more than one
+        resident, so `seats` holds one entry per LOCATED person and a
+        patient's absence means "not located". Resolving that absence
+        to any other entry — the only one present, the first one, the
+        room's primary — would file one resident's activity onto
+        another's record, and unlike a missed observation that is not
+        recoverable. There is no default here and there must never be
+        one.
+        """
+        seats = state.get("seats")
+        if not isinstance(seats, dict):
+            return None
+        seat = seats.get(str(patient_id))
+        return seat if isinstance(seat, dict) else None
+
+    @staticmethod
     def _cam_entry(state: dict, camera_id: "UUID | str") -> dict | None:
         """Match the backend's full camera UUID to the service's
         short key ("9271358c" == str(uuid)[:8]) or an exact key."""
@@ -217,7 +242,7 @@ class IdentityClient:
             # verdict is honest; fail open like a crash would.
             return IdentityResult.empty(faces_enrolled=True)
 
-        seat = state.get("seat")
+        seat = self._seat_for(state, patient_id)
         seat_here = bool(
             seat and str(camera_id).startswith(str(seat.get("camera", "\x00")))
         )

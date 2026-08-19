@@ -20,20 +20,29 @@ from __future__ import annotations
 
 import hmac
 
-STATE_CONTRACT = "state-v1"
+STATE_CONTRACT = "state-v2"
 AUTH_ENV = "NEMARA_IDENTITY_TOKEN"
 
-# /state response, state-v1 (reference for both sides):
+# /state response, state-v2 (reference for both sides):
 # {
-#   "contract": "state-v1",
+#   "contract": "state-v2",
 #   "ready": bool,
-#   "seat": null | {camera, camera_name, track, score, anchor,
-#                    face_confirmed, since, confirmed_at},
+#   "seats": { "<patient uuid>": {camera, camera_name, track, score,
+#              anchor, face_confirmed, since, confirmed_at}, ... },
 #   "cameras": { "<8-hex prefix>": {name, tracks: {tid: {bbox, age_s}},
 #                 solo, lag_s, pod_ms, stage_ms, probe_ms}, ... },
 # }
 # Camera keys are the FIRST 8 HEX CHARS of the camera UUID (the LiveKit
 # identity suffix); consumers match by str(uuid).startswith(key).
+#
+# v1 -> v2 (2026-08-20): the single `seat` became `seats`, keyed by
+# patient, because a camera can watch more than one resident. A patient
+# ABSENT from `seats` is not located; that is not the same as absent
+# from the room, and it must never resolve to another patient's seat.
+#
+# The backend reads both for one release (identity_client), so the node
+# image and the backend can ship in either order without an
+# identity-blind window. Delete the v1 branch once every node is on v2.
 
 
 def auth_ok(header_value: str | None, configured_token: str) -> bool:

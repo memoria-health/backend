@@ -596,8 +596,13 @@ def _read_trace(limit_bytes: int = 900_000) -> dict:
         })
         if t == "body":
             tk["body"].append(r)
-            if r.get("patient"):
-                body_pat.append(r["patient"])
+            # One score per patient the camera covers (2026-08-20 — the
+            # gallery stopped emitting a fixed patient/other pair). The
+            # distribution card wants the winning score per attempt, so
+            # take the best; a shared camera contributes one sample per
+            # probe, same as a private one.
+            if r.get("scores"):
+                body_pat.append(max(r["scores"].values()))
         elif t == "idevent":
             tk["idev"].append(r)
             ev[r.get("event", "?")] += 1

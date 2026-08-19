@@ -27,18 +27,27 @@ camera_patients                       ← NEW: the whole camera↔patient relati
 ```
 
 `coverage(camera)` = every row in `camera_patients`. Unassigned = no rows.
-The LiveKit room is derived, not stored: `patient_<primary.patient_id>`.
-`livekit_room` on `cameras` becomes a generated/derived value at query
-time — the roster already returns it per poll, and the bridge reads it
-from there, so removing the stored copy is safe.
+
+**`cameras.livekit_room` STAYS — this reverses the earlier plan
+(2026-08-20).** It was slated for deletion, to be recomputed as
+`patient_<primary.patient_id>` at query time. That is wrong twice over.
+It is the stored ADDRESS of the one process that holds this camera's
+video, and three separate readers now depend on it: the identity node
+(which residents to load), the backend router (which process to ask),
+and the caregiver app's Live tab (which room to join). Deriving it from
+the primary would put the patient relationship inside the identity path
+and would silently move a live stream whenever the primary changed.
+
+Primary is used exactly once, when a camera is assigned, to choose what
+to write into that column. Nothing reads it back.
 
 Delta order (idempotent, additive first — prod safety):
 1. add `cameras.caregiver_id`, backfill from `patients.caregiver_id`, set NOT NULL
 2. create `camera_patients`; backfill one `is_primary=true` row per existing camera
 3. RLS: caregiver sees cameras where `caregiver_id` is theirs; patient-scoped
    reads go through `camera_patients`
-4. only after the code no longer reads them: drop `cameras.patient_id`,
-   `cameras.livekit_room`
+4. only after the code no longer reads it: drop `cameras.patient_id`
+   (`livekit_room` is NOT dropped — see above)
 
 Step 4 ships in a SECOND deploy, after step 1-3 plus the code are live and
 verified. Never in the same release — a rollback with the column already

@@ -20,7 +20,7 @@ import logging
 import os
 import threading
 import time
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Optional
 from uuid import UUID
@@ -28,10 +28,7 @@ from uuid import UUID
 import cv2
 import numpy as np
 
-from identity.gallery import (
-    LABEL_PATIENT,
-    CrossClipBodyGallery,
-)
+from identity.gallery import CrossClipBodyGallery
 from identity.body_embeddings import extract_body_embedding
 from identity.display_veto import ScreenMap, apply_veto
 from identity.matching import topk_mean_cosine_match
@@ -47,6 +44,7 @@ from identity.seat import (
     Seat,
     heal_seat,
     notary_contradiction,
+    resolve_track_conflicts,
     update_seat,
 )
 from identity.state import CameraState
@@ -221,12 +219,14 @@ def best_face_per_track(obs: RemoteObservations) -> dict[int, tuple]:
 
 @dataclass
 class IdentityHome:
-    """Home-wide shared state: the single patient seat + shared models."""
+    """Room-wide shared state: one seat per resident + shared models."""
 
-    patient_id: UUID
     sam: SamServiceClient
     body_gallery: CrossClipBodyGallery
-    face_matrix: np.ndarray                  # (N,512) enrollment, refreshed
+    # patient_id → (N,512) ArcFace enrollment, refreshed on a timer.
+    # One entry per resident that ANY camera in this room covers; a
+    # camera asks only about the residents IT covers (see `covered`).
+    face_galleries: dict[UUID, np.ndarray]
     # Pod admission control. Was a single Lock ("single-flight A40"),
     # which measurement on 2026-07-29 showed was the actual bottleneck:
     # with both rooms occupied the machine sat ~97% IDLE (GPU 5-8%, 3 of
@@ -265,10 +265,17 @@ class IdentityHome:
                 max(1, int(os.environ.get("NEMARA_POD_CONCURRENCY", "2")))
             )
         return sem
-    # Guards `seat`: candidates fold from per-camera worker THREADS
+    # Guards `seats`: candidates fold from per-camera worker THREADS
     # (asyncio.to_thread), so the read-modify-write must serialize.
     seat_lock: threading.Lock = field(default_factory=threading.Lock)
-    seat: Optional[Seat] = None
+    # patient_id → that resident's seat. A resident with no entry is
+    # simply not located right now, which is the honest answer and the
+    # one every consumer must treat as "unknown" rather than "absent".
+    seats: dict[UUID, Seat] = field(default_factory=dict)
+    # camera-id-8-prefix → the residents that camera watches. Refreshed
+    # alongside the galleries, so sharing a camera with a second
+    # resident takes effect without restarting the node.
+    coverage: dict[str, list[UUID]] = field(default_factory=dict)
     cameras: dict[str, "CameraLoop"] = field(default_factory=dict)
     # Extra pod workers, one entry per additional base URL in
     # NEMARA_POD_URLS (comma-separated). Empty = every camera talks to
@@ -332,14 +339,43 @@ class IdentityHome:
     cam_names: dict = field(default_factory=dict)
     # Swap-healing streak (seat-follows-the-face): consecutive folds
     # whose verdict was "the notary moved" (see notary_contradiction).
-    _contra_key: Optional[tuple] = None
-    _contra_streak: int = 0
+    # Per resident — a swap on Alice's seat says nothing about Bob's.
+    _contra: dict = field(default_factory=dict)   # pid -> (key, streak)
     # (anchor, confirm_latency_s) per lock — the "how long until we
     # know it's the patient" metric, measured per track (soak stats).
     confirm_stats: list = field(default_factory=list)
 
     def name_of(self, cam_id: str) -> str:
         return self.cam_names.get(cam_id[:8], cam_id[:8])
+
+    def covered(self, cam_id: str) -> list[UUID]:
+        """Residents this camera watches, restricted to those with a
+        loaded face gallery.
+
+        Coverage and enrollment are separate facts: a caregiver can
+        point a camera at a second resident before that resident has
+        enrolled a face. Such a resident is dropped here rather than
+        carried as an empty gallery, because an empty gallery scores
+        0.0 against everything and would only ever add a losing entry
+        to every comparison.
+        """
+        return [
+            pid for pid in self.coverage.get(cam_id[:8], ())
+            if self.face_galleries.get(pid) is not None
+        ]
+
+    def seat_on(self, cam_id: str) -> Optional[tuple[UUID, Seat]]:
+        """The (resident, seat) currently held on this camera, if any.
+
+        Only one can exist: `resolve_track_conflicts` forbids two
+        residents sharing a track, and a camera's cadence/probe
+        decisions only need to know whether SOMEONE is seated here.
+        """
+        best: Optional[tuple[UUID, Seat]] = None
+        for pid, s in list(self.seats.items()):
+            if s.camera_id == cam_id and (best is None or s.score > best[1].score):
+                best = (pid, s)
+        return best
 
     def live_keys(self) -> set[tuple[str, int]]:
         # Reads the frozenset snapshots (GIL-atomic ref reads) — safe
@@ -353,40 +389,76 @@ class IdentityHome:
     SWAP_HEAL_ROUNDS = 3   # consecutive contradiction verdicts to heal
 
     def fold_candidates(self, cands: list[Candidate], now: float) -> None:
+        """Fold one round of scores into the seats — once per resident.
+
+        Every resident with a seat is folded even when this round
+        produced no candidate for them, because an absent candidate is
+        how "silence holds the seat" and "the seat dies with its track"
+        both reach `update_seat`.
+        """
+        by_patient: dict[UUID, list[Candidate]] = defaultdict(list)
+        for c in cands:
+            by_patient[c.patient_id].append(c)
+
         with self.seat_lock:
-            old = self.seat
-            seat = update_seat(
-                self.seat, cands, live=self.live_keys(),
-                floor=SEAT_FLOOR, delta=SEAT_DELTA, now=now,
-            )
-            # Swap healing: the tracker can trade two people's track
-            # numbers (live 2026-07-24, twice) and the seat rides the
-            # number. When the holder's evidence collapses while
-            # another track sustains history-backed face evidence for
-            # SWAP_HEAL_ROUNDS consecutive folds, the seat follows the
-            # face. The ratcheted reference makes an ordinary steal
-            # impossible post-swap — this is the only recovery path.
-            ch = notary_contradiction(seat, cands, floor=SEAT_FLOOR)
-            if ch is not None and ch.key == self._contra_key:
-                self._contra_streak += 1
-            elif ch is not None:
-                self._contra_key, self._contra_streak = ch.key, 1
-            else:
-                self._contra_key, self._contra_streak = None, 0
-            if ch is not None and self._contra_streak >= self.SWAP_HEAL_ROUNDS:
-                seat = heal_seat(ch, now=now)
-                self._contra_key, self._contra_streak = None, 0
-            self.seat = seat
-        self._journal_transition(old, seat, now)
+            old = dict(self.seats)
+            live = self.live_keys()
+            seats: dict[UUID, Seat] = {}
+            for pid in set(self.seats) | set(by_patient):
+                mine = by_patient.get(pid, [])
+                seat = update_seat(
+                    self.seats.get(pid), mine, live=live,
+                    floor=SEAT_FLOOR, delta=SEAT_DELTA, now=now,
+                )
+                # Swap healing: the tracker can trade two people's track
+                # numbers (live 2026-07-24, twice) and the seat rides the
+                # number. When the holder's evidence collapses while
+                # another track sustains history-backed face evidence for
+                # SWAP_HEAL_ROUNDS consecutive folds, the seat follows the
+                # face. The ratcheted reference makes an ordinary steal
+                # impossible post-swap — this is the only recovery path.
+                ch = notary_contradiction(seat, mine, floor=SEAT_FLOOR)
+                key, streak = self._contra.get(pid, (None, 0))
+                if ch is not None and ch.key == key:
+                    streak += 1
+                elif ch is not None:
+                    key, streak = ch.key, 1
+                else:
+                    key, streak = None, 0
+                if ch is not None and streak >= self.SWAP_HEAL_ROUNDS:
+                    seat = heal_seat(ch, now=now)
+                    key, streak = None, 0
+                if key is None and streak == 0:
+                    self._contra.pop(pid, None)
+                else:
+                    self._contra[pid] = (key, streak)
+                if seat is not None:
+                    seats[pid] = seat
+            # One body is one person — a track that won two residents'
+            # seats keeps only the stronger claim.
+            self.seats = resolve_track_conflicts(seats)
+            new = dict(self.seats)
+        self._journal_transitions(old, new, now)
+
+    def _journal_transitions(
+        self, old: dict[UUID, Seat], new: dict[UUID, Seat], now: float,
+    ) -> None:
+        """Journal every resident whose seat changed this fold."""
+        if self.journal is None:
+            return
+        for pid in set(old) | set(new):
+            self._journal_transition(pid, old.get(pid), new.get(pid), now)
 
     def _journal_transition(
-        self, old: Optional[Seat], new: Optional[Seat], now: float,
+        self, pid: UUID, old: Optional[Seat], new: Optional[Seat], now: float,
     ) -> None:
-        """Journal seat changes with a snapshot (outside seat_lock —
-        JPEG writes must never sit inside the hot mutex)."""
+        """Journal one resident's seat change with a snapshot (outside
+        seat_lock — JPEG writes must never sit inside the hot mutex)."""
         if self.journal is None or old == new:
             return
         from identity.journal import annotate
+
+        who = str(pid)[:8]
 
         if new is not None and (old is None or old.key != new.key):
             kind = "seat_locked" if old is None else "seat_moved"
@@ -404,13 +476,14 @@ class IdentityHome:
                 ] if cam else []
                 frame = annotate(
                     frame, tv.bbox if tv else None,
-                    f"T{new.track_id} PATIENT {new.score:.2f}@{new.anchor}",
+                    f"T{new.track_id} {who} {new.score:.2f}@{new.anchor}",
                     kind, context_boxes=ctx,
                 )
             self.journal.log(
                 kind, cam=new.camera_id,
                 cam_name=self.name_of(new.camera_id), tid=new.track_id,
                 score=round(new.score, 2), anchor=new.anchor,
+                patient=who,
                 confirm_latency_s=latency, frame_bgr=frame,
             )
         elif new is None and old is not None:
@@ -424,13 +497,13 @@ class IdentityHome:
                 ] if cam else []
                 frame = annotate(
                     frame, tv.bbox if tv else None,
-                    f"T{old.track_id} PATIENT UNSET", "seat_died",
+                    f"T{old.track_id} {who} UNSET", "seat_died",
                     context_boxes=ctx,
                 )
             self.journal.log(
                 "seat_died", cam=old.camera_id,
                 cam_name=self.name_of(old.camera_id), tid=old.track_id,
-                frame_bgr=frame,
+                patient=who, frame_bgr=frame,
             )
 
     def reap_seat(self, now: float) -> None:
@@ -443,13 +516,21 @@ class IdentityHome:
         flag). An empty candidate fold applies rule 1 only.
         """
         with self.seat_lock:
-            old = self.seat
-            self.seat = update_seat(
-                self.seat, [], live=self.live_keys(),
-                floor=SEAT_FLOOR, delta=SEAT_DELTA, now=now,
-            )
-            new = self.seat
-        self._journal_transition(old, new, now)
+            old = dict(self.seats)
+            live = self.live_keys()
+            self.seats = {
+                pid: s
+                for pid, s in (
+                    (pid, update_seat(
+                        seat, [], live=live,
+                        floor=SEAT_FLOOR, delta=SEAT_DELTA, now=now,
+                    ))
+                    for pid, seat in self.seats.items()
+                )
+                if s is not None
+            }
+            new = dict(self.seats)
+        self._journal_transitions(old, new, now)
 
 
 def _contested(cx: float, cy: float, boxes: list, *, own: int) -> bool:
@@ -535,7 +616,13 @@ class CameraLoop:
         # sightings — top-K so back-of-head garbage can't dilute a real
         # patient (T11 walk-around), padded so a lone outlier can't
         # seat an impostor (the aunt). Dies with the track.
-        self._sightings: dict[int, SightingHistory] = {}
+        # (track_id, patient_id) → that track's face evidence FOR THAT
+        # RESIDENT. A track on a shared camera accumulates one history
+        # per candidate resident, because "twelve sightings averaging
+        # 0.46" is a claim about a specific person and pooling them
+        # across residents would let Alice's strong history speak for a
+        # Bob comparison.
+        self._sightings: dict[tuple[int, UUID], SightingHistory] = {}
         # Set by intake: (ts, native-resolution BGR) — the probe scores
         # faces at NATIVE pixels (ring frames are downscaled for memory).
         self.latest_native: Optional[tuple[float, np.ndarray]] = None
@@ -610,10 +697,13 @@ class CameraLoop:
             # while searching) runs dense; a guest-occupied camera runs
             # light; an empty room polls slowly (every empty-room call
             # is a SAM3 ground on the shared GPU).
-            seat = self.home.seat
+            # "Someone we know is elsewhere" is what makes THIS camera
+            # cheap — unchanged for one resident, and for several it
+            # takes any seated resident as the signal rather than
+            # requiring all of them to be located.
             if not self.state.tracks and self._last_shipped is not None:
                 interval = EMPTY_INTERVAL_S
-            elif seat is not None and seat.camera_id != self.camera_id:
+            elif self.home.seats and self.home.seat_on(self.camera_id) is None:
                 interval = NONPATIENT_INTERVAL_S
             else:
                 interval = ACTIVE_INTERVAL_S
@@ -915,7 +1005,9 @@ class CameraLoop:
         """
         _idx, pipeline_ts, frame = pipeline_frame
         self.lag_s = time.time() - pipeline_ts
-        self.latest_jpeg = self._overlay(frame, self.home.seat, self._body_cos)
+        self.latest_jpeg = self._overlay(
+            frame, self.home.seat_on(self.camera_id), self._body_cos,
+        )
 
     # ── OUT-OF-BAND IDENTITY (2026-07-24 decoupling) ─────────────────
     # Face (pod /faces, no SAM, ~25ms/crop) + body (local OSNet) + seat
@@ -928,9 +1020,16 @@ class CameraLoop:
                 if not FACES_ENABLED:
                     continue
                 now = time.time()
-                seat = self.home.seat
+                # Dense while NOBODY is located, light once anyone is.
+                # Deliberately "anyone" and not "everyone the camera
+                # covers": the stricter reading would hold a shared
+                # camera at search cadence for as long as one resident
+                # is out of the house, multiplying face-probe cost for
+                # a person who isn't there. Finding the second resident
+                # a little slower is the cheaper mistake.
+                seat = self.home.seat_on(self.camera_id)
                 gap = (
-                    FACE_PROBE_SEARCH_S if seat is None
+                    FACE_PROBE_SEARCH_S if not self.home.seats
                     else FACE_PROBE_LOCKED_S
                 )
                 if now - self._probed_at < gap:
@@ -983,6 +1082,11 @@ class CameraLoop:
                 hits = await self.home.sam_for(self.camera_id).faces(
                     payload, face_boxes, full=(seat is None),
                 )
+                # `seat` here is THIS camera's holder, so full-frame
+                # scanning stays on wherever nobody is located yet —
+                # including a shared camera whose second resident has
+                # not been found, which is exactly where it earns its
+                # cost.
                 # COVERAGE scan (searching only): every ring frame since
                 # the last probe, ≥PROBE_SCAN_GAP_S apart, full-frame in
                 # parallel — the perfect frame of a brief crossing can
@@ -1053,8 +1157,14 @@ class CameraLoop:
     def _fold_probe(
         self, hits: list, frame: np.ndarray, boxes: list, now: float,
     ) -> None:
-        matrix = self.home.face_matrix
-        faces_by_tid: dict[int, tuple[float, float]] = {}
+        # The residents THIS camera watches. One entry for a private
+        # camera (and then everything below is the pre-multi-patient
+        # path with a loop of length one around it); several for a
+        # shared room. Empty means nobody on this camera has enrolled
+        # a face, so there is no identity question to ask.
+        covered = self.home.covered(self.camera_id)
+        # (track_id, patient_id) → best (cosine, face_px) this probe.
+        faces_by_key: dict[tuple[int, UUID], tuple[float, float]] = {}
         for tid, emb, px, det, cx, cy in hits:
             if tid == -1:
                 # Full-frame hit — assign to a track, never guess: it
@@ -1067,112 +1177,134 @@ class CameraLoop:
                 # Crop hit whose position another track's box also
                 # claims — overlap/adjacency, nobody's evidence.
                 continue
-            cos = (
-                topk_mean_cosine_match(emb, matrix).score
-                if matrix.size else None
-            )
-            if cos is None:
-                continue
-            # Every sighting feeds the track's history — the judgment
-            # below reads the HISTORY's robust statistic, not the frame.
-            self._sightings.setdefault(tid, SightingHistory()).add(
-                cos, px, now=now,
-            )
-            prev = faces_by_tid.get(tid)
-            if prev is None or px > prev[1]:
-                faces_by_tid[tid] = (cos, px)
+            # One face, asked about each resident in turn. The galleries
+            # are separate matrices rather than one stacked matrix with
+            # labels: each is ~10-30 rows, the scan is microseconds, and
+            # keeping them apart means a resident's top-K mean is
+            # computed over their OWN enrollment — stacking would let a
+            # crowded gallery borrow another person's best rows.
+            for pid in covered:
+                matrix = self.home.face_galleries.get(pid)
+                if matrix is None or not matrix.size:
+                    continue
+                cos = topk_mean_cosine_match(emb, matrix).score
+                # Every sighting feeds that resident's history for this
+                # track — the judgment below reads the HISTORY's robust
+                # statistic, not the frame.
+                self._sightings.setdefault(
+                    (tid, pid), SightingHistory(),
+                ).add(cos, px, now=now)
+                prev = faces_by_key.get((tid, pid))
+                if prev is None or px > prev[1]:
+                    faces_by_key[(tid, pid)] = (cos, px)
         # Histories die with their tracks (seat-reference lifecycle).
         live_tids = {b[0] for b in boxes}
         self._sightings = {
-            t: v for t, v in self._sightings.items() if t in live_tids
+            k: v for k, v in self._sightings.items() if k[0] in live_tids
         }
 
         cands: list[Candidate] = []
-        body_cos_by_tid: dict[int, float] = {}
+        body_by_key: dict[tuple[int, UUID], float] = {}
         for tid, x1, y1, x2, y2 in boxes:
-            f = faces_by_tid.get(tid)
-            body_cos = None
+            # ONE body embedding per track, scored against every covered
+            # resident's pool. The embedding extraction is the expensive
+            # part and it does not repeat per resident.
+            body_cos: dict[UUID, float] = {}
             emb = extract_body_embedding(
                 frame_bgr=frame, bbox=(x1, y1, x2, y2),
             )
-            if emb is not None:
+            if emb is not None and covered:
                 m = self.home.body_gallery.match(
-                    patient_id=self.home.patient_id, probe_embedding=emb,
+                    patient_ids=covered, probe_embedding=emb,
                 )
-                if m is not None and m.label == LABEL_PATIENT:
-                    body_cos = m.score
-                    body_cos_by_tid[tid] = m.score
-            # Face side: the track's HISTORY speaks (top-K robust to
-            # back-of-head garbage; consistency waiver lets N marginal
-            # sightings substitute for one big face). A single
-            # overwhelming sighting (close pass) still speaks for
-            # itself instantly; anything weaker with a thin history is
-            # PROVISIONAL (can hold a seat, can't take one).
-            hist = self._sightings.get(tid)
-            hist_ev = hist.evidence(now=now) if hist is not None else 0.0
-            single_ev = face_conf(f[0], f[1]) if f else 0.0
-            # A single frame speaks for itself ONLY when overwhelming
-            # (close pass); otherwise the history's verdict IS the
-            # evidence. Never max() a marginal single over the history
-            # — live 2026-07-24 (T13): 25 near-zeros then one 0.46,
-            # and the max() bypassed the history while the history's
-            # depth disabled the provisional gate. The two defenses
-            # cancelled at their seam; an impostor locked.
-            if single_ev >= INSTANT_FACE_CONF:
-                face_ev = max(hist_ev, single_ev)
-                provisional = False
-            else:
-                face_ev = hist_ev
-                provisional = (
-                    hist is None or hist.hits_at(now) < FUSION_MIN_HITS
-                )
-            body_ev = body_conf(body_cos)
-            if face_ev == 0.0 and body_ev == 0.0:
-                continue
-            if face_ev >= body_ev:
-                score, anchor = face_ev, "face"
-            else:
-                score, anchor = body_ev, "body"
-            cands.append(Candidate(
-                camera_id=self.camera_id, track_id=tid,
-                score=score, anchor=anchor,
-                provisional=(anchor == "face" and provisional),
-            ))
-        self._body_cos = body_cos_by_tid
+                if m is not None:
+                    body_cos[m.patient_id] = m.score
+                    body_by_key[(tid, m.patient_id)] = m.score
+            for pid in covered:
+                f = faces_by_key.get((tid, pid))
+                # Face side: the track's HISTORY for THIS resident
+                # speaks (top-K robust to back-of-head garbage;
+                # consistency waiver lets N marginal sightings
+                # substitute for one big face). A single overwhelming
+                # sighting (close pass) still speaks for itself
+                # instantly; anything weaker with a thin history is
+                # PROVISIONAL (can hold a seat, can't take one).
+                hist = self._sightings.get((tid, pid))
+                hist_ev = hist.evidence(now=now) if hist is not None else 0.0
+                single_ev = face_conf(f[0], f[1]) if f else 0.0
+                # A single frame speaks for itself ONLY when overwhelming
+                # (close pass); otherwise the history's verdict IS the
+                # evidence. Never max() a marginal single over the history
+                # — live 2026-07-24 (T13): 25 near-zeros then one 0.46,
+                # and the max() bypassed the history while the history's
+                # depth disabled the provisional gate. The two defenses
+                # cancelled at their seam; an impostor locked.
+                if single_ev >= INSTANT_FACE_CONF:
+                    face_ev = max(hist_ev, single_ev)
+                    provisional = False
+                else:
+                    face_ev = hist_ev
+                    provisional = (
+                        hist is None or hist.hits_at(now) < FUSION_MIN_HITS
+                    )
+                body_ev = body_conf(body_cos.get(pid))
+                if face_ev == 0.0 and body_ev == 0.0:
+                    continue
+                if face_ev >= body_ev:
+                    score, anchor = face_ev, "face"
+                else:
+                    score, anchor = body_ev, "body"
+                cands.append(Candidate(
+                    camera_id=self.camera_id, track_id=tid, patient_id=pid,
+                    score=score, anchor=anchor,
+                    provisional=(anchor == "face" and provisional),
+                ))
+        self._body_cos = {
+            tid: sc for (tid, _pid), sc in body_by_key.items()
+        }
         self.home.fold_candidates(cands, now)
         self.probe_history.append({
             "ts": round(now, 1),
-            "locked": self.home.seat is not None,
+            "locked": bool(self.home.seats),
             "tracks": len(boxes),
             "faces": [
-                [tid, round(cos, 3), int(px)]
-                for tid, (cos, px) in faces_by_tid.items()
+                [tid, str(pid)[:8], round(cos, 3), int(px)]
+                for (tid, pid), (cos, px) in faces_by_key.items()
             ],
             "body": [
-                [tid, round(cos, 3)] for tid, cos in body_cos_by_tid.items()
+                [tid, str(pid)[:8], round(cos, 3)]
+                for (tid, pid), cos in body_by_key.items()
             ],
             "cands": [
-                [c.track_id, round(c.score, 3), c.anchor,
-                 bool(c.provisional)]
+                [c.track_id, str(c.patient_id)[:8], round(c.score, 3),
+                 c.anchor, bool(c.provisional)]
                 for c in cands
             ],
         })
         log.info(
-            "identity.probe cam=%s tracks=%d faces=%s cands=%s",
-            self.camera_id, len(boxes),
+            "identity.probe cam=%s tracks=%d covered=%d faces=%s cands=%s",
+            self.camera_id, len(boxes), len(covered),
             [
-                (tid, round(cos, 2), int(px))
-                for tid, (cos, px) in faces_by_tid.items()
+                (tid, str(pid)[:8], round(cos, 2), int(px))
+                for (tid, pid), (cos, px) in faces_by_key.items()
             ],
             [
-                (c.track_id, round(c.score, 2),
+                (c.track_id, str(c.patient_id)[:8], round(c.score, 2),
                  c.anchor + ("?" if c.provisional else ""))
                 for c in cands
             ],
         )
 
-        seat = self.home.seat
-        if seat is not None and seat.camera_id == self.camera_id:
+        # `seat_on` returns the strongest seat on this camera, which is
+        # unambiguous here: harvest_eligible requires `solo`, so there is
+        # exactly one live track and therefore at most one seat to pick
+        # from. Multi-person harvesting still does not exist — a shared
+        # lounge with two people in it harvests for neither, which is
+        # the pre-existing rule and the right one (a crossing is exactly
+        # when the pool gets poisoned).
+        held = self.home.seat_on(self.camera_id)
+        if held is not None:
+            seat_pid, seat = held
             tv = self.state.tracks.get(seat.track_id)
             if tv is not None and harvest_eligible(
                 seat, camera_id=self.camera_id, track_id=seat.track_id,
@@ -1181,21 +1313,29 @@ class CameraLoop:
             ):
                 emb = extract_body_embedding(frame_bgr=frame, bbox=tv.bbox)
                 if emb is not None:
+                    # Harvest into the pool of the resident who actually
+                    # holds this seat — never a room default. A harvest
+                    # filed under the wrong person poisons that pool for
+                    # its whole 4h TTL and drives body false-positives
+                    # long after the mistake (the aunt lesson).
                     self.home.body_gallery.harvest(
-                        patient_id=self.home.patient_id, embedding=emb,
-                        label=LABEL_PATIENT, confidence=seat.score,
+                        patient_id=seat_pid, embedding=emb,
+                        confidence=seat.score,
                     )
                     self.home.body_gallery.remember_recent(
-                        patient_id=self.home.patient_id, embedding=emb,
+                        patient_id=seat_pid, embedding=emb,
                         confidence=seat.score,
                     )
 
     def _overlay(
-        self, frame: np.ndarray, seat: Optional[Seat],
+        self, frame: np.ndarray, held: Optional[tuple[UUID, Seat]],
         body_cos: dict[int, float],
     ) -> bytes:
         img = frame.copy()
         h = img.shape[0]
+        # Use the LOCAL snapshot throughout — home.seats can be
+        # reassigned by another camera's fold between two reads (TOCTOU).
+        who, seat = held if held is not None else (None, None)
         for rx1, ry1, rx2, ry2 in self.screen_map.live(time.monotonic()):
             cv2.rectangle(img, (int(rx1), int(ry1)), (int(rx2), int(ry2)),
                           (0, 0, 200), 2)
@@ -1204,7 +1344,8 @@ class CameraLoop:
             is_seat = seat is not None and seat.key == (self.camera_id, tid)
             col = (80, 220, 80) if is_seat else (60, 200, 255)
             tag = (
-                f"PATIENT T{tid} {seat.score:.2f}/{seat.anchor}" if is_seat
+                f"{str(who)[:8]} T{tid} {seat.score:.2f}/{seat.anchor}"
+                if is_seat
                 else f"T{tid}" + (
                     f" b{body_cos[tid]:.2f}" if tid in body_cos else ""
                 )
@@ -1212,13 +1353,11 @@ class CameraLoop:
             cv2.rectangle(img, (x1, y1), (x2, y2), col, 3 if is_seat else 2)
             cv2.putText(img, tag, (x1, max(18, y1 - 8)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, 2)
-        # Use the LOCAL seat snapshot — home.seat can be reassigned to
-        # None by another camera's fold between two reads (TOCTOU).
         self.hud = (
             f"{self.home.name_of(self.camera_id)} | "
             f"lag {self.lag_s:.1f}s pod {self.pod_ms:.0f}ms"
             f" q {self.queue_ms:.0f}ms | tracks {len(self.state.tracks)}"
-            + (f" | seat {seat.score:.2f}@{seat.anchor}"
+            + (f" | {str(who)[:8]} {seat.score:.2f}@{seat.anchor}"
                + ("*face" if seat.face_confirmed else "")
                if seat else " | seat -")  # ASCII: cv2.putText renders
                                           # non-ASCII as "???"

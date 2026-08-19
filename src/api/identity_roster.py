@@ -101,14 +101,24 @@ class RosterResponse(BaseModel):
 PORT_MIN = 8012
 PORT_MAX = 8111
 
-# A home is LIVE when it has at least one camera actually streaming.
-# Slots follow live homes: claim order prefers them, and a dormant home
+# A room is LIVE when at least one camera actually STREAMS INTO IT.
+# Slots follow live rooms: claim order prefers them, and a dormant room
 # yields its slot to one (2026-08-19 — prod had 7 of 8 slots held by
 # May/June test homes with no cameras online while every home that was
 # actually streaming sat unassigned and identity-blind).
+#
+# The test is `livekit_room`, not "a camera is assigned to this patient"
+# (2026-08-20). Those differ the moment a camera watches two residents:
+# it publishes into ONE room, so the second resident is covered by a
+# streaming camera while no camera streams into THEIR room. Under the
+# old test they would be handed a process with zero cameras in it —
+# a slot and a set of models burned on nothing, reported blind by the
+# fleet watch. Their identity answers come from the process that holds
+# the shared camera, which the router resolves the same way.
 _LIVE_CAM = (
     "EXISTS (SELECT 1 FROM public.cameras c "
-    "         WHERE c.patient_id = p.id AND c.online AND NOT c.disabled)"
+    "         WHERE c.livekit_room = 'patient_' || p.id::text "
+    "           AND c.online AND NOT c.disabled)"
 )
 
 

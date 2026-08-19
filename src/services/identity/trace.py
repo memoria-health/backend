@@ -117,17 +117,26 @@ def trk(
 
 
 def body_score(
-    *, patient: float, other: float, verdict: str, tid: int | None = None,
+    *, scores: dict[str, float], verdict: str, tid: int | None = None,
 ) -> None:
-    """Every body match attempt — the real top-3 cosines vs the patient and
-    other pools, incl. no-matches. This is the 'stream the scores and see
-    what wins out' tap: the full per-tick score distribution."""
+    """Every body match attempt — the real top-3 cosines against each
+    covered patient's pool, incl. no-matches. This is the 'stream the
+    scores and see what wins out' tap: the full per-tick score
+    distribution.
+
+    `scores` is {patient_id: top3_mean}, one entry per patient the
+    camera covers. It replaced a fixed patient/other pair when the
+    gallery stopped keying pools by PATIENT/OTHER (2026-08-20) — a
+    camera can watch more than one resident, so the number of scores
+    per attempt is a property of the camera, not a constant.
+    """
     b = _base()
     if b is None:
         return
     b.update({
-        "type": "body", "patient": round(float(patient), 3),
-        "other": round(float(other), 3), "verdict": verdict, "tid": tid,
+        "type": "body",
+        "scores": {k: round(float(v), 3) for k, v in scores.items()},
+        "verdict": verdict, "tid": tid,
     })
     _emit(b)
 

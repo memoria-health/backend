@@ -59,8 +59,7 @@ log() { echo "$(date -u +%FT%TZ) roster: $*" | tee -a "$LOGDIR/roster.log"; }
 # The backend allocates the lowest free port per node and tells us, the same
 # way it allocates gateways.tunnel_port.
 _start_room() {
-  local room="$1" port="$2" patient
-  patient="${room#patient_}"
+  local room="$1" port="$2"
   mkdir -p "$STATE_DIR/$room"
   # Singleton per room, enforced, not assumed (node F melt, 2026-08-13):
   # a stop/kill race once orphaned a live identity process, and the
@@ -73,10 +72,11 @@ _start_room() {
     while true; do
       cd "$STATE_DIR/$room" || exit 1
       t0=$(date +%s)
-      # --patient explicitly: its argparse default is a hardcoded pilot UUID,
-      # which on any other home silently binds the wrong patient.
+      # No --patient (2026-08-20): the room's cameras name the residents,
+      # because a shared camera watches more than one and a single flag
+      # could only ever describe one of them.
       python3 -m identity.service \
-        --room "$room" --patient "$patient" --port "$port" \
+        --room "$room" --port "$port" \
         --pod-url "http://127.0.0.1:${PERCEPTION_PORT}" \
         >>"$LOGDIR/identity-$room.log" 2>&1
       rc=$?

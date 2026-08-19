@@ -549,15 +549,31 @@ async def test_corpse_rows_are_reaped_after_seven_days(
     assert holder != "node-holding"
 
 
-async def _mk_camera(session: AsyncSession, patient_id: UUID, *, online: bool) -> None:
+async def _mk_camera(
+    session: AsyncSession, patient_id: UUID, *, online: bool,
+    publishes_into: UUID | None = None,
+) -> None:
     """A camera row for liveness. Only patient_id/display_id/room are
-    NOT NULL without a default; `online` is the field under test."""
+    NOT NULL without a default; `online` is the field under test.
+
+    `livekit_room` is set because every real creation path sets it and
+    liveness reads it (2026-08-20): a room is live when a camera
+    STREAMS INTO it, not when a camera is assigned to its patient.
+    `publishes_into` makes them differ, which is exactly what a shared
+    camera does — it covers this patient while publishing into someone
+    else's room.
+    """
+    room_owner = publishes_into or patient_id
     await session.execute(
         text(
-            "INSERT INTO public.cameras (id, patient_id, display_id, room, online) "
-            "VALUES (:id, :p, :d, :r, :o)"
+            "INSERT INTO public.cameras "
+            "  (id, patient_id, display_id, room, online, livekit_room) "
+            "VALUES (:id, :p, :d, :r, :o, :lk)"
         ),
-        {"id": uuid4(), "p": patient_id, "d": 1, "r": "Roster Test Room", "o": online},
+        {
+            "id": uuid4(), "p": patient_id, "d": 1, "r": "Roster Test Room",
+            "o": online, "lk": f"patient_{room_owner}",
+        },
     )
     await session.commit()
 
@@ -681,3 +697,36 @@ async def test_dormant_home_keeps_its_slot_when_capacity_is_spare(
 
     body = (await _poll(client, "node-standby", cap=4)).json()
     assert set(_names(body)) == {f"patient_{dormant}", f"patient_{live}"}
+
+
+async def test_a_shared_camera_does_not_make_the_second_resident_live(
+    client: AsyncClient, session: AsyncSession, auth_user
+) -> None:
+    """A camera covering two residents publishes into ONE room, so only
+    that room needs a process (2026-08-20).
+
+    Under the old liveness test — "a camera is assigned to this
+    patient" — the second resident looked live and was handed a slot,
+    a port and a full set of models for a process with zero cameras in
+    it. Their identity answers come from the process holding the shared
+    camera, which is where the router sends them.
+    """
+    caregiver_id, email = auth_user
+    await _clear(session)
+    await _mk_caregiver(session, caregiver_id, email)
+    await _park_others(session)
+    bob = await _mk_patient(session, caregiver_id)       # older
+    alice = await _mk_patient(session, caregiver_id)     # newer
+    # One shared lounge camera: it covers Bob, and it publishes into
+    # Alice's room. Under the old "a camera is assigned to this
+    # patient" test, Bob reads as live and — being older — takes the
+    # only slot, leaving the room that actually carries video without
+    # a process. Contention is what makes the two rules diverge, so
+    # capacity is 1.
+    await _mk_camera(session, bob, online=True, publishes_into=alice)
+
+    body = (await _poll(client, "node-shared", cap=1)).json()
+
+    assert _names(body) == [f"patient_{alice}"], (
+        "the slot must follow the room the video actually arrives in"
+    )

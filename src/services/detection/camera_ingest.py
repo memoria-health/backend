@@ -2023,9 +2023,16 @@ class CameraIngest:
             # pass over the same verdicts. A fall therefore reaches
             # everyone the camera covers, while a routine detector stays
             # quiet for each of them unless identity says it was them.
+            # No coverage means nobody is watched by this camera, so
+            # there is nobody to promote to. There used to be a fallback
+            # to this ingest's own patient here; it is gone (2026-08-20)
+            # because it was the one place a missing relationship
+            # silently resolved to a default person, and a camera with
+            # no coverage is filtered out of the roster and cannot tick
+            # in the first place.
             covered = await camera_coverage.coverage(session, self.camera_id)
             promotion = None
-            for pid in covered or [self.patient_id]:
+            for pid in covered:
                 result_for_patient = await maybe_promote_analysis(
                     session,
                     patient_id=pid,

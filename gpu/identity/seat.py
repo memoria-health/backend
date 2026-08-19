@@ -1,4 +1,5 @@
-"""The single home-wide patient seat — Aryaman's rule (2026-07-24).
+"""One seat per resident — Aryaman's rule (2026-07-24, widened
+2026-08-20).
 
 Seat = highest combined score. A challenger takes it only by beating
 the seated reference score by δ. The reference lives and dies with its
@@ -8,15 +9,30 @@ their reference dies with it (deliberately deferred: add decay only if
 the pilot shows a stuck wrong seat; plan §6).
 
 Empty-seat rule: lock the best candidate only if it clears the floor
-AND beats the runner-up by δ — two plausible patients lock neither
+AND beats the runner-up by δ — two plausible tracks lock neither
 (UNKNOWN is recoverable; a wrong patient is not).
+
+MULTI-PATIENT. A camera can watch more than one resident, so a home
+holds one seat PER PATIENT rather than one seat outright. Everything
+above is unchanged and simply runs once per resident over that
+resident's own candidates — the same binary question, asked N times.
+Two arbitrations then exist and they are deliberately separate:
+
+  which track is Alice   — `update_seat`, exactly as before
+  which resident is T    — `resolve_track_conflicts`, below
+
+Keeping them apart is what makes the one-resident case identical to
+the pre-2026-08-20 code: with a single patient there is nothing for
+the second arbitration to arbitrate, and it returns its input.
 """
 
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from dataclasses import dataclass, replace
 from typing import Optional
+from uuid import UUID
 
 log = logging.getLogger(__name__)
 
@@ -27,6 +43,10 @@ TrackKey = tuple[str, int]  # (camera_id, track_id)
 class Candidate:
     camera_id: str
     track_id: int
+    # WHICH resident this score is about. A track produces one candidate
+    # per patient the camera covers, so a candidate is a claim ("track 4
+    # looks like Alice, 0.61"), never an identity by itself.
+    patient_id: UUID
     score: float
     anchor: str                    # "face" | "body"
     # Marginal face evidence not yet backed by a fused track template
@@ -149,6 +169,49 @@ def update_seat(
         return updated
 
     return _challenge(seat, best, delta=delta, now=now)
+
+
+def resolve_track_conflicts(
+    seats: dict[UUID, Seat],
+) -> dict[UUID, Seat]:
+    """One body is one person: no track may hold two residents' seats.
+
+    `update_seat` runs per resident and knows nothing about the others,
+    so on a shared camera the same track can win Alice's seat AND Bob's
+    — two people's routines would then be recorded off one body. The
+    highest score keeps the track; the loser is UNSEATED rather than
+    moved to its runner-up track, because the runner-up already lost
+    that resident's own δ contest and re-seating it here would smuggle
+    in a lock that arbitration rejected.
+
+    Greedy by score (Aryaman, 2026-08-20): the face and body bars are
+    unforgiving enough that two enrolled residents rarely both clear
+    them on one body, and when they do the stronger evidence is the
+    honest answer. Ties break on patient id so a coverage query with no
+    ORDER BY can't make attribution flap between ticks.
+
+    Pure. With one resident it returns its input untouched — this is
+    the function that has to be a no-op for the 90% case.
+    """
+    by_track: dict[TrackKey, list[UUID]] = defaultdict(list)
+    for pid, s in seats.items():
+        by_track[s.key].append(pid)
+
+    resolved = dict(seats)
+    for key, pids in by_track.items():
+        if len(pids) < 2:
+            continue
+        winner = max(pids, key=lambda p: (seats[p].score, str(p)))
+        for pid in pids:
+            if pid == winner:
+                continue
+            log.info(
+                "identity.seat_contested key=%s kept=%s (%.2f) unseated=%s "
+                "(%.2f)",
+                key, winner, seats[winner].score, pid, seats[pid].score,
+            )
+            resolved.pop(pid, None)
+    return resolved
 
 
 def notary_contradiction(

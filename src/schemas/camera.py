@@ -87,6 +87,14 @@ class CameraResponse(BaseModel):
     # can map a Camera row to a subscribed LiveKit track without
     # reconstructing the identity from the UUID prefix client-side.
     livekit_identity: str | None
+    # The LiveKit room this camera PUBLISHES INTO — the address a viewer
+    # must join to see it. Exposed to clients (2026-08-20) because it is
+    # no longer derivable from the patient being viewed: a camera that
+    # watches two residents publishes into one room, so the second
+    # resident's Live tab has to follow the camera's room rather than
+    # construct `patient_<their own id>` and join a room this camera
+    # never appears in.
+    livekit_room: str | None = None
     created_at: datetime
     # True once the wall phone has called /v1/cameras/pair and we've
     # set the api_key_hash. False = "row exists with an open pairing

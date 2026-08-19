@@ -373,17 +373,17 @@ for room in "${ROOMS[@]}"; do
   room="$(echo "$room" | tr -d '[:space:]')"
   [ -z "$room" ] && continue
   port=$((8012 + i))
-  patient="${room#patient_}"
-  log "starting identity room=$room patient=$patient port=$port"
+  log "starting identity room=$room port=$port"
   mkdir -p "$STATE_DIR/$room"
   (
     while true; do
       cd "$STATE_DIR/$room" || exit 1
       dev_code_overlay
-      # --patient explicitly: its argparse default is a hardcoded pilot UUID,
-      # which on any other home would silently bind the wrong patient.
+      # No --patient (2026-08-20): the room's cameras name the residents,
+      # because a shared camera watches more than one and a single flag
+      # could only ever describe one of them.
       python3 -m identity.service \
-        --room "$room" --patient "$patient" --port "$port" \
+        --room "$room" --port "$port" \
         --pod-url "http://127.0.0.1:${PERCEPTION_PORT:-8000}" \
         >>"$LOGDIR/identity-$room.log" 2>&1
       rc=$?
