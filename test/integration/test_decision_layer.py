@@ -16,7 +16,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.db.detector import Detector
 from src.services.detection.analyses_store import add_analysis
 from src.services.detection.event_promotion import maybe_promote_analysis
-from test.integration.identity_helpers import _setup_patient_with_camera
+from test.integration.identity_helpers import (
+    _enroll_face,
+    _setup_patient_with_camera,
+)
 
 _V2 = SimpleNamespace(detection_v2_decision_enabled=True)
 
@@ -268,6 +271,7 @@ async def test_routine_patient_custom_fails_quiet_without_confirmed_patient(
         client, auth_user, session,
     )
     ident = "custom_tvhabit"
+    await _enroll_face(session, patient_id)
     await _add_detector(
         session, patient_id, ident, is_sustained=False,
         category="routine", subject_scope="patient",
@@ -335,6 +339,8 @@ async def test_behaviour_and_care_patient_customs_fail_quiet_too(
     patient_id, camera_id = await _setup_patient_with_camera(
         client, auth_user, session,
     )
+    # The gate only arms for a home that CAN identify someone.
+    await _enroll_face(session, patient_id)
     now = datetime.now(timezone.utc)
     for i, category in enumerate(("behaviour", "care")):
         ident = f"custom_quiet_{category}"
@@ -362,3 +368,38 @@ async def test_behaviour_and_care_patient_customs_fail_quiet_too(
         )
         await session.commit()
         assert len(res2.fired) == 1, f"{category} blocked a confirmed patient"
+
+
+@pytest.mark.asyncio
+async def test_unenrolled_home_is_not_silenced_by_the_identity_gate(
+    client: AsyncClient, auth_user, session: AsyncSession,
+) -> None:
+    """Enrollment is OPTIONAL (Aryaman, 2026-08-19).
+
+    Fail-quiet gating asks identity to confirm the patient. A household
+    that never enrolled a face has no confirmation source, so the gate
+    could never open and every routine detector stayed silent forever —
+    found on prod day one, on a home with detectors on and nothing ever
+    firing. The gate must arm only where it can actually be satisfied.
+    """
+    patient_id, camera_id = await _setup_patient_with_camera(
+        client, auth_user, session,
+    )
+    ident = "custom_unenrolled"
+    await _add_detector(
+        session, patient_id, ident, is_sustained=False,
+        category="routine", subject_scope="patient",
+    )
+    await session.commit()
+
+    # No enrollment anywhere, and identity says nothing.
+    res = await maybe_promote_analysis(
+        session, patient_id=patient_id, camera_id=camera_id,
+        occurred_at=datetime.now(timezone.utc), description="unconfirmed tick",
+        detector_fields=_fields(ident), settings=_V2,
+    )
+    await session.commit()
+
+    assert len(res.fired) == 1, (
+        "an unenrolled home must still get its routine detectors"
+    )
