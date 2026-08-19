@@ -5,8 +5,8 @@ runtime needs (identifier / prompt_fragment / schema_json) plus the catalog
 metadata (cohort, recommended, promotion threshold). Three consumers read from
 here, so they can never drift out of sync:
 
-  - `onboarding.seed_detectors_for_patient` — seeds the `recommended` subset for
-    the patient's cohort on patient create (the original auto-seed behaviour).
+  - `onboarding.seed_detectors_for_patient` — seeds only the HIDDEN internal
+    detectors on patient create. The caregiver picks everything they can see.
   - `api/detectors.py` — the library list + "add from library" endpoints.
   - `detection.event_promotion` — per-detector confidence thresholds.
 
@@ -753,11 +753,10 @@ class CatalogEntry:
     # Two INDEPENDENT flags:
     #   `recommended` — the special "Recommended" group in the library UI. Only
     #                   `fall` is recommended.
-    #   `seeded`      — auto-created on patient create AND pre-checked at
-    #                   onboarding: `fall` + the cohort presets (adult:
-    #                   agitation/wandering/medication; child: climbing/distress).
-    # A seeded-but-not-recommended detector is pre-selected when making a
-    # patient yet still listed under "More detectors".
+    #   `seeded`      — auto-created on patient create. Only HIDDEN internal
+    #                   detectors set this now (2026-08-19): the caregiver
+    #                   picks everything visible from the library, so a new
+    #                   patient starts with an empty detector list.
     seeded: bool = False
     # Internal detectors the caregiver should never see or manage. Excluded
     # from `for_cohort` (so it's not in the library picker) and filtered out of
@@ -800,26 +799,24 @@ class CatalogEntry:
 
 
 # Order matters: entries appear in this order within each cohort (the iOS
-# library list + the seed order). The SEEDED presets come first so onboarding
-# seeds them in today's order — adult (fall, agitation, wandering, medication),
-# child (fall, climbing, distress) — byte-identical to the previous preset
-# tuples. Of those, only `fall` is `recommended` (the special "Recommended"
-# group); the rest are seeded-but-not-recommended, so they're pre-checked at
-# onboarding yet listed under "More detectors". `fall` is `cohort="both"`.
+# library list). These four led the list back when they were auto-seeded and
+# keep their position so the picker's order is unchanged. Only `fall` is
+# `recommended` (the special "Recommended" group); the rest sit under "More
+# detectors". `fall` is `cohort="both"`.
 CATALOG: tuple[CatalogEntry, ...] = (
-    # ── recommended presets (seeded by default) ──
+    # ── presets the caregiver picks from the library ──
     CatalogEntry(
         key="fall", name="Falls", icon_name="figure.fall",
         description="Sudden fall events across all rooms.",
         category="safety", cohort="both",
-        recommended=True, seeded=True, prompt_fragment=_FALL_PROMPT_FRAGMENT,
+        recommended=True, seeded=False, prompt_fragment=_FALL_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
     CatalogEntry(
         key="agitation", name="Agitation", icon_name="figure.walk.motion",
         description="Explicit aggression: physical or verbal fighting, angry outbursts.",
         category="behaviour", is_sustained=True, cohort="adult",
-        recommended=False, seeded=True, prompt_fragment=_AGITATION_PROMPT_FRAGMENT,
+        recommended=False, seeded=False, prompt_fragment=_AGITATION_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
     # Convulsion REMOVED from the catalog (Aryaman 2026-07-28): the
@@ -834,7 +831,7 @@ CATALOG: tuple[CatalogEntry, ...] = (
         key="wandering", name="Wandering", icon_name="door.left.hand.open",
         description="Main door opening, front entry only.",
         category="safety", cohort="adult",
-        recommended=False, seeded=True, prompt_fragment=_WANDERING_PROMPT_FRAGMENT,
+        recommended=False, seeded=False, prompt_fragment=_WANDERING_PROMPT_FRAGMENT,
         promotion_threshold=0.70,
     ),
     CatalogEntry(
@@ -862,7 +859,7 @@ CATALOG: tuple[CatalogEntry, ...] = (
         key="medication", name="Medication adherence", icon_name="pills",
         description="Confirms the person took their medication.",
         category="routine", cohort="adult",
-        recommended=False, seeded=True, prompt_fragment=_MEDICATION_PROMPT_FRAGMENT,
+        recommended=False, seeded=False, prompt_fragment=_MEDICATION_PROMPT_FRAGMENT,
         # ALL DAY (Aryaman 2026-07-28): presets never ship hardcoded
         # schedules — a time window is a CAREGIVER choice made through
         # the editor's picker (one representation, consistent on every
@@ -1021,9 +1018,10 @@ def for_cohort(minor: bool) -> list[CatalogEntry]:
 
 
 def seeded_for_cohort(minor: bool) -> list[CatalogEntry]:
-    """The subset auto-seeded on patient create AND pre-checked at onboarding —
-    fall + the cohort presets (+ any hidden internal detectors like the setup
-    self-test). Reads CATALOG directly rather than via `for_cohort` so a `hidden`
+    """The subset auto-created on patient create. Since 2026-08-19 that is ONLY
+    the hidden internal detectors (the setup self-test): the caregiver picks
+    every detector they can actually see, so nothing visible is created for
+    them. Reads CATALOG directly rather than via `for_cohort` so a `hidden`
     detector still seeds even though it's excluded from the library UI."""
     want = "child" if minor else "adult"
     return [e for e in CATALOG if e.cohort in (want, "both") and e.seeded]

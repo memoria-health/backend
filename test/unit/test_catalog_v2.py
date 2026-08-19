@@ -44,3 +44,18 @@ def test_row_kwargs_splat_matches_orm_columns() -> None:
         assert hasattr(Detector, column), f"no ORM column {column}"
     # Customs are classified by the compiler later (P5) — empty splat.
     assert catalog_v2.row_kwargs("custom_anything") == {}
+
+
+def test_only_hidden_detectors_are_auto_seeded() -> None:
+    """A new patient starts with an empty detector list — the caregiver
+    picks from the library on add (2026-08-19). Only HIDDEN internal
+    detectors seed, because they are excluded from the library and so
+    cannot be picked. Re-seeding anything visible would put detectors in
+    a household that nobody chose."""
+    for minor in (False, True):
+        seeded = catalog.seeded_for_cohort(minor)
+        assert seeded, "the setup self-test must still seed"
+        assert all(e.hidden for e in seeded), (
+            f"visible detectors auto-seeded: "
+            f"{[e.key for e in seeded if not e.hidden]}"
+        )

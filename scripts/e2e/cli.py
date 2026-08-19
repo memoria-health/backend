@@ -340,8 +340,8 @@ def add_patient(
             )
             session.add(patient)
             await session.flush()
-            # Auto-seed preset detectors so the new patient has the same
-            # starter set the iOS app expects.
+            # Seeds only the hidden setup self-test — visible detectors are
+            # picked from the library, so this patient starts with none.
             from src.services import onboarding
             await onboarding.seed_detectors_for_patient(session, patient.id)
             await session.commit()

@@ -83,11 +83,10 @@ async def create_patient(
 ) -> PatientResponse:
     """Create a patient under the current caregiver.
 
-    Auto-seeds preset detectors via `services.onboarding.seed_detectors_for_patient`
-    in the same transaction. The set is age-based: 18+ or unknown birthday get
-    the older-adult set (Falls / Agitation / Wandering / Medication adherence);
-    under-18 patients get only the both-cohort safety net (Falls) — the child
-    preset set was deleted 2026-08-16 (adult-only product).
+    Creates NO visible detectors: the caregiver picks those from the library
+    on add (2026-08-19). `services.onboarding.seed_detectors_for_patient` still
+    runs in the same transaction, but it now only creates the hidden internal
+    setup self-test, which is not in the library and so cannot be picked.
     """
     now = datetime.now(timezone.utc)
     p = Patient(
