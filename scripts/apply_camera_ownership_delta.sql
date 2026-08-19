@@ -21,7 +21,8 @@
 
 -- ── 1. Owning account ───────────────────────────────────────────────
 alter table public.cameras
-  add column if not exists caregiver_id uuid references public.caregivers(id);
+  add column if not exists caregiver_id uuid
+    references public.caregivers(id) on delete cascade;
 
 -- Backfill from the patient that currently owns the row. Safe to re-run.
 update public.cameras c
@@ -37,6 +38,14 @@ update public.cameras c
 
 create index if not exists cameras_caregiver_idx
   on public.cameras (caregiver_id);
+
+-- A camera the installer has set up but nobody has assigned yet has no
+-- patient at all, so the column has to allow it. Relaxing NOT NULL is
+-- reversible (it can be re-imposed while every row still has a value);
+-- DROPPING the column is not, which is why that waits for the contract
+-- delta. Until then patient_id is kept in sync with the primary, so
+-- readers that have not migrated yet keep seeing what they expect.
+alter table public.cameras alter column patient_id drop not null;
 
 -- ── 2. Coverage ─────────────────────────────────────────────────────
 create table if not exists public.camera_patients (

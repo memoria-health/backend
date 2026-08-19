@@ -43,7 +43,10 @@ async def _restore_real_fleet(session: AsyncSession):
         "SELECT id, identity_node_id, identity_port FROM public.patients "
         " WHERE identity_node_id IS NOT NULL "
         "   AND identity_node_id NOT LIKE 'node-%' "
-        "   AND identity_node_id <> 'fleet-sentinel'"))).all()]
+        # 'sentinel' is THIS suite's own parking node (see the claim-order
+        # case below), so it is not a real assignment to restore. Restoring
+        # onto it after _clear has deleted the node row fails the FK.
+        "   AND identity_node_id NOT IN ('fleet-sentinel', 'sentinel')"))).all()]
     yield
     for pid, node, port in rows:
         await session.execute(text(
@@ -578,9 +581,13 @@ async def _park_others(session: AsyncSession) -> None:
             "ON CONFLICT (node_id) DO UPDATE SET last_seen_at = now()"
         )
     )
+    # Clear the port too: a parked home is served by nobody, and leaving a
+    # stale port behind collides on patients_identity_node_port_uidx the
+    # moment two of them carry the same one.
     await session.execute(
         text(
-            "UPDATE public.patients SET identity_node_id = 'node-park' "
+            "UPDATE public.patients "
+            "   SET identity_node_id = 'node-park', identity_port = NULL "
             " WHERE identity_node_id IS NULL"
         )
     )

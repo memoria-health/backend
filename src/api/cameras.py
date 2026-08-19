@@ -18,13 +18,13 @@ from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text
 
 log = logging.getLogger(__name__)
 
 from src.api import cameras_ingest as pi_ingest_module
 from src.api.deps import CameraAuth, CaregiverAuth, SessionDep, SettingsDep
-from src.services import room_classifier
+from src.services import camera_coverage, room_classifier
 from src.services.detection import censor, frame_codec
 from src.services.ingest.pi.auth import mint_ingest_token
 from src.db.camera import Camera
@@ -35,6 +35,8 @@ from src.repos import (
     pi_discovery_repo,
 )
 from src.schemas.camera import (
+    AccountCameraResponse,
+    CoverageRequest,
     CameraDetectorsResponse,
     CameraResponse,
     DesiredStateResponse,
@@ -210,6 +212,7 @@ async def create_pairing_code(
     cam = Camera(
         id=camera_id,
         patient_id=patient_id,
+        caregiver_id=auth.id,
         display_id=next_display_id,
         room=body.room,
         icon_name=body.icon_name,
@@ -365,6 +368,7 @@ async def provision_pi_camera(
     cam = Camera(
         id=camera_id,
         patient_id=patient_id,
+        caregiver_id=auth.id,
         display_id=next_display_id,
         room=body.room,
         icon_name=body.icon_name,
@@ -412,6 +416,7 @@ async def provision_pi_camera(
     return PiProvisionResponse(
         camera_id=camera_id,
         patient_id=patient_id,
+        caregiver_id=auth.id,
         livekit_identity=livekit_identity,
         livekit_room=livekit_room,
     )
@@ -455,6 +460,7 @@ async def provision_gateway_camera(
     cam = Camera(
         id=camera_id,
         patient_id=patient_id,
+        caregiver_id=auth.id,
         display_id=next_display_id,
         room=body.room,
         icon_name=body.icon_name,
@@ -1180,3 +1186,98 @@ async def door_frame(
             ) from None
 
     return Response(content=jpeg, media_type="image/jpeg")
+
+
+# ── Account-scoped cameras: list, assign, unassign ──────────────────
+# A camera belongs to the ACCOUNT from the moment it is provisioned, and
+# only later to patients. These endpoints are how a caregiver sets one up
+# ("1 sensor ready"), points it at one or more residents, or takes it off
+# them again. Everything patient-scoped above still works unchanged.
+
+@router.get("/cameras", response_model=list[AccountCameraResponse])
+async def list_account_cameras(
+    auth: CaregiverAuth,
+    session: SessionDep,
+) -> list[AccountCameraResponse]:
+    """Every camera on this account, assigned or not.
+
+    The unassigned ones are what the app shows as ready to set up. They
+    are NOT discovered over the network — the bridge provisioned them
+    against this account, so the caregiver can be anywhere.
+    """
+    rows = (await session.execute(
+        select(Camera).where(Camera.caregiver_id == auth.id)
+        .order_by(Camera.created_at)
+    )).scalars().all()
+    out: list[AccountCameraResponse] = []
+    for cam in rows:
+        covers = await camera_coverage.coverage(session, cam.id)
+        out.append(AccountCameraResponse(
+            id=cam.id, room=cam.room, icon_name=cam.icon_name,
+            online=cam.online, source_type=cam.source_type,
+            patient_ids=covers, primary_patient_id=covers[0] if covers else None,
+            unassigned=not covers,
+        ))
+    return out
+
+
+@router.post("/cameras/{camera_id}/coverage", status_code=status.HTTP_200_OK)
+async def set_camera_coverage(
+    camera_id: UUID,
+    body: CoverageRequest,
+    auth: CaregiverAuth,
+    session: SessionDep,
+) -> dict:
+    """Assign (or re-assign) a camera to one or more patients."""
+    cam = (await session.execute(
+        select(Camera).where(
+            Camera.id == camera_id, Camera.caregiver_id == auth.id)
+    )).scalar_one_or_none()
+    if cam is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail="camera_not_found")
+
+    wanted = {body.primary_patient_id, *body.also_patient_ids}
+    owned = set((await session.execute(
+        text("SELECT id FROM public.patients WHERE caregiver_id = :c"),
+        {"c": auth.id},
+    )).scalars().all())
+    if not wanted <= owned:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                            detail="patient_not_on_this_account")
+
+    if body.room is not None:
+        cam.room = body.room
+    if body.icon_name is not None:
+        cam.icon_name = body.icon_name
+    await camera_coverage.set_coverage(
+        session, camera_id,
+        primary_patient_id=body.primary_patient_id,
+        also_patient_ids=body.also_patient_ids,
+    )
+    # Detector links follow the patient, so every newly covered home needs
+    # its presets reconciled onto this camera.
+    for pid in wanted:
+        await camera_detector_repo.sync_links_for_patient(session, pid)
+    await session.commit()
+    return {"camera_id": str(camera_id),
+            "patient_ids": [str(p) for p in sorted(wanted, key=str)]}
+
+
+@router.delete("/cameras/{camera_id}/coverage", status_code=status.HTTP_200_OK)
+async def clear_camera_coverage(
+    camera_id: UUID,
+    auth: CaregiverAuth,
+    session: SessionDep,
+) -> dict:
+    """Unassign a camera. It stays on the account and stops streaming."""
+    cam = (await session.execute(
+        select(Camera).where(
+            Camera.id == camera_id, Camera.caregiver_id == auth.id)
+    )).scalar_one_or_none()
+    if cam is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail="camera_not_found")
+    await camera_coverage.clear_coverage(session, camera_id)
+    await session.commit()
+    return {"camera_id": str(camera_id), "unassigned": True}

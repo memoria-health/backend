@@ -23,7 +23,10 @@ class Camera(Base):
     __tablename__ = "cameras"
 
     id: Mapped[UUID] = mapped_column(primary_key=True)
-    patient_id: Mapped[UUID] = mapped_column(ForeignKey("patients.id", ondelete="CASCADE"))
+    # Kept in sync with the primary of `camera_patients` until that table
+    # is the only source; None while a camera is unassigned.
+    patient_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("patients.id", ondelete="CASCADE"))
     display_id: Mapped[int] = mapped_column(Integer)
     room: Mapped[str] = mapped_column(String(80))
     icon_name: Mapped[str] = mapped_column(String(80))
@@ -183,4 +186,12 @@ class Camera(Base):
     # app to close and stay true.
     app_present: Mapped[bool] = mapped_column(
         Boolean, server_default=text("true"), default=True,
+    )
+
+    # The owning account — a camera exists from the moment it is
+    # provisioned, before anyone says which patients it watches. Declared
+    # last because a defaulted field cannot precede a non-defaulted one in
+    # a dataclass-mapped model.
+    caregiver_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("caregivers.id"), default=None,
     )

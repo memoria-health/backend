@@ -136,6 +136,23 @@ async def _live_baseline(session: AsyncSession, settings) -> int:
     )).scalar() or 0
 
 
+async def _down_baseline(session: AsyncSession, settings) -> int:
+    """Stale identity_nodes rows this suite did NOT create.
+
+    Same reasoning as _live_baseline: the local Supabase is shared with a
+    real fleet node, and when that pod is stopped its row goes stale and
+    counts as down. Absolute nodes_down assertions have to measure the
+    pre-existing count rather than assume zero."""
+    return (await session.execute(
+        text(
+            "SELECT count(*) FROM public.identity_nodes "
+            " WHERE node_id NOT LIKE 'node-%' AND node_id <> 'fleet-sentinel' "
+            "   AND last_seen_at <= now() - make_interval(secs => :s)"
+        ),
+        {"s": settings.identity_roster_stale_after_s},
+    )).scalar() or 0
+
+
 async def _clear(session: AsyncSession) -> None:
     """Isolate this test WITHOUT destroying the dev database.
 
@@ -158,12 +175,24 @@ async def _clear(session: AsyncSession) -> None:
             "ON CONFLICT (node_id) DO UPDATE SET last_seen_at = now()"
         )
     )
+    # NO port: a parked home is served by nobody, and the counts under test
+    # look at the node, never the port. Handing out ports here instead trips
+    # either the per-node uniqueness index (one constant for every home) or
+    # the 8012-8111 range check (a counter, once the dev database has
+    # accumulated more than a hundred test patients).
     await session.execute(
         text(
-            "UPDATE public.patients "
-            "   SET identity_node_id = 'fleet-sentinel', identity_port = 8012 "
-            " WHERE identity_node_id IS NULL "
-            "    OR identity_node_id LIKE 'node-%'"
+            "WITH parked AS ("
+            "  SELECT id, NULL::int AS port"
+            "    FROM public.patients"
+            # Everything the suite does not own — including homes held by a
+            # REAL node that has gone quiet (a stopped dev pod makes its row
+            # stale, and its homes then count as blind and fail the
+            # healthy-fleet case). _restore_real_fleet puts reality back.
+            "   WHERE identity_node_id IS DISTINCT FROM 'fleet-sentinel'"
+            ") UPDATE public.patients p "
+            "     SET identity_node_id = 'fleet-sentinel', identity_port = parked.port "
+            "    FROM parked WHERE p.id = parked.id"
         )
     )
     await session.execute(
@@ -222,7 +251,8 @@ async def test_healthy_fleet_pages_nothing(
 
     baseline = await _live_baseline(session, settings)
     counts = await _watch(settings, get_sessionmaker()).check()
-    assert counts == {"blind": 0, "overdue": 0, "nodes_down": 0,
+    assert counts == {"blind": 0, "overdue": 0,
+                      "nodes_down": await _down_baseline(session, settings),
                       "nodes_live": 1 + baseline,
                       "cameras_polled": 0, "cameras_occupied": 0,
                       "cameras_lagging": 0}
@@ -302,7 +332,7 @@ async def test_dead_node_is_a_warning_not_a_critical(
     baseline = await _live_baseline(session, settings)
     watch = _watch(settings, get_sessionmaker())
     counts = await watch.check()
-    assert counts["nodes_down"] == 1
+    assert counts["nodes_down"] == 1 + await _down_baseline(session, settings)
     assert counts["nodes_live"] == baseline
     # One stale cycle is a heartbeat gap, not an incident (every backend
     # restart produces one) — the node-down page holds for a streak.
@@ -341,7 +371,8 @@ async def test_recovery_resolves_the_incident(
     baseline = await _live_baseline(session, settings)
     counts = await watch.check()
 
-    assert counts == {"blind": 0, "overdue": 0, "nodes_down": 0,
+    assert counts == {"blind": 0, "overdue": 0,
+                      "nodes_down": await _down_baseline(session, settings),
                       "nodes_live": 1 + baseline,
                       "cameras_polled": 0, "cameras_occupied": 0,
                       "cameras_lagging": 0}

@@ -52,6 +52,7 @@ from src.api import health as health_mod
 from src.api.deps import SessionDep, SettingsDep
 from src.db.camera import Camera
 from src.repos import camera_detector_repo
+from src.services import camera_coverage
 from src.services.ingest.pi.auth import hash_ingest_token, mint_ingest_token
 from src.services.ingest.pi.mjpeg_reader import parse_mjpeg
 from src.services.ingest.pi.relay_publisher import RelayConfig, RelayPublisher
@@ -385,8 +386,13 @@ async def gateway_roster(
     # fallback until the ownership backfill/provision fills them in. This is
     # what makes liveness per-box: the heartbeat below only stamps the
     # cameras this box actually runs.
-    _cam_where = ("WHERE patient_id IN "
-                  "(SELECT id FROM public.patients WHERE caregiver_id = :c) "
+    # Ownership is the ACCOUNT (cameras.caregiver_id), not the patient — a
+    # camera can be on the account before anyone assigns it. `patient_id IS
+    # NOT NULL` is what keeps those unassigned ones OUT of the roster, so
+    # they never publish until someone says who they watch.
+    _cam_where = ("WHERE (caregiver_id = :c OR patient_id IN "
+                  "      (SELECT id FROM public.patients WHERE caregiver_id = :c)) "
+                  "AND patient_id IS NOT NULL "
                   "AND source_type = 'gateway' "
                   "AND (gateway_id = :gw OR gateway_id IS NULL)")
     await session.execute(
@@ -582,29 +588,31 @@ async def gateway_provision_camera(
             {"c": caregiver_id, "h": token_hash},
         )
 
-    patient_ids = [r[0] for r in (await session.execute(
-        text("SELECT id FROM public.patients WHERE caregiver_id = :c ORDER BY created_at"),
-        {"c": caregiver_id},
-    )).all()]
-    if not patient_ids:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="caregiver_has_no_patients",
-        )
+    # No patient lookup any more: a camera belongs to the account, so it can
+    # be provisioned before the caregiver has added anyone. The old
+    # caregiver_has_no_patients rejection is gone with it.
 
+    # ONE row per physical camera (2026-08-19). This used to loop over every
+    # patient of the caregiver, so a single Trueview camera in a shared room
+    # became N rows publishing N streams — N× ingest, N× model spend on
+    # identical footage, duplicate events, and no way to add a patient later.
+    # The camera now belongs to the ACCOUNT and starts unassigned: it is
+    # absent from the roster, so it does not publish until someone says who
+    # it watches (see POST /v1/cameras/{id}/assign).
     cameras = []
-    for patient_id in patient_ids:
-        camera_id = uuid4()
+    for camera_id in (uuid4(),):
         livekit_identity = f"cam_{camera_id.hex[:8]}"
-        livekit_room = f"patient_{patient_id}"
+        # Room follows the primary patient and is set at assignment time.
+        livekit_room = None
         next_display_id = (await session.execute(
             select(func.coalesce(func.max(Camera.display_id), 0)).where(
-                Camera.patient_id == patient_id)
+                Camera.caregiver_id == caregiver_id)
         )).scalar_one() + 1
         ingest_token_plaintext, ingest_token_hash = mint_ingest_token()
         cam = Camera(
             id=camera_id,
-            patient_id=patient_id,
+            caregiver_id=caregiver_id,
+            patient_id=None,
             display_id=next_display_id,
             room=body.room,
             icon_name=body.icon_name,
@@ -633,11 +641,25 @@ async def gateway_provision_camera(
         )
         session.add(cam)
         await session.flush()
-        # Reconcile detector links from where_rooms (this bulk gateway
-        # path is exactly where preset links used to drift).
-        await camera_detector_repo.sync_links_for_patient(session, patient_id)
+        # An account with exactly ONE patient has no decision to make, so
+        # assign it now: the caregiver should not be asked "who does this
+        # watch?" when there is only one answer. With several patients the
+        # camera stays unassigned and the app asks.
+        solo = (await session.execute(
+            text("SELECT id FROM public.patients WHERE caregiver_id = :c"),
+            {"c": caregiver_id},
+        )).scalars().all()
+        assigned_to = solo[0] if len(solo) == 1 else None
+        if assigned_to is not None:
+            await camera_coverage.set_coverage(
+                session, camera_id, primary_patient_id=assigned_to)
+            await camera_detector_repo.sync_links_for_patient(
+                session, assigned_to)
+            livekit_room = f"patient_{assigned_to}"
         cameras.append({
-            "patient_id": str(patient_id),
+            # Null on a multi-patient account: the camera is on the account
+            # and the app asks who it watches before it can publish.
+            "patient_id": str(assigned_to) if assigned_to else None,
             "camera_id": str(camera_id),
             "livekit_identity": livekit_identity,
             "livekit_room": livekit_room,

@@ -295,3 +295,26 @@ class PiProvisionResponse(BaseModel):
     patient_id: UUID
     livekit_identity: str
     livekit_room: str
+
+
+class AccountCameraResponse(BaseModel):
+    """A camera as the ACCOUNT sees it — including ones no patient owns yet."""
+
+    id: UUID
+    room: str
+    icon_name: str
+    online: bool
+    source_type: str
+    # Coverage, primary first. Empty until someone assigns it.
+    patient_ids: list[UUID]
+    primary_patient_id: UUID | None
+    unassigned: bool
+
+
+class CoverageRequest(BaseModel):
+    """Assign a camera: name it, pick its icon, and say who it watches."""
+
+    room: str | None = Field(default=None, max_length=80)
+    icon_name: str | None = Field(default=None, max_length=80)
+    primary_patient_id: UUID
+    also_patient_ids: list[UUID] = Field(default_factory=list)

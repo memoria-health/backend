@@ -322,10 +322,11 @@ create table public.cameras (
   -- camera the installer set up before anyone decided who it watches.
   -- Nullable during the migration off patient_id; NOT NULL lands with the
   -- delta that drops it.
-  caregiver_id        uuid references public.caregivers(id),
-  -- DEPRECATED, still authoritative: superseded by camera_patients (see
-  -- below). Dropped in a follow-up delta once nothing reads it.
-  patient_id          uuid not null references public.patients(id) on delete cascade,
+  caregiver_id        uuid references public.caregivers(id) on delete cascade,
+  -- DEPRECATED, kept in sync with the primary: superseded by
+  -- camera_patients (below). Nullable because a camera can exist before
+  -- anyone assigns it. Dropped in a follow-up delta once nothing reads it.
+  patient_id          uuid references public.patients(id) on delete cascade,
   display_id          int  not null,                  -- per-patient sequence: "Cam 01"
   room                text not null,
   icon_name           text not null default 'tv',
