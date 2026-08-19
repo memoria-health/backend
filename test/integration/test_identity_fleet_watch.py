@@ -136,6 +136,25 @@ async def _live_baseline(session: AsyncSession, settings) -> int:
     )).scalar() or 0
 
 
+async def _down_baseline(session: AsyncSession, settings) -> int:
+    """Stale identity_nodes rows this suite did NOT create.
+
+    Same problem as _live_baseline and the same fix. A real fleet node
+    heartbeats into this local Supabase; when it stops, its row lingers
+    as permanently "down" and every absolute nodes_down assertion here
+    starts failing on a machine that is otherwise fine. _clear() cannot
+    delete it — the rule in this file is never to remove rows the suite
+    did not create — so measure it instead."""
+    return (await session.execute(
+        text(
+            "SELECT count(*) FROM public.identity_nodes "
+            " WHERE node_id NOT LIKE 'node-%' AND node_id <> 'fleet-sentinel' "
+            "   AND last_seen_at <= now() - make_interval(secs => :s)"
+        ),
+        {"s": settings.identity_roster_stale_after_s},
+    )).scalar() or 0
+
+
 async def _clear(session: AsyncSession) -> None:
     """Isolate this test WITHOUT destroying the dev database.
 
@@ -158,10 +177,16 @@ async def _clear(session: AsyncSession) -> None:
             "ON CONFLICT (node_id) DO UPDATE SET last_seen_at = now()"
         )
     )
+    # identity_port stays NULL. patients_identity_node_port_uidx is UNIQUE
+    # on (node, port) — partial, exempting NULL port — so stamping one
+    # shared port here collided the moment two homes needed parking, and
+    # the whole file died on a UniqueViolationError before asserting
+    # anything. Nothing in check() reads the port; parking only needs the
+    # node.
     await session.execute(
         text(
             "UPDATE public.patients "
-            "   SET identity_node_id = 'fleet-sentinel', identity_port = 8012 "
+            "   SET identity_node_id = 'fleet-sentinel', identity_port = NULL "
             " WHERE identity_node_id IS NULL "
             "    OR identity_node_id LIKE 'node-%'"
         )
@@ -222,7 +247,8 @@ async def test_healthy_fleet_pages_nothing(
 
     baseline = await _live_baseline(session, settings)
     counts = await _watch(settings, get_sessionmaker()).check()
-    assert counts == {"blind": 0, "overdue": 0, "nodes_down": 0,
+    assert counts == {"blind": 0, "overdue": 0,
+                      "nodes_down": await _down_baseline(session, settings),
                       "nodes_live": 1 + baseline,
                       "cameras_polled": 0, "cameras_occupied": 0,
                       "cameras_lagging": 0}
@@ -302,7 +328,7 @@ async def test_dead_node_is_a_warning_not_a_critical(
     baseline = await _live_baseline(session, settings)
     watch = _watch(settings, get_sessionmaker())
     counts = await watch.check()
-    assert counts["nodes_down"] == 1
+    assert counts["nodes_down"] == 1 + await _down_baseline(session, settings)
     assert counts["nodes_live"] == baseline
     # One stale cycle is a heartbeat gap, not an incident (every backend
     # restart produces one) — the node-down page holds for a streak.
@@ -341,7 +367,8 @@ async def test_recovery_resolves_the_incident(
     baseline = await _live_baseline(session, settings)
     counts = await watch.check()
 
-    assert counts == {"blind": 0, "overdue": 0, "nodes_down": 0,
+    assert counts == {"blind": 0, "overdue": 0,
+                      "nodes_down": await _down_baseline(session, settings),
                       "nodes_live": 1 + baseline,
                       "cameras_polled": 0, "cameras_occupied": 0,
                       "cameras_lagging": 0}
