@@ -39,7 +39,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from src.db.camera import Camera
 from src.db.caregiver import Caregiver
 from src.db.patient import Patient
-from src.services import clip_archival, email, event_gate, push
+from src.services import (
+    camera_coverage, clip_archival, email, event_gate, push,
+)
 from src.services.detection.analyses_store import add_analysis
 from src.services.detection.audio_buffer import AudioBuffer
 from src.services.detection.event_promotion import maybe_promote_analysis
@@ -2014,15 +2016,28 @@ class CameraIngest:
                 state_after=state_after_state,
                 captured_at=captured_at,
             )
-            promotion = await maybe_promote_analysis(
-                session,
-                patient_id=self.patient_id,
-                camera_id=self.camera_id,
-                occurred_at=captured_at,
-                description=result.description,
-                detector_fields=result.detector_fields,
-                settings=self._settings,
-            )
+            # Promote once PER PATIENT this camera watches. A shared room
+            # (an RCFE lounge, a couple's living room) is one camera and
+            # one set of model calls, but each resident has their own
+            # detectors, thresholds and record — so each gets their own
+            # pass over the same verdicts. A fall therefore reaches
+            # everyone the camera covers, while a routine detector stays
+            # quiet for each of them unless identity says it was them.
+            covered = await camera_coverage.coverage(session, self.camera_id)
+            promotion = None
+            for pid in covered or [self.patient_id]:
+                result_for_patient = await maybe_promote_analysis(
+                    session,
+                    patient_id=pid,
+                    camera_id=self.camera_id,
+                    occurred_at=captured_at,
+                    description=result.description,
+                    detector_fields=result.detector_fields,
+                    settings=self._settings,
+                )
+                # The primary's outcome is the one the tick log reports.
+                if promotion is None or pid == self.patient_id:
+                    promotion = result_for_patient
             await session.commit()
 
             # High-signal confirmation that a real analysis landed — grep

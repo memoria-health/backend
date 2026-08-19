@@ -401,3 +401,51 @@ async def test_single_patient_camera_is_not_silenced_by_the_identity_gate(
     assert len(res.fired) == 1, (
         "a single-patient camera must still get its routine detectors"
     )
+
+
+@pytest.mark.asyncio
+async def test_shared_camera_fires_safety_for_every_resident(
+    client: AsyncClient, auth_user, session: AsyncSession,
+) -> None:
+    """One camera, two residents, nobody identified (Aryaman, 2026-08-19).
+
+    A fall in a shared lounge must reach BOTH records — a duplicate alert
+    is recoverable, a missed fall is not. The routine detector in the same
+    clip must reach NEITHER, because "who ate lunch?" has no honest answer
+    when nobody was recognised.
+    """
+    patient_id, camera_id = await _setup_patient_with_camera(
+        client, auth_user, session,
+    )
+    housemate = await _share_camera_with_another_patient(
+        session, camera_id, patient_id,
+    )
+
+    safety, routine = "custom_collapse", "custom_snack"
+    fields: dict = {}
+    for pid in (patient_id, housemate):
+        await _add_detector(session, pid, safety, is_sustained=False,
+                            category="safety", subject_scope="patient")
+        await _add_detector(session, pid, routine, is_sustained=False,
+                            category="routine", subject_scope="patient")
+    await session.commit()
+    fields.update(_fields(safety))
+    fields.update(_fields(routine))
+
+    now = datetime.now(timezone.utc)
+    fired_for: list[UUID] = []
+    for pid in (patient_id, housemate):
+        res = await maybe_promote_analysis(
+            session, patient_id=pid, camera_id=camera_id,
+            occurred_at=now, description="someone went down",
+            detector_fields=fields, settings=_V2,
+        )
+        await session.commit()
+        fired_for.extend(e.patient_id for e in res.fired)
+        assert all(e.category == "safety" for e in res.fired), (
+            "an unattributed routine event would land on the wrong record"
+        )
+
+    assert set(fired_for) == {patient_id, housemate}, (
+        "a fall on a shared camera must reach every resident it covers"
+    )

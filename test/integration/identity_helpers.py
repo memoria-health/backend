@@ -83,7 +83,7 @@ async def _setup_patient_with_camera(
     return patient_id, camera_id
 
 
-async def _share_camera_with_another_patient(session, camera_id, patient_id) -> None:
+async def _share_camera_with_another_patient(session, camera_id, patient_id) -> UUID:
     """Make a camera cover a SECOND patient.
 
     The fail-quiet identity gate arms only where a camera watches more
@@ -108,3 +108,4 @@ async def _share_camera_with_another_patient(session, camera_id, patient_id) -> 
         {"c": camera_id, "o": other},
     )
     await session.commit()
+    return other
