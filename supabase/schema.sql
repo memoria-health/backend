@@ -318,6 +318,13 @@ create table public.gateways (
 
 create table public.cameras (
   id                  uuid primary key default gen_random_uuid(),
+  -- The owning ACCOUNT. Always known at provision time, including for a
+  -- camera the installer set up before anyone decided who it watches.
+  -- Nullable during the migration off patient_id; NOT NULL lands with the
+  -- delta that drops it.
+  caregiver_id        uuid references public.caregivers(id),
+  -- DEPRECATED, still authoritative: superseded by camera_patients (see
+  -- below). Dropped in a follow-up delta once nothing reads it.
   patient_id          uuid not null references public.patients(id) on delete cascade,
   display_id          int  not null,                  -- per-patient sequence: "Cam 01"
   room                text not null,
@@ -669,6 +676,25 @@ create trigger detectors_set_updated_at
 --                                   so doesn't appear here)
 --   - row in this table        → detector runs on that specific camera
 --   - no row                   → detector does NOT run on that camera
+-- Which patients a camera watches. A shared room (an RCFE lounge, a
+-- couple's living room) is ONE camera covering several residents: one
+-- stream, one set of model calls, results attributed per resident.
+-- No rows = provisioned but not yet assigned to anyone.
+create table public.camera_patients (
+  camera_id  uuid not null references public.cameras(id)  on delete cascade,
+  patient_id uuid not null references public.patients(id) on delete cascade,
+  -- The patient whose LiveKit room this camera publishes into. A camera
+  -- streams to exactly one room; everyone else covered gets the results.
+  is_primary boolean not null default false,
+  added_at   timestamptz not null default now(),
+  primary key (camera_id, patient_id)
+);
+create unique index camera_patients_one_primary
+  on public.camera_patients (camera_id) where is_primary;
+create index camera_patients_patient_idx
+  on public.camera_patients (patient_id);
+
+
 create table public.cameras_detectors (
   camera_id   uuid not null references public.cameras(id)   on delete cascade,
   detector_id uuid not null references public.detectors(id) on delete cascade,
@@ -981,7 +1007,28 @@ create policy patients_member on public.patients
   for all using (public.has_patient_access(id)) with check (caregiver_id = auth.uid());
 
 alter table public.cameras enable row level security;
+-- Two ways in: you own the account (the ONLY way to see a camera nobody
+-- has assigned yet), or you can reach a patient it covers.
 create policy cameras_member on public.cameras
+  for all using (
+    caregiver_id = auth.uid()
+    or exists (
+      select 1 from public.camera_patients cp
+       where cp.camera_id = cameras.id
+         and public.has_patient_access(cp.patient_id)
+    )
+  )
+  with check (
+    caregiver_id = auth.uid()
+    or exists (
+      select 1 from public.camera_patients cp
+       where cp.camera_id = cameras.id
+         and public.has_patient_access(cp.patient_id)
+    )
+  );
+
+alter table public.camera_patients enable row level security;
+create policy camera_patients_member on public.camera_patients
   for all using (public.has_patient_access(patient_id))
   with check (public.has_patient_access(patient_id));
 
