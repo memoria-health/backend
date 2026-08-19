@@ -58,6 +58,16 @@ log = logging.getLogger(__name__)
 # who caused it is still at their desk.
 UNASSIGNED_GRACE_S = 300
 
+# Only a home with a camera actually streaming can be "blind" — a home
+# with nothing online has no identity to miss. Counting every patient row
+# made this page fire critical forever on dormant test accounts (10 of 10
+# on prod, 2026-08-19), which is how a real alarm gets ignored. Mirrors
+# the roster's liveness predicate (src/api/identity_roster.py).
+_LIVE_CAM = (
+    "EXISTS (SELECT 1 FROM public.cameras c "
+    "         WHERE c.patient_id = p.id AND c.online AND NOT c.disabled)"
+)
+
 # Prefixes keep this subsystem's dedup keys out of the event gate's, which
 # uses bare event uuids. A collision would collapse two incidents into one
 # and settling either would hide the other.
@@ -143,12 +153,13 @@ class FleetWatch:
             # the home is just as blind in the meantime.
             blind = (await session.execute(text(
                 "SELECT count(*) FROM public.patients p "
-                " WHERE p.identity_node_id IS NULL "
+                " WHERE " + _LIVE_CAM + " AND ("
+                "       p.identity_node_id IS NULL "
                 "    OR NOT EXISTS ("
                 "         SELECT 1 FROM public.identity_nodes n "
                 "          WHERE n.node_id = p.identity_node_id "
                 "            AND n.last_seen_at > now() - make_interval("
-                "                  secs => :stale))"
+                "                  secs => :stale)))"
             ), {"stale": stale_s})).scalar() or 0
 
             # ...and of those, the ones that have been blind long enough to
@@ -162,7 +173,8 @@ class FleetWatch:
                 "SELECT count(*) FROM public.patients p "
                 " LEFT JOIN public.identity_nodes n "
                 "        ON n.node_id = p.identity_node_id "
-                " WHERE (p.identity_node_id IS NULL "
+                " WHERE " + _LIVE_CAM +
+                "   AND (p.identity_node_id IS NULL "
                 "        OR n.last_seen_at <= now() - make_interval("
                 "             secs => :stale)) "
                 "   AND COALESCE(n.last_seen_at, p.created_at) "
