@@ -404,3 +404,41 @@ async def test_home_with_nothing_streaming_is_not_paged(
     assert counts["blind"] == 0
     assert counts["overdue"] == 0
     assert "identity-fleet:unassigned-homes" not in pages.triggered
+
+
+async def test_dead_node_holding_only_dormant_homes_pages_nothing(
+    session: AsyncSession, auth_user, settings, monkeypatch
+) -> None:
+    """"Homes held" has to mean what blind/overdue mean.
+
+    Unfiltered it counted every patient row ever pinned to the node, so a
+    dev box with one real camera paged "142 home(s) held" and prod would
+    have said 8 where the truth was 2. A node holding only dormant homes
+    is a corpse, not an incident — and a number nobody believes is a page
+    nobody reads.
+    """
+    pages = _Pages()
+    pages.install(monkeypatch)
+    cid, email = auth_user
+    await _clear(session)
+    await _mk_caregiver(session, cid, email)
+
+    # Past the grace period, but nothing streaming: not a watched home.
+    pid = uuid4()
+    await session.execute(
+        text(
+            "INSERT INTO public.patients "
+            "  (id, caregiver_id, full_name, preferred_name, relation, created_at) "
+            "VALUES (:id, :cg, 'Fleet Dormant', 'Fleet', 'parent', "
+            "        now() - make_interval(mins => 60))"
+        ),
+        {"id": pid, "cg": cid},
+    )
+    await session.commit()
+    await _assign(session, pid, "node-dead", seen_mins_ago=30)
+
+    watch = _watch(settings, get_sessionmaker())
+    await watch.check()
+    await watch.check()   # past the one-cycle hold, so a real page would land
+
+    assert "identity-fleet:node-down:node-dead" not in pages.triggered
