@@ -97,8 +97,24 @@ async def _mk_patient(session: AsyncSession, cid: UUID, age_mins: int = 0) -> UU
         ),
         {"id": pid, "cg": cid, "n": f"Fleet {str(pid)[:8]}", "m": age_mins},
     )
+    # A home is only WATCHED once something is streaming (2026-08-19): a
+    # home with no camera online has no identity to be deprived of, and
+    # counting those made the critical page fire forever on dormant test
+    # rows. Every case in this suite is about a home that should be
+    # watched, so the helper gives each one a live camera.
+    await _mk_online_camera(session, pid)
     await session.commit()
     return pid
+
+
+async def _mk_online_camera(session: AsyncSession, pid: UUID) -> None:
+    await session.execute(
+        text(
+            "INSERT INTO public.cameras (id, patient_id, display_id, room, online) "
+            "VALUES (:id, :p, 1, 'Fleet Test Room', true)"
+        ),
+        {"id": uuid4(), "p": pid},
+    )
 
 
 # One extra live node exists in every test: the sentinel below.
@@ -352,3 +368,39 @@ async def test_repeated_checks_do_not_repage(
     await watch.check()
     assert calls == 1
     assert pages.triggered == {}, "re-paged an incident already open"
+
+
+async def test_home_with_nothing_streaming_is_not_paged(
+    session: AsyncSession, auth_user, settings, monkeypatch
+) -> None:
+    """The noise that made the critical page worthless (2026-08-19).
+
+    Prod carried 10 'blind' homes and paged on every cycle; every one was a
+    dormant test account with no camera online. A home that is streaming
+    nothing has no identity to be deprived of.
+    """
+    pages = _Pages()
+    pages.install(monkeypatch)
+    cid, email = auth_user
+    await _clear(session)
+    await _mk_caregiver(session, cid, email)
+
+    # Old enough to be well past the grace period — the ONLY thing keeping
+    # it off the page is that nothing is streaming.
+    pid = uuid4()
+    await session.execute(
+        text(
+            "INSERT INTO public.patients "
+            "  (id, caregiver_id, full_name, preferred_name, relation, created_at) "
+            "VALUES (:id, :cg, 'Fleet Dormant', 'Fleet', 'parent', "
+            "        now() - make_interval(mins => 60))"
+        ),
+        {"id": pid, "cg": cid},
+    )
+    await session.commit()
+
+    counts = await _watch(settings, get_sessionmaker()).check()
+
+    assert counts["blind"] == 0
+    assert counts["overdue"] == 0
+    assert "identity-fleet:unassigned-homes" not in pages.triggered

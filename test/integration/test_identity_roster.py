@@ -544,3 +544,133 @@ async def test_corpse_rows_are_reaped_after_seven_days(
         )
     ).scalar()
     assert holder != "node-holding"
+
+
+async def _mk_camera(session: AsyncSession, patient_id: UUID, *, online: bool) -> None:
+    """A camera row for liveness. Only patient_id/display_id/room are
+    NOT NULL without a default; `online` is the field under test."""
+    await session.execute(
+        text(
+            "INSERT INTO public.cameras (id, patient_id, display_id, room, online) "
+            "VALUES (:id, :p, :d, :r, :o)"
+        ),
+        {"id": uuid4(), "p": patient_id, "d": 1, "r": "Roster Test Room", "o": online},
+    )
+    await session.commit()
+
+
+async def _park_others(session: AsyncSession) -> None:
+    """Take every pre-existing home OUT of the unassigned pool.
+
+    These cases assert WHICH home is claimed, not just how many, so a real
+    home on the developer's rig (with a camera genuinely online) would
+    otherwise outrank the fixtures and fail the test for the right reason.
+    Parking is a plain UPDATE onto a `node-` id that `_clear` both detaches
+    and deletes, so nothing is destroyed and the next case starts clean.
+    """
+    # patients.identity_node_id is FK'd to identity_nodes, so the parking
+    # node has to exist. Fresh heartbeat = never stale, so the release step
+    # cannot hand these back mid-test.
+    await session.execute(
+        text(
+            "INSERT INTO public.identity_nodes (node_id, base_url, capacity) "
+            "VALUES ('node-park', 'http://park.invalid', 64) "
+            "ON CONFLICT (node_id) DO UPDATE SET last_seen_at = now()"
+        )
+    )
+    await session.execute(
+        text(
+            "UPDATE public.patients SET identity_node_id = 'node-park' "
+            " WHERE identity_node_id IS NULL"
+        )
+    )
+    await session.commit()
+
+
+async def test_live_home_is_claimed_before_an_older_dormant_one(
+    client: AsyncClient, session: AsyncSession, auth_user
+) -> None:
+    # The starvation that put dormant June homes on every prod slot while
+    # streaming homes stayed identity-blind (2026-08-19).
+    caregiver_id, email = auth_user
+    await _clear(session)
+    await _mk_caregiver(session, caregiver_id, email)
+    await _park_others(session)
+    dormant = await _mk_patient(session, caregiver_id)   # older
+    live = await _mk_patient(session, caregiver_id)      # newer, but streaming
+    await _mk_camera(session, live, online=True)
+
+    body = (await _poll(client, "node-live-first", cap=1)).json()
+
+    assert _names(body) == [f"patient_{live}"], (
+        "a streaming home must outrank an older dormant one"
+    )
+    assert f"patient_{dormant}" not in _names(body)
+
+
+async def test_dormant_home_yields_its_slot_to_a_live_one(
+    client: AsyncClient, session: AsyncSession, auth_user
+) -> None:
+    caregiver_id, email = auth_user
+    await _clear(session)
+    await _mk_caregiver(session, caregiver_id, email)
+    await _park_others(session)
+    dormant = await _mk_patient(session, caregiver_id)
+
+    # Seats the dormant home — nothing else wants the slot yet.
+    first = (await _poll(client, "node-evict", cap=1)).json()
+    assert _names(first) == [f"patient_{dormant}"]
+
+    # A streaming home appears with the node already full.
+    live = await _mk_patient(session, caregiver_id)
+    await _mk_camera(session, live, online=True)
+
+    second = (await _poll(client, "node-evict", cap=1)).json()
+    assert _names(second) == [f"patient_{live}"], (
+        "a dormant home must give way once a live home needs the slot"
+    )
+    freed = (
+        await session.execute(
+            text("SELECT identity_port FROM public.patients WHERE id = :p"),
+            {"p": dormant},
+        )
+    ).scalar()
+    assert freed is None, "the evicted home's port returns to the pool"
+
+
+async def test_a_live_home_is_never_evicted(
+    client: AsyncClient, session: AsyncSession, auth_user
+) -> None:
+    caregiver_id, email = auth_user
+    await _clear(session)
+    await _mk_caregiver(session, caregiver_id, email)
+    await _park_others(session)
+    seated = await _mk_patient(session, caregiver_id)
+    await _mk_camera(session, seated, online=True)
+    (await _poll(client, "node-nokick", cap=1)).json()
+
+    # A second live home wants in, but there is nothing dormant to evict.
+    waiting = await _mk_patient(session, caregiver_id)
+    await _mk_camera(session, waiting, online=True)
+
+    body = (await _poll(client, "node-nokick", cap=1)).json()
+    assert _names(body) == [f"patient_{seated}"], (
+        "evicting a streaming home to seat another just moves the blindness"
+    )
+
+
+async def test_dormant_home_keeps_its_slot_when_capacity_is_spare(
+    client: AsyncClient, session: AsyncSession, auth_user
+) -> None:
+    # Warm standby: an idle home costs ~zero GPU, so it is only displaced
+    # under contention — never on a timer.
+    caregiver_id, email = auth_user
+    await _clear(session)
+    await _mk_caregiver(session, caregiver_id, email)
+    await _park_others(session)
+    dormant = await _mk_patient(session, caregiver_id)
+    live = await _mk_patient(session, caregiver_id)
+    await _mk_camera(session, live, online=True)
+
+    body = (await _poll(client, "node-standby", cap=4)).json()
+    assert set(_names(body)) == {f"patient_{dormant}", f"patient_{live}"}

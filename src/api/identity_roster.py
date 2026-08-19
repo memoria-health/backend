@@ -101,6 +101,16 @@ class RosterResponse(BaseModel):
 PORT_MIN = 8012
 PORT_MAX = 8111
 
+# A home is LIVE when it has at least one camera actually streaming.
+# Slots follow live homes: claim order prefers them, and a dormant home
+# yields its slot to one (2026-08-19 — prod had 7 of 8 slots held by
+# May/June test homes with no cameras online while every home that was
+# actually streaming sat unassigned and identity-blind).
+_LIVE_CAM = (
+    "EXISTS (SELECT 1 FROM public.cameras c "
+    "         WHERE c.patient_id = p.id AND c.online AND NOT c.disabled)"
+)
+
 
 @router.post("/roster", response_model=RosterResponse)
 async def post_roster(
@@ -187,6 +197,47 @@ async def post_roster(
         {"self": body.node_id},
     )
 
+    # 2c. Make room for LIVE homes by evicting DORMANT ones (2026-08-19).
+    #     Claim priority alone cannot help a home that arrives after the
+    #     slots are gone: nothing ever released an assignment on a live
+    #     node, so June's test homes held every slot indefinitely.
+    #
+    #     NOT a timer. An idle home costs ~zero GPU (the empty-room
+    #     economy), so evicting on a schedule would only buy churn — each
+    #     re-claim costs a process start and a re-ground. A dormant home
+    #     keeps its slot as warm standby until a LIVE home actually needs
+    #     it, and never longer. A home with a live camera is never evicted.
+    evicted = (
+        await session.execute(
+            text(
+                "WITH need AS ("
+                "  SELECT count(*) AS n FROM public.patients p "
+                "   WHERE p.identity_node_id IS NULL AND " + _LIVE_CAM +
+                "), spare AS ("
+                "  SELECT :cap - count(*) AS n FROM public.patients "
+                "   WHERE identity_node_id = :node "
+                "), victims AS ("
+                "  SELECT p.id FROM public.patients p "
+                "   WHERE p.identity_node_id = :node AND NOT " + _LIVE_CAM +
+                # Oldest first: the longest-settled dormant homes are the
+                # likeliest to be permanently dormant.
+                "   ORDER BY p.created_at "
+                "   LIMIT GREATEST("
+                "     (SELECT n FROM need) - GREATEST((SELECT n FROM spare), 0), 0) "
+                "   FOR UPDATE SKIP LOCKED"
+                ") UPDATE public.patients "
+                "     SET identity_node_id = NULL, identity_port = NULL "
+                "   WHERE id IN (SELECT id FROM victims)"
+            ),
+            {"node": body.node_id, "cap": body.capacity},
+        )
+    ).rowcount or 0
+    if evicted:
+        log.info(
+            "identity.roster evicted=%d dormant home(s) on %s to seat live homes",
+            evicted, body.node_id,
+        )
+
     # 3. Claim up to remaining capacity from the unassigned pool.
     #
     #    FOR UPDATE SKIP LOCKED is what makes two nodes polling at the same
@@ -216,9 +267,12 @@ async def post_roster(
                 # function ("FOR UPDATE is not allowed with window
                 # functions"). Lock first, number the locked set after.
                 "), locked AS ("
-                "  SELECT id, created_at FROM public.patients "
+                "  SELECT id, created_at FROM public.patients p "
                 "   WHERE identity_node_id IS NULL "
-                "   ORDER BY created_at "
+                # LIVE homes first: a streaming home is blind RIGHT NOW,
+                # while a dormant one has nothing to be blind about. Within
+                # each group the oldest-waiting still wins.
+                "   ORDER BY (" + _LIVE_CAM + ") DESC, created_at "
                 "   LIMIT GREATEST((SELECT n FROM avail), 0) "
                 "   FOR UPDATE SKIP LOCKED"
                 "), pick AS ("
@@ -256,9 +310,10 @@ async def post_roster(
     rows = (
         await session.execute(
             text(
-                "SELECT id, identity_port FROM public.patients "
+                "SELECT id, identity_port FROM public.patients p "
                 " WHERE identity_node_id = :node AND identity_port IS NOT NULL "
-                " ORDER BY created_at LIMIT :cap"
+                # Shedding keeps the LIVE homes; settled-longest breaks ties.
+                " ORDER BY (" + _LIVE_CAM + ") DESC, created_at LIMIT :cap"
             ),
             {"node": body.node_id, "cap": body.capacity},
         )

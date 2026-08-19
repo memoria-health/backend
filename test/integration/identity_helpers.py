@@ -69,3 +69,25 @@ async def _setup_patient_with_camera(
     )
     await session.commit()
     return patient_id, camera_id
+
+
+async def _enroll_face(session, patient_id) -> None:
+    """Give a home a usable face enrollment.
+
+    The fail-quiet identity gate only ARMS for a home that can actually
+    identify someone (2026-08-19). Tests asserting that an unconfirmed
+    person is suppressed must therefore enroll first — otherwise they are
+    asserting the pre-fix behaviour, where an unenrolled household had
+    every routine detector silenced forever by a confirmation that could
+    never arrive.
+    """
+    from sqlalchemy import text
+    await session.execute(
+        text(
+            "INSERT INTO public.patient_face_embeddings "
+            "  (patient_id, embedding, det_score, source, status) "
+            "VALUES (:p, :e, 0.99, 'selfie', 'ready')"
+        ),
+        {"p": patient_id, "e": b"\x00" * 2048},
+    )
+    await session.commit()
