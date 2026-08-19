@@ -44,8 +44,8 @@ async def test_gateway_mints_token_for_its_own_camera(
 ) -> None:
     """The happy path: a box gets a JWT for a camera it provisioned,
     with no LiveKit secret ever leaving the backend."""
-    _, email, _ = await _setup_patient(client, auth_user)
-    cam = (await _provision(client, email, "gw-token-A", room="Living Room"))["cameras"][0]
+    headers, email, pid = await _setup_patient(client, auth_user)
+    cam = (await _provision(client, email, "gw-token-A", room="Living Room", headers=headers, patient_id=pid))["cameras"][0]
 
     r = await _mint(
         client, "gw-token-A",
@@ -77,9 +77,9 @@ async def test_gateway_cannot_mint_for_another_boxs_camera(
     """THE escalation case. Two boxes under one caregiver: A must not be
     able to publish as B's camera. Before per-box ownership existed, any
     holder of any site token could have signed a token for any camera."""
-    _, email, _ = await _setup_patient(client, auth_user)
-    await _provision(client, email, "gw-token-A", room="Room A")
-    b_cam = (await _provision(client, email, "gw-token-B", room="Room B"))["cameras"][0]
+    headers, email, pid = await _setup_patient(client, auth_user)
+    await _provision(client, email, "gw-token-A", room="Room A", headers=headers, patient_id=pid)
+    b_cam = (await _provision(client, email, "gw-token-B", room="Room B", headers=headers, patient_id=pid))["cameras"][0]
 
     r = await _mint(
         client, "gw-token-A",
@@ -94,8 +94,8 @@ async def test_gateway_cannot_mint_for_another_room(
 ) -> None:
     """Right camera, wrong room. The room must be the camera's own, or a
     box could join a room it has no business in."""
-    _, email, _ = await _setup_patient(client, auth_user)
-    cam = (await _provision(client, email, "gw-token-A", room="Living Room"))["cameras"][0]
+    headers, email, pid = await _setup_patient(client, auth_user)
+    cam = (await _provision(client, email, "gw-token-A", room="Living Room", headers=headers, patient_id=pid))["cameras"][0]
 
     r = await _mint(
         client, "gw-token-A",
@@ -110,8 +110,8 @@ async def test_unknown_gateway_token_is_rejected(
     client: AsyncClient, auth_user, session: AsyncSession,
 ) -> None:
     """A bearer that hashes to no gateway row gets nothing."""
-    _, email, _ = await _setup_patient(client, auth_user)
-    cam = (await _provision(client, email, "gw-token-A", room="Living Room"))["cameras"][0]
+    headers, email, pid = await _setup_patient(client, auth_user)
+    cam = (await _provision(client, email, "gw-token-A", room="Living Room", headers=headers, patient_id=pid))["cameras"][0]
 
     r = await _mint(
         client, "gw-token-NOT-REAL",
@@ -128,8 +128,8 @@ async def test_unowned_camera_is_not_mintable(
     transitional fallback. Minting is stricter on purpose: an unowned
     camera has no proven box, so it must NOT be publishable. Read access
     failing open is tolerable; a publish credential is not."""
-    _, email, pid = await _setup_patient(client, auth_user)
-    await _provision(client, email, "gw-token-A", room="Owned")
+    headers, email, pid = await _setup_patient(client, auth_user)
+    await _provision(client, email, "gw-token-A", room="Owned", headers=headers, patient_id=pid)
 
     from uuid import uuid4
     orphan = uuid4()

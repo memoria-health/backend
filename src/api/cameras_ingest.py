@@ -52,7 +52,6 @@ from src.api import health as health_mod
 from src.api.deps import SessionDep, SettingsDep
 from src.db.camera import Camera
 from src.repos import camera_detector_repo
-from src.services import camera_coverage
 from src.services.ingest.pi.auth import hash_ingest_token, mint_ingest_token
 from src.services.ingest.pi.mjpeg_reader import parse_mjpeg
 from src.services.ingest.pi.relay_publisher import RelayConfig, RelayPublisher
@@ -641,25 +640,11 @@ async def gateway_provision_camera(
         )
         session.add(cam)
         await session.flush()
-        # An account with exactly ONE patient has no decision to make, so
-        # assign it now: the caregiver should not be asked "who does this
-        # watch?" when there is only one answer. With several patients the
-        # camera stays unassigned and the app asks.
-        solo = (await session.execute(
-            text("SELECT id FROM public.patients WHERE caregiver_id = :c"),
-            {"c": caregiver_id},
-        )).scalars().all()
-        assigned_to = solo[0] if len(solo) == 1 else None
-        if assigned_to is not None:
-            await camera_coverage.set_coverage(
-                session, camera_id, primary_patient_id=assigned_to)
-            await camera_detector_repo.sync_links_for_patient(
-                session, assigned_to)
-            livekit_room = f"patient_{assigned_to}"
         cameras.append({
-            # Null on a multi-patient account: the camera is on the account
-            # and the app asks who it watches before it can publish.
-            "patient_id": str(assigned_to) if assigned_to else None,
+            # Always unassigned: the caregiver names it and says who it
+            # watches in the app. One path, whether the account has one
+            # patient or twenty.
+            "patient_id": None,
             "camera_id": str(camera_id),
             "livekit_identity": livekit_identity,
             "livekit_room": livekit_room,

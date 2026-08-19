@@ -43,15 +43,32 @@ async def _setup_patient(
     return headers, email, p["id"]
 
 
-async def _provision(client: AsyncClient, email: str, token: str, room: str) -> dict:
-    """Provision a gateway camera as the box holding `token`."""
+async def _provision(
+    client: AsyncClient, email: str, token: str, room: str,
+    *, headers: dict | None = None, patient_id: str | None = None,
+) -> dict:
+    """Provision a gateway camera as the box holding `token`.
+
+    Provisioning leaves the camera on the ACCOUNT with no patient, and the
+    roster skips unassigned cameras, so pass `headers`/`patient_id` when the
+    case needs one actually in service.
+    """
     r = await client.post(
         "/v1/gateway/provision-camera",
         headers={"Authorization": f"Bearer {token}"},
         json={"email": email, "room": room},
     )
     assert r.status_code == 201, r.text
-    return r.json()
+    body = r.json()
+    if headers and patient_id:
+        for cam in body["cameras"]:
+            a = await client.post(
+                f"/v1/cameras/{cam['camera_id']}/coverage",
+                headers=headers, json={"primary_patient_id": patient_id},
+            )
+            assert a.status_code == 200, a.text
+            cam["livekit_room"] = f"patient_{patient_id}"
+    return body
 
 
 async def _roster_identities(client: AsyncClient, token: str) -> set[str]:
@@ -68,8 +85,8 @@ async def test_provision_stamps_owning_gateway(
     client: AsyncClient, auth_user, session: AsyncSession,
 ) -> None:
     """A provisioned camera records the box that provisioned it."""
-    _, email, _ = await _setup_patient(client, auth_user)
-    resp = await _provision(client, email, "gw-token-A", room="Living Room")
+    headers, email, pid = await _setup_patient(client, auth_user)
+    resp = await _provision(client, email, "gw-token-A", room="Living Room", headers=headers, patient_id=pid)
     camera_id = resp["cameras"][0]["camera_id"]
 
     gw_id = (await session.execute(
@@ -88,9 +105,9 @@ async def test_roster_isolates_cameras_by_gateway(
     client: AsyncClient, auth_user, session: AsyncSession,
 ) -> None:
     """Two boxes for the same caregiver each see only their own camera."""
-    _, email, _ = await _setup_patient(client, auth_user)
-    a = await _provision(client, email, "gw-token-A", room="Room A")
-    b = await _provision(client, email, "gw-token-B", room="Room B")
+    headers, email, pid = await _setup_patient(client, auth_user)
+    a = await _provision(client, email, "gw-token-A", room="Room A", headers=headers, patient_id=pid)
+    b = await _provision(client, email, "gw-token-B", room="Room B", headers=headers, patient_id=pid)
     a_ident = a["cameras"][0]["livekit_identity"]
     b_ident = b["cameras"][0]["livekit_identity"]
 
@@ -107,8 +124,8 @@ async def test_roster_includes_unowned_null_cameras(
 ) -> None:
     """A gateway camera with no owner (gateway_id NULL) still reaches every
     box — the transitional fallback so un-backfilled rows keep working."""
-    _, email, pid = await _setup_patient(client, auth_user)
-    await _provision(client, email, "gw-token-A", room="Owned")
+    headers, email, pid = await _setup_patient(client, auth_user)
+    await _provision(client, email, "gw-token-A", room="Owned", headers=headers, patient_id=pid)
 
     orphan = uuid4()
     await session.execute(
@@ -133,9 +150,9 @@ async def test_roster_assigns_stable_unique_tunnel_ports(
     """First roster poll assigns a unique reverse-SSH port (never the
     reserved 22001); later polls return the SAME port; two boxes never
     collide."""
-    _, email, _ = await _setup_patient(client, auth_user)
-    await _provision(client, email, "gw-token-A", room="Room A")
-    await _provision(client, email, "gw-token-B", room="Room B")
+    headers, email, pid = await _setup_patient(client, auth_user)
+    await _provision(client, email, "gw-token-A", room="Room A", headers=headers, patient_id=pid)
+    await _provision(client, email, "gw-token-B", room="Room B", headers=headers, patient_id=pid)
 
     async def _port(token: str) -> int:
         r = await client.get(
@@ -165,8 +182,8 @@ async def test_roster_reports_backend_view_of_frames_arriving(
     and publisher.py's watchdog restarts on it, so the field must be
     present on every camera row and must track the column.
     """
-    _, email, _ = await _setup_patient(client, auth_user)
-    resp = await _provision(client, email, "gw-token-A", room="Living Room")
+    headers, email, pid = await _setup_patient(client, auth_user)
+    resp = await _provision(client, email, "gw-token-A", room="Living Room", headers=headers, patient_id=pid)
     camera_id = resp["cameras"][0]["camera_id"]
 
     async def _rows() -> dict[str, bool]:
