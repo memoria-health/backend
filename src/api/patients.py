@@ -89,6 +89,8 @@ async def create_patient(
     setup self-test, which is not in the library and so cannot be picked.
     """
     now = datetime.now(timezone.utc)
+    # The JWT principal carries no timezone, so read the caregiver row.
+    creator = await caregiver_repo.find_by_id(session, auth.id)
     p = Patient(
         id=uuid4(),
         caregiver_id=auth.id,
@@ -103,6 +105,10 @@ async def create_patient(
         date_of_birth=body.date_of_birth,
         gender=body.gender,
         home_address=body.home_address,
+        # Default the home's zone to the creating caregiver's. Right when
+        # they live together, and a sane start when they do not — the
+        # caregiver can move the patient's zone afterwards.
+        timezone=body.timezone or (creator.timezone if creator else None),
         # Record the picked country verbatim; the residency region collapses to
         # what we physically support (region_for_country) — client never sets it.
         country=body.country,

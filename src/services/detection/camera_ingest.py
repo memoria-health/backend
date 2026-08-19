@@ -39,7 +39,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from src.db.camera import Camera
 from src.db.caregiver import Caregiver
 from src.db.patient import Patient
-from src.services import clip_archival, email, event_gate, push
+from src.services import clip_archival, email, event_gate, patient_tz, push
 from src.services.detection.analyses_store import add_analysis
 from src.services.detection.audio_buffer import AudioBuffer
 from src.services.detection.event_promotion import maybe_promote_analysis
@@ -722,26 +722,22 @@ class CameraIngest:
             )
 
     async def _resolve_caregiver_tz(self, session, patient: "Patient") -> ZoneInfo:
-        """Caregiver's IANA timezone for when_scope windows, cached for
-        the worker's life. Any failure falls back to the scheduled
-        runner's convention (America/New_York) — window gating degrades,
+        """The HOME's IANA timezone for when_scope windows, cached for
+        the worker's life. Falls back to the caregiver's zone, then to
+        the scheduled runner's convention — window gating degrades,
         never crashes a tick."""
         if self._caregiver_tz is not None:
             return self._caregiver_tz
-        name = None
+        cg_name = None
         try:
             cg = await session.get(Caregiver, patient.caregiver_id)
-            name = cg.timezone if cg else None
+            cg_name = cg.timezone if cg else None
         except Exception:  # noqa: BLE001
             log.warning(
                 "%s caregiver tz lookup failed — using fallback",
                 self._log_tag,
             )
-        try:
-            tz = ZoneInfo(name) if name else ZoneInfo("America/New_York")
-        except ZoneInfoNotFoundError:
-            log.warning("%s bad caregiver tz %r — using fallback", self._log_tag, name)
-            tz = ZoneInfo("America/New_York")
+        tz = patient_tz.zone_for(getattr(patient, "timezone", None), cg_name)
         self._caregiver_tz = tz
         return tz
 

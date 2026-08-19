@@ -83,6 +83,17 @@ class Patient(Base):
     # NULL = never asked, which drives the first-open consent banner on
     # web + iOS. Both "Share" and "Not now" stamp it, so once a decision
     # exists the banner never re-nags.
+    # IANA timezone THIS HOME is in. Every day boundary the caregiver
+    # sees — the journal, scheduled windows, sleep nights — resolves
+    # here first. It used to resolve to the caregiver's own timezone,
+    # which is wrong the moment they do not live with the patient: a
+    # daughter in New York watching a father in California saw his day
+    # roll over at 9pm his time. NULL = never set, fall back to the
+    # caregiver's zone (see services/patient_tz.py) so existing homes
+    # keep exactly the behaviour they had.
+    timezone: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, default=None,
+    )
     data_collection_enabled: Mapped[bool] = mapped_column(
         Boolean, server_default=text("false"), default=False,
     )

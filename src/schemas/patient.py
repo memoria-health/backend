@@ -11,7 +11,7 @@ from enum import Enum
 from typing import Annotated
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 
 
 class Relation(str, Enum):
@@ -52,6 +52,25 @@ Email = Annotated[str, Field(min_length=3, max_length=255)]
 Country = Annotated[str, Field(min_length=2, max_length=2, pattern=r"^[A-Z]{2}$")]
 
 
+def _known_zone(v: str) -> str:
+    """Reject a timezone the server cannot actually resolve. Storing an
+    unknown name would not error anywhere — it would silently fall back
+    to the caregiver's zone forever, which reads as "the setting does
+    nothing" rather than as a bad value."""
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    try:
+        ZoneInfo(v)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise ValueError(f"unknown IANA timezone: {v!r}")
+    return v
+
+
+# IANA name, e.g. "America/Los_Angeles". Validated against the server's
+# own tz database so what is stored is always resolvable.
+TimezoneName = Annotated[
+    str, Field(min_length=1, max_length=64), AfterValidator(_known_zone)]
+
+
 class PatientResponse(BaseModel):
     """Full patient row returned by list / get / create / update endpoints."""
 
@@ -65,6 +84,10 @@ class PatientResponse(BaseModel):
     gender: Gender | None
     relation: Relation
     home_address: Address | None
+    # IANA timezone THIS HOME is in — every day boundary the caregiver sees
+    # resolves here first. NULL means "never set": fall back to the
+    # caregiver's own zone, which is what all homes did before this existed.
+    timezone: str | None
     # Country picked at onboarding (ISO alpha-2). The residency `region` below
     # is derived from it; both are set once and immutable thereafter.
     country: Country
@@ -132,6 +155,10 @@ class CreatePatientRequest(BaseModel):
     date_of_birth: date | None = None
     gender: Gender | None = None
     home_address: Address | None = None
+    # IANA timezone of the patient's home. Omitted → the server copies the
+    # creating caregiver's zone, which is right for the common case where
+    # they live together and a sane starting point when they do not.
+    timezone: TimezoneName | None = None
     # Country this home is in (ISO alpha-2). Optional + defaults to 'US' so
     # pre-country clients keep working during rollout. The server DERIVES the
     # data-residency `region` from it (region_for_country) — the client never
@@ -165,6 +192,8 @@ class UpdatePatientRequest(BaseModel):
     gender: Gender | None = None
     relation: Relation | None = None
     home_address: Address | None = None
+    # Move the home to another zone. Every day boundary shifts with it.
+    timezone: TimezoneName | None = None
     cameras_paused: bool | None = None
     # Facilities audio kill toggle. Flip propagates to the gateway within
     # ~0.4s via the roster long-poll fingerprint; publishers republish

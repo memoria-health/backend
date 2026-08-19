@@ -203,6 +203,12 @@ create table public.patients (
   -- alerts when enabled). JSON array of strings.
   email_alerts_enabled    boolean not null default false,
   email_alert_recipients  jsonb   not null default '[]'::jsonb,
+  -- IANA timezone of THIS HOME. Every day boundary the caregiver sees —
+  -- the journal, scheduled windows, sleep nights — resolves here first,
+  -- because the day being described is the patient's. NULL = never set,
+  -- which falls back to the caregiver's own zone (the behaviour before
+  -- this column existed). See src/services/patient_tz.py.
+  timezone                text,
   -- Data-collection consent (research opt-in). `data_collection_enabled`
   -- is the master switch to store short video+audio clips of this
   -- patient for research, only when someone is present; default OFF
