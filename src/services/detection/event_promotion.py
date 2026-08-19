@@ -481,33 +481,35 @@ async def _maybe_page_record_only(
     task.add_done_callback(_page_tasks.discard)
 
 
-# Identity gating is only meaningful for homes that CAN identify. A
-# household that never enrolled a face has no confirmation source, so
-# gating routine detectors on a confirmation that can never arrive
-# leaves them permanently silent (Aryaman 2026-08-19, prod day one:
-# every non-safety detector dead for an unenrolled test home). Cached
-# 60s — one row lookup per home per minute, not per detector per tick.
-_ENROLLMENT_TTL_S = 60.0
-_enrollment_cache: dict[str, tuple[bool, float]] = {}
+# Identity gating only means something when the camera could be showing
+# SOMEBODY ELSE. On a camera watching one patient, whoever is in frame is
+# them, so demanding confirmation would silence the home forever (found
+# on prod day one: every non-safety detector dead for a household that
+# never enrolled a face). On a camera shared by several residents the
+# opposite is true — an unattributed routine event would land on the
+# wrong person's record. So the gate arms on coverage, not enrollment.
+# Cached 60s: one lookup per camera per minute, not per detector per tick.
+_COVERAGE_TTL_S = 60.0
+_coverage_cache: dict[str, tuple[int, float]] = {}
 
 
-async def _patient_has_enrollment(session: AsyncSession, patient_id) -> bool:
-    key = str(patient_id)
+async def _covered_patient_count(session: AsyncSession, camera_id) -> int:
+    key = str(camera_id)
     now = time.monotonic()
-    hit = _enrollment_cache.get(key)
+    hit = _coverage_cache.get(key)
     if hit is not None and now < hit[1]:
         return hit[0]
     try:
-        val = bool((await session.execute(text(
-            "select 1 from public.patient_face_embeddings "
-            "where patient_id = :p and status = 'ready' limit 1"),
-            {"p": key})).scalar())
+        val = int((await session.execute(text(
+            "select count(*) from public.camera_patients where camera_id = :c"),
+            {"c": key})).scalar() or 0)
     except Exception:  # noqa: BLE001 — a probe, not a tick
-        # Fail toward TODAY'S behavior (gate armed) and say so — a DB
-        # hiccup here must not crash promotion or silently widen firing.
-        log.exception("[enrollment-probe] failed for %s — arming gate", key)
-        return True
-    _enrollment_cache[key] = (val, now + _ENROLLMENT_TTL_S)
+        # Fail toward the STRICTER reading (treat as shared, so routine
+        # events wait for identity) and say so. A DB hiccup must not
+        # silently widen what gets written to someone's record.
+        log.exception("[coverage-probe] failed for %s — treating as shared", key)
+        return 2
+    _coverage_cache[key] = (val, now + _COVERAGE_TTL_S)
     return val
 
 
@@ -613,14 +615,13 @@ async def maybe_promote_analysis(
         # track — narrated a seated person into an empty room. A new
         # category added tomorrow must default to fail-quiet, not to
         # bypassing identity.
-        # …and the gate only ARMS once the home has a usable enrollment:
-        # with no enrolled face, identity can never confirm anyone, and
-        # fail-quiet would mean fail-forever (Aryaman 2026-08-19).
+        # …and it only ARMS on a camera shared by more than one patient,
+        # where "which of them was it?" is a real question (2026-08-19).
         if (det.subject_scope == "patient"
                 and det.category != "safety"
                 and not _is_truthy_bool(
                     detector_fields.get("identity_patient_in_clip"))
-                and await _patient_has_enrollment(session, patient_id)):
+                and await _covered_patient_count(session, camera_id) > 1):
             skipped.append(f"{ident}(patient_unconfirmed)")
             continue
 

@@ -248,7 +248,9 @@ async def create_pairing_code(
         pi_stream_url=None,
     )
     session.add(cam)
-    await session.flush()  # Ensure the camera row is visible to the assignment query below.
+    await session.flush()  # camera row visible to the queries below
+    await camera_coverage.set_coverage(
+        session, cam.id, primary_patient_id=patient_id)
     # Reconcile detector links from each detector's where_rooms: presets
     # attach per their scope (all-rooms presets "just work" everywhere),
     # room-scoped detectors attach only to matching rooms, and null-scoped
@@ -396,6 +398,8 @@ async def provision_pi_camera(
     )
     session.add(cam)
     await session.flush()
+    await camera_coverage.set_coverage(
+        session, cam.id, primary_patient_id=patient_id)
     # Reconcile detector links from where_rooms, same convention as the
     # iPhone path so a freshly-provisioned Pi camera is
     # detector-equivalent to an iPhone camera in the same room.
@@ -486,6 +490,8 @@ async def provision_gateway_camera(
     )
     session.add(cam)
     await session.flush()
+    await camera_coverage.set_coverage(
+        session, cam.id, primary_patient_id=patient_id)
     # Reconcile detector links from where_rooms — same as the other
     # camera-create paths, and also repairs any pre-existing drift.
     await camera_detector_repo.sync_links_for_patient(session, patient_id)

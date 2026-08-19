@@ -13,6 +13,7 @@ from uuid import UUID, uuid4
 
 import numpy as np
 from httpx import AsyncClient
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.services.identity.embeddings import embedding_to_bytes
@@ -67,27 +68,43 @@ async def _setup_patient_with_camera(
             created_at=datetime.now(timezone.utc),
         )
     )
+    # Record the camera->patient link the same way every real creation
+    # path does — coverage is what the account view and the identity gate
+    # read, not cameras.patient_id.
+    await session.execute(
+        text(
+            "INSERT INTO public.camera_patients "
+            "  (camera_id, patient_id, is_primary) "
+            "VALUES (:c, :p, true) ON CONFLICT DO NOTHING"
+        ),
+        {"c": camera_id, "p": patient_id},
+    )
     await session.commit()
     return patient_id, camera_id
 
 
-async def _enroll_face(session, patient_id) -> None:
-    """Give a home a usable face enrollment.
+async def _share_camera_with_another_patient(session, camera_id, patient_id) -> None:
+    """Make a camera cover a SECOND patient.
 
-    The fail-quiet identity gate only ARMS for a home that can actually
-    identify someone (2026-08-19). Tests asserting that an unconfirmed
-    person is suppressed must therefore enroll first — otherwise they are
-    asserting the pre-fix behaviour, where an unenrolled household had
-    every routine detector silenced forever by a confirmation that could
-    never arrive.
+    The fail-quiet identity gate arms only where a camera watches more
+    than one person — that is the only case where an unattributed routine
+    event could land on the wrong record.
     """
-    from sqlalchemy import text
+    other = uuid4()
     await session.execute(
         text(
-            "INSERT INTO public.patient_face_embeddings "
-            "  (patient_id, embedding, det_score, source, status) "
-            "VALUES (:p, :e, 0.99, 'selfie', 'ready')"
+            "INSERT INTO public.patients "
+            "  (id, caregiver_id, full_name, preferred_name, relation) "
+            "SELECT :o, caregiver_id, 'Housemate', 'Housemate', 'other' "
+            "  FROM public.patients WHERE id = :p"
         ),
-        {"p": patient_id, "e": b"\x00" * 2048},
+        {"o": other, "p": patient_id},
+    )
+    await session.execute(
+        text(
+            "INSERT INTO public.camera_patients (camera_id, patient_id, is_primary) "
+            "VALUES (:c, :o, false) ON CONFLICT DO NOTHING"
+        ),
+        {"c": camera_id, "o": other},
     )
     await session.commit()
