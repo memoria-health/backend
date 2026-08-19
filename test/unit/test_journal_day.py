@@ -294,3 +294,37 @@ def test_sleep_gaps_split_the_band() -> None:
     assert len(spans) == 2
     assert abs(spans[0][1] - 14.0) < 0.01   # gap opens at 2 AM (noon axis)
     assert abs(spans[1][0] - 14.5) < 0.01   # resumes 2:30 AM
+
+
+def test_off_state_detectors_keep_their_history() -> None:
+    """Sleep and activity draw from their own arguments, not from events.
+    Keying "did this day have data" off events alone reported them empty
+    and dropped a real night the moment the detector was switched off."""
+    off_sleep = _det(id="s1", name="Sleep", identifier="sleep",
+                     alert_trigger="record_only", is_on=False)
+    off_activity = _det(id="a1", name="Activity", identifier="activity",
+                        alert_trigger="record_only", is_on=False)
+    entries = jd.build_entries(
+        detectors=[off_sleep, off_activity], events_by_detector={}, tz=TZ,
+        sleep_row={"bedtime": _local(22, 30), "wake_time": _local(6, 15),
+                   "disturbances": 1, "out_of_bed_events": None},
+        activity_ticks=[(_local(10, 0), "walking")],
+        detected_times_by_identifier={}, streak_days_by_detector={},
+        coverage_hours=24)
+    titles = [e["title"] for e in entries]
+    assert "Sleep" in titles
+    assert "Activity" in titles
+
+
+def test_off_state_detectors_with_no_data_are_still_skipped() -> None:
+    """The other half of the rule: no data means no quiet claim."""
+    off_sleep = _det(id="s1", name="Sleep", identifier="sleep",
+                     alert_trigger="record_only", is_on=False)
+    off_activity = _det(id="a1", name="Activity", identifier="activity",
+                        alert_trigger="record_only", is_on=False)
+    entries = jd.build_entries(
+        detectors=[off_sleep, off_activity], events_by_detector={}, tz=TZ,
+        sleep_row=None, activity_ticks=[],
+        detected_times_by_identifier={}, streak_days_by_detector={},
+        coverage_hours=24)
+    assert entries == []
