@@ -203,6 +203,13 @@ create table public.patients (
   -- alerts when enabled). JSON array of strings.
   email_alerts_enabled    boolean not null default false,
   email_alert_recipients  jsonb   not null default '[]'::jsonb,
+  -- Hold this patient's alerts for an OPERATOR yes/no before any caregiver
+  -- is told (src/services/event_gate.py). Defaults ON: review is the point
+  -- of production. Only category='safety' auto-releases (60s) — everything
+  -- else waits for a human verdict, so an unattended queue holds those
+  -- events indefinitely. Unrelated to events.reviewed, which is the
+  -- caregiver's own retrospective review.
+  event_gate_enabled      boolean not null default true,
   -- IANA timezone of THIS HOME. Every day boundary the caregiver sees —
   -- the journal, scheduled windows, sleep nights — resolves here first,
   -- because the day being described is the patient's. NULL = never set,
