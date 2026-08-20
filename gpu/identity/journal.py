@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 from pathlib import Path
@@ -80,6 +81,15 @@ def annotate(
     return img
 
 
+# Snapshot budget. Every journalled seat change can write a JPEG, and
+# nothing ever deleted them: 7.2G of frame dumps by 2026-08-19, and the
+# multi-patient seats write one entry PER RESIDENT rather than one per
+# home, so the rate went up. Oldest-first eviction keeps the directory
+# bounded without a cron job or an operator remembering.
+_SNAP_MAX = int(os.environ.get("NEMARA_JOURNAL_SNAP_MAX", "3000"))
+_LOG_MAX_BYTES = int(os.environ.get("NEMARA_JOURNAL_MAX_BYTES", str(64 << 20)))
+
+
 class EventJournal:
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
@@ -88,6 +98,27 @@ class EventJournal:
         self.path = self.root / "events.jsonl"
         self._lock = threading.Lock()
         self._seq = int(time.time()) % 10**6  # unique-enough across restarts
+        self._since_gc = 0
+
+    def _gc_locked(self) -> None:
+        """Evict oldest snapshots past the cap, and roll the jsonl once.
+
+        Runs every _SNAP_MAX//10 writes rather than every write — a
+        directory listing per seat change would cost more than the JPEG.
+        """
+        try:
+            snaps = sorted(
+                self.snaps.glob("*.jpg"), key=lambda p: p.stat().st_mtime,
+            )
+            for p in snaps[:-_SNAP_MAX] if len(snaps) > _SNAP_MAX else []:
+                p.unlink(missing_ok=True)
+            if self.path.exists() and self.path.stat().st_size > _LOG_MAX_BYTES:
+                # One generation only. The journal is a live debugging
+                # tail, not an archive; keeping N rotations is how the
+                # disk filled in the first place.
+                self.path.replace(self.path.with_suffix(".jsonl.1"))
+        except Exception:  # noqa: BLE001 — housekeeping must never kill a loop
+            log.exception("identity.journal_gc_failed")
 
     def log(
         self,
@@ -125,6 +156,10 @@ class EventJournal:
             with self._lock:
                 with open(self.path, "a") as f:
                     f.write(json.dumps(evt) + "\n")
+                self._since_gc += 1
+                if self._since_gc >= max(50, _SNAP_MAX // 10):
+                    self._since_gc = 0
+                    self._gc_locked()
         except Exception:  # noqa: BLE001
             log.exception("identity.journal_failed kind=%s", kind)
 

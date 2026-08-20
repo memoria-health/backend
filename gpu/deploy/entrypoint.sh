@@ -61,6 +61,10 @@ if [ -n "${PUBLIC_KEY:-}" ] && [ -x "$SSHD_BIN" ]; then
   chmod 700 /root/.ssh
   echo "$PUBLIC_KEY" >> /root/.ssh/authorized_keys
   chmod 600 /root/.ssh/authorized_keys
+  # Host keys are NOT in the image (they must not be — a shared host key
+  # across every node is a fleet-wide impersonation risk). sshd refuses
+  # to start without them, so generate per-container on first boot.
+  ssh-keygen -A >/dev/null 2>&1 || true
   if "$SSHD_BIN"; then
     log "sshd up (PUBLIC_KEY present)"
   else
