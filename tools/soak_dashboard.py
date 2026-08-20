@@ -1284,10 +1284,17 @@ async function pollIdentity(){
     if(!s.on){$("idsvc").innerHTML='<span class="warn">identity service not running — uv run python tools/run_identity.py</span>';return;}
     const nm=c=>{const k=(c||'').slice(0,8);const m=window._camnames||{};return m[k]||m[c]||k;};
     let h='';
-    if(s.seat){
-      h+=`<div><span class="ok" style="font-weight:700">PATIENT = T${s.seat.track}</span> on ${nm(s.seat.camera)} · score ${s.seat.score}@${s.seat.anchor}${s.seat.face_confirmed?' <span class="ok">*face-confirmed</span>':''} · held ${Math.max(0,Math.round((Date.now()/1000)-s.seat.since))}s</div>`;
+    // state-v2: one seat per LOCATED resident, keyed by patient uuid.
+    // A camera can watch more than one person, so this is a list —
+    // rendering only the first would make a working two-resident lock
+    // look like a half-broken one on the exact screen used to verify it.
+    const seats=Object.entries(s.seats||{});
+    if(seats.length){
+      for(const [pid,st] of seats){
+        h+=`<div><span class="ok" style="font-weight:700">${pid.slice(0,8)} = T${st.track}</span> on ${nm(st.camera)} · score ${st.score}@${st.anchor}${st.face_confirmed?' <span class="ok">*face-confirmed</span>':''} · held ${Math.max(0,Math.round((Date.now()/1000)-st.since))}s</div>`;
+      }
     } else {
-      h+='<div><span class="warn">no patient locked</span> — searching (walk near a camera to bootstrap)</div>';
+      h+='<div><span class="warn">nobody located</span> — searching (walk near a camera to bootstrap)</div>';
     }
     for(const [c,v] of Object.entries(s.cameras||{})){
       const t=Object.keys(v.tracks||{});

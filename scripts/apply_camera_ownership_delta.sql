@@ -102,3 +102,16 @@ drop policy if exists camera_patients_member on public.camera_patients;
 create policy camera_patients_member on public.camera_patients
   for all using (public.has_patient_access(patient_id))
   with check (public.has_patient_access(patient_id));
+
+-- ── livekit_room is now a lookup key, not just a stored string ──────
+--
+-- It answers "which identity process holds this camera" (IdentityRouter)
+-- and "does any camera stream into this room" (the roster's liveness
+-- test). Both were added 2026-08-20; before that nothing ever searched
+-- on the column, so it has no index and both queries scan.
+--
+-- Small tables today, so this is about not leaving a scan behind in a
+-- path that runs per camera per tick-ish (router, 15s route cache) and
+-- per patient per node poll (roster, 30s).
+create index if not exists cameras_livekit_room_idx
+  on public.cameras (livekit_room);

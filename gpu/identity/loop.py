@@ -364,18 +364,28 @@ class IdentityHome:
             if self.face_galleries.get(pid) is not None
         ]
 
-    def seat_on(self, cam_id: str) -> Optional[tuple[UUID, Seat]]:
-        """The (resident, seat) currently held on this camera, if any.
+    def seats_on(self, cam_id: str) -> list[tuple[UUID, Seat]]:
+        """Every (resident, seat) held on this camera, strongest first.
 
-        Only one can exist: `resolve_track_conflicts` forbids two
-        residents sharing a track, and a camera's cadence/probe
-        decisions only need to know whether SOMEONE is seated here.
+        There can be more than one: `resolve_track_conflicts` forbids
+        two residents sharing a TRACK, not a camera, and two residents
+        on two tracks of one camera is the ordinary shared-lounge
+        state.
         """
-        best: Optional[tuple[UUID, Seat]] = None
-        for pid, s in list(self.seats.items()):
-            if s.camera_id == cam_id and (best is None or s.score > best[1].score):
-                best = (pid, s)
-        return best
+        return sorted(
+            (
+                (pid, s) for pid, s in list(self.seats.items())
+                if s.camera_id == cam_id
+            ),
+            key=lambda e: e[1].score, reverse=True,
+        )
+
+    def seat_on(self, cam_id: str) -> Optional[tuple[UUID, Seat]]:
+        """The strongest seat held on this camera, if any — for callers
+        that only need "is SOMEONE located here" (probe cadence, the
+        harvest, which `solo` already restricts to one live track)."""
+        held = self.seats_on(cam_id)
+        return held[0] if held else None
 
     def live_keys(self) -> set[tuple[str, int]]:
         # Reads the frozenset snapshots (GIL-atomic ref reads) — safe
@@ -437,6 +447,12 @@ class IdentityHome:
             # One body is one person — a track that won two residents'
             # seats keeps only the stronger claim.
             self.seats = resolve_track_conflicts(seats)
+            # Swap-heal streaks belong to a seat. A resident who lost
+            # theirs (unseated here, or their track died) must not carry
+            # a half-built streak into their next lock.
+            self._contra = {
+                pid: v for pid, v in self._contra.items() if pid in self.seats
+            }
             new = dict(self.seats)
         self._journal_transitions(old, new, now)
 
@@ -1006,7 +1022,7 @@ class CameraLoop:
         _idx, pipeline_ts, frame = pipeline_frame
         self.lag_s = time.time() - pipeline_ts
         self.latest_jpeg = self._overlay(
-            frame, self.home.seat_on(self.camera_id), self._body_cos,
+            frame, self.home.seats_on(self.camera_id), self._body_cos,
         )
 
     # ── OUT-OF-BAND IDENTITY (2026-07-24 decoupling) ─────────────────
@@ -1027,7 +1043,6 @@ class CameraLoop:
                 # is out of the house, multiplying face-probe cost for
                 # a person who isn't there. Finding the second resident
                 # a little slower is the cheaper mistake.
-                seat = self.home.seat_on(self.camera_id)
                 gap = (
                     FACE_PROBE_SEARCH_S if not self.home.seats
                     else FACE_PROBE_LOCKED_S
@@ -1079,14 +1094,23 @@ class CameraLoop:
                 # by 5-13s, so a close walk-past crops where the person
                 # WAS (live 2026-07-24, seat stayed empty through a
                 # clear pass). Full-frame is lag-immune for close faces.
-                hits = await self.home.sam_for(self.camera_id).faces(
-                    payload, face_boxes, full=(seat is None),
+                # Full-frame scanning is a SEARCH aid: crop boxes lag the
+                # world by 5-13s, so a close walk-past crops where the
+                # person was. Run it while a resident THIS CAMERA COVERS
+                # is still unlocated.
+                #
+                # Not "nobody is seated on this camera" — that would keep
+                # full-frame on for a camera showing a guest while the
+                # only resident is already located elsewhere, which is
+                # cost this never used to pay. With one resident this
+                # expression is exactly the old home-wide `seat is None`.
+                searching = any(
+                    pid not in self.home.seats
+                    for pid in self.home.covered(self.camera_id)
                 )
-                # `seat` here is THIS camera's holder, so full-frame
-                # scanning stays on wherever nobody is located yet —
-                # including a shared camera whose second resident has
-                # not been found, which is exactly where it earns its
-                # cost.
+                hits = await self.home.sam_for(self.camera_id).faces(
+                    payload, face_boxes, full=searching,
+                )
                 # COVERAGE scan (searching only): every ring frame since
                 # the last probe, ≥PROBE_SCAN_GAP_S apart, full-frame in
                 # parallel — the perfect frame of a brief crossing can
@@ -1094,7 +1118,7 @@ class CameraLoop:
                 # Aryaman's requirement 2026-07-24). Only when the ring
                 # is native-res (probe_frame is the ring's newest
                 # object); a downscaled ring crushes faces.
-                if seat is None and probe_frame is frame:
+                if searching and probe_frame is frame:
                     extra, last_t = [], f_ts
                     for _i, ts2, fr2 in reversed(self.ring[:-1]):
                         if ts2 <= self._scanned_to:
@@ -1328,39 +1352,45 @@ class CameraLoop:
                     )
 
     def _overlay(
-        self, frame: np.ndarray, held: Optional[tuple[UUID, Seat]],
+        self, frame: np.ndarray, held: list[tuple[UUID, Seat]],
         body_cos: dict[int, float],
     ) -> bytes:
         img = frame.copy()
         h = img.shape[0]
         # Use the LOCAL snapshot throughout — home.seats can be
         # reassigned by another camera's fold between two reads (TOCTOU).
-        who, seat = held if held is not None else (None, None)
+        # EVERY seated resident is drawn, not just the strongest: this
+        # view is how a shared camera gets verified, and showing one of
+        # two people would make a working two-resident lock look broken.
+        by_track = {s.track_id: (pid, s) for pid, s in held}
         for rx1, ry1, rx2, ry2 in self.screen_map.live(time.monotonic()):
             cv2.rectangle(img, (int(rx1), int(ry1)), (int(rx2), int(ry2)),
                           (0, 0, 200), 2)
         for tid, tv in self.state.tracks.items():
             x1, y1, x2, y2 = (int(v) for v in tv.bbox)
-            is_seat = seat is not None and seat.key == (self.camera_id, tid)
-            col = (80, 220, 80) if is_seat else (60, 200, 255)
+            seated = by_track.get(tid)
+            col = (80, 220, 80) if seated else (60, 200, 255)
             tag = (
-                f"{str(who)[:8]} T{tid} {seat.score:.2f}/{seat.anchor}"
-                if is_seat
+                f"{str(seated[0])[:8]} T{tid} "
+                f"{seated[1].score:.2f}/{seated[1].anchor}"
+                if seated
                 else f"T{tid}" + (
                     f" b{body_cos[tid]:.2f}" if tid in body_cos else ""
                 )
             )
-            cv2.rectangle(img, (x1, y1), (x2, y2), col, 3 if is_seat else 2)
+            cv2.rectangle(img, (x1, y1), (x2, y2), col, 3 if seated else 2)
             cv2.putText(img, tag, (x1, max(18, y1 - 8)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, 2)
         self.hud = (
             f"{self.home.name_of(self.camera_id)} | "
             f"lag {self.lag_s:.1f}s pod {self.pod_ms:.0f}ms"
             f" q {self.queue_ms:.0f}ms | tracks {len(self.state.tracks)}"
-            + (f" | {str(who)[:8]} {seat.score:.2f}@{seat.anchor}"
-               + ("*face" if seat.face_confirmed else "")
-               if seat else " | seat -")  # ASCII: cv2.putText renders
-                                          # non-ASCII as "???"
+            # ASCII only: cv2.putText renders non-ASCII as "???"
+            + (" | " + " ".join(
+                f"{str(pid)[:8]} {s.score:.2f}@{s.anchor}"
+                + ("*face" if s.face_confirmed else "")
+                for pid, s in held
+            ) if held else " | seat -")
         )
         cv2.rectangle(img, (0, h - 26), (len(self.hud) * 9 + 16, h), (0, 0, 0), -1)
         cv2.putText(img, self.hud, (8, h - 8), cv2.FONT_HERSHEY_SIMPLEX,
