@@ -107,13 +107,20 @@ async def _mk_patient(session: AsyncSession, cid: UUID, age_mins: int = 0) -> UU
     return pid
 
 
-async def _mk_online_camera(session: AsyncSession, pid: UUID) -> None:
+async def _mk_online_camera(
+    session: AsyncSession, pid: UUID, *, publishes_into: UUID | None = None,
+) -> None:
+    """`livekit_room` is set because every real creation path sets it and
+    liveness reads it: a home is watchable when a camera STREAMS INTO its
+    room, not when a camera is assigned to its patient. `publishes_into`
+    makes the two differ, which is what a shared camera does."""
     await session.execute(
         text(
-            "INSERT INTO public.cameras (id, patient_id, display_id, room, online) "
-            "VALUES (:id, :p, 1, 'Fleet Test Room', true)"
+            "INSERT INTO public.cameras "
+            "  (id, patient_id, display_id, room, online, livekit_room) "
+            "VALUES (:id, :p, 1, 'Fleet Test Room', true, :lk)"
         ),
-        {"id": uuid4(), "p": pid},
+        {"id": uuid4(), "p": pid, "lk": f"patient_{publishes_into or pid}"},
     )
 
 
@@ -435,3 +442,39 @@ async def test_home_with_nothing_streaming_is_not_paged(
     assert counts["blind"] == 0
     assert counts["overdue"] == 0
     assert "identity-fleet:unassigned-homes" not in pages.triggered
+
+
+async def test_shared_camera_second_resident_is_not_paged_as_blind(
+    session: AsyncSession, auth_user, settings, monkeypatch
+) -> None:
+    """The pager must agree with the roster about who NEEDS a process.
+
+    A camera covering two residents publishes into ONE room, so the
+    roster deliberately assigns no process to the second resident —
+    their identity comes from the process that holds the shared camera.
+    While this module kept its own COPY of the liveness predicate, that
+    resident read as "live but unassigned" and paged CRITICAL every
+    cycle, forever, for a system working exactly as designed.
+    """
+    pages = _Pages()
+    pages.install(monkeypatch)
+    cid, email = auth_user
+    await _clear(session)
+    await _mk_caregiver(session, cid, email)
+    alice = await _mk_patient(session, cid)
+    bob = await _mk_patient(session, cid)
+    # Bob owns nothing of his own: his only camera is the shared one,
+    # which streams into Alice's room. _mk_patient gave him a private
+    # camera, so replace it.
+    await session.execute(
+        text("DELETE FROM public.cameras WHERE patient_id = :p"), {"p": bob},
+    )
+    await _mk_online_camera(session, bob, publishes_into=alice)
+    await session.commit()
+
+    counts = await _watch(settings, get_sessionmaker()).check()
+
+    assert counts["blind"] == 1, (
+        "Alice's room is blind; Bob is not a home that needs its own "
+        "process, so counting him would page for a working system"
+    )

@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import text
 
+from src.api.identity_roster import _LIVE_CAM
 from src.services import pager
 
 if TYPE_CHECKING:
@@ -61,12 +62,17 @@ UNASSIGNED_GRACE_S = 300
 # Only a home with a camera actually streaming can be "blind" — a home
 # with nothing online has no identity to miss. Counting every patient row
 # made this page fire critical forever on dormant test accounts (10 of 10
-# on prod, 2026-08-19), which is how a real alarm gets ignored. Mirrors
-# the roster's liveness predicate (src/api/identity_roster.py).
-_LIVE_CAM = (
-    "EXISTS (SELECT 1 FROM public.cameras c "
-    "         WHERE c.patient_id = p.id AND c.online AND NOT c.disabled)"
-)
+# on prod, 2026-08-19), which is how a real alarm gets ignored.
+#
+# IMPORTED, not mirrored (2026-08-20). This used to be a copy of the
+# roster's predicate with a comment saying so, and the copy drifted the
+# moment the roster started keying on `livekit_room`: the roster
+# deliberately gives no process to the second resident of a shared
+# camera (their video arrives in the other resident's room), while this
+# copy still counted them as a home that ought to have one — so every
+# shared camera would have paged "homes blind", forever, correctly
+# according to a rule that was no longer true. A pager that disagrees
+# with the thing it watches is worse than no pager.
 
 # Prefixes keep this subsystem's dedup keys out of the event gate's, which
 # uses bare event uuids. A collision would collapse two incidents into one
