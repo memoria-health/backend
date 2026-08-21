@@ -47,6 +47,7 @@ from fastapi import APIRouter, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import func, select, text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api import health as health_mod
 from src.api.deps import SessionDep, SettingsDep
@@ -548,11 +549,100 @@ async def gateway_wait(
     return {"changed": False, "fingerprint": fp}
 
 
-class GatewayProvisionRequest(BaseModel):
-    """Body for the email-only gateway provision (no caregiver password)."""
+class GatewayEnrollRequest(BaseModel):
+    """Body for the email-only enrolment of a service's bearer token."""
     email: str
+
+
+class GatewayProvisionRequest(GatewayEnrollRequest):
+    """Body for the email-only gateway provision (no caregiver password)."""
     room: str = "Camera"
     icon_name: str = "tv"
+
+
+async def _enroll_gateway_token(
+    session: AsyncSession, authorization: str, email: str, now: datetime,
+) -> tuple[UUID, UUID, bool]:
+    """Tie the presented bearer token to a caregiver account, idempotently.
+
+    Returns `(gateway_id, caregiver_id, already_enrolled)`.
+
+    This is the ONE place a `public.gateways` row is written. It used to
+    live inside provision-camera, which meant provisioning a camera was
+    the only way a token could ever become known — so a service with
+    nothing to provision (a bridge watching no cameras, or any box that
+    had just rotated its token) could not enrol at all, and 401d on the
+    roster forever. Both callers share this so the two paths cannot drift
+    into disagreeing about what "enrolled" means.
+    """
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="missing_bearer_token",
+        )
+    box_token = authorization[len("bearer "):].strip()
+    if not box_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="empty_bearer_token",
+        )
+    cg = (await session.execute(
+        text("SELECT id FROM public.caregivers WHERE lower(email) = lower(:e)"),
+        {"e": email.strip()},
+    )).first()
+    if cg is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="caregiver_not_found",
+        )
+    caregiver_id = cg[0]
+
+    # Only the hash is ever stored, and it is what the roster looks up. The
+    # SELECT-then-INSERT is what makes a re-enrol land on the same row
+    # instead of adding a second one for the same token.
+    token_hash = hash_ingest_token(box_token)
+    existing = (await session.execute(
+        text("SELECT id FROM public.gateways WHERE token_hash = :h"),
+        {"h": token_hash},
+    )).first()
+    if existing is None:
+        gateway_id = (await session.execute(
+            text("INSERT INTO public.gateways (caregiver_id, token_hash, created_at) "
+                 "VALUES (:c, :h, :n) RETURNING id"),
+            {"c": caregiver_id, "h": token_hash, "n": now},
+        )).scalar_one()
+        return gateway_id, caregiver_id, False
+    gateway_id = existing[0]
+    await session.execute(
+        text("UPDATE public.gateways SET caregiver_id = :c WHERE token_hash = :h"),
+        {"c": caregiver_id, "h": token_hash},
+    )
+    return gateway_id, caregiver_id, True
+
+
+@router.post(
+    "/gateway/enroll",
+    status_code=status.HTTP_200_OK,
+)
+async def gateway_enroll(
+    body: GatewayEnrollRequest,
+    session: SessionDep,
+    authorization: str = Header(default=""),
+) -> dict:
+    """Make this service's bearer token known to the backend. No camera.
+
+    Same handshake as provision-camera — Bearer <the service's own token>
+    plus the caregiver's email — minus the camera. That was the missing
+    half: a token only ever got its `gateways` row by provisioning
+    something, so rotating a credential meant creating a junk camera row,
+    and a bridge with zero cameras could not enrol at all.
+
+    Idempotent, because a service re-POSTs this on every boot. Returns
+    neither the token nor its hash: the caller already holds the
+    plaintext, and echoing it only spreads it into logs.
+    """
+    _gw, _cg, already = await _enroll_gateway_token(
+        session, authorization, body.email, datetime.now(timezone.utc),
+    )
+    await session.commit()
+    return {"ok": True, "already_enrolled": already}
 
 
 @router.post(
@@ -574,44 +664,13 @@ async def gateway_provision_camera(
     by caregiver. Nothing account-specific is baked into the image — the box
     learns its account HERE, at setup.
     """
-    if not authorization.lower().startswith("bearer "):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="missing_bearer_token",
-        )
-    box_token = authorization[len("bearer "):].strip()
-    if not box_token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="empty_bearer_token",
-        )
-    cg = (await session.execute(
-        text("SELECT id FROM public.caregivers WHERE lower(email) = lower(:e)"),
-        {"e": body.email.strip()},
-    )).first()
-    if cg is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="caregiver_not_found",
-        )
-    caregiver_id = cg[0]
     now = datetime.now(timezone.utc)
-
-    # tie THIS box's unique token to the caregiver (idempotent upsert per box)
-    token_hash = hash_ingest_token(box_token)
-    existing = (await session.execute(
-        text("SELECT id FROM public.gateways WHERE token_hash = :h"),
-        {"h": token_hash},
-    )).first()
-    if existing is None:
-        gateway_id = (await session.execute(
-            text("INSERT INTO public.gateways (caregiver_id, token_hash, created_at) "
-                 "VALUES (:c, :h, :n) RETURNING id"),
-            {"c": caregiver_id, "h": token_hash, "n": now},
-        )).scalar_one()
-    else:
-        gateway_id = existing[0]
-        await session.execute(
-            text("UPDATE public.gateways SET caregiver_id = :c WHERE token_hash = :h"),
-            {"c": caregiver_id, "h": token_hash},
-        )
+    # Tie THIS box's unique token to the caregiver, same idempotent upsert
+    # POST /v1/gateway/enroll performs on its own — provisioning a camera is
+    # now one of two ways to enrol, not the only one.
+    gateway_id, caregiver_id, _already = await _enroll_gateway_token(
+        session, authorization, body.email, now,
+    )
 
     # No patient lookup any more: a camera belongs to the account, so it can
     # be provisioned before the caregiver has added anyone. The old

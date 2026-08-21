@@ -7,6 +7,10 @@ the transitional NULL-owner fallback. Each box's FIRST roster poll also
 lazily assigns it a UNIQUE reverse-SSH relay port (folded into the
 liveness UPDATE).
 
+Also covers `POST /v1/gateway/enroll`: how a service's token becomes
+known to the backend WITHOUT provisioning a camera, which is what makes
+the roster answer it at all.
+
 Requires the local DB to have `scripts/apply_gateway_delta.sql`,
 `scripts/apply_gateway_ownership_delta.sql` AND
 `scripts/apply_gateway_tunnel_port_delta.sql` applied, same as the
@@ -69,6 +73,25 @@ async def _provision(
             assert a.status_code == 200, a.text
             cam["livekit_room"] = f"patient_{patient_id}"
     return body
+
+
+async def _enroll(client: AsyncClient, token: str, email: str):
+    """Enrol the service holding `token` against the caregiver `email`."""
+    return await client.post(
+        "/v1/gateway/enroll",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"email": email},
+    )
+
+
+async def _gateway_rows(session: AsyncSession, token: str) -> list:
+    """Every gateways row matching `token`'s hash — plural on purpose, so a
+    duplicate row shows up as a length rather than hiding behind a
+    scalar_one()."""
+    return (await session.execute(
+        text("SELECT id, caregiver_id FROM public.gateways WHERE token_hash = :h"),
+        {"h": hash_ingest_token(token)},
+    )).all()
 
 
 async def _roster_identities(client: AsyncClient, token: str) -> set[str]:
@@ -266,3 +289,148 @@ async def test_audio_kill_honours_every_covered_patient(
         "a covered patient's audio-off was ignored because the roster "
         "reads the primary only"
     )
+
+
+# ─── enrolment: how a token becomes known without a camera ──────────
+
+
+@pytest.mark.asyncio
+async def test_enroll_ties_a_bare_token_to_the_caregiver(
+    client: AsyncClient, auth_user, session: AsyncSession,
+) -> None:
+    """A service with no camera to provision can still become known.
+
+    Provisioning a camera used to be the ONLY thing that wrote a gateways
+    row, so anything holding a token and nothing to provision — a bridge
+    watching zero cameras, or any box that had just rotated its token —
+    could never enrol, and 401d on the roster forever. Enrolment has to
+    write that row on its own, and create no camera to do it.
+    """
+    _headers, email, _pid = await _setup_patient(client, auth_user)
+
+    r = await _enroll(client, "gw-token-ENROL", email)
+    assert r.status_code == 200, r.text
+    assert r.json() == {"ok": True, "already_enrolled": False}
+
+    uid, _ = auth_user
+    rows = await _gateway_rows(session, "gw-token-ENROL")
+    assert len(rows) == 1
+    assert str(rows[0][1]) == str(uid)
+
+    # No camera. The junk-camera workaround is exactly what this replaces.
+    cameras = (await session.execute(
+        text("SELECT count(*) FROM public.cameras WHERE caregiver_id = :c"),
+        {"c": str(uid)},
+    )).scalar_one()
+    assert cameras == 0
+
+
+@pytest.mark.asyncio
+async def test_enroll_never_echoes_the_token_back(
+    client: AsyncClient, auth_user, session: AsyncSession,
+) -> None:
+    """The response must carry neither the token nor its hash.
+
+    The caller already holds the plaintext, so returning it buys nothing
+    and puts a live credential into every proxy log and crash report on
+    the path. The hash is the stored secret's only server-side form and
+    is ours alone.
+    """
+    _headers, email, _pid = await _setup_patient(client, auth_user)
+    r = await _enroll(client, "gw-token-QUIET", email)
+    assert r.status_code == 200, r.text
+    assert "gw-token-QUIET" not in r.text
+    assert hash_ingest_token("gw-token-QUIET") not in r.text
+
+
+@pytest.mark.asyncio
+async def test_enroll_twice_does_not_make_a_second_gateway(
+    client: AsyncClient, auth_user, session: AsyncSession,
+) -> None:
+    """Re-enrolling lands on the SAME row.
+
+    A service re-POSTs this on every boot, so the second call is the
+    normal case, not the exception. Two rows sharing one token hash would
+    make the roster's `WHERE token_hash = :d` lookup ambiguous — it takes
+    `.first()`, so which gateway the box is would depend on row order.
+    """
+    _headers, email, _pid = await _setup_patient(client, auth_user)
+
+    first = await _enroll(client, "gw-token-TWICE", email)
+    assert first.json()["already_enrolled"] is False
+    second = await _enroll(client, "gw-token-TWICE", email)
+    assert second.status_code == 200, second.text
+    assert second.json()["already_enrolled"] is True
+
+    rows = await _gateway_rows(session, "gw-token-TWICE")
+    assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_enrolled_token_can_then_poll_the_roster(
+    client: AsyncClient, auth_user, session: AsyncSession,
+) -> None:
+    """The point of the whole endpoint: the 401 goes away.
+
+    This is what token rotation looks like from the backend's side — a
+    freshly minted token that has never provisioned anything. Before
+    enrolment the roster rejects it; after, it answers, assigns the box
+    its tunnel port, and reports an empty camera list rather than an
+    error. Nobody has to create a throwaway camera to get there.
+    """
+    _headers, email, _pid = await _setup_patient(client, auth_user)
+    auth = {"Authorization": "Bearer gw-token-ROTATED"}
+
+    before = await client.get("/v1/gateway/roster", headers=auth)
+    assert before.status_code == 401
+    assert before.json()["detail"] == "invalid_gateway_token"
+
+    assert (await _enroll(client, "gw-token-ROTATED", email)).status_code == 200
+
+    after = await client.get("/v1/gateway/roster", headers=auth)
+    assert after.status_code == 200, after.text
+    assert after.json()["cameras"] == []
+    assert after.json()["tunnel_port"] >= 22002
+
+
+@pytest.mark.asyncio
+async def test_enroll_rejects_an_email_with_no_account(
+    client: AsyncClient, auth_user, session: AsyncSession,
+) -> None:
+    """A typo'd email must not silently create an orphan gateway.
+
+    A gateways row with no caregiver behind it would poll forever and
+    return nothing, which reads on the box exactly like a broken backend.
+    Same 404 / `caregiver_not_found` as provisioning gives, and no row.
+    """
+    await _setup_patient(client, auth_user)
+    r = await _enroll(client, "gw-token-NOBODY", "nobody@example.invalid")
+    assert r.status_code == 404
+    assert r.json()["detail"] == "caregiver_not_found"
+    assert await _gateway_rows(session, "gw-token-NOBODY") == []
+
+
+@pytest.mark.asyncio
+async def test_enroll_refuses_a_missing_or_empty_bearer(
+    client: AsyncClient, auth_user, session: AsyncSession,
+) -> None:
+    """Enrolment writes an auth row, so it cannot be the soft spot.
+
+    It must fail the same two ways, with the same words, as every other
+    gateway endpoint: a caller with no header and a caller with an empty
+    one are told apart, and neither gets anywhere near the upsert.
+    """
+    _headers, email, _pid = await _setup_patient(client, auth_user)
+    body = {"email": email}
+
+    missing = await client.post("/v1/gateway/enroll", json=body)
+    assert missing.status_code == 401
+    assert missing.json()["detail"] == "missing_bearer_token"
+
+    empty = await client.post(
+        "/v1/gateway/enroll",
+        headers={"Authorization": "Bearer "},
+        json=body,
+    )
+    assert empty.status_code == 401
+    assert empty.json()["detail"] == "empty_bearer_token"
