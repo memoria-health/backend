@@ -799,11 +799,23 @@ class RoomWorker:
         self, publication: rtc.RemoteTrackPublication, camera_id
     ) -> None:
         """Pin the analytics ('think lane') simulcast layer for this
-        subscriber. MEDIUM = the 640x360 rung: every consumer is
-        satisfied (VLM tokens are resolution-independent, reid runs at
-        640w, block motion is a 32x18 grid), delivery holds full rate
-        because 360p never stresses the SFU's bandwidth estimator, and
-        buffers stay ~55MB/cam — the 2026-07-18 OOM class can't recur.
+        subscriber. HIGH (native) is the steady state. MEDIUM (640x360)
+        is a rollback lever for CPU starvation and buffer pressure only
+        — it is NOT quality-neutral, so do not reach for it to save
+        money:
+
+          - Identity needs native pixels. gpu/identity/loop.py measured
+            640px shipping (2026-07-26) and rejected it: ~9x off
+            wire/encode but only ~10% off GPU, "not worth the
+            small-distant-person detection risk". A face 20ft out has
+            too few pixels to embed at 360p.
+          - Gemini's token count IS resolution-independent (~12.4k input
+            tokens/call whether the SFU delivers 512x288 or 2304x1296),
+            but that is a COST fact, not an accuracy one — the same
+            price buys a worse picture.
+          - Block motion genuinely does not care (32x18 grid).
+
+        The cost lever is frame COUNT (TARGET_FPS), not resolution.
 
         History: with NO request, a width-0 UpdateTrackSettings default
         lands on VIDEO_QUALITY_LOW → the 320x180 rung at 2-9fps with
