@@ -90,11 +90,30 @@ _GATEWAY_CAM_WHERE = (
     "AND source_type = 'gateway' "
     "AND (gateway_id = :gw OR gateway_id IS NULL)")
 
+# A hosted service (the Warner bridge) serves MANY accounts, so the
+# caregiver filter above is exactly wrong for it — provisioning for a
+# second customer rebound the whole service and the first customer's
+# cameras vanished from the roster. Ownership is the gateway row and
+# nothing else here: no caregiver scope, and no `gateway_id IS NULL`
+# fallback, because an unowned camera belongs to whoever provisioned it
+# and a shared service must never guess. This is NARROWER than a box's
+# scope, which is what makes it safe to let a service ask for it.
+_BRIDGE_CAM_WHERE = (
+    "WHERE gateway_id = :gw "
+    "AND patient_id IS NOT NULL "
+    "AND source_type = 'gateway'")
+
 # The row every fleet member gets back. `privacy_enabled` is room-derived;
 # `audio_capture_enabled` is the STRICTEST covered patient (see the
 # COALESCE); `online` is the SUBSCRIBER's view of whether frames are
 # actually landing, which a publisher cannot see about itself.
-_GATEWAY_CAM_SELECT = (
+def _cam_select(multi_tenant: bool) -> str:
+    """The camera list, scoped by what this service IS."""
+    where = _BRIDGE_CAM_WHERE if multi_tenant else _GATEWAY_CAM_WHERE
+    return _GATEWAY_CAM_SELECT_HEAD + where + " ORDER BY created_at"
+
+
+_GATEWAY_CAM_SELECT_HEAD = (
     "SELECT id, livekit_identity, livekit_room, desired_state, "
     "privacy_enabled, online, "
     "COALESCE("
@@ -105,7 +124,7 @@ _GATEWAY_CAM_SELECT = (
     " (SELECT audio_capture_enabled FROM public.patients p "
     "   WHERE p.id = cameras.patient_id)"
     ") AS audio_capture_enabled "
-    f"FROM public.cameras {_GATEWAY_CAM_WHERE} ORDER BY created_at")
+    "FROM public.cameras ")
 
 FLEET_CONTRACT = "fleet-v1"
 
@@ -392,14 +411,15 @@ async def gateway_roster(
         )
     digest = hash_ingest_token(presented)
     gw = (await session.execute(
-        text("SELECT id, caregiver_id FROM public.gateways WHERE token_hash = :d"),
+        text("SELECT id, caregiver_id, multi_tenant FROM public.gateways "
+             " WHERE token_hash = :d"),
         {"d": digest},
     )).first()
     if gw is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_gateway_token",
         )
-    gateway_id, caregiver_id = gw[0], gw[1]
+    gateway_id, caregiver_id, multi_tenant = gw[0], gw[1], bool(gw[2])
     # Liveness (polling the roster IS the heartbeat) + reverse-SSH tunnel port
     # in one statement. The port is assigned lazily on the box's FIRST poll
     # (covers rows that predate the column too — no backfill needed); the box
@@ -427,13 +447,13 @@ async def gateway_roster(
     # camera can be on the account before anyone assigns it. `patient_id IS
     # NOT NULL` is what keeps those unassigned ones OUT of the roster, so
     # they never publish until someone says who they watch.
-    _cam_where = _GATEWAY_CAM_WHERE
+    _cam_where = _BRIDGE_CAM_WHERE if multi_tenant else _GATEWAY_CAM_WHERE
     await session.execute(
         text(f"UPDATE public.cameras SET last_heartbeat_at = now() {_cam_where}"),
         {"c": caregiver_id, "gw": gateway_id},
     )
     rows = (await session.execute(
-        text(_GATEWAY_CAM_SELECT), {"c": caregiver_id, "gw": gateway_id},
+        text(_cam_select(multi_tenant)), {"c": caregiver_id, "gw": gateway_id},
     )).all()
     await session.commit()
     # `privacy_enabled` (room-derived, 2026-07-27): when true the gateway
@@ -557,7 +577,14 @@ async def gateway_wait(
 
 
 class GatewayEnrollRequest(BaseModel):
-    """Body for the email-only enrolment of a service's bearer token."""
+    """Body for the email-only enrolment of a service's bearer token.
+
+    `service_kind` is how a HOSTED service says it serves many accounts.
+    Declaring it narrows what the service can see — cameras carrying its
+    own gateway_id and nothing else — so it grants nothing.
+    """
+
+    service_kind: str | None = None
     email: str
 
 
@@ -587,11 +614,11 @@ def _camera_rows(rows) -> list[dict]:
 
 async def _gateway_from_bearer(
     session: AsyncSession, authorization: str,
-) -> tuple[UUID, UUID]:
+) -> tuple[UUID, UUID, bool]:
     """Identify the polling service by its own bearer token.
 
     Only the sha256 is stored, so this is a hash lookup rather than a
-    comparison. Returns `(gateway_id, caregiver_id)`.
+    comparison. Returns `(gateway_id, caregiver_id, multi_tenant)`.
     """
     if not authorization.lower().startswith("bearer "):
         raise HTTPException(
@@ -603,18 +630,28 @@ async def _gateway_from_bearer(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="empty_bearer_token",
         )
     gw = (await session.execute(
-        text("SELECT id, caregiver_id FROM public.gateways WHERE token_hash = :d"),
+        text("SELECT id, caregiver_id, multi_tenant FROM public.gateways "
+             " WHERE token_hash = :d"),
         {"d": hash_ingest_token(presented)},
     )).first()
     if gw is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_gateway_token",
         )
-    return gw[0], gw[1]
+    return gw[0], gw[1], bool(gw[2])
+
+
+# Kinds that serve MANY caregiver accounts. A box in one home does not.
+_MULTI_TENANT_KINDS = frozenset({"camera-bridge"})
+
+
+def _is_multi_tenant(service_kind: str | None) -> bool:
+    return (service_kind or "").strip().lower() in _MULTI_TENANT_KINDS
 
 
 async def _enroll_gateway_token(
     session: AsyncSession, authorization: str, email: str, now: datetime,
+    service_kind: str | None = None,
 ) -> tuple[UUID, UUID, bool]:
     """Tie the presented bearer token to a caregiver account, idempotently.
 
@@ -652,21 +689,35 @@ async def _enroll_gateway_token(
     # instead of adding a second one for the same token.
     token_hash = hash_ingest_token(box_token)
     existing = (await session.execute(
-        text("SELECT id FROM public.gateways WHERE token_hash = :h"),
+        text("SELECT id, multi_tenant FROM public.gateways "
+             " WHERE token_hash = :h"),
         {"h": token_hash},
     )).first()
     if existing is None:
         gateway_id = (await session.execute(
-            text("INSERT INTO public.gateways (caregiver_id, token_hash, created_at) "
-                 "VALUES (:c, :h, :n) RETURNING id"),
-            {"c": caregiver_id, "h": token_hash, "n": now},
+            text("INSERT INTO public.gateways "
+                 " (caregiver_id, token_hash, created_at, multi_tenant) "
+                 "VALUES (:c, :h, :n, :mt) RETURNING id"),
+            {"c": caregiver_id, "h": token_hash, "n": now,
+             "mt": _is_multi_tenant(service_kind)},
         )).scalar_one()
         return gateway_id, caregiver_id, False
-    gateway_id = existing[0]
-    await session.execute(
-        text("UPDATE public.gateways SET caregiver_id = :c WHERE token_hash = :h"),
-        {"c": caregiver_id, "h": token_hash},
-    )
+    gateway_id, was_multi_tenant = existing[0], bool(existing[1])
+    if not was_multi_tenant and not _is_multi_tenant(service_kind):
+        # A BOX moves house: re-provisioned into a different home, so the
+        # binding follows. A hosted service must never be rewritten this
+        # way — it serves many accounts at once, and rebinding it to
+        # whoever was provisioned last made every other customer's
+        # cameras vanish from its roster, silently.
+        await session.execute(
+            text("UPDATE public.gateways SET caregiver_id = :c "
+                 " WHERE token_hash = :h"),
+            {"c": caregiver_id, "h": token_hash},
+        )
+    if _is_multi_tenant(service_kind) and not was_multi_tenant:
+        await session.execute(
+            text("UPDATE public.gateways SET multi_tenant = true "
+                 " WHERE token_hash = :h"), {"h": token_hash})
     return gateway_id, caregiver_id, True
 
 
@@ -693,6 +744,7 @@ async def gateway_enroll(
     """
     _gw, _cg, already = await _enroll_gateway_token(
         session, authorization, body.email, datetime.now(timezone.utc),
+        service_kind=body.service_kind,
     )
     await session.commit()
     return {"ok": True, "already_enrolled": already}
@@ -833,7 +885,8 @@ async def fleet_poll(
     house. Here only the cameras the service reports HEALTHY are stamped,
     and only those it actually owns.
     """
-    gateway_id, caregiver_id = await _gateway_from_bearer(session, authorization)
+    gateway_id, caregiver_id, multi_tenant = await _gateway_from_bearer(
+        session, authorization)
 
     if not body.contract and not body.service and not body.entities:
         raise HTTPException(
@@ -864,12 +917,14 @@ async def fleet_poll(
         # fleet as alive.
         await session.execute(
             text("UPDATE public.cameras SET last_heartbeat_at = now() "
-                 f"{_GATEWAY_CAM_WHERE} AND id = ANY(CAST(:ids AS uuid[]))"),
+                 + (_BRIDGE_CAM_WHERE if multi_tenant else _GATEWAY_CAM_WHERE)
+                 + " AND id = ANY(CAST(:ids AS uuid[]))"),
             {"c": caregiver_id, "gw": gateway_id, "ids": healthy},
         )
 
     rows = (await session.execute(
-        text(_GATEWAY_CAM_SELECT), {"c": caregiver_id, "gw": gateway_id},
+        text(_cam_select(multi_tenant)),
+        {"c": caregiver_id, "gw": gateway_id},
     )).all()
     await session.commit()
     return {"contract": FLEET_CONTRACT, "cameras": _camera_rows(rows)}
