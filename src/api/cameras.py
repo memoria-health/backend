@@ -22,7 +22,6 @@ from sqlalchemy import delete, func, select, text
 
 log = logging.getLogger(__name__)
 
-from src.api import cameras_ingest as pi_ingest_module
 from src.api.deps import CameraAuth, CaregiverAuth, SessionDep, SettingsDep
 from src.services import camera_coverage, room_classifier
 from src.services.detection import censor, frame_codec
@@ -1087,15 +1086,6 @@ async def update_camera(
     # HTTP push so the Pi sees EOF, reconnects, hits the desired_state
     # gate in /v1/cameras/me/frames, and switches into paused mode within
     # ~1 frame. Without this the Pi would keep streaming for the rest of
-    # the existing push connection's lifetime (long-lived). No-op for
-    # wall-phone rows (they have no active relay) and no-op when nothing
-    # is currently pushing — both safe by construction in
-    # cancel_active_relay.
-    if (
-        body.desired_state == "disconnected"
-        and cam.source_type == "pi"
-    ):
-        await pi_ingest_module.cancel_active_relay(camera_id)
     # Use the helper that derives `paired` from api_key_hash — bare
     # model_validate would fail since the ORM row has no `paired`
     # attribute (it's a Pydantic-only computed field).

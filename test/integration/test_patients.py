@@ -335,22 +335,16 @@ async def test_patch_cameras_paused_false_to_true_cascades_to_disconnected(
         source_type="pi", desired_state="connected",
     )
 
-    with patch(
-        "src.api.patients.pi_ingest_module.cancel_active_relay",
-        new=AsyncMock(return_value=False),
-    ) as mock_cancel:
-        r = await client.patch(
-            f"/v1/patients/{pid}", headers=headers,
-            json={"cameras_paused": True},
-        )
+    r = await client.patch(
+        f"/v1/patients/{pid}", headers=headers,
+        json={"cameras_paused": True},
+    )
 
     assert r.status_code == 200
     assert r.json()["cameras_paused"] is True
 
     assert await _camera_desired_state(iphone_id) == "disconnected"
     assert await _camera_desired_state(pi_id) == "disconnected"
-
-    mock_cancel.assert_awaited_once_with(pi_id)
 
 
 @pytest.mark.asyncio
@@ -376,22 +370,16 @@ async def test_patch_cameras_paused_true_to_false_cascades_to_connected(
         f"/v1/patients/{pid}", headers=headers, json={"cameras_paused": True},
     )
 
-    with patch(
-        "src.api.patients.pi_ingest_module.cancel_active_relay",
-        new=AsyncMock(return_value=False),
-    ) as mock_cancel:
-        r = await client.patch(
-            f"/v1/patients/{pid}", headers=headers,
-            json={"cameras_paused": False},
-        )
+    r = await client.patch(
+        f"/v1/patients/{pid}", headers=headers,
+        json={"cameras_paused": False},
+    )
 
     assert r.status_code == 200
     assert r.json()["cameras_paused"] is False
 
     assert await _camera_desired_state(iphone_id) == "connected"
     assert await _camera_desired_state(pi_id) == "connected"
-
-    mock_cancel.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -410,18 +398,13 @@ async def test_patch_cameras_paused_same_value_does_not_cascade(
         source_type="iphone", desired_state="disconnected",
     )
 
-    with patch(
-        "src.api.patients.pi_ingest_module.cancel_active_relay",
-        new=AsyncMock(return_value=False),
-    ) as mock_cancel:
-        r = await client.patch(
-            f"/v1/patients/{pid}", headers=headers,
-            json={"cameras_paused": False},
-        )
+    r = await client.patch(
+        f"/v1/patients/{pid}", headers=headers,
+        json={"cameras_paused": False},
+    )
 
     assert r.status_code == 200
     assert await _camera_desired_state(cam_id) == "disconnected"
-    mock_cancel.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -439,18 +422,13 @@ async def test_patch_without_cameras_paused_does_not_touch_cameras(
         source_type="iphone", desired_state="disconnected",
     )
 
-    with patch(
-        "src.api.patients.pi_ingest_module.cancel_active_relay",
-        new=AsyncMock(return_value=False),
-    ) as mock_cancel:
-        r = await client.patch(
-            f"/v1/patients/{pid}", headers=headers,
-            json={"preferred_name": "Margie"},
-        )
+    r = await client.patch(
+        f"/v1/patients/{pid}", headers=headers,
+        json={"preferred_name": "Margie"},
+    )
 
     assert r.status_code == 200
     assert await _camera_desired_state(cam_id) == "disconnected"
-    mock_cancel.assert_not_awaited()
 
 
 @pytest.mark.asyncio

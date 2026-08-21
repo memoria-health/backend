@@ -17,7 +17,6 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, File, HTTPException, UploadFile, status
 from pydantic import BaseModel
 
-from src.api import cameras_ingest as pi_ingest_module
 from src.api.deps import CaregiverAuth, SessionDep, SettingsDep
 from src.db.patient import Patient
 from src.errors import StorageError
@@ -197,8 +196,6 @@ async def patch_patient(
                 caregiver_id=auth.id,
                 desired_state=cascade_to,
             )
-            if cascade_to == "disconnected" and cam.source_type == "pi":
-                await pi_ingest_module.cancel_active_relay(cam.id)
 
     await session.commit()
 
