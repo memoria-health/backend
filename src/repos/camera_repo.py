@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from datetime import datetime, timezone
 from uuid import UUID
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.camera import Camera
@@ -20,12 +20,33 @@ from src.repos.access import accessible_patient_ids
 async def list_for_patient(
     session: AsyncSession, patient_id: UUID, *, caregiver_id: UUID
 ) -> Sequence[Camera]:
-    """Return every camera for a caregiver-owned patient."""
+    """Every camera that WATCHES this patient, not just the ones it owns.
+
+    A camera covers 0..N patients (`public.camera_patients`) and streams
+    into the PRIMARY patient's LiveKit room only — one camera, one
+    stream, one participant. That is a cost decision and it is the right
+    one: a second patient does not need a second copy of the same video.
+
+    But it is a decision about LiveKit, and it must not reach the app.
+    This filtered on `cameras.patient_id`, which holds the primary, so a
+    caregiver who assigned a camera to two patients opened the second one
+    and found nothing there. Both of them get the camera now, pointed at
+    the same room.
+    """
+    covered = (await session.execute(
+        text("SELECT camera_id FROM public.camera_patients "
+             " WHERE patient_id = :p"),
+        {"p": patient_id},
+    )).scalars().all()
+
     result = await session.execute(
         select(Camera)
+        # Scoped on the camera's PRIMARY patient, which is always one of
+        # this caregiver's — coverage cannot cross accounts, because
+        # set_coverage will not link a patient the caller does not own.
         .join(Patient, Patient.id == Camera.patient_id)
         .where(
-            Camera.patient_id == patient_id,
+            or_(Camera.patient_id == patient_id, Camera.id.in_(covered)),
             Patient.id.in_(accessible_patient_ids(caregiver_id)),
         )
         .order_by(Camera.display_id.asc())

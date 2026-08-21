@@ -47,7 +47,13 @@ class CameraResponse(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     id: UUID
+    # The PRIMARY patient. A camera can cover others; see livekit_room.
     patient_id: UUID
+    # The room this camera actually publishes into — always the primary
+    # patient's. A client showing a SECOND covered patient must join
+    # this, not `patient_<the patient on screen>`, or it joins an empty
+    # room and shows a black tile.
+    livekit_room: str | None = None
     display_id: int
     room: Room
     icon_name: IconName

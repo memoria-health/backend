@@ -71,6 +71,7 @@ def _to_response(c: Camera) -> CameraResponse:
     return CameraResponse(
         id=c.id,
         patient_id=c.patient_id,
+        livekit_room=c.livekit_room,
         display_id=c.display_id,
         room=c.room,
         icon_name=c.icon_name,
