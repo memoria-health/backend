@@ -203,3 +203,66 @@ async def test_roster_reports_backend_view_of_frames_arriving(
     )
     await session.commit()
     assert (await _rows())[camera_id] is True
+
+
+@pytest.mark.asyncio
+async def test_audio_kill_honours_every_covered_patient(
+    client: AsyncClient, auth_user, session: AsyncSession,
+) -> None:
+    """A shared camera must obey the STRICTEST covered patient.
+
+    A camera covering two patients streams into the primary's room, so
+    the roster derived `audio_capture_enabled` from `cameras.patient_id`
+    — the primary — and a secondary patient's audio-off was silently
+    ignored. That is the same fall-back-to-primary we removed from
+    identity, sitting in the facilities audio kill, where the failure is
+    a microphone open at a site that does not permit recording.
+    """
+    uid, email = auth_user
+    headers = {"Authorization": f"Bearer {mint_test_jwt(uid, email)}"}
+    await client.post("/v1/me", headers=headers, json={"display_name": "Test"})
+    primary = (await client.post(
+        "/v1/patients", headers=headers, json=_PATIENT_BODY)).json()
+    secondary = (await client.post(
+        "/v1/patients", headers=headers,
+        json={**_PATIENT_BODY, "full_name": "Arthur O'Brien"})).json()
+
+    resp = await _provision(client, email, "gw-token-AUDIO", room="Shared Room")
+    camera_id = resp["cameras"][0]["camera_id"]
+    cover = await client.post(
+        f"/v1/cameras/{camera_id}/coverage", headers=headers,
+        json={"primary_patient_id": primary["id"],
+              "also_patient_ids": [secondary["id"]]},
+    )
+    assert cover.status_code == 200, cover.text
+
+    async def _audio() -> bool:
+        r = await client.get(
+            "/v1/gateway/roster",
+            headers={"Authorization": "Bearer gw-token-AUDIO"},
+        )
+        assert r.status_code == 200, r.text
+        rows = {c["camera_id"]: c["audio_capture_enabled"]
+                for c in r.json()["cameras"]}
+        return rows[camera_id]
+
+    # Both permit it.
+    await session.execute(
+        text("UPDATE public.patients SET audio_capture_enabled = true "
+             "WHERE id IN (:a, :b)"),
+        {"a": primary["id"], "b": secondary["id"]},
+    )
+    await session.commit()
+    assert await _audio() is True
+
+    # The SECONDARY says no. The primary still says yes.
+    await session.execute(
+        text("UPDATE public.patients SET audio_capture_enabled = false "
+             "WHERE id = :b"),
+        {"b": secondary["id"]},
+    )
+    await session.commit()
+    assert await _audio() is False, (
+        "a covered patient's audio-off was ignored because the roster "
+        "reads the primary only"
+    )

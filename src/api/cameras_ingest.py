@@ -401,8 +401,23 @@ async def gateway_roster(
     rows = (await session.execute(
         text("SELECT id, livekit_identity, livekit_room, desired_state, "
              "privacy_enabled, online, "
-             "(SELECT audio_capture_enabled FROM public.patients p "
-             " WHERE p.id = patient_id) AS audio_capture_enabled "
+             # The STRICTEST covered patient wins. A shared camera
+             # streams into the primary's room, so reading
+             # cameras.patient_id read the primary ONLY and a secondary
+             # patient's audio-off was silently ignored — the same
+             # fall-back-to-primary we removed from identity, here in
+             # the facilities audio kill, where being wrong means a
+             # microphone open at a site that forbids recording.
+             # COALESCE covers a camera with no coverage rows yet
+             # (pre-backfill); patient_id still mirrors the primary.
+             "COALESCE("
+             " (SELECT bool_and(p.audio_capture_enabled)"
+             "    FROM public.camera_patients cp"
+             "    JOIN public.patients p ON p.id = cp.patient_id"
+             "   WHERE cp.camera_id = cameras.id),"
+             " (SELECT audio_capture_enabled FROM public.patients p "
+             "   WHERE p.id = cameras.patient_id)"
+             ") AS audio_capture_enabled "
              f"FROM public.cameras {_cam_where} ORDER BY created_at"),
         {"c": caregiver_id, "gw": gateway_id},
     )).all()
@@ -483,8 +498,19 @@ async def gateway_wait(
         rows = (await session.execute(
             text("SELECT id, livekit_identity, livekit_room, desired_state, "
                  "privacy_enabled, "
-                 "(SELECT audio_capture_enabled FROM public.patients p "
-                 " WHERE p.id = patient_id) AS audio_capture_enabled "
+                 # Same strictest-covered-patient rule as the roster. It
+                 # has to match exactly: this feeds the fingerprint the
+                 # long poll wakes on, so a disagreement here would wake
+                 # the box to be told the opposite of what the roster
+                 # says, forever.
+                 "COALESCE("
+                 " (SELECT bool_and(p.audio_capture_enabled)"
+                 "    FROM public.camera_patients cp"
+                 "    JOIN public.patients p ON p.id = cp.patient_id"
+                 "   WHERE cp.camera_id = cameras.id),"
+                 " (SELECT audio_capture_enabled FROM public.patients p "
+                 "   WHERE p.id = cameras.patient_id)"
+                 ") AS audio_capture_enabled "
                  "FROM public.cameras WHERE patient_id IN "
                  "(SELECT id FROM public.patients WHERE caregiver_id = :c) "
                  "AND source_type = 'gateway' "
