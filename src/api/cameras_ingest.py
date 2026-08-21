@@ -72,6 +72,43 @@ _active_relays: dict[str, asyncio.Task[None]] = {}
 # uses for the pull-mode response Content-Type.
 _BOUNDARY_RE = re.compile(rb'boundary="?([^";\s]+)"?')
 
+# Which cameras a gateway box owns. Ownership is the ACCOUNT
+# (cameras.caregiver_id), not the patient — a camera can be on the account
+# before anyone assigns it, and `patient_id IS NOT NULL` is what keeps
+# those unassigned ones out so they never publish until someone says who
+# they watch. `gateway_id IS NULL` is the transitional fallback until the
+# ownership backfill fills it in.
+#
+# Module level because both /gateway/roster and /fleet/poll answer the
+# same question. Two copies of this predicate would eventually disagree
+# about which cameras a box owns, which is how the audio-kill bug got to
+# live in two endpoints at once.
+_GATEWAY_CAM_WHERE = (
+    "WHERE (caregiver_id = :c OR patient_id IN "
+    "      (SELECT id FROM public.patients WHERE caregiver_id = :c)) "
+    "AND patient_id IS NOT NULL "
+    "AND source_type = 'gateway' "
+    "AND (gateway_id = :gw OR gateway_id IS NULL)")
+
+# The row every fleet member gets back. `privacy_enabled` is room-derived;
+# `audio_capture_enabled` is the STRICTEST covered patient (see the
+# COALESCE); `online` is the SUBSCRIBER's view of whether frames are
+# actually landing, which a publisher cannot see about itself.
+_GATEWAY_CAM_SELECT = (
+    "SELECT id, livekit_identity, livekit_room, desired_state, "
+    "privacy_enabled, online, "
+    "COALESCE("
+    " (SELECT bool_and(p.audio_capture_enabled)"
+    "    FROM public.camera_patients cp"
+    "    JOIN public.patients p ON p.id = cp.patient_id"
+    "   WHERE cp.camera_id = cameras.id),"
+    " (SELECT audio_capture_enabled FROM public.patients p "
+    "   WHERE p.id = cameras.patient_id)"
+    ") AS audio_capture_enabled "
+    f"FROM public.cameras {_GATEWAY_CAM_WHERE} ORDER BY created_at")
+
+FLEET_CONTRACT = "fleet-v1"
+
 
 def _extract_boundary(content_type: str | None) -> bytes:
     """Pull the boundary parameter out of the Content-Type header.
@@ -390,37 +427,13 @@ async def gateway_roster(
     # camera can be on the account before anyone assigns it. `patient_id IS
     # NOT NULL` is what keeps those unassigned ones OUT of the roster, so
     # they never publish until someone says who they watch.
-    _cam_where = ("WHERE (caregiver_id = :c OR patient_id IN "
-                  "      (SELECT id FROM public.patients WHERE caregiver_id = :c)) "
-                  "AND patient_id IS NOT NULL "
-                  "AND source_type = 'gateway' "
-                  "AND (gateway_id = :gw OR gateway_id IS NULL)")
+    _cam_where = _GATEWAY_CAM_WHERE
     await session.execute(
         text(f"UPDATE public.cameras SET last_heartbeat_at = now() {_cam_where}"),
         {"c": caregiver_id, "gw": gateway_id},
     )
     rows = (await session.execute(
-        text("SELECT id, livekit_identity, livekit_room, desired_state, "
-             "privacy_enabled, online, "
-             # The STRICTEST covered patient wins. A shared camera
-             # streams into the primary's room, so reading
-             # cameras.patient_id read the primary ONLY and a secondary
-             # patient's audio-off was silently ignored — the same
-             # fall-back-to-primary we removed from identity, here in
-             # the facilities audio kill, where being wrong means a
-             # microphone open at a site that forbids recording.
-             # COALESCE covers a camera with no coverage rows yet
-             # (pre-backfill); patient_id still mirrors the primary.
-             "COALESCE("
-             " (SELECT bool_and(p.audio_capture_enabled)"
-             "    FROM public.camera_patients cp"
-             "    JOIN public.patients p ON p.id = cp.patient_id"
-             "   WHERE cp.camera_id = cameras.id),"
-             " (SELECT audio_capture_enabled FROM public.patients p "
-             "   WHERE p.id = cameras.patient_id)"
-             ") AS audio_capture_enabled "
-             f"FROM public.cameras {_cam_where} ORDER BY created_at"),
-        {"c": caregiver_id, "gw": gateway_id},
+        text(_GATEWAY_CAM_SELECT), {"c": caregiver_id, "gw": gateway_id},
     )).all()
     await session.commit()
     # `privacy_enabled` (room-derived, 2026-07-27): when true the gateway
@@ -440,14 +453,7 @@ async def gateway_roster(
     # Deliberately NOT in /gateway/wait's fingerprint — `online` flaps
     # on ordinary blips, and fingerprinting it would wake the long poll
     # constantly for something the 3s roster poll delivers anyway.
-    return {"tunnel_port": tunnel_port, "cameras": [
-        {"camera_id": str(r[0]), "livekit_identity": r[1],
-         "livekit_room": r[2], "desired_state": r[3],
-         "privacy_enabled": bool(r[4]),
-         "online": bool(r[5]),
-         "audio_capture_enabled": bool(r[6]) if r[6] is not None else True}
-        for r in rows
-    ]}
+    return {"tunnel_port": tunnel_port, "cameras": _camera_rows(rows)}
 
 
 @router.get(
@@ -523,8 +529,9 @@ async def gateway_wait(
         cams = [{"camera_id": str(r[0]), "livekit_identity": r[1],
                  "livekit_room": r[2], "desired_state": r[3],
                  "privacy_enabled": bool(r[4]),
+                 # Fails CLOSED, matching _camera_rows above.
                  "audio_capture_enabled":
-                     bool(r[5]) if r[5] is not None else True}
+                     bool(r[5]) if r[5] is not None else False}
                 for r in rows]
         # privacy_enabled + audio_capture_enabled ride in the fingerprint
         # so a classifier / reclassify / audio-kill flip wakes the
@@ -558,6 +565,52 @@ class GatewayProvisionRequest(GatewayEnrollRequest):
     """Body for the email-only gateway provision (no caregiver password)."""
     room: str = "Camera"
     icon_name: str = "tv"
+
+
+def _camera_rows(rows) -> list[dict]:
+    """One shape for every fleet member, so the roster and the fleet poll
+    cannot answer the same question differently."""
+    return [
+        {"camera_id": str(r[0]), "livekit_identity": r[1],
+         "livekit_room": r[2], "desired_state": r[3],
+         "privacy_enabled": bool(r[4]),
+         "online": bool(r[5]),
+         # NULL means we could not determine it, and the flag means
+         # "this site does not permit recording audio". Defaulting to
+         # permitted is the unsafe direction, and the bridge already
+         # defaults the same field to False for the same reason — the
+         # two ends of the contract must agree on which way is safe.
+         "audio_capture_enabled": bool(r[6]) if r[6] is not None else False}
+        for r in rows
+    ]
+
+
+async def _gateway_from_bearer(
+    session: AsyncSession, authorization: str,
+) -> tuple[UUID, UUID]:
+    """Identify the polling service by its own bearer token.
+
+    Only the sha256 is stored, so this is a hash lookup rather than a
+    comparison. Returns `(gateway_id, caregiver_id)`.
+    """
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="missing_bearer_token",
+        )
+    presented = authorization[len("bearer "):].strip()
+    if not presented:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="empty_bearer_token",
+        )
+    gw = (await session.execute(
+        text("SELECT id, caregiver_id FROM public.gateways WHERE token_hash = :d"),
+        {"d": hash_ingest_token(presented)},
+    )).first()
+    if gw is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_gateway_token",
+        )
+    return gw[0], gw[1]
 
 
 async def _enroll_gateway_token(
@@ -738,3 +791,85 @@ async def gateway_provision_camera(
     await session.commit()
     return {"caregiver_email": body.email, "provisioned": len(cameras),
             "cameras": cameras}
+
+
+class FleetPollRequest(BaseModel):
+    """A fleet member's report. See docs/design/fleet-service-contract.md.
+
+    Loosely typed on purpose: the backend must accept a report from a
+    service one version ahead without rejecting it, and `contract` is what
+    guards against actually misreading one.
+    """
+
+    contract: str = ""
+    service: dict = {}
+    entities: list[dict] = []
+
+
+@router.post(
+    "/fleet/poll",
+    status_code=status.HTTP_200_OK,
+    response_model=None,
+)
+async def fleet_poll(
+    body: FleetPollRequest,
+    session: SessionDep,
+    authorization: str = Header(default=""),
+) -> dict:
+    """Report first, then be told what to run.
+
+    The camera bridge polled `/gateway/roster` for `desired_state`,
+    `privacy_enabled` and `audio_capture_enabled`, acted on none of them,
+    and reported nothing back — and nothing detected that for weeks,
+    because reporting was optional and acting was unverified. Making the
+    report a PRECONDITION of the instruction fixes that structurally: a
+    service that stops reporting stops being told what to do, and goes
+    visibly stale within one poll interval.
+
+    The second rule is that liveness is per CAMERA. `/gateway/roster`
+    stamps `last_heartbeat_at` for every camera on the box simply because
+    the box is polling, so a camera whose worker died ten minutes ago
+    still reads as healthy — and a blind camera looks exactly like a quiet
+    house. Here only the cameras the service reports HEALTHY are stamped,
+    and only those it actually owns.
+    """
+    gateway_id, caregiver_id = await _gateway_from_bearer(session, authorization)
+
+    if not body.contract and not body.service and not body.entities:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="a poll must carry a report; see the fleet-service contract",
+        )
+    if body.contract != FLEET_CONTRACT:
+        # A version we cannot read is refused rather than half-parsed,
+        # the same rule gpu/identity/contract.py already applies where a
+        # mismatch means "no verdict" instead of a silent misparse.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"unsupported contract {body.contract!r}, expected "
+                   f"{FLEET_CONTRACT!r}",
+        )
+    if not isinstance(body.service, dict) or not body.service.get("instance_id"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="report must name the reporting instance",
+        )
+
+    healthy = [e.get("id") for e in body.entities
+               if isinstance(e, dict) and e.get("healthy") and e.get("id")]
+    if healthy:
+        # Scoped by the ownership predicate as well as by the reported
+        # ids: the report is data from a client, so trusting the ids
+        # alone would let any enrolled service mark any camera in the
+        # fleet as alive.
+        await session.execute(
+            text("UPDATE public.cameras SET last_heartbeat_at = now() "
+                 f"{_GATEWAY_CAM_WHERE} AND id = ANY(CAST(:ids AS uuid[]))"),
+            {"c": caregiver_id, "gw": gateway_id, "ids": healthy},
+        )
+
+    rows = (await session.execute(
+        text(_GATEWAY_CAM_SELECT), {"c": caregiver_id, "gw": gateway_id},
+    )).all()
+    await session.commit()
+    return {"contract": FLEET_CONTRACT, "cameras": _camera_rows(rows)}
