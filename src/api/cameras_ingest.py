@@ -53,7 +53,7 @@ from src.api import health as health_mod
 from src.api.deps import SessionDep, SettingsDep
 from src.db.camera import Camera
 from src.repos import camera_detector_repo
-from src.services.ingest.pi.auth import hash_ingest_token, mint_ingest_token
+from src.services.fleet_auth import hash_ingest_token, mint_ingest_token
 from src.services.ingest.pi.mjpeg_reader import parse_mjpeg
 from src.services.ingest.pi.relay_publisher import RelayConfig, RelayPublisher
 

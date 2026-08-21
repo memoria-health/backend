@@ -26,7 +26,7 @@ from httpx import AsyncClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.services.ingest.pi.auth import hash_ingest_token
+from src.services.fleet_auth import hash_ingest_token
 from test.conftest import mint_test_jwt
 
 _PATIENT_BODY = {

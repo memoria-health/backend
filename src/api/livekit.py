@@ -221,7 +221,7 @@ async def _resolve_gateway_camera_or_401(
     """
     from sqlalchemy import text
 
-    from src.services.ingest.pi.auth import hash_ingest_token
+    from src.services.fleet_auth import hash_ingest_token
 
     if credentials.credentials is None or not credentials.credentials.strip():
         raise _INVALID

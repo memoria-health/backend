@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.services.ingest.pi.auth import (
+from src.services.fleet_auth import (
     INGEST_TOKEN_HASH_LENGTH,
     hash_ingest_token,
     mint_ingest_token,

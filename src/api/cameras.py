@@ -26,7 +26,7 @@ from src.api import cameras_ingest as pi_ingest_module
 from src.api.deps import CameraAuth, CaregiverAuth, SessionDep, SettingsDep
 from src.services import camera_coverage, room_classifier
 from src.services.detection import censor, frame_codec
-from src.services.ingest.pi.auth import mint_ingest_token
+from src.services.fleet_auth import mint_ingest_token
 from src.db.camera import Camera
 from src.repos import (
     camera_detector_repo,

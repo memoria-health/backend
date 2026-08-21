@@ -1,30 +1,15 @@
-"""Pi-camera ingest bearer-token mint + verify.
+"""Bearer credentials for the services that talk to this backend.
 
-The token authenticates the Pi when it POSTs frames to
-`/v1/cameras/me/frames`. Lifecycle:
+Camera bridges, gateway boxes, and anything else in the fleet. A service
+holds a plaintext token; the backend stores only its sha256 and looks it
+up on every poll, so a leaked database does not leak service credentials.
 
-  1. `mint_ingest_token()` at provision time produces
-     `(plaintext, sha256_hex)`. Backend stores the hash on the
-     `cameras` row and returns the plaintext to the Pi (via the next
-     announce response, the only Pi-facing channel before the camera
-     has any other credentials).
-  2. Pi includes `Authorization: Bearer <plaintext>` on every frame-
-     push connection. The push endpoint hashes the presented token
-     and looks up the matching `cameras.ingest_token_hash`.
-  3. To rotate, mint a new token and overwrite the hash. The Pi
-     picks up the new value on its next announce response.
-
-The plaintext is 32 random bytes URL-safe-base64 encoded (43 chars
-without padding). Long enough to make brute-force lookup against the
-hashed column infeasible without DB access. The hash is SHA-256 hex
-(64 chars), unsalted: because the token is high-entropy random and
-only one is ever issued per camera, salting buys nothing the entropy
-doesn't already provide and would require a column-scan lookup
-instead of an indexed equality match.
-
-Constant-time comparison guards against timing attacks even though
-the surface area is tiny (the only attacker channel is the push
-endpoint itself, rate-limited at the transport layer).
+Lived in `services/ingest/pi/` until 2026-08-21, which was doubly wrong:
+there is no Raspberry Pi in the product, and this is not ingest — it is
+the credential system every fleet endpoint depends on (`/gateway/roster`,
+`/gateway/enroll`, `/fleet/poll`, `/livekit/token`). The name mattered
+because "delete the pi code, it is unused" is a reasonable-sounding
+instruction that would have taken camera auth down with it.
 """
 
 from __future__ import annotations
