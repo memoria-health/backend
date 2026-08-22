@@ -123,18 +123,26 @@ class IdentityRouter:
                 row = (
                     await session.execute(
                         text(
-                            # base_url is the HOST; the port is per-room,
-                            # because the node runs one process per room. A
-                            # node-level URL alone reaches exactly one home
-                            # and silently starves the rest.
-                            "SELECT n.base_url, p.identity_port "
+                            # base_url is the HOST; the port is per
+                            # SENSOR, because the node runs one process
+                            # per sensor. A node-level URL alone reaches
+                            # exactly one of them and starves the rest.
+                            #
+                            # A direct read since 2026-08-22. This used
+                            # to reach the port by matching the room name
+                            # against a patient — two joins to answer a
+                            # question the sensor row now holds itself,
+                            # and one that resolved to nothing once rooms
+                            # became the account's. That fails OPEN, so
+                            # every bridge sensor would have logged
+                            # "unassigned" and run with no identity at
+                            # all rather than erroring.
+                            "SELECT n.base_url, c.identity_port "
                             "  FROM public.cameras c "
-                            "  JOIN public.patients p "
-                            "    ON c.livekit_room = 'patient_' || p.id::text "
                             "  JOIN public.identity_nodes n "
-                            "    ON n.node_id = p.identity_node_id "
+                            "    ON n.node_id = c.identity_node_id "
                             " WHERE c.id = :cid "
-                            "   AND p.identity_port IS NOT NULL"
+                            "   AND c.identity_port IS NOT NULL"
                         ),
                         {"cid": key},
                     )

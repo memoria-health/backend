@@ -1291,6 +1291,41 @@ class CameraIngest:
             except Exception:
                 log.exception("%s reid.label_clip crashed", self._log_tag)
                 identity = IdentityResult.empty()
+
+            # Coverage, resolved here rather than at promotion time,
+            # because identity has to be asked about each patient while
+            # the tick's state is still cached.
+            async with self._sessionmaker() as _cov_session:
+                covered_now = await camera_coverage.coverage(
+                    _cov_session, self.camera_id)
+
+            # And once more for every OTHER patient this sensor covers.
+            # `_state()` is cached for the tick, so N patients cost one
+            # HTTP call, not N. Identity keys `seats` by patient and
+            # refuses to resolve an absent one to anybody else, so this
+            # is the only way to learn who is actually in frame when a
+            # sensor watches two people. The primary's answer is reused
+            # rather than re-fetched.
+            identity_by_patient = {self.patient_id: identity}
+            for _pid in covered_now:
+                if _pid in identity_by_patient:
+                    continue
+                try:
+                    identity_by_patient[_pid] = await self._reid.label_clip(
+                        mp4_bytes=mp4_bytes,
+                        patient_id=_pid,
+                        camera_id=self.camera_id,
+                        face_evidence=False,
+                        mode=reid_mode,
+                        tick_seq=self._tick_counter,
+                        capture_ts=_capture_ts,
+                    )
+                except Exception:
+                    log.exception(
+                        "%s reid.label_clip crashed for covered patient %s",
+                        self._log_tag, _pid,
+                    )
+                    identity_by_patient[_pid] = IdentityResult.empty()
             # W3 identity lock: fold this tick into the sticky lock —
             # fresh PATIENT evidence (re)enters it; a held lock rides
             # through blur/track-death and upgrades the result so every
@@ -2031,17 +2066,40 @@ class CameraIngest:
             # no coverage is filtered out of the roster and cannot tick
             # in the first place.
             covered = await camera_coverage.coverage(session, self.camera_id)
+            # One promotion per covered patient, and every one of them is
+            # dispatched. This kept only the first result and discarded
+            # the rest, so on a shared sensor a second resident's fall was
+            # written to `events` and then went nowhere — no push, no
+            # email, no page, no clip.
+            #
+            # Each patient is judged on THEIR OWN identity answer, not on
+            # one patient's answer applied to everybody:
+            #   identity locates P  -> P's detectors fire for P
+            #   identity locates no-one -> SAFETY fires for every covered
+            #     patient (a fall nobody can attribute is still a fall),
+            #     and non-safety fires for none of them, because filing
+            #     one resident's routine onto another is not recoverable.
+            # The second rule lives in `event_promotion`; what changed
+            # here is that it now receives the right patient's flag.
+            promotions: list = []
             promotion = None
             for pid in covered:
+                fields_for_patient = dict(result.detector_fields)
+                per_patient = identity_by_patient.get(pid)
+                if per_patient is not None:
+                    fields_for_patient["identity_patient_in_clip"] = (
+                        per_patient.reid_ran and per_patient.patient_in_clip
+                    )
                 result_for_patient = await maybe_promote_analysis(
                     session,
                     patient_id=pid,
                     camera_id=self.camera_id,
                     occurred_at=captured_at,
                     description=result.description,
-                    detector_fields=result.detector_fields,
+                    detector_fields=fields_for_patient,
                     settings=self._settings,
                 )
+                promotions.append(result_for_patient)
                 # The primary's outcome is the one the tick log reports.
                 if promotion is None or pid == self.patient_id:
                     promotion = result_for_patient
@@ -2068,8 +2126,11 @@ class CameraIngest:
             # rolled-back tick must not leave a phantom push trail.
             # Fire-and-forget: tick latency stays bound by Gemini, not
             # by Apple's push endpoint.
-            if promotion.fired:
-                fired_ids = [ev.id for ev in promotion.fired]
+            # Every covered patient's fired events, not just the
+            # primary's — the whole point of the loop above.
+            all_fired = [ev for pr in promotions for ev in (pr.fired or [])]
+            if all_fired:
+                fired_ids = [ev.id for ev in all_fired]
                 # Event gate: when patients.event_gate_enabled is OFF
                 # (the default, and true for every patient today) this
                 # dispatches push+email exactly as before. ON holds the
@@ -2144,28 +2205,35 @@ class CameraIngest:
                     if pre_frames
                     else window[-1].captured_at
                 )
-                for fired_event in promotion.fired:
-                    asyncio.create_task(
-                        clip_archival.archive_event(
-                            event_id=fired_event.id,
-                            patient_id=self.patient_id,
-                            camera_id=self.camera_id,
-                            pre_frames=pre_frames,
-                            pre_pcm=clip_pre_pcm,
-                            pre_pcm_start=clip_pre_pcm_start,
-                            pre_end_captured_at=pre_end_captured_at,
-                            frame_buffer=self.frame_buffer,
-                            audio_buffer=self.audio_buffer,
-                            sessionmaker=self._sessionmaker,
-                            settings=self._settings,
-                        ),
-                        name=f"clip-archive-{fired_event.id}",
-                    )
+                # Every covered patient's events, each clipped under the
+                # patient it fired for. This looped only the primary's,
+                # so a second resident's safety event had no clip.
+                for pr in promotions:
+                    for fired_event in (pr.fired or []):
+                        _pid_for_clip = getattr(
+                            fired_event, "patient_id", None) or self.patient_id
+                        asyncio.create_task(
+                            clip_archival.archive_event(
+                                event_id=fired_event.id,
+                                patient_id=_pid_for_clip,
+                                camera_id=self.camera_id,
+                                pre_frames=pre_frames,
+                                pre_pcm=clip_pre_pcm,
+                                pre_pcm_start=clip_pre_pcm_start,
+                                pre_end_captured_at=pre_end_captured_at,
+                                frame_buffer=self.frame_buffer,
+                                audio_buffer=self.audio_buffer,
+                                sessionmaker=self._sessionmaker,
+                                settings=self._settings,
+                            ),
+                            name=f"clip-archive-{fired_event.id}",
+                        )
 
             log.info(
                 "%s DONE provider=%s people=%s(%s) src=%s motion=%s "
                 "state=%s/%s events_fired=%d dedup=%d",
                 self._log_tag, used_provider, gate_people_present, gate_people_count,
                 present_src, motion_in_clip, state_after_state, no_people_count_log,
-                len(promotion.fired), len(promotion.skipped_for_dedup),
+                len(all_fired),
+                sum(len(pr.skipped_for_dedup) for pr in promotions),
             )

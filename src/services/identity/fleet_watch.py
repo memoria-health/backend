@@ -42,7 +42,7 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import text
 
-from src.api.identity_roster import _LIVE_CAM
+from src.api.identity_roster import _LIVE_SENSOR
 from src.services import pager
 
 if TYPE_CHECKING:
@@ -158,12 +158,12 @@ class FleetWatch:
             # because the roster has not yet got round to releasing it and
             # the home is just as blind in the meantime.
             blind = (await session.execute(text(
-                "SELECT count(*) FROM public.patients p "
-                " WHERE " + _LIVE_CAM + " AND ("
-                "       p.identity_node_id IS NULL "
+                "SELECT count(*) FROM public.cameras c "
+                " WHERE " + _LIVE_SENSOR + " AND ("
+                "       c.identity_node_id IS NULL "
                 "    OR NOT EXISTS ("
                 "         SELECT 1 FROM public.identity_nodes n "
-                "          WHERE n.node_id = p.identity_node_id "
+                "          WHERE n.node_id = c.identity_node_id "
                 "            AND n.last_seen_at > now() - make_interval("
                 "                  secs => :stale)))"
             ), {"stale": stale_s})).scalar() or 0
@@ -176,23 +176,23 @@ class FleetWatch:
             # node, and is otherwise invisible because it has no node row
             # to have aged.
             overdue = (await session.execute(text(
-                "SELECT count(*) FROM public.patients p "
+                "SELECT count(*) FROM public.cameras c "
                 " LEFT JOIN public.identity_nodes n "
-                "        ON n.node_id = p.identity_node_id "
-                " WHERE " + _LIVE_CAM +
-                "   AND (p.identity_node_id IS NULL "
+                "        ON n.node_id = c.identity_node_id "
+                " WHERE " + _LIVE_SENSOR +
+                "   AND (c.identity_node_id IS NULL "
                 "        OR n.last_seen_at <= now() - make_interval("
                 "             secs => :stale)) "
-                "   AND COALESCE(n.last_seen_at, p.created_at) "
+                "   AND COALESCE(n.last_seen_at, c.created_at) "
                 "       < now() - make_interval(secs => :grace)"
             ), {"stale": stale_s, "grace": UNASSIGNED_GRACE_S})).scalar() or 0
 
             # Nodes that were serving homes and have stopped polling.
             down = (await session.execute(text(
-                "SELECT n.node_id, count(p.id), "
+                "SELECT n.node_id, count(c.id), "
                 "       EXTRACT(EPOCH FROM now() - n.last_seen_at)::int "
                 "  FROM public.identity_nodes n "
-                "  LEFT JOIN public.patients p ON p.identity_node_id = n.node_id "
+                "  LEFT JOIN public.cameras c ON c.identity_node_id = n.node_id "
                 " WHERE n.last_seen_at <= now() - make_interval(secs => :stale) "
                 " GROUP BY n.node_id, n.last_seen_at"
             ), {"stale": stale_s})).all()
@@ -242,11 +242,11 @@ class FleetWatch:
         tick_s = float(self._settings.livekit_worker_tick_seconds)
         async with self._sessionmaker() as session:
             served = (await session.execute(text(
-                "SELECT p.id::text, n.node_id, n.base_url, p.identity_port "
-                "  FROM public.patients p "
+                "SELECT c.id::text, n.node_id, n.base_url, c.identity_port "
+                "  FROM public.cameras c "
                 "  JOIN public.identity_nodes n "
-                "    ON n.node_id = p.identity_node_id "
-                " WHERE p.identity_port IS NOT NULL "
+                "    ON n.node_id = c.identity_node_id "
+                " WHERE c.identity_port IS NOT NULL "
                 "   AND n.last_seen_at > now() - make_interval(secs => :stale)"
             ), {"stale": stale_s})).all()
 

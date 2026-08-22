@@ -43,7 +43,7 @@ from src.services.data_collection.manager import RecorderManager
 from src.services.data_collection.manager import temp_root as recorder_temp_root
 from src.services.detection import frame_codec
 from src.services.detection.camera_ingest import CameraIngest
-from src.services.detection.patient_presence import PatientPresence
+from src.services.detection.patient_presence import PresenceRegistry
 from src.services.detection.room_reconciler import LiveKitRoomReconciler
 
 if TYPE_CHECKING:
@@ -206,9 +206,12 @@ class RoomWorker:
         self._sessionmaker = sessionmaker
         self._motion_cache = motion_cache
         self._reid = reid
-        # One per room (= per patient): "patient confirmed on camera A
-        # ⇒ patient-scoped detectors skip on B/C" (2026-07-18).
-        self._patient_presence = PatientPresence()
+        # Keyed by PATIENT, not by room. "Patient confirmed on camera A
+        # ⇒ their patient-scoped detectors skip on B/C" (2026-07-18) was
+        # one instance per room while a room was a patient; an account
+        # room holds every resident, so one registry would have let one
+        # person's presence suppress another's detectors.
+        self._presence = PresenceRegistry()
         # Optional callback used by the idle monitor to ask the
         # parent DetectorWorker to remove this room. See
         # _IDLE_TEARDOWN_WINDOW_S for the trigger condition.
@@ -1214,7 +1217,7 @@ class RoomWorker:
             patient_id=row.patient_id,
             sessionmaker=self._sessionmaker,
             motion_cache=self._motion_cache,
-            patient_presence=self._patient_presence,
+            patient_presence=self._presence.for_patient(row.patient_id),
             settings=self._settings,
             reid=self._reid,
             livekit_identity=identity,

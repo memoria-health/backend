@@ -275,11 +275,11 @@ async def _identity_node_targets(sm: Any, stale_s: int) -> list[tuple[str, str]]
             rows = (
                 await s.execute(
                     text(
-                        "SELECT n.node_id, n.base_url, min(p.identity_port) "
+                        "SELECT n.node_id, n.base_url, min(c.identity_port) "
                         "  FROM public.identity_nodes n "
-                        "  JOIN public.patients p "
-                        "    ON p.identity_node_id = n.node_id "
-                        "   AND p.identity_port IS NOT NULL "
+                        "  JOIN public.cameras c "
+                        "    ON c.identity_node_id = n.node_id "
+                        "   AND c.identity_port IS NOT NULL "
                         " WHERE n.last_seen_at > now() - make_interval("
                         "         secs => :stale) "
                         " GROUP BY n.node_id, n.base_url "

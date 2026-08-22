@@ -30,6 +30,7 @@ from uuid import UUID
 
 from livekit import api as lkapi
 
+from src.services import livekit_rooms
 from src.services.detection import camera_presence
 from src.services.detection.motion_cache import MotionCache
 from src.services.detection.room_worker import RoomWorker
@@ -381,7 +382,12 @@ class DetectorWorker:
             candidates: list[str] = []
             skipped_foreign = 0
             for r in rooms_resp.rooms:
-                if not r.name.startswith(_PATIENT_ROOM_PREFIX):
+                # Both room shapes, same as the webhook. Gating on
+                # `patient_` here meant that on every restart no
+                # RoomWorker spawned for an account room — no detection
+                # at all — and the stale sweep below then flipped every
+                # live bridge sensor to online=false.
+                if not livekit_rooms.is_room_name(r.name):
                     continue
                 if r.num_participants == 0:
                     continue

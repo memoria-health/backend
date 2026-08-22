@@ -77,8 +77,22 @@ class RosterRequest(BaseModel):
 
 
 class RosterRoom(BaseModel):
-    # `patient_<uuid>` — the LiveKit room the identity process joins.
+    """One SENSOR to run, and where to reach the process running it.
+
+    Still called a room because that is what the node joins, but the unit
+    is the sensor: several sensors on one account now share a room, so
+    the room alone no longer says what to subscribe to.
+    """
+
+    # `account_<caregiver_id>`, or `patient_<patient_id>` for wall phones
+    # paired before 2026-08-22. An ADDRESS — the node must read no meaning
+    # out of either shape.
     room: str
+    # Which participant in that room this process is for. Without it a
+    # node given two sensors on one account would start two processes
+    # both subscribing to everything in the room.
+    camera_id: str
+    camera_identity: str
     # Which port to listen on. Assigned by the backend, not chosen by the
     # node: the backend has to be able to REACH this process, and it cannot
     # do that if the node picks unilaterally.
@@ -101,25 +115,18 @@ class RosterResponse(BaseModel):
 PORT_MIN = 8012
 PORT_MAX = 8111
 
-# A room is LIVE when at least one camera actually STREAMS INTO IT.
-# Slots follow live rooms: claim order prefers them, and a dormant room
-# yields its slot to one (2026-08-19 — prod had 7 of 8 slots held by
-# May/June test homes with no cameras online while every home that was
-# actually streaming sat unassigned and identity-blind).
+# A SENSOR is live when it is actually streaming. Slots follow live
+# sensors: claim order prefers them, and a dormant one yields its slot to
+# a live one (2026-08-19 — prod had 7 of 8 slots held by May/June test
+# homes with no cameras online while every home that was actually
+# streaming sat unassigned and identity-blind).
 #
-# The test is `livekit_room`, not "a camera is assigned to this patient"
-# (2026-08-20). Those differ the moment a camera watches two residents:
-# it publishes into ONE room, so the second resident is covered by a
-# streaming camera while no camera streams into THEIR room. Under the
-# old test they would be handed a process with zero cameras in it —
-# a slot and a set of models burned on nothing, reported blind by the
-# fleet watch. Their identity answers come from the process that holds
-# the shared camera, which the router resolves the same way.
-_LIVE_CAM = (
-    "EXISTS (SELECT 1 FROM public.cameras c "
-    "         WHERE c.livekit_room = 'patient_' || p.id::text "
-    "           AND c.online AND NOT c.disabled)"
-)
+# This was a correlated EXISTS from a patient row to "some camera in this
+# patient's room", because the slot was allocated per patient and a
+# patient does not stream — only their cameras do, so liveness always had
+# to be borrowed from one. Sharding on the sensor makes the question
+# direct: the thing holding the slot is the thing producing the frames.
+_LIVE_SENSOR = "(c.online AND NOT c.disabled)"
 
 
 @router.post("/roster", response_model=RosterResponse)
@@ -175,7 +182,7 @@ async def post_roster(
             text(
                 # identity_port is cleared with the assignment — it belongs to
                 # a node, not to the home, and must return to that node's pool.
-                "UPDATE public.patients "
+                "UPDATE public.cameras "
                 "   SET identity_node_id = NULL, identity_port = NULL "
                 "WHERE identity_node_id IS NOT NULL "
                 "  AND identity_node_id <> :self "
@@ -200,7 +207,7 @@ async def post_roster(
             " WHERE node_id <> :self "
             "   AND last_seen_at < now() - interval '7 days' "
             "   AND node_id NOT IN ("
-            "     SELECT identity_node_id FROM public.patients "
+            "     SELECT identity_node_id FROM public.cameras "
             "      WHERE identity_node_id IS NOT NULL"
             "   )"
         ),
@@ -221,21 +228,21 @@ async def post_roster(
         await session.execute(
             text(
                 "WITH need AS ("
-                "  SELECT count(*) AS n FROM public.patients p "
-                "   WHERE p.identity_node_id IS NULL AND " + _LIVE_CAM +
+                "  SELECT count(*) AS n FROM public.cameras c "
+                "   WHERE c.identity_node_id IS NULL AND " + _LIVE_SENSOR +
                 "), spare AS ("
-                "  SELECT :cap - count(*) AS n FROM public.patients "
+                "  SELECT :cap - count(*) AS n FROM public.cameras "
                 "   WHERE identity_node_id = :node "
                 "), victims AS ("
-                "  SELECT p.id FROM public.patients p "
-                "   WHERE p.identity_node_id = :node AND NOT " + _LIVE_CAM +
+                "  SELECT c.id FROM public.cameras c "
+                "   WHERE c.identity_node_id = :node AND NOT " + _LIVE_SENSOR +
                 # Oldest first: the longest-settled dormant homes are the
                 # likeliest to be permanently dormant.
-                "   ORDER BY p.created_at "
+                "   ORDER BY c.created_at "
                 "   LIMIT GREATEST("
                 "     (SELECT n FROM need) - GREATEST((SELECT n FROM spare), 0), 0) "
                 "   FOR UPDATE SKIP LOCKED"
-                ") UPDATE public.patients "
+                ") UPDATE public.cameras "
                 "     SET identity_node_id = NULL, identity_port = NULL "
                 "   WHERE id IN (SELECT id FROM victims)"
             ),
@@ -270,19 +277,19 @@ async def post_roster(
         await session.execute(
             text(
                 "WITH avail AS ("
-                "  SELECT :cap - count(*) AS n FROM public.patients "
+                "  SELECT :cap - count(*) AS n FROM public.cameras "
                 "   WHERE identity_node_id = :node"
                 # The lock and the numbering must be separate CTEs: Postgres
                 # rejects FOR UPDATE in a query that also has a window
                 # function ("FOR UPDATE is not allowed with window
                 # functions"). Lock first, number the locked set after.
                 "), locked AS ("
-                "  SELECT id, created_at FROM public.patients p "
+                "  SELECT id, created_at FROM public.cameras c "
                 "   WHERE identity_node_id IS NULL "
                 # LIVE homes first: a streaming home is blind RIGHT NOW,
                 # while a dormant one has nothing to be blind about. Within
                 # each group the oldest-waiting still wins.
-                "   ORDER BY (" + _LIVE_CAM + ") DESC, created_at "
+                "   ORDER BY (" + _LIVE_SENSOR + ") DESC, created_at "
                 "   LIMIT GREATEST((SELECT n FROM avail), 0) "
                 "   FOR UPDATE SKIP LOCKED"
                 "), pick AS ("
@@ -297,14 +304,14 @@ async def post_roster(
                 "  SELECT gs AS port, row_number() OVER (ORDER BY gs) AS rn "
                 "    FROM generate_series(CAST(:pmin AS int), CAST(:pmax AS int)) gs "
                 "   WHERE gs NOT IN ("
-                "     SELECT identity_port FROM public.patients "
+                "     SELECT identity_port FROM public.cameras "
                 "      WHERE identity_node_id = :node AND identity_port IS NOT NULL"
                 "   )"
                 ") "
-                "UPDATE public.patients p "
+                "UPDATE public.cameras c "
                 "   SET identity_node_id = :node, identity_port = f.port "
                 "  FROM pick JOIN free_ports f USING (rn) "
-                " WHERE p.id = pick.id"
+                " WHERE c.id = pick.id"
             ),
             {
                 "node": body.node_id, "cap": body.capacity,
@@ -320,10 +327,21 @@ async def post_roster(
     rows = (
         await session.execute(
             text(
-                "SELECT id, identity_port FROM public.patients p "
-                " WHERE identity_node_id = :node AND identity_port IS NOT NULL "
+                "SELECT c.id, c.identity_port, c.livekit_room, "
+                "       c.livekit_identity FROM public.cameras c "
+                " WHERE c.identity_node_id = :node "
+                "   AND c.identity_port IS NOT NULL "
+                # A sensor with no LiveKit identity cannot be subscribed
+                # to, so there is nothing for a process to do with it.
+                # Excluded rather than returned as null: the response is
+                # validated as a whole, so ONE unaddressable row used to
+                # 500 the entire poll and leave the node with no roster
+                # at all — every other sensor on it going dark for the
+                # sake of one that could never have worked.
+                "   AND c.livekit_identity IS NOT NULL "
+                "   AND c.livekit_room IS NOT NULL "
                 # Shedding keeps the LIVE homes; settled-longest breaks ties.
-                " ORDER BY (" + _LIVE_CAM + ") DESC, created_at LIMIT :cap"
+                " ORDER BY (" + _LIVE_SENSOR + ") DESC, created_at LIMIT :cap"
             ),
             {"node": body.node_id, "cap": body.capacity},
         )
@@ -331,7 +349,11 @@ async def post_roster(
 
     await session.commit()
 
-    rooms = [RosterRoom(room=f"patient_{pid}", port=port) for pid, port in rows]
+    rooms = [
+        RosterRoom(room=room, camera_id=str(cam_id),
+                   camera_identity=identity, port=port)
+        for cam_id, port, room, identity in rows
+    ]
     if reclaimed or claimed:
         # Worth a line at INFO: these are the only two events in the whole
         # scheme that change which machine is watching a home.
