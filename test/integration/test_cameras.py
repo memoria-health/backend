@@ -14,7 +14,7 @@ from httpx import AsyncClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from test.conftest import mint_test_jwt
+from test.conftest import mint_test_jwt, seed_camera
 
 
 _PATIENT_BODY = {
@@ -41,24 +41,11 @@ async def _insert_camera(
     icon_name: str = "tv",
     online: bool = True,
 ) -> UUID:
-    """Insert one camera row via raw SQL (no caregiver-facing POST exists)."""
-    cid = uuid4()
-    await session.execute(
-        text("""
-            INSERT INTO cameras (id, patient_id, display_id, room, icon_name, online, created_at)
-            VALUES (:id, :pid, :display, :room, :icon, :online, now())
-        """),
-        {
-            "id": str(cid),
-            "pid": patient_id,
-            "display": display_id,
-            "room": room,
-            "icon": icon_name,
-            "online": online,
-        },
+    """This suite's defaults, on the shared seeder."""
+    return await seed_camera(
+        session, patient_id=patient_id, display_id=display_id,
+        room=room, icon_name=icon_name, online=online,
     )
-    await session.commit()
-    return cid
 
 
 @pytest.mark.asyncio

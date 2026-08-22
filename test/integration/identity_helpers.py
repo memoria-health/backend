@@ -17,7 +17,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.services.identity.embeddings import embedding_to_bytes
-from test.conftest import mint_test_jwt
+from test.conftest import mint_test_jwt, seed_camera
 
 _PATIENT_BODY = {
     "full_name": "Maggie",
@@ -45,41 +45,15 @@ async def _setup_patient_with_camera(
         "/v1/patients", headers=headers, json=_PATIENT_BODY,
     )).json()
     patient_id = UUID(p["id"])
-    from sqlalchemy import insert
-
-    from src.db.camera import Camera
-    camera_id = uuid4()
-    await session.execute(
-        insert(Camera).values(
-            id=camera_id,
-            patient_id=patient_id,
-            display_id=1,
-            room="Test Room",
-            icon_name="bed.double",
-            online=True,
-            api_key_hash="test_hash",
-            livekit_identity=f"cam_{camera_id.hex[:8]}",
-            state="open",
-            no_people_count=0,
-            close_threshold=6,
-            state_changed_at=datetime.now(timezone.utc),
-            disabled=False,
-            desired_state="connected",
-            created_at=datetime.now(timezone.utc),
-        )
+    camera_id = await seed_camera(
+        session, patient_id=patient_id, caregiver_id=uid,
+        room="Test Room", icon_name="bed.double", online=True,
+        api_key_hash="test_hash", state="open", no_people_count=0,
+        close_threshold=6, state_changed_at=datetime.now(timezone.utc),
+        disabled=False, desired_state="connected",
     )
-    # Record the camera->patient link the same way every real creation
-    # path does — coverage is what the account view and the identity gate
-    # read, not cameras.patient_id.
-    await session.execute(
-        text(
-            "INSERT INTO public.camera_patients "
-            "  (camera_id, patient_id, is_primary) "
-            "VALUES (:c, :p, true) ON CONFLICT DO NOTHING"
-        ),
-        {"c": camera_id, "p": patient_id},
-    )
-    await session.commit()
+    # seed_camera writes the camera->patient link too — coverage is what
+    # the account view and the identity gate read, not cameras.patient_id.
     return patient_id, camera_id
 
 
@@ -102,8 +76,8 @@ async def _share_camera_with_another_patient(session, camera_id, patient_id) -> 
     )
     await session.execute(
         text(
-            "INSERT INTO public.camera_patients (camera_id, patient_id, is_primary) "
-            "VALUES (:c, :o, false) ON CONFLICT DO NOTHING"
+            "INSERT INTO public.camera_patients (camera_id, patient_id) "
+            "VALUES (:c, :o) ON CONFLICT DO NOTHING"
         ),
         {"c": camera_id, "o": other},
     )

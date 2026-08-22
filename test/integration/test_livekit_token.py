@@ -14,12 +14,14 @@ from __future__ import annotations
 from uuid import UUID, uuid4
 
 import jwt as pyjwt
+from datetime import datetime, timezone
+
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import text
 
 from src.settings import Settings, get_settings
-from test.conftest import mint_test_jwt
+from test.conftest import mint_test_jwt, seed_camera
 
 
 _PATIENT_BODY = {
@@ -312,16 +314,11 @@ async def test_viewer_token_stays_subscribable_with_a_private_camera(
     video. Per-track severing happens outside the token."""
     headers, pid = await _setup_patient(client, auth_user)
     # Give the patient a private camera directly in the DB.
-    await session.execute(
-        text(
-            "INSERT INTO cameras (id, patient_id, display_id, room, icon_name, "
-            "online, created_at, room_class, room_classified_at, privacy_enabled) "
-            "VALUES (:id, :pid, 1, 'Bathroom', 'tv', true, now(), 'bathroom', "
-            "now(), true)"
-        ),
-        {"id": str(uuid4()), "pid": pid},
+    await seed_camera(
+        session, patient_id=pid, room="Bathroom", online=True,
+        room_class="bathroom", room_classified_at=datetime.now(timezone.utc),
+        privacy_enabled=True,
     )
-    await session.commit()
 
     r = await client.post(
         "/v1/livekit/token",

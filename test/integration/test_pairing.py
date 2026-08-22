@@ -264,12 +264,12 @@ async def test_pair_rejects_expired_code(
         text(
             """
             INSERT INTO cameras (
-                id, patient_id, display_id, room, icon_name, online,
+                id, patient_id, caregiver_id, display_id, room, icon_name, online,
                 created_at, pairing_code, pairing_expires_at,
                 livekit_identity, livekit_room,
                 state, no_people_count, state_changed_at, close_threshold
             ) VALUES (
-                :id, :pid, 1, 'Living room', 'tv', false,
+                :id, :pid, (select caregiver_id from patients where id = :pid), 1, 'Living room', 'tv', false,
                 :now, :code, :exp, :ident, :room,
                 'open', 0, :now, 6
             )
@@ -378,7 +378,11 @@ async def test_pair_does_not_increment_other_patient_display_ids(
     r2 = (await client.post(
         f"/v1/patients/{p2}/cameras/pairing-code",
         headers=headers,
-        json=_PAIRING_BODY,
+        # Any DIFFERENT name. This reused _PAIRING_BODY, so both sensors
+        # were called "Living room" — incidental to what is being tested
+        # (display_id is per patient), and now refused, because one
+        # account is one home and a home has one Living Room.
+        json={**_PAIRING_BODY, "room": "Second Sensor"},
     )).json()
 
     c1 = await session.get(Camera, UUID(r1["camera_id"]))

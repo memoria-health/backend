@@ -89,8 +89,11 @@ async def delete_by_id(
     """Delete a patient the caregiver OWNS. Returns True if a row was
     deleted, False if no owned row matched.
 
-    Cascades to cameras / detectors / events via DB-level
-    `ON DELETE CASCADE` on the FKs.
+    Cascades to detectors / events via DB-level `ON DELETE CASCADE`.
+    SENSORS survive: `cameras.patient_id` is `ON DELETE SET NULL` since
+    2026-08-22, because a sensor can watch more than one person and
+    deleting one of them must not take the hardware from the others. The
+    caller re-points the shim from whatever coverage remains.
 
     Scoped with `owned_patient_ids`, not `accessible_patient_ids`
     (audit finding H3). Membership grants read/write; it must not grant

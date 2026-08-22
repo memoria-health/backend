@@ -16,6 +16,8 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 
+from sqlalchemy import text as sa_text
+
 from src.db.camera import Camera
 from src.db.session import get_sessionmaker
 from test.conftest import mint_test_jwt
@@ -34,10 +36,17 @@ async def _insert_camera(
     cam_id = uuid4()
     sm = get_sessionmaker()
     async with sm() as s:
+        # Derived rather than passed in: a camera's account is not an
+        # independent fact about it, it is the account its patient is on.
+        caregiver_id = (await s.execute(
+            sa_text("select caregiver_id from patients where id = :p"),
+            {"p": str(patient_id)},
+        )).scalar_one()
         s.add(
             Camera(
                 id=cam_id,
                 patient_id=patient_id,
+                caregiver_id=caregiver_id,
                 display_id=display_id,
                 room=room,
                 icon_name="bed.double",
@@ -47,7 +56,10 @@ async def _insert_camera(
                 close_threshold=2,
                 source_type=source_type,
                 desired_state=desired_state,
-                ingest_token_hash=("a" * 64) if source_type == "pi" else None,
+                # A gateway sensor authenticates with an ingest token,
+                # and `cameras_ingest_token_required` enforces that.
+                ingest_token_hash=(
+                    "a" * 64 if source_type == "gateway" else None),
                 created_at=datetime.now(timezone.utc),
             ),
         )
@@ -330,9 +342,9 @@ async def test_patch_cameras_paused_false_to_true_cascades_to_disconnected(
         patient_id=UUID(pid), display_id=1, room="Living Room",
         source_type="iphone", desired_state="connected",
     )
-    pi_id = await _insert_camera(
+    gateway_id = await _insert_camera(
         patient_id=UUID(pid), display_id=2, room="Bedroom",
-        source_type="pi", desired_state="connected",
+        source_type="gateway", desired_state="connected",
     )
 
     r = await client.patch(
@@ -344,7 +356,7 @@ async def test_patch_cameras_paused_false_to_true_cascades_to_disconnected(
     assert r.json()["cameras_paused"] is True
 
     assert await _camera_desired_state(iphone_id) == "disconnected"
-    assert await _camera_desired_state(pi_id) == "disconnected"
+    assert await _camera_desired_state(gateway_id) == "disconnected"
 
 
 @pytest.mark.asyncio
@@ -361,9 +373,9 @@ async def test_patch_cameras_paused_true_to_false_cascades_to_connected(
         patient_id=UUID(pid), display_id=1, room="Living Room",
         source_type="iphone", desired_state="disconnected",
     )
-    pi_id = await _insert_camera(
+    gateway_id = await _insert_camera(
         patient_id=UUID(pid), display_id=2, room="Bedroom",
-        source_type="pi", desired_state="disconnected",
+        source_type="gateway", desired_state="disconnected",
     )
 
     await client.patch(
@@ -379,7 +391,7 @@ async def test_patch_cameras_paused_true_to_false_cascades_to_connected(
     assert r.json()["cameras_paused"] is False
 
     assert await _camera_desired_state(iphone_id) == "connected"
-    assert await _camera_desired_state(pi_id) == "connected"
+    assert await _camera_desired_state(gateway_id) == "connected"
 
 
 @pytest.mark.asyncio

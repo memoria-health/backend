@@ -35,6 +35,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.camera import Camera
+from src.db.camera_patient import CameraPatient
 from src.db.event import Event
 from src.db.patient import Patient
 from src.db.session import get_sessionmaker
@@ -153,10 +154,12 @@ async def seed_patient(session: AsyncSession, caregiver_id: UUID) -> Patient:
         (4, "Hallway",     "door.left.hand.open"),
     ]
     for display_id, room, icon in cam_specs:
+        cam_id = uuid4()
         session.add(
             Camera(
-                id=uuid4(),
+                id=cam_id,
                 patient_id=patient.id,
+                caregiver_id=patient.caregiver_id,
                 display_id=display_id,
                 room=room,
                 icon_name=icon,
@@ -164,6 +167,11 @@ async def seed_patient(session: AsyncSession, caregiver_id: UUID) -> Patient:
                 created_at=now,
             )
         )
+        # Coverage, not just the shim column. `camera_patients` is what
+        # the patient camera list, the detector links and the RLS policy
+        # read; a seeded sensor without a row here reads as unassigned.
+        session.add(CameraPatient(
+            camera_id=cam_id, patient_id=patient.id, added_at=now))
 
     # Events — Margaret seeds CLEAN: no events, so her profile starts in
     # the "calm" state (not highlighted with a fall). The prior 7-event

@@ -16,6 +16,7 @@ Assumes a local Supabase with scripts/apply_identity_nodes_delta.sql applied.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 import pytest
@@ -26,6 +27,8 @@ from src.db.session import get_sessionmaker
 from src.services.identity import fleet_watch as fw_mod
 from src.services.identity.fleet_watch import FleetWatch
 import pytest_asyncio
+
+from test.conftest import seed_camera
 
 @pytest_asyncio.fixture(autouse=True)
 async def _restore_real_fleet(session: AsyncSession):
@@ -38,14 +41,14 @@ async def _restore_real_fleet(session: AsyncSession):
     pytest run was reshuffling production. Real rows = anything not
     named by this suite."""
     rows = [tuple(r) for r in (await session.execute(text(
-        "SELECT id, identity_node_id, identity_port FROM public.patients "
+        "SELECT id, identity_node_id, identity_port FROM public.cameras "
         " WHERE identity_node_id IS NOT NULL "
         "   AND identity_node_id NOT LIKE 'node-%' "
         "   AND identity_node_id <> 'fleet-sentinel'"))).all()]
     yield
     for pid, node, port in rows:
         await session.execute(text(
-            "UPDATE public.patients "
+            "UPDATE public.cameras "
             "   SET identity_node_id = :n, identity_port = :p "
             " WHERE id = :i"), {"n": node, "p": port, "i": pid})
     await session.commit()
@@ -86,7 +89,15 @@ async def _mk_caregiver(session: AsyncSession, cid: UUID, email: str) -> None:
     await session.commit()
 
 
-async def _mk_patient(session: AsyncSession, cid: UUID, age_mins: int = 0) -> UUID:
+async def _mk_home(session: AsyncSession, cid: UUID, age_mins: int = 0) -> UUID:
+    """A patient with one live SENSOR, and the SENSOR's id.
+
+    Returns the sensor because that is what holds an identity slot since
+    2026-08-22. It used to return the patient id, which every caller then
+    handed to `_assign` — harmless while the slot lived on the patient,
+    and a silent no-op afterwards: the UPDATE matched no row, so a home
+    the test believed was served read blind.
+    """
     pid = uuid4()
     await session.execute(
         text(
@@ -102,25 +113,23 @@ async def _mk_patient(session: AsyncSession, cid: UUID, age_mins: int = 0) -> UU
     # counting those made the critical page fire forever on dormant test
     # rows. Every case in this suite is about a home that should be
     # watched, so the helper gives each one a live camera.
-    await _mk_online_camera(session, pid)
+    cam_id = await _mk_online_camera(session, pid, age_mins=age_mins)
     await session.commit()
-    return pid
+    return cam_id
 
 
 async def _mk_online_camera(
     session: AsyncSession, pid: UUID, *, publishes_into: UUID | None = None,
-) -> None:
+    age_mins: int = 0,
+) -> UUID:
     """`livekit_room` is set because every real creation path sets it and
     liveness reads it: a home is watchable when a camera STREAMS INTO its
     room, not when a camera is assigned to its patient. `publishes_into`
     makes the two differ, which is what a shared camera does."""
-    await session.execute(
-        text(
-            "INSERT INTO public.cameras "
-            "  (id, patient_id, display_id, room, online, livekit_room) "
-            "VALUES (:id, :p, 1, 'Fleet Test Room', true, :lk)"
-        ),
-        {"id": uuid4(), "p": pid, "lk": f"patient_{publishes_into or pid}"},
+    return await seed_camera(
+        session, patient_id=pid, online=True,
+        livekit_room=f"patient_{publishes_into or pid}",
+        created_at=datetime.now(timezone.utc) - timedelta(minutes=age_mins),
     )
 
 
@@ -191,13 +200,13 @@ async def _clear(session: AsyncSession) -> None:
         text(
             "WITH parked AS ("
             "  SELECT id, NULL::int AS port"
-            "    FROM public.patients"
+            "    FROM public.cameras"
             # Everything the suite does not own — including homes held by a
             # REAL node that has gone quiet (a stopped dev pod makes its row
             # stale, and its homes then count as blind and fail the
             # healthy-fleet case). _restore_real_fleet puts reality back.
             "   WHERE identity_node_id IS DISTINCT FROM 'fleet-sentinel'"
-            ") UPDATE public.patients p "
+            ") UPDATE public.cameras p "
             "     SET identity_node_id = 'fleet-sentinel', identity_port = parked.port "
             "    FROM parked WHERE p.id = parked.id"
         )
@@ -209,8 +218,9 @@ async def _clear(session: AsyncSession) -> None:
 
 
 async def _assign(
-    session: AsyncSession, pid: UUID, node: str, *, seen_mins_ago: int = 0,
+    session: AsyncSession, camera_id: UUID, node: str, *, seen_mins_ago: int = 0,
 ) -> None:
+    """Put a SENSOR on a node. The slot is the sensor's, not the home's."""
     await session.execute(
         text(
             "INSERT INTO public.identity_nodes "
@@ -223,10 +233,10 @@ async def _assign(
     )
     await session.execute(
         text(
-            "UPDATE public.patients "
+            "UPDATE public.cameras "
             "   SET identity_node_id = :n, identity_port = 8012 WHERE id = :id"
         ),
-        {"n": node, "id": pid},
+        {"n": node, "id": camera_id},
     )
     await session.commit()
 
@@ -253,7 +263,7 @@ async def test_healthy_fleet_pages_nothing(
     cid, email = auth_user
     await _clear(session)
     await _mk_caregiver(session, cid, email)
-    pid = await _mk_patient(session, cid)
+    pid = await _mk_home(session, cid)
     await _assign(session, pid, "node-ok", seen_mins_ago=0)
 
     baseline = await _live_baseline(session, settings)
@@ -278,7 +288,7 @@ async def test_home_with_no_node_pages_critical(
     await _mk_caregiver(session, cid, email)
     # Older than the grace period, so this is an orphan and not a failover
     # that started a moment ago.
-    await _mk_patient(session, cid, age_mins=60)
+    await _mk_home(session, cid, age_mins=60)
 
     counts = await _watch(settings, get_sessionmaker()).check()
     assert counts["blind"] == 1
@@ -309,7 +319,7 @@ async def test_a_brand_new_home_is_not_paged_immediately(
     pages.triggered.clear()
     pages.resolved.clear()
 
-    await _mk_patient(session, cid, age_mins=0)
+    await _mk_home(session, cid, age_mins=0)
     after = await _watch(settings, get_sessionmaker()).check()
 
     assert after["blind"] - before["blind"] == 1, "it IS blind right now"
@@ -333,7 +343,7 @@ async def test_dead_node_is_a_warning_not_a_critical(
     cid, email = auth_user
     await _clear(session)
     await _mk_caregiver(session, cid, email)
-    pid = await _mk_patient(session, cid, age_mins=60)
+    pid = await _mk_home(session, cid, age_mins=60)
     await _assign(session, pid, "node-dead", seen_mins_ago=30)
 
     baseline = await _live_baseline(session, settings)
@@ -364,7 +374,7 @@ async def test_recovery_resolves_the_incident(
     cid, email = auth_user
     await _clear(session)
     await _mk_caregiver(session, cid, email)
-    pid = await _mk_patient(session, cid, age_mins=60)
+    pid = await _mk_home(session, cid, age_mins=60)
     await _assign(session, pid, "node-flap", seen_mins_ago=30)
 
     watch = _watch(settings, get_sessionmaker())
@@ -397,7 +407,7 @@ async def test_repeated_checks_do_not_repage(
     cid, email = auth_user
     await _clear(session)
     await _mk_caregiver(session, cid, email)
-    await _mk_patient(session, cid, age_mins=60)
+    await _mk_home(session, cid, age_mins=60)
 
     watch = _watch(settings, get_sessionmaker())
     await watch.check()
@@ -444,37 +454,49 @@ async def test_home_with_nothing_streaming_is_not_paged(
     assert "identity-fleet:unassigned-homes" not in pages.triggered
 
 
-async def test_shared_camera_second_resident_is_not_paged_as_blind(
+async def test_a_shared_sensor_is_counted_once(
     session: AsyncSession, auth_user, settings, monkeypatch
 ) -> None:
-    """The pager must agree with the roster about who NEEDS a process.
+    """The pager must agree with the roster about what needs a process.
 
-    A camera covering two residents publishes into ONE room, so the
-    roster deliberately assigns no process to the second resident —
-    their identity comes from the process that holds the shared camera.
-    While this module kept its own COPY of the liveness predicate, that
-    resident read as "live but unassigned" and paged CRITICAL every
-    cycle, forever, for a system working exactly as designed.
+    This asked whether a SECOND RESIDENT on a shared camera was paged as
+    blind, because a process was allocated per patient and this module
+    kept its own copy of the liveness rule; when the two disagreed, a
+    resident read "live but unassigned" and paged CRITICAL every cycle,
+    forever, for a system working exactly as designed.
+
+    Sharding on the sensor removes the disagreement at the source — both
+    sides now count sensors, and a sensor is one row however many people
+    it covers. What is left worth pinning is that coverage cannot inflate
+    the count: adding a resident must not turn one unwatched sensor into
+    two pages about the same blind camera.
     """
     pages = _Pages()
     pages.install(monkeypatch)
     cid, email = auth_user
     await _clear(session)
     await _mk_caregiver(session, cid, email)
-    alice = await _mk_patient(session, cid)
-    bob = await _mk_patient(session, cid)
-    # Bob owns nothing of his own: his only camera is the shared one,
-    # which streams into Alice's room. _mk_patient gave him a private
-    # camera, so replace it.
+    shared = await _mk_home(session, cid)
+
+    housemate = uuid4()
     await session.execute(
-        text("DELETE FROM public.cameras WHERE patient_id = :p"), {"p": bob},
+        text(
+            "INSERT INTO public.patients "
+            "  (id, caregiver_id, full_name, preferred_name, relation) "
+            "VALUES (:id, :cg, 'Housemate', 'Housemate', 'other')"
+        ),
+        {"id": housemate, "cg": cid},
     )
-    await _mk_online_camera(session, bob, publishes_into=alice)
+    await session.execute(
+        text("INSERT INTO public.camera_patients (camera_id, patient_id) "
+             "VALUES (:c, :p) ON CONFLICT DO NOTHING"),
+        {"c": shared, "p": housemate},
+    )
     await session.commit()
 
     counts = await _watch(settings, get_sessionmaker()).check()
 
     assert counts["blind"] == 1, (
-        "Alice's room is blind; Bob is not a home that needs its own "
-        "process, so counting him would page for a working system"
+        "one unwatched sensor is one page, whether it watches one person "
+        "or two"
     )

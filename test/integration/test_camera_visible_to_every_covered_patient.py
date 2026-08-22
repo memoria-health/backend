@@ -1,14 +1,16 @@
-"""A shared camera must appear in EVERY patient it covers.
+"""A shared sensor must appear in EVERY patient it covers.
 
-One physical camera streams into the primary patient's LiveKit room —
-that is a cost decision, and it is right: a second patient does not need
-a second copy of the same video. But it is a decision about LiveKit, and
-it must not reach the app. If a caregiver assigns a camera to two
-patients, the camera belongs in both patients' views, playing the same
-stream.
+One physical sensor is one row, one LiveKit participant, one stream —
+a second patient does not need a second copy of the same video, and
+paying for one was the bug that made this file necessary.
 
-`list_for_patient` filtered on `cameras.patient_id`, which holds the
-PRIMARY, so the second patient's camera list came back empty.
+`list_for_patient` filtered on `cameras.patient_id`, which held the
+primary, so the second patient's sensor list came back empty.
+
+The room they share is the ACCOUNT's now, not the first patient's
+(2026-08-22). The property under test is unchanged and the reason it
+holds is simpler: there is no longer a patient in the room name for a
+second patient to be missing from.
 """
 
 from __future__ import annotations
@@ -33,7 +35,7 @@ async def _two_patients(client: AsyncClient, auth_user):
     return headers, email, a["id"], b["id"]
 
 
-async def _shared_camera(client, email, headers, primary, also) -> dict:
+async def _shared_camera(client, email, headers, first, second) -> dict:
     r = await client.post(
         "/v1/gateway/provision-camera",
         headers={"Authorization": "Bearer gw-shared-cam"},
@@ -42,7 +44,7 @@ async def _shared_camera(client, email, headers, primary, also) -> dict:
     camera = r.json()["cameras"][0]
     c = await client.post(
         f"/v1/cameras/{camera['camera_id']}/coverage", headers=headers,
-        json={"primary_patient_id": primary, "also_patient_ids": [also]})
+        json={"patient_ids": [first, second]})
     assert c.status_code == 200, c.text
     return camera
 
@@ -54,7 +56,7 @@ async def _listed(client, headers, patient_id) -> list[dict]:
 
 
 @pytest.mark.asyncio
-async def test_the_primary_patient_sees_the_camera(
+async def test_the_first_covered_patient_sees_the_camera(
     client: AsyncClient, auth_user, session: AsyncSession,
 ) -> None:
     headers, email, primary, also = await _two_patients(client, auth_user)
@@ -79,9 +81,9 @@ async def test_the_second_covered_patient_sees_it_too(
 async def test_both_patients_are_pointed_at_the_SAME_room(
     client: AsyncClient, auth_user, session: AsyncSession,
 ) -> None:
-    """One camera, one stream, one LiveKit participant. The second
-    patient watches the primary's room rather than a room of their own,
-    which is what keeps a shared camera from costing twice."""
+    """One sensor, one stream, one LiveKit participant. Both patients
+    watch the same room — the account's — which is what keeps a shared
+    sensor from costing twice."""
     headers, email, primary, also = await _two_patients(client, auth_user)
     await _shared_camera(client, email, headers, primary, also)
     for_primary = await _listed(client, headers, primary)

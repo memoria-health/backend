@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import time
+from datetime import datetime, timezone
 from collections.abc import AsyncIterator
 from uuid import UUID, uuid4
 
@@ -32,6 +33,7 @@ import jwt as pyjwt
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # Env overrides MUST precede the src imports: get_settings() is
@@ -220,3 +222,92 @@ async def client(app) -> AsyncIterator[httpx.AsyncClient]:
     transport = ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
+
+
+# ─── camera seeding ──────────────────────────────────────────────
+
+
+async def seed_camera(
+    session: AsyncSession,
+    *,
+    patient_id: UUID | str | None = None,
+    caregiver_id: UUID | str | None = None,
+    room: str | None = None,
+    online: bool = False,
+    source_type: str = "iphone",
+    livekit_room: str | None = None,
+    livekit_identity: str | None = None,
+    cover_patient: bool = True,
+    camera_id: UUID | None = None,
+    **columns,
+) -> UUID:
+    """Insert one camera row and return its id.
+
+    Eleven test modules each grew their own near-identical version of
+    this, and every schema change since had to be applied to all of them
+    by hand — the account-room migration hit ten files before a single
+    behaviour was under test, and each one failed differently depending
+    on which columns its copy happened to set. One definition means the
+    next schema change is one edit.
+
+    The invariants it will not let a caller get wrong, because each has
+    already produced a confusing failure somewhere:
+
+      * `caregiver_id` is NOT NULL and is derived from the patient when
+        it is not given. It is not an independent fact about a camera.
+      * names are unique per account, so an unnamed camera gets a unique
+        one rather than colliding with the last fixture's.
+      * a 'gateway' row needs an `ingest_token_hash`
+        (`cameras_ingest_token_required`).
+      * coverage lives in `camera_patients`; `cameras.patient_id` is a
+        compatibility shim. Both are written so a fixture is visible to
+        old and migrated readers alike.
+
+    Extra columns pass straight through as `**columns`, so a test that
+    cares about `disabled`, `state`, `privacy_enabled` and so on still
+    says so locally instead of growing another copy of this.
+    """
+    camera_id = camera_id or uuid4()
+
+    if caregiver_id is None:
+        if patient_id is None:
+            raise AssertionError(
+                "seed_camera needs a patient_id or a caregiver_id — a camera "
+                "always belongs to an account"
+            )
+        caregiver_id = (await session.execute(
+            text("SELECT caregiver_id FROM public.patients WHERE id = :p"),
+            {"p": patient_id},
+        )).scalar_one()
+
+    values: dict = {
+        "id": camera_id,
+        "patient_id": patient_id,
+        "caregiver_id": caregiver_id,
+        "display_id": columns.pop("display_id", 1),
+        "room": room or f"Room {camera_id.hex[:8]}",
+        "icon_name": columns.pop("icon_name", "tv"),
+        "online": online,
+        "created_at": columns.pop("created_at", datetime.now(timezone.utc)),
+        "source_type": source_type,
+        "livekit_identity": livekit_identity or f"cam_{camera_id.hex[:8]}",
+        "livekit_room": livekit_room if livekit_room is not None
+        else f"account_{str(caregiver_id).lower()}",
+        "ingest_token_hash": columns.pop(
+            "ingest_token_hash",
+            camera_id.hex * 2 if source_type == "gateway" else None),
+        **columns,
+    }
+    cols = ", ".join(values)
+    binds = ", ".join(f":{k}" for k in values)
+    await session.execute(
+        text(f"INSERT INTO public.cameras ({cols}) VALUES ({binds})"), values,
+    )
+    if cover_patient and patient_id is not None:
+        await session.execute(
+            text("INSERT INTO public.camera_patients (camera_id, patient_id) "
+                 "VALUES (:c, :p) ON CONFLICT DO NOTHING"),
+            {"c": camera_id, "p": patient_id},
+        )
+    await session.commit()
+    return camera_id

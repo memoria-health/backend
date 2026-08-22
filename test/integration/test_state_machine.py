@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.camera import Camera
 from src.services.detection.state_machine import apply_tick_update
-from test.conftest import mint_test_jwt
+from test.conftest import mint_test_jwt, seed_camera
 
 _PATIENT_BODY = {
     "full_name": "Margaret O'Brien",
@@ -44,33 +44,13 @@ async def _insert_camera(
     state: str = "open",
     no_people_count: int = 0,
 ) -> UUID:
-    """Insert a minimal camera row directly via SQL (service-role path)."""
-    cid = uuid4()
+    """This suite's state-machine defaults, on the shared seeder."""
     now = datetime.now(timezone.utc)
-    await session.execute(
-        text(
-            """
-            INSERT INTO cameras (
-                id, patient_id, display_id, room, icon_name, online,
-                created_at, state, no_people_count, state_changed_at,
-                close_threshold
-            ) VALUES (
-                :id, :pid, 1, 'Living room', 'tv', false,
-                :now, :state, :nc, :now, :ct
-            )
-            """
-        ),
-        {
-            "id": str(cid),
-            "pid": patient_id,
-            "now": now,
-            "state": state,
-            "nc": no_people_count,
-            "ct": close_threshold,
-        },
+    return await seed_camera(
+        session, patient_id=patient_id, room="Living room",
+        state=state, no_people_count=no_people_count,
+        close_threshold=close_threshold, state_changed_at=now,
     )
-    await session.commit()
-    return cid
 
 
 @pytest.mark.asyncio

@@ -146,6 +146,7 @@ def fire_event(
             event = Event(
                 id=uuid4(),
                 patient_id=p.id,
+                caregiver_id=p.caregiver_id,
                 detector_id=None,
                 camera_id=None,
                 category=category,

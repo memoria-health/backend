@@ -124,6 +124,7 @@ async def main() -> None:
                 Camera(
                     id=uuid4(),
                     patient_id=patient.id,
+                    caregiver_id=patient.caregiver_id,
                     display_id=display_id,
                     room=room,
                     icon_name=icon,

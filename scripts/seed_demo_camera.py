@@ -41,6 +41,7 @@ from sqlalchemy import func, select
 
 from src.api.pairing import DEMO_CAMERA_IDENTITY
 from src.db.camera import Camera
+from src.db.camera_patient import CameraPatient
 from src.db.caregiver import Caregiver
 from src.db.patient import Patient
 from src.db.session import get_sessionmaker
@@ -149,6 +150,7 @@ async def seed(email: str, code: str) -> None:
             cam = Camera(
                 id=cid,
                 patient_id=patient.id,
+                caregiver_id=patient.caregiver_id,
                 display_id=max_display + 1,
                 room=DEMO_ROOM,
                 icon_name="tv",
@@ -166,9 +168,12 @@ async def seed(email: str, code: str) -> None:
                 battery_percent=None,
                 desired_state="disconnected",
                 source_type="iphone",
-                pi_stream_url=None,
             )
             session.add(cam)
+            # Coverage, not just the shim column — it is what the patient
+            # camera list and the RLS policy read.
+            session.add(CameraPatient(
+                camera_id=cid, patient_id=patient.id, added_at=now))
             action = "created"
         else:
             # Reset to a pairable state so the demo code works again.

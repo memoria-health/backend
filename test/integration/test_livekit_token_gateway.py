@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import jwt as pyjwt
 import pytest
+
+from test.conftest import seed_camera
 from httpx import AsyncClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -133,17 +135,12 @@ async def test_unowned_camera_is_not_mintable(
 
     from uuid import uuid4
     orphan = uuid4()
-    await session.execute(
-        text(
-            "INSERT INTO public.cameras "
-            "(id, patient_id, display_id, room, icon_name, online, created_at, "
-            " livekit_identity, livekit_room, source_type, ingest_token_hash, gateway_id) "
-            "VALUES (:id, :pid, 98, 'Orphan', 'tv', false, now(), "
-            " 'cam_orphan_mint', :room, 'gateway', :tok, NULL)"
-        ),
-        {"id": str(orphan), "pid": pid, "room": f"patient_{pid}", "tok": "y" * 64},
+    await seed_camera(
+        session, patient_id=pid, camera_id=orphan, display_id=98,
+        room="Orphan", online=False, source_type="gateway",
+        livekit_identity="cam_orphan_mint", livekit_room=f"patient_{pid}",
+        ingest_token_hash="y" * 64, gateway_id=None,
     )
-    await session.commit()
 
     r = await _mint(
         client, "gw-token-A",

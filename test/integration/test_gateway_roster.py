@@ -27,7 +27,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.services.fleet_auth import hash_ingest_token
-from test.conftest import mint_test_jwt
+from test.conftest import mint_test_jwt, seed_camera
 
 _PATIENT_BODY = {
     "full_name": "Margaret O'Brien",
@@ -53,9 +53,14 @@ async def _provision(
 ) -> dict:
     """Provision a gateway camera as the box holding `token`.
 
-    Provisioning leaves the camera on the ACCOUNT with no patient, and the
-    roster skips unassigned cameras, so pass `headers`/`patient_id` when the
-    case needs one actually in service.
+    Provisioning leaves the camera on the ACCOUNT with no patient, and it
+    is on the roster and streaming from that moment. Pass
+    `headers`/`patient_id` only when the case is actually about coverage.
+
+    This used to overwrite `livekit_room` with `patient_<id>` after
+    assigning, because assigning was what gave a camera its room. It no
+    longer is: the room is the account's and assignment does not move it,
+    so the value provisioning returned is the right one throughout.
     """
     r = await client.post(
         "/v1/gateway/provision-camera",
@@ -68,10 +73,9 @@ async def _provision(
         for cam in body["cameras"]:
             a = await client.post(
                 f"/v1/cameras/{cam['camera_id']}/coverage",
-                headers=headers, json={"primary_patient_id": patient_id},
+                headers=headers, json={"patient_ids": [patient_id]},
             )
             assert a.status_code == 200, a.text
-            cam["livekit_room"] = f"patient_{patient_id}"
     return body
 
 
@@ -151,17 +155,12 @@ async def test_roster_includes_unowned_null_cameras(
     await _provision(client, email, "gw-token-A", room="Owned", headers=headers, patient_id=pid)
 
     orphan = uuid4()
-    await session.execute(
-        text(
-            "INSERT INTO public.cameras "
-            "(id, patient_id, display_id, room, icon_name, online, created_at, "
-            " livekit_identity, livekit_room, source_type, ingest_token_hash, gateway_id) "
-            "VALUES (:id, :pid, 99, 'Orphan', 'tv', false, now(), "
-            " 'cam_orphan', :room, 'gateway', :tok, NULL)"
-        ),
-        {"id": str(orphan), "pid": pid, "room": f"patient_{pid}", "tok": "x" * 64},
+    await seed_camera(
+        session, patient_id=pid, camera_id=orphan, display_id=99,
+        room="Orphan", online=False, source_type="gateway",
+        livekit_identity="cam_orphan", livekit_room=f"patient_{pid}",
+        ingest_token_hash="x" * 64, gateway_id=None,
     )
-    await session.commit()
 
     assert "cam_orphan" in await _roster_identities(client, "gw-token-A")
 
@@ -229,17 +228,27 @@ async def test_roster_reports_backend_view_of_frames_arriving(
 
 
 @pytest.mark.asyncio
-async def test_audio_kill_honours_every_covered_patient(
+async def test_the_audio_kill_belongs_to_the_sensor(
     client: AsyncClient, auth_user, session: AsyncSession,
 ) -> None:
-    """A shared camera must obey the STRICTEST covered patient.
+    """The audio kill is the SENSOR's, and coverage cannot weaken it.
 
-    A camera covering two patients streams into the primary's room, so
-    the roster derived `audio_capture_enabled` from `cameras.patient_id`
-    — the primary — and a secondary patient's audio-off was silently
-    ignored. That is the same fall-back-to-primary we removed from
-    identity, sitting in the facilities audio kill, where the failure is
-    a microphone open at a site that does not permit recording.
+    It used to be derived from the covered patients with a bool_and, to
+    stop a shared camera obeying only its primary. That was the right
+    patch for the wrong model: the kill is a statement about a physical
+    room ("no recording in here"), not about a person, and once a sensor
+    could cover nobody the expression returned NULL — which fails closed,
+    so every unassigned sensor would have been silently deaf.
+
+    So it is a column on the sensor now, and the properties to hold are
+    that the roster reports it verbatim, and that assigning or
+    unassigning patients never changes it.
+
+    Open: `patients.audio_capture_enabled` still exists and is still on
+    the patient API, but nothing reads it any more. Wiring that control
+    to the sensors covering the patient (and deciding what a shared
+    sensor does when two patients disagree) is a UI design question, not
+    a silent default to pick here.
     """
     uid, email = auth_user
     headers = {"Authorization": f"Bearer {mint_test_jwt(uid, email)}"}
@@ -254,8 +263,7 @@ async def test_audio_kill_honours_every_covered_patient(
     camera_id = resp["cameras"][0]["camera_id"]
     cover = await client.post(
         f"/v1/cameras/{camera_id}/coverage", headers=headers,
-        json={"primary_patient_id": primary["id"],
-              "also_patient_ids": [secondary["id"]]},
+        json={"patient_ids": [primary["id"], secondary["id"]]},
     )
     assert cover.status_code == 200, cover.text
 
@@ -269,26 +277,28 @@ async def test_audio_kill_honours_every_covered_patient(
                 for c in r.json()["cameras"]}
         return rows[camera_id]
 
-    # Both permit it.
-    await session.execute(
-        text("UPDATE public.patients SET audio_capture_enabled = true "
-             "WHERE id IN (:a, :b)"),
-        {"a": primary["id"], "b": secondary["id"]},
-    )
-    await session.commit()
+    # A fresh sensor permits audio, and covering two patients does not
+    # change that — under the old bool_and this depended on both patient
+    # rows, and for an unassigned sensor it collapsed to NULL.
     assert await _audio() is True
 
-    # The SECONDARY says no. The primary still says yes.
+    # Killed at the sensor, which is where a facilities rule belongs.
     await session.execute(
-        text("UPDATE public.patients SET audio_capture_enabled = false "
-             "WHERE id = :b"),
-        {"b": secondary["id"]},
+        text("UPDATE public.cameras SET audio_capture_enabled = false "
+             "WHERE id = :id"),
+        {"id": camera_id},
     )
     await session.commit()
-    assert await _audio() is False, (
-        "a covered patient's audio-off was ignored because the roster "
-        "reads the primary only"
-    )
+    assert await _audio() is False
+
+    # And coverage cannot lift it. Taking every patient off the sensor
+    # must not re-open a microphone at a site that does not permit one —
+    # the failure the old NULL-fails-closed rule was guarding against,
+    # now structural rather than incidental.
+    cleared = await client.delete(
+        f"/v1/cameras/{camera_id}/coverage", headers=headers)
+    assert cleared.status_code == 200, cleared.text
+    assert await _audio() is False
 
 
 # ─── enrolment: how a token becomes known without a camera ──────────
