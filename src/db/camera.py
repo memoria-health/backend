@@ -107,9 +107,8 @@ class Camera(Base):
     # ── Source type (iPhone vs Pi) ───────────────────────────────────
     # Discriminates the ingest path. 'iphone' rows are paired via the
     # existing /v1/cameras/pair flow and publish directly to LiveKit.
-    # 'pi' rows are provisioned via /v1/cameras/pi-provision (Phase 4),
-    # carry a `pi_stream_url`, and have their LiveKit publishing
-    # handled by the backend's pi_ingest worker process. From the
+    # 'gateway' rows are provisioned by a fleet service
+    # publish straight to LiveKit with an ingest token. From the
     # detection pipeline's perspective both look identical.
     source_type: Mapped[str] = mapped_column(
         String(16), server_default=text("'iphone'"), default="iphone",
@@ -126,25 +125,14 @@ class Camera(Base):
     # ORM model to reference here).
     gateway_id: Mapped[UUID | None] = mapped_column(default=None)
 
-    # ── Pi MJPEG endpoint (vestigial) ────────────────────────────────
-    # Was the URL the backend pulled MJPEG from in the pull-mode design.
-    # Push refactor (Pi POSTs frames outbound to /v1/cameras/me/frames)
-    # made this column unused; kept nullable for backwards compat and
-    # for diagnostic queries. NOT referenced by the relay path.
-    pi_stream_url: Mapped[str | None] = mapped_column(String(2048), default=None)
-
-    # ── Pi PCM audio endpoint (vestigial) ────────────────────────────
-    # Same status as pi_stream_url after the push refactor. Kept
-    # nullable, unused by the ingest path.
-    pi_audio_url: Mapped[str | None] = mapped_column(String(2048), default=None)
 
     # ── Ingest bearer token (push auth) ──────────────────────────────
     # Hashed bearer token the Pi presents on
     # POST /v1/cameras/me/frames. Generated at provision time, the
     # plaintext value is returned ONCE in the next announce response,
     # never stored or logged server-side outside this hash. SHA-256
-    # hex digest (64 chars). Required for source_type='pi', forbidden
-    # for source_type='iphone' (iPhones use their own per-session
+    # hex digest (64 chars). Required for source_type='gateway',
+    # forbidden for 'iphone' (wall phones use their own per-session
     # LiveKit access tokens minted via /v1/livekit/token).
     ingest_token_hash: Mapped[str | None] = mapped_column(String(64), default=None)
     ingest_token_created_at: Mapped[datetime | None] = mapped_column(
@@ -170,6 +158,13 @@ class Camera(Base):
     # NEVER via the public camera PATCH. While true: live video+audio to
     # caregivers is severed per-camera at the SFU and data collection
     # never records this camera; detection + text insights keep flowing.
+    # Facilities audio kill. False = this sensor never publishes an audio
+    # track. Lived on `patients` until 2026-08-22; it is a statement about
+    # a room, and a sensor covering nobody had no patient to read it from.
+    audio_capture_enabled: Mapped[bool] = mapped_column(
+        Boolean, server_default=text("true"), default=True,
+    )
+
     privacy_enabled: Mapped[bool] = mapped_column(
         Boolean, server_default=text("false"), default=False,
     )
@@ -186,6 +181,16 @@ class Camera(Base):
     # app to close and stay true.
     app_present: Mapped[bool] = mapped_column(
         Boolean, server_default=text("true"), default=True,
+    )
+
+    # ── Setup self-test arming (per camera) ─────────────────────────
+    # When this camera last passed the three-finger test. Cleared on its
+    # next participant_joined, so a restart re-arms the test. NULL =
+    # armed. Read ONLY by the registry's setup-test check — it is not a
+    # gate on anything else (no detector, alert, or onboarding step
+    # depends on a camera having passed).
+    setup_test_passed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None,
     )
 
     # The owning account — a camera exists from the moment it is

@@ -31,7 +31,6 @@ from src.repos import (
     camera_detector_repo,
     camera_repo,
     patient_repo,
-    pi_discovery_repo,
 )
 from src.schemas.camera import (
     AccountCameraResponse,
@@ -39,8 +38,6 @@ from src.schemas.camera import (
     CameraDetectorsResponse,
     CameraResponse,
     DesiredStateResponse,
-    PiProvisionRequest,
-    PiProvisionResponse,
     SetCameraDetectorsRequest,
     UpdateCameraRequest,
     UpdateMyDesiredStateRequest,
@@ -87,7 +84,39 @@ def _to_response(c: Camera) -> CameraResponse:
         room_class_confidence=c.room_class_confidence,
         room_classified_at=c.room_classified_at,
         privacy_enabled=c.privacy_enabled,
+        audio_capture_enabled=c.audio_capture_enabled,
     )
+
+
+async def _room_name_taken(
+    session: SessionDep, *, camera_id: UUID, caregiver_id: UUID, name: str,
+) -> bool:
+    """Is another sensor on this account already called `name`?
+
+    One account is one home, and a home does not have two Living Rooms.
+    Beyond being confusing to read in a list, `cameras.room` is the key a
+    detector's `where_rooms` matches on, so a duplicate name is how a
+    detector eventually attaches to the wrong sensor.
+
+    Scoped on `patient_id` until 2026-08-22, which silently did nothing
+    for an unassigned sensor: patient_id is NULL there, `NULL = NULL` is
+    NULL, so the check matched no rows and every duplicate passed.
+    Unassigned is the normal state between the installer leaving and the
+    caregiver opening the app, so that was the common case.
+
+    `cameras_account_room_unique` enforces the same rule in the database,
+    because this handler is not the only writer. This stays so the caller
+    gets a 409 rather than an IntegrityError.
+    """
+    clash = (await session.execute(
+        text(
+            "SELECT 1 FROM public.cameras "
+            " WHERE caregiver_id = :cg AND id <> :cam "
+            "   AND lower(room) = lower(:name) LIMIT 1"
+        ),
+        {"cg": caregiver_id, "cam": camera_id, "name": name},
+    )).first()
+    return clash is not None
 
 
 @router.get(
@@ -152,20 +181,29 @@ async def create_pairing_code(
     # supersedes any incomplete previous attempt for the same name.
     # The old pairing_code is invalidated, but no one entered it
     # anyway. Real (api_key_hash IS NOT NULL) cameras still block.
+    # An orphan is an abandoned WALL-PHONE pairing attempt, nothing else.
+    #
+    # `api_key_hash IS NULL` is true of every gateway/bridge row too —
+    # they authenticate with an ingest token — so widening this sweep from
+    # patient to account made it reach live sensors: minting a pairing
+    # code named "Living Room" silently DELETED the bridge sensor already
+    # called that, with no 409 and no way to tell. source_type pins it to
+    # the only rows the sweep was ever about.
     await session.execute(
         delete(Camera)
-        .where(Camera.patient_id == patient_id)
+        .where(Camera.caregiver_id == auth.id)
         .where(func.lower(Camera.room) == requested.lower())
         .where(Camera.api_key_hash.is_(None))
+        .where(Camera.source_type == "iphone")
     )
 
-    # Reject ACTUAL duplicates — fully paired cameras with the same
-    # room name. App-level check; no DB unique constraint on
-    # (patient_id, room) yet, since adding one would need a migration
-    # + cleanup of any historical duplicates. Case-insensitive.
+    # Reject ACTUAL duplicates — fully paired sensors with the same
+    # name, anywhere on the account. `cameras_account_room_unique` now
+    # enforces this in the database too; this stays so the caller gets a
+    # 409 rather than an IntegrityError.
     duplicate_stmt = (
         select(Camera.id)
-        .where(Camera.patient_id == patient_id)
+        .where(Camera.caregiver_id == auth.id)
         .where(func.lower(Camera.room) == requested.lower())
         .limit(1)
     )
@@ -239,18 +277,15 @@ async def create_pairing_code(
         # label to "Disconnect", matching reality.
         desired_state="disconnected",
         # The pairing flow only creates iPhone cameras. Pi cameras
-        # come in through /v1/cameras/pi-provision (Phase 4) which
+        # come in through the gateway path, which
         # constructs its own Camera row. Setting source_type and
-        # pi_stream_url explicitly here keeps the row's full state
         # grep-able and surfaces source_type drift if a future change
         # alters the Python-side default.
         source_type="iphone",
-        pi_stream_url=None,
     )
     session.add(cam)
     await session.flush()  # camera row visible to the queries below
-    await camera_coverage.set_coverage(
-        session, cam.id, primary_patient_id=patient_id)
+    await camera_coverage.set_coverage(session, cam.id, [patient_id])
     # Reconcile detector links from each detector's where_rooms: presets
     # attach per their scope (all-rooms presets "just work" everywhere),
     # room-scoped detectors attach only to matching rooms, and null-scoped
@@ -267,166 +302,6 @@ async def create_pairing_code(
 
 
 @router.post(
-    "/patients/{patient_id}/cameras/pi-provision",
-    response_model=PiProvisionResponse,
-    status_code=status.HTTP_201_CREATED,
-)
-async def provision_pi_camera(
-    patient_id: UUID,
-    body: PiProvisionRequest,
-    auth: CaregiverAuth,
-    session: SessionDep,
-) -> PiProvisionResponse:
-    """Create a Pi camera row.
-
-    Two ways to specify which Pi this row points at:
-
-      - discovery_id: pick from the announce list (normal customer
-        flow). Backend resolves the URL from the discovery record
-        and marks it claimed.
-      - pi_stream_url (+ optional pi_audio_url): direct URL for
-        scripted provisioning or admin use.
-
-    The Pydantic validator on PiProvisionRequest enforces that
-    exactly one of the two modes is set.
-
-    Sets source_type='pi'. Same LiveKit identity / room convention
-    as iPhone cameras so the detection pipeline (RoomWorker,
-    CameraIngest) treats Pi cameras identically once they appear
-    in the room. The row appears with `online=false` and
-    `state='open'`. Once the Pi starts pushing frames and the relay
-    publishes into LiveKit, the room reconciler flips `online=true`
-    (two-signal rule: REST participant present + fresh frames).
-    """
-    # Caregiver must own the patient. RLS would also catch this but
-    # an explicit 404 is the right wire shape for "this patient isn't
-    # yours" (matching the iPhone pairing-code endpoint above).
-    patient = await patient_repo.find_by_id(session, patient_id, caregiver_id=auth.id)
-    if patient is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="patient_not_found",
-        )
-
-    # Resolve the URLs from whichever mode the caller used. The
-    # Pydantic validator guarantees exactly one is set.
-    discovery_id_to_claim: UUID | None = None
-    if body.discovery_id is not None:
-        discovery = await pi_discovery_repo.find_by_id(session, body.discovery_id)
-        if discovery is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="discovery_not_found",
-            )
-        if discovery.claimed_at is not None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="discovery_already_claimed",
-            )
-        pi_stream_url = discovery.current_url
-        pi_audio_url = discovery.current_audio_url
-        discovery_id_to_claim = discovery.id
-    else:
-        # Direct-URL mode. The validator guarantees pi_stream_url is set.
-        assert body.pi_stream_url is not None
-        pi_stream_url = body.pi_stream_url
-        pi_audio_url = body.pi_audio_url
-
-    # Reject duplicate provisioning: a discovery is uniquely tied to
-    # one physical Pi (via hardware MAC); if it has been claimed
-    # before, the caregiver should delete the existing camera row
-    # before re-pairing. For direct-URL mode (vestigial) we fall back
-    # to the URL check for backwards compat with test fixtures.
-    if discovery_id_to_claim is None and pi_stream_url is not None:
-        existing_url_stmt = (
-            select(Camera.id).where(Camera.pi_stream_url == pi_stream_url).limit(1)
-        )
-        existing_url = (await session.execute(existing_url_stmt)).scalar_one_or_none()
-        if existing_url is not None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="pi_stream_url_already_registered",
-            )
-
-    # Next display_id for this patient, same as the iPhone path.
-    max_display_stmt = select(func.coalesce(func.max(Camera.display_id), 0)).where(
-        Camera.patient_id == patient_id
-    )
-    next_display_id = (await session.execute(max_display_stmt)).scalar_one() + 1
-
-    now = datetime.now(timezone.utc)
-    camera_id = uuid4()
-    short = camera_id.hex[:8]
-    livekit_identity = f"cam_{short}"
-    livekit_room = f"patient_{patient_id}"
-
-    # Mint the Pi's ingest bearer token. The hash lands on the camera
-    # row (used by the push endpoint to authenticate); the plaintext
-    # gets stashed on the discovery row (read once by the Pi on its
-    # next announce, then nulled). For Mode B (no discovery), there
-    # is no per-Pi channel to deliver the plaintext, so we surface it
-    # in the provision response as the only place it can land.
-    ingest_token_plaintext, ingest_token_hash = mint_ingest_token()
-
-    cam = Camera(
-        id=camera_id,
-        patient_id=patient_id,
-        caregiver_id=auth.id,
-        display_id=next_display_id,
-        room=body.room,
-        icon_name=body.icon_name,
-        online=False,
-        created_at=now,
-        # Pi rows skip the pairing-code / api_key dance used by the
-        # iPhone path. Instead, the Pi authenticates with the
-        # ingest_token_hash bearer token below when pushing frames.
-        pairing_code=None,
-        pairing_expires_at=None,
-        api_key_hash=None,
-        livekit_identity=livekit_identity,
-        livekit_room=livekit_room,
-        state="open",
-        no_people_count=0,
-        state_changed_at=now,
-        close_threshold=6,
-        battery_percent=None,
-        desired_state="connected",
-        source_type="pi",
-        pi_stream_url=pi_stream_url,
-        pi_audio_url=pi_audio_url,
-        ingest_token_hash=ingest_token_hash,
-        ingest_token_created_at=now,
-    )
-    session.add(cam)
-    await session.flush()
-    await camera_coverage.set_coverage(
-        session, cam.id, primary_patient_id=patient_id)
-    # Reconcile detector links from where_rooms, same convention as the
-    # iPhone path so a freshly-provisioned Pi camera is
-    # detector-equivalent to an iPhone camera in the same room.
-    await camera_detector_repo.sync_links_for_patient(session, patient_id)
-    # Mark the discovery claimed (if we got here via discovery mode)
-    # so it disappears from the next /discovered listing, AND stash
-    # the plaintext ingest token on the discovery row so the Pi can
-    # pick it up on its next announce.
-    if discovery_id_to_claim is not None:
-        await pi_discovery_repo.claim(
-            session,
-            discovery_id=discovery_id_to_claim,
-            camera_id=camera_id,
-            pending_ingest_token=ingest_token_plaintext,
-        )
-    await session.commit()
-
-    return PiProvisionResponse(
-        camera_id=camera_id,
-        patient_id=patient_id,
-        caregiver_id=auth.id,
-        livekit_identity=livekit_identity,
-        livekit_room=livekit_room,
-    )
-
-
-@router.post(
     "/patients/{patient_id}/cameras/gateway-provision",
     status_code=status.HTTP_201_CREATED,
     response_model=None,
@@ -439,10 +314,10 @@ async def provision_gateway_camera(
 ) -> dict:
     """Register a gateway camera (a Tapo behind a mini-PC).
 
-    Like the iPhone pairing-code flow and pi-provision, but for our direct-
+    Like the iPhone pairing-code flow, but for our direct-
     publish gateway: NO pairing code (the camera is dumb — the mini-PC pairs on
-    its behalf) and NO pi_stream_url (the gateway publishes straight to LiveKit,
-    so the backend relay never pulls anything). Creates a `source_type='pi'` row
+    its behalf). The gateway publishes straight to LiveKit,
+    the sensor publishes straight to LiveKit). Creates a `source_type='gateway'` row
     with an ingest token and RETURNS the plaintext token — the only place it
     lands — so the mini-PC's setup agent can write it into its own config.
     """
@@ -482,16 +357,13 @@ async def provision_gateway_camera(
         battery_percent=None,
         desired_state="disconnected",
         source_type="gateway",
-        pi_stream_url=None,
-        pi_audio_url=None,
         ingest_token_hash=ingest_token_hash,
         ingest_token_created_at=now,
         app_present=True,
     )
     session.add(cam)
     await session.flush()
-    await camera_coverage.set_coverage(
-        session, cam.id, primary_patient_id=patient_id)
+    await camera_coverage.set_coverage(session, cam.id, [patient_id])
     # Reconcile detector links from where_rooms — same as the other
     # camera-create paths, and also repairs any pre-existing drift.
     await camera_detector_repo.sync_links_for_patient(session, patient_id)
@@ -515,19 +387,6 @@ async def delete_camera(
     session: SessionDep,
     request: Request,
 ) -> None:
-    # Reset the matching pi_discovery's claim state BEFORE the camera
-    # row goes away. The pi_discoveries.claimed_camera_id FK is
-    # `ON DELETE SET NULL`, so without this the discovery survives the
-    # cascade in a zombie state — claimed_camera_id=NULL but
-    # claimed_at still set, which makes the row a paired-but-pointing-
-    # at-nothing record. The /discovered endpoint filters on
-    # `claimed_at IS NULL`, so the Pi can't be re-paired without
-    # operator-level SQL surgery (which we just had to do at 17:03
-    # PDT 2026-05-28 when the bedroom camera was deleted). Clearing
-    # claimed_at and pending_ingest_token here lets the Pi appear in
-    # /discovered immediately on the next caregiver-app refresh.
-    # No-op when the camera was never a Pi (no matching discovery row).
-    await pi_discovery_repo.unclaim_for_camera(session, camera_id=camera_id)
     # Capture patient_id BEFORE the row goes away — needed for the link
     # reconcile below.
     cam = await camera_repo.find_by_id(session, camera_id, caregiver_id=auth.id)
@@ -852,13 +711,6 @@ async def delete_self(
     time.
     """
     camera_id = auth.id
-    # Symmetric with delete_camera: reset the matching pi_discovery
-    # claim state before the FK cascade strands it. No-op for wall
-    # phone (no discovery row), but kept here so the contract is
-    # uniform across both delete paths and we don't recreate the
-    # zombie-discovery bug if the wall-phone DELETE ever runs against
-    # a Pi-typed row by accident.
-    await pi_discovery_repo.unclaim_for_camera(session, camera_id=camera_id)
     await session.execute(delete(Camera).where(Camera.id == camera_id))
     await session.commit()
     worker = getattr(request.app.state, "detector_worker", None)
@@ -1031,10 +883,6 @@ async def update_camera(
     """
     renamed = body.room is not None
     if renamed:
-        # Same case-insensitive per-patient uniqueness rule the pairing
-        # flow enforces at creation — two cameras named "Kitchen" would
-        # break the room-name-keyed flows (orphan sweep, detector
-        # where_rooms). Excludes self so a case-only rename is allowed.
         cam_for_dup = await camera_repo.find_by_id(
             session, camera_id, caregiver_id=auth.id,
         )
@@ -1044,14 +892,9 @@ async def update_camera(
                 detail="camera_not_found",
             )
         requested = body.room.strip()
-        dup_stmt = (
-            select(Camera.id)
-            .where(Camera.patient_id == cam_for_dup.patient_id)
-            .where(func.lower(Camera.room) == requested.lower())
-            .where(Camera.id != camera_id)
-            .limit(1)
-        )
-        if (await session.execute(dup_stmt)).scalar_one_or_none() is not None:
+        if await _room_name_taken(
+            session, camera_id=camera_id, caregiver_id=auth.id, name=requested,
+        ):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="camera_room_duplicate",
@@ -1064,6 +907,7 @@ async def update_camera(
         ai_paused=body.ai_paused,
         desired_state=body.desired_state,
         room=body.room,
+        audio_capture_enabled=body.audio_capture_enabled,
     )
     if cam is None:
         raise HTTPException(
@@ -1212,8 +1056,7 @@ async def list_account_cameras(
         out.append(AccountCameraResponse(
             id=cam.id, room=cam.room, icon_name=cam.icon_name,
             online=cam.online, source_type=cam.source_type,
-            patient_ids=covers, primary_patient_id=covers[0] if covers else None,
-            unassigned=not covers,
+            patient_ids=covers, unassigned=not covers,
         ))
     return out
 
@@ -1234,12 +1077,12 @@ async def set_camera_coverage(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
                             detail="camera_not_found")
 
-    wanted = {body.primary_patient_id, *body.also_patient_ids}
+    wanted = list(dict.fromkeys(body.patient_ids))
     owned = set((await session.execute(
         text("SELECT id FROM public.patients WHERE caregiver_id = :c"),
         {"c": auth.id},
     )).scalars().all())
-    if not wanted <= owned:
+    if not set(wanted) <= owned:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
                             detail="patient_not_on_this_account")
 
@@ -1247,18 +1090,17 @@ async def set_camera_coverage(
         cam.room = body.room
     if body.icon_name is not None:
         cam.icon_name = body.icon_name
-    await camera_coverage.set_coverage(
-        session, camera_id,
-        primary_patient_id=body.primary_patient_id,
-        also_patient_ids=body.also_patient_ids,
-    )
-    # Detector links follow the patient, so every newly covered home needs
-    # its presets reconciled onto this camera.
-    for pid in wanted:
+    # Everyone who was covered BEFORE this call, so a patient being taken
+    # OFF the sensor gets their links reconciled too. Syncing only the
+    # incoming set left a removed patient's detectors still linked, and
+    # they went on running against a sensor that no longer watched them.
+    previously = await camera_coverage.coverage(session, camera_id)
+    await camera_coverage.set_coverage(session, camera_id, wanted)
+    for pid in dict.fromkeys([*previously, *wanted]):
         await camera_detector_repo.sync_links_for_patient(session, pid)
     await session.commit()
     return {"camera_id": str(camera_id),
-            "patient_ids": [str(p) for p in sorted(wanted, key=str)]}
+            "patient_ids": [str(p) for p in wanted]}
 
 
 @router.delete("/cameras/{camera_id}/coverage", status_code=status.HTTP_200_OK)
@@ -1267,7 +1109,13 @@ async def clear_camera_coverage(
     auth: CaregiverAuth,
     session: SessionDep,
 ) -> dict:
-    """Unassign a camera. It stays on the account and stops streaming."""
+    """Unassign a sensor. It stays on the account and KEEPS streaming.
+
+    It used to stop: the roster required a patient, so removing the last
+    one took the sensor off the fleet. That made "this sensor no longer
+    watches Dad" and "turn this sensor off" the same action, which is not
+    what a caregiver means by either. Turning it off is `desired_state`.
+    """
     cam = (await session.execute(
         select(Camera).where(
             Camera.id == camera_id, Camera.caregiver_id == auth.id)
@@ -1275,6 +1123,11 @@ async def clear_camera_coverage(
     if cam is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
                             detail="camera_not_found")
+    previously = await camera_coverage.coverage(session, camera_id)
     await camera_coverage.clear_coverage(session, camera_id)
+    # Their detectors must stop pointing at a sensor that no longer
+    # watches them; without this the links outlive the assignment.
+    for pid in previously:
+        await camera_detector_repo.sync_links_for_patient(session, pid)
     await session.commit()
     return {"camera_id": str(camera_id), "unassigned": True}

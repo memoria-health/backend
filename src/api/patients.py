@@ -14,6 +14,7 @@ import logging
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
+from sqlalchemy import text
 from fastapi import APIRouter, File, HTTPException, UploadFile, status
 from pydantic import BaseModel
 
@@ -251,8 +252,11 @@ async def delete_patient(
     auth: CaregiverAuth,
     session: SessionDep,
 ) -> None:
-    """Remove a caregiver-owned patient. Cascades to cameras /
-    detectors / events via DB-level `ON DELETE CASCADE`.
+    """Remove a caregiver-owned patient. Cascades to detectors / events.
+
+    SENSORS SURVIVE. `cameras.patient_id` is `ON DELETE SET NULL` since
+    2026-08-22 — a sensor can watch more than one person, and deleting
+    one of them must not take the hardware away from the others.
     """
     deleted = await patient_repo.delete_by_id(session, patient_id, caregiver_id=auth.id)
     if not deleted:
@@ -260,6 +264,20 @@ async def delete_patient(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="patient_not_found",
         )
+    # Re-point the compatibility shim at whoever is still covered. The FK
+    # nulled it for every sensor this patient was filed under; leaving it
+    # NULL would make a sensor that still watches somebody read as
+    # unassigned to the ~70 readers that have not migrated off the column.
+    await session.execute(
+        text(
+            "UPDATE public.cameras c SET patient_id = ("
+            "  SELECT cp.patient_id FROM public.camera_patients cp "
+            "   WHERE cp.camera_id = c.id "
+            "   ORDER BY cp.added_at, cp.patient_id LIMIT 1) "
+            " WHERE c.caregiver_id = :cg AND c.patient_id IS NULL"
+        ),
+        {"cg": auth.id},
+    )
     await session.commit()
 
 

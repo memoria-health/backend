@@ -261,7 +261,7 @@ class Settings(BaseSettings):
     # (Replaces the per-clip masked-audio switch: audio is now kept
     # unconditionally per the 2026-07-28 product call — redaction
     # pixelates video spans and never touches the track. Capture is
-    # still severed at the publisher by patients.audio_capture_enabled.)
+    # still severed at the publisher by cameras.audio_capture_enabled.)
     # Recording is raw-to-local-disk; between mux and upload the clip is
     # re-screened in chunks and the sensitive spans pixelated via the
     # event-clip censor (research mode, span-gated). ANY redaction

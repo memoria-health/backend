@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import time
 
 from datetime import datetime, timezone
@@ -28,31 +27,32 @@ from src.api import health as health_mod
 from src.api.deps import SessionDep, SettingsDep
 from src.db.camera import Camera
 from src.repos import camera_detector_repo
+from src.services import livekit_rooms
 from src.services.fleet_auth import hash_ingest_token, mint_ingest_token
 
 log = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/v1", tags=["pi-ingest"])
+router = APIRouter(prefix="/v1", tags=["fleet"])
 
-# Matches the boundary parameter from a multipart/x-mixed-replace
-# Content-Type header. Same regex shape as mjpeg_reader.read_mjpeg
-# uses for the pull-mode response Content-Type.
-
-# Which cameras a gateway box owns. Ownership is the ACCOUNT
-# (cameras.caregiver_id), not the patient — a camera can be on the account
-# before anyone assigns it, and `patient_id IS NOT NULL` is what keeps
-# those unassigned ones out so they never publish until someone says who
-# they watch. `gateway_id IS NULL` is the transitional fallback until the
-# ownership backfill fills it in.
+# Which sensors a gateway box owns. Ownership is the ACCOUNT
+# (cameras.caregiver_id), not the patient — a sensor is on the account
+# before anyone assigns it, and it streams from that moment.
+# `gateway_id IS NULL` is the transitional fallback until the ownership
+# backfill fills it in.
 #
 # Module level because both /gateway/roster and /fleet/poll answer the
 # same question. Two copies of this predicate would eventually disagree
 # about which cameras a box owns, which is how the audio-kill bug got to
 # live in two endpoints at once.
+#
+# `patient_id IS NOT NULL` was here until 2026-08-22 and was the reason an
+# unassigned sensor never published: it had no patient, so it was not on
+# the roster, so nothing told it to stream. The installer could not see
+# their own work. A sensor is on the roster because it EXISTS on the
+# account, not because someone has decided yet who it watches.
 _GATEWAY_CAM_WHERE = (
     "WHERE (caregiver_id = :c OR patient_id IN "
     "      (SELECT id FROM public.patients WHERE caregiver_id = :c)) "
-    "AND patient_id IS NOT NULL "
     "AND source_type = 'gateway' "
     "AND (gateway_id = :gw OR gateway_id IS NULL)")
 
@@ -66,59 +66,29 @@ _GATEWAY_CAM_WHERE = (
 # scope, which is what makes it safe to let a service ask for it.
 _BRIDGE_CAM_WHERE = (
     "WHERE gateway_id = :gw "
-    "AND patient_id IS NOT NULL "
     "AND source_type = 'gateway'")
 
 # The row every fleet member gets back. `privacy_enabled` is room-derived;
-# `audio_capture_enabled` is the STRICTEST covered patient (see the
-# COALESCE); `online` is the SUBSCRIBER's view of whether frames are
-# actually landing, which a publisher cannot see about itself.
+# `audio_capture_enabled` is the SENSOR's own column; `online` is the
+# SUBSCRIBER's view of whether frames are actually landing, which a
+# publisher cannot see about itself.
 def _cam_select(multi_tenant: bool) -> str:
     """The camera list, scoped by what this service IS."""
     where = _BRIDGE_CAM_WHERE if multi_tenant else _GATEWAY_CAM_WHERE
     return _GATEWAY_CAM_SELECT_HEAD + where + " ORDER BY created_at"
 
 
+# The audio kill is the SENSOR's own column since 2026-08-22. It was a
+# bool_and across covered patients, which is a statement about people
+# used to answer a question about a room — and once a sensor can cover
+# nobody, that expression returns NULL, and NULL fails closed, so every
+# unassigned sensor would have been silently deaf.
 _GATEWAY_CAM_SELECT_HEAD = (
     "SELECT id, livekit_identity, livekit_room, desired_state, "
-    "privacy_enabled, online, "
-    "COALESCE("
-    " (SELECT bool_and(p.audio_capture_enabled)"
-    "    FROM public.camera_patients cp"
-    "    JOIN public.patients p ON p.id = cp.patient_id"
-    "   WHERE cp.camera_id = cameras.id),"
-    " (SELECT audio_capture_enabled FROM public.patients p "
-    "   WHERE p.id = cameras.patient_id)"
-    ") AS audio_capture_enabled "
+    "privacy_enabled, online, audio_capture_enabled "
     "FROM public.cameras ")
 
 FLEET_CONTRACT = "fleet-v1"
-
-
-def _extract_boundary(content_type: str | None) -> bytes:
-    """Pull the boundary parameter out of the Content-Type header.
-
-    The Pi sets `Content-Type: multipart/x-mixed-replace; boundary=frame`
-    on its outbound POST. Anything else is a client bug; we 400 it.
-    """
-    if not content_type:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="missing_content_type",
-        )
-    lower = content_type.lower()
-    if "multipart/x-mixed-replace" not in lower:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="expected_multipart_mixed_replace",
-        )
-    match = _BOUNDARY_RE.search(content_type.encode("latin-1"))
-    if match is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="missing_boundary_parameter",
-        )
-    return match.group(1)
 
 
 @router.post(
@@ -289,48 +259,27 @@ async def gateway_wait(
     # string stops being the docstring and the contract above vanishes
     # from /docs and from help().
     health_mod.last_gateway_poll_mono = time.monotonic()
-    if not authorization.lower().startswith("bearer "):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="missing_bearer_token",
-        )
-    presented = authorization[len("bearer "):].strip()
-    if not presented:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="empty_bearer_token",
-        )
-    digest = hash_ingest_token(presented)
-    gw = (await session.execute(
-        text("SELECT id, caregiver_id FROM public.gateways WHERE token_hash = :d"),
-        {"d": digest},
-    )).first()
-    if gw is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_gateway_token",
-        )
-    gateway_id, caregiver_id = gw[0], gw[1]
+    # Same helper the roster uses, so this cannot drift from it — and it
+    # is the ONLY source of `multi_tenant`. The inlined lookup that used
+    # to be here selected `id, caregiver_id` alone, so a bridge long-
+    # polled on the single-tenant BOX scope while its roster answered on
+    # the bridge scope: the two disagreed about which sensors exist, and
+    # a change to one the fingerprint could not see would never wake it.
+    gateway_id, caregiver_id, multi_tenant = await _gateway_from_bearer(
+        session, authorization,
+    )
 
     async def snapshot():
         rows = (await session.execute(
             text("SELECT id, livekit_identity, livekit_room, desired_state, "
                  "privacy_enabled, "
-                 # Same strictest-covered-patient rule as the roster. It
-                 # has to match exactly: this feeds the fingerprint the
-                 # long poll wakes on, so a disagreement here would wake
-                 # the box to be told the opposite of what the roster
-                 # says, forever.
-                 "COALESCE("
-                 " (SELECT bool_and(p.audio_capture_enabled)"
-                 "    FROM public.camera_patients cp"
-                 "    JOIN public.patients p ON p.id = cp.patient_id"
-                 "   WHERE cp.camera_id = cameras.id),"
-                 " (SELECT audio_capture_enabled FROM public.patients p "
-                 "   WHERE p.id = cameras.patient_id)"
-                 ") AS audio_capture_enabled "
-                 "FROM public.cameras WHERE patient_id IN "
-                 "(SELECT id FROM public.patients WHERE caregiver_id = :c) "
-                 "AND source_type = 'gateway' "
-                 "AND (gateway_id = :gw OR gateway_id IS NULL) "
-                 "ORDER BY livekit_identity"),
+                 # Same audio rule as the roster, and it has to match
+                 # exactly: this feeds the fingerprint the long poll
+                 # wakes on.
+                 "audio_capture_enabled "
+                 "FROM public.cameras "
+                 + (_BRIDGE_CAM_WHERE if multi_tenant else _GATEWAY_CAM_WHERE)
+                 + " ORDER BY livekit_identity"),
             {"c": caregiver_id, "gw": gateway_id},
         )).all()
         await session.commit()   # release the connection between checks
@@ -482,14 +431,30 @@ async def _enroll_gateway_token(
         {"h": token_hash},
     )).first()
     if existing is None:
+        # ON CONFLICT because the SELECT above and this INSERT are not
+        # atomic: two concurrent first-enrols with the same token both
+        # miss the SELECT. Without the unique index that produced two
+        # rows for one credential and the lookups do `.first()`, so which
+        # account a service was bound to came down to row order. With the
+        # index and without this, the loser gets a 500 instead. A bridge
+        # re-enrols on every boot, so a restart loop is exactly this.
         gateway_id = (await session.execute(
             text("INSERT INTO public.gateways "
                  " (caregiver_id, token_hash, created_at, multi_tenant) "
-                 "VALUES (:c, :h, :n, :mt) RETURNING id"),
+                 "VALUES (:c, :h, :n, :mt) "
+                 "ON CONFLICT (token_hash) DO NOTHING RETURNING id"),
             {"c": caregiver_id, "h": token_hash, "n": now,
              "mt": _is_multi_tenant(service_kind)},
-        )).scalar_one()
-        return gateway_id, caregiver_id, False
+        )).scalar_one_or_none()
+        if gateway_id is not None:
+            return gateway_id, caregiver_id, False
+        # Lost the race. The winner's row is the one row, so read it and
+        # fall through to the same update path a re-enrol takes.
+        existing = (await session.execute(
+            text("SELECT id, multi_tenant FROM public.gateways "
+                 " WHERE token_hash = :h"),
+            {"h": token_hash},
+        )).first()
     gateway_id, was_multi_tenant = existing[0], bool(existing[1])
     if not was_multi_tenant and not _is_multi_tenant(service_kind):
         # A BOX moves house: re-provisioned into a different home, so the
@@ -563,6 +528,15 @@ async def gateway_provision_camera(
     # now one of two ways to enrol, not the only one.
     gateway_id, caregiver_id, _already = await _enroll_gateway_token(
         session, authorization, body.email, now,
+        # Honoured here too, not only at /gateway/enroll. The field was
+        # already on the body (inherited from GatewayEnrollRequest) and
+        # was silently dropped, which made the whole multi-tenant path
+        # unreachable for the one caller that needs it: a bridge's FIRST
+        # contact is a provision, so its row was born single-tenant and
+        # the next customer's provision rebound the entire service to
+        # them. Every multi-tenancy test passed because they all enrol
+        # first and provision second — the order the bridge never used.
+        service_kind=body.service_kind,
     )
 
     # No patient lookup any more: a camera belongs to the account, so it can
@@ -579,8 +553,12 @@ async def gateway_provision_camera(
     cameras = []
     for camera_id in (uuid4(),):
         livekit_identity = f"cam_{camera_id.hex[:8]}"
-        # Room follows the primary patient and is set at assignment time.
-        livekit_room = None
+        # The room is the ACCOUNT's, so it is known right here — an
+        # installer types a caregiver's email and nothing else, and that
+        # is enough. It used to be None until a caregiver picked a
+        # patient, which meant the person standing in the house holding
+        # the sensor could not see it work before they left.
+        livekit_room = livekit_rooms.account_room(caregiver_id)
         next_display_id = (await session.execute(
             select(func.coalesce(func.max(Camera.display_id), 0)).where(
                 Camera.caregiver_id == caregiver_id)
@@ -605,13 +583,20 @@ async def gateway_provision_camera(
             state_changed_at=now,
             close_threshold=6,
             battery_percent=None,
-            desired_state="disconnected",
+            # A sensor an installer just mounted is meant to be running.
+            # This defaulted to 'disconnected', copied from the wall
+            # phone, where it is right — a phone is battery-powered and
+            # someone must choose to spend it. A bridge sensor is mains
+            # powered and was mounted for the purpose of streaming, so
+            # defaulting it off meant the installer's own sensor was dark
+            # until a caregiver, who is not in the house, turned it on.
+            # The now-deleted pi-provision already defaulted to
+            # connected; the two paths disagreeing was the tell.
+            desired_state="connected",
             source_type="gateway",
             # Own this camera to THIS box, so the roster + heartbeat scope
             # per-gateway (not fleet-wide across the caregiver's boxes).
             gateway_id=gateway_id,
-            pi_stream_url=None,
-            pi_audio_url=None,
             ingest_token_hash=ingest_token_hash,
             ingest_token_created_at=now,
             app_present=True,

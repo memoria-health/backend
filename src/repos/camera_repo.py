@@ -57,12 +57,19 @@ async def list_for_patient(
 async def find_by_id(
     session: AsyncSession, camera_id: UUID, *, caregiver_id: UUID
 ) -> Camera | None:
+    """A sensor on this caregiver's account, assigned or not.
+
+    Scoped by ACCOUNT, mirroring the `cameras_member` RLS policy. It was
+    an INNER JOIN on the patient, so an unassigned sensor — patient_id
+    NULL — joined nothing and every per-sensor control 404'd: rename,
+    disable, desired_state, the audio kill, delete. The sensor streamed
+    and could not be turned off, which is the opposite of what a privacy
+    control is for.
+    """
     result = await session.execute(
-        select(Camera)
-        .join(Patient, Patient.id == Camera.patient_id)
-        .where(
+        select(Camera).where(
             Camera.id == camera_id,
-            Patient.id.in_(accessible_patient_ids(caregiver_id)),
+            Camera.caregiver_id == caregiver_id,
         )
     )
     return result.scalar_one_or_none()
@@ -89,6 +96,7 @@ async def update_partial(
     ai_paused: bool | None = None,
     desired_state: str | None = None,
     room: str | None = None,
+    audio_capture_enabled: bool | None = None,
 ) -> Camera | None:
     """Partial-update a caregiver-owned camera. Returns the refreshed
     row, or None if the camera doesn't exist for this caregiver.
@@ -133,6 +141,8 @@ async def update_partial(
         cam.ai_paused = ai_paused
     if desired_state is not None:
         cam.desired_state = desired_state
+    if audio_capture_enabled is not None:
+        cam.audio_capture_enabled = audio_capture_enabled
     if room is not None and room != cam.room:
         # Room rename → re-classify (room-privacy escape hatch ⚑3): the
         # caregiver saying "this is actually the Living Room" is the ONE
