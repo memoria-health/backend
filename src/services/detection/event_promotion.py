@@ -784,17 +784,18 @@ async def maybe_promote_analysis(
                 description=description,
             )
         )
-        # Fire-once: the moment a self-test promotes, disable its (single,
-        # per-patient) row so it can never fire again — on this camera or
-        # any other. The caller commits this session, persisting
-        # is_on=false; the next tick's registry query (is_on=true filter)
-        # drops it everywhere.
+        # Fire-once is PER CAMERA (2026-08-22): stamp the camera that just
+        # passed instead of disabling the shared per-patient row, so every
+        # other camera in the home keeps its own chance to prove the alert
+        # path. The caller commits this session; the next tick's registry
+        # check drops the test on this camera only. A camera restart clears
+        # the stamp and re-arms it.
         if winner.identifier in _FIRE_ONCE_KEYS:
-            det.is_on = False
+            cam.setup_test_passed_at = occurred_at
             _log.info(
-                "[event_promotion] fire-once detector %s (%s) disabled after "
-                "first fire for patient %s", det.id, winner.identifier,
-                patient_id,
+                "[event_promotion] fire-once detector %s (%s) passed on "
+                "camera %s for patient %s", det.id, winner.identifier,
+                cam.id, patient_id,
             )
 
     if suppressed:

@@ -53,6 +53,16 @@ class _FakeSession:
         if "SELECT id, livekit_room" in sql:
             rows = [(c["id"], c["room"]) for c in cams if c["online"]]
             return _FakeResult(rows=rows)
+        # Checked BEFORE the offline branch: the re-arm UPDATE is also
+        # identity-scoped, and would otherwise be mistaken for one.
+        if "setup_test_passed_at = NULL" in sql:
+            ident = params.get("identity")
+            n = 0
+            for c in cams:
+                if c["identity"] == ident and c.get("setup_test_passed_at"):
+                    c["setup_test_passed_at"] = None
+                    n += 1
+            return _FakeResult(rowcount=n)
         if "livekit_identity = :identity" in sql:
             ident = params.get("identity")
             n = 0
@@ -211,3 +221,55 @@ async def test_helpers_never_raise_on_db_failure() -> None:
     assert await camera_presence.mark_offline_by_identity(sm, "cam_x") is False
     assert await camera_presence.mark_room_offline(sm, "patient_x") == 0
     assert await camera_presence.sweep_stale_online(sm, set()) == 0
+    assert await camera_presence.rearm_setup_test_by_identity(sm, "cam_x") is False
+
+
+# ── rearm_setup_test_by_identity ──────────────────────────────────────
+# A camera restart re-arms its setup self-test, and only its own: the
+# whole point of moving fire-once off the shared per-patient row.
+
+
+@pytest.mark.asyncio
+async def test_rearm_clears_the_stamp_on_that_camera_only() -> None:
+    store = _store([
+        {"id": uuid4(), "identity": "cam_aaaa", "room": "patient_x",
+         "online": True, "setup_test_passed_at": "2026-08-22T08:02:17Z"},
+        {"id": uuid4(), "identity": "cam_bbbb", "room": "patient_x",
+         "online": True, "setup_test_passed_at": "2026-08-22T08:02:17Z"},
+    ])
+    rearmed = await camera_presence.rearm_setup_test_by_identity(
+        _sessionmaker(store), "cam_aaaa",
+    )
+    assert rearmed is True
+    assert store["cameras"][0]["setup_test_passed_at"] is None
+    assert store["cameras"][1]["setup_test_passed_at"] is not None
+    assert store["commits"] == 1
+
+
+@pytest.mark.asyncio
+async def test_rearm_leaves_online_alone() -> None:
+    """The re-arm is identity-scoped like the offline write, so a typo that
+    let it fall through to that branch would silently mark a rejoining
+    camera offline."""
+    store = _store([
+        {"id": uuid4(), "identity": "cam_aaaa", "room": "patient_x",
+         "online": True, "setup_test_passed_at": "2026-08-22T08:02:17Z"},
+    ])
+    await camera_presence.rearm_setup_test_by_identity(
+        _sessionmaker(store), "cam_aaaa",
+    )
+    assert store["cameras"][0]["online"] is True
+
+
+@pytest.mark.asyncio
+async def test_rearm_on_camera_that_never_passed_is_a_no_op() -> None:
+    """No stamp means no Realtime echo — clients re-render off every
+    cameras UPDATE, and a camera reconnects far more often than it tests."""
+    store = _store([
+        {"id": uuid4(), "identity": "cam_aaaa", "room": "patient_x",
+         "online": True, "setup_test_passed_at": None},
+    ])
+    rearmed = await camera_presence.rearm_setup_test_by_identity(
+        _sessionmaker(store), "cam_aaaa",
+    )
+    assert rearmed is False

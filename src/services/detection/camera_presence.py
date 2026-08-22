@@ -165,6 +165,16 @@ _OFFLINE_BY_IDENTITY_SQL = text(
     """
 )
 
+# Idempotent for the same reason as above: only clears a stamp that is set,
+# so a reconnect on a camera that never passed emits no Realtime echo.
+_REARM_SETUP_TEST_SQL = text(
+    """
+    UPDATE public.cameras
+    SET setup_test_passed_at = NULL
+    WHERE livekit_identity = :identity AND setup_test_passed_at IS NOT NULL
+    """
+)
+
 _OFFLINE_BY_ROOM_SQL = text(
     """
     UPDATE public.cameras
@@ -178,6 +188,38 @@ _SELECT_ONLINE_CAMERAS_WITH_ROOM_SQL = text(
     SELECT id, livekit_room FROM public.cameras WHERE online = true
     """
 )
+
+
+async def rearm_setup_test_by_identity(
+    sessionmaker: async_sessionmaker, livekit_identity: str,
+) -> bool:
+    """participant_joined trigger. Re-arm the setup self-test on the camera
+    with this LiveKit identity, because a publisher rejoining is what a
+    restart/reboot looks like from here. Returns True iff a stamp was
+    actually cleared. Never raises — a failed re-arm must not break the
+    webhook, it only means the test stays passed until the next restart.
+    """
+    if not livekit_identity:
+        return False
+    try:
+        async with sessionmaker() as session:
+            res = await session.execute(
+                _REARM_SETUP_TEST_SQL, {"identity": livekit_identity},
+            )
+            await session.commit()
+        rearmed = (res.rowcount or 0) > 0
+        if rearmed:
+            log.info(
+                "camera_presence.setup_test_rearmed identity=%s",
+                livekit_identity,
+            )
+        return rearmed
+    except Exception:
+        log.exception(
+            "camera_presence.rearm_setup_test_failed identity=%s",
+            livekit_identity,
+        )
+        return False
 
 
 async def mark_offline_by_identity(
