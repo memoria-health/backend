@@ -28,7 +28,6 @@ nemara-backend/
 │   └── seed.sql                  # empty; Python seeder runs in scripts/seed.py
 ├── tools/
 │   ├── lk_room_audit.py          # LiveKit room snapshot; flags zombie/idle detector workers
-│   ├── provision_pi.sh           # SSH into a Pi and run scripts/pi/install.sh
 │   ├── download_models.py        # pre-fetch model weights
 │   ├── live_tracker_view.py      # legacy live-tracker debug viewer (superseded by gpu/identity/service.py)
 │   └── soak_dashboard.py / soak_report.py / soak_watch.py   # soak monitoring + analysis
@@ -53,12 +52,11 @@ nemara-backend/
 │   │   ├── patient_members.py    #   patient sharing — owner/member roles, share-by-email
 │   │   ├── detectors.py          #   detector CRUD + /detectors/library + /detectors/infer
 │   │   ├── events.py             #   list/get/review + /v1/events/{id}/clip-url
-│   │   ├── cameras.py            #   cameras CRUD, pairing-code, pi-provision, /v1/cameras/me/* (wall phone)
+│   │   ├── cameras.py            #   cameras CRUD, pairing-code, /v1/cameras/me/* (wall phone)
 │   │   ├── cameras_ingest.py     #   Pi push: /v1/cameras/me/frames + /ingest-status
 │   │   ├── pairing.py            #   /v1/cameras/pair (6-digit code → api key)
 │   │   ├── livekit.py            #   /v1/livekit/token (camera api-key OR caregiver JWT)
 │   │   ├── livekit_webhooks.py   #   participant joined/left + room_finished → worker dispatch
-│   │   ├── pi_discovery.py       #   /v1/cameras/pi-announce (unauthenticated) + /discovered
 │   │   ├── face_embeddings.py    #   identity selfie enrollment + status/summary
 │   │   ├── talk.py               #   /active-camera + /talk/{start,end}
 │   │   ├── devices.py            #   /v1/me/devices (APNs token registration)
@@ -112,10 +110,10 @@ All presented as `Authorization: Bearer …`; four distinct verifiers:
 
 1. **Caregiver JWT** (Supabase) on every iOS-facing route. `verify_supabase_jwt` dispatches on the token's `alg` header — ES256 via JWKS in prod, HS256 with `NEMARA_SUPABASE_JWT_SECRET` for local dev. Exposed via `CaregiverAuth` dep in `api/deps.py`.
 2. **Camera api-key** on wall-phone routes (`/v1/cameras/me/*`, `/v1/livekit/token` camera role). bcrypt-hashed on the `cameras` row, verified by linear scan over active cameras (O(N), small N). A well-formed key with no match returns **404** (not 401) so the wall phone knows its row was deleted and resets to pairing. Exposed via `CameraAuth`.
-3. **Pi ingest token** on `/v1/cameras/me/frames` + `/ingest-status`. High-entropy `token_urlsafe(32)`, stored as an **unsalted SHA-256** digest (`cameras.ingest_token_hash`) so auth is an indexed equality lookup instead of a bcrypt scan. Delivered exactly once via the pi-announce response.
+3. **Fleet ingest token** on the gateway/bridge endpoints (`/v1/fleet/poll`, `/v1/gateway/roster`, `/v1/gateway/enroll`, `/v1/livekit/token`). High-entropy `token_urlsafe(32)`, stored as an **unsalted SHA-256** digest (`cameras.ingest_token_hash` / `gateways.token_hash`) so auth is an indexed equality lookup instead of a bcrypt scan.
 4. **LiveKit webhook signature** on `/v1/livekit/webhooks` — JWT verified against the LiveKit API key/secret.
 
-`POST /v1/cameras/pair` and `POST /v1/cameras/pi-announce` are deliberately unauthenticated (pairing-code possession / physical-proximity provisioning are the trust anchors).
+`POST /v1/cameras/pair` is deliberately unauthenticated (possession of the pairing code is the trust anchor).
 
 ## App lifecycle (main.py)
 
@@ -180,17 +178,6 @@ Identity answers "is the person in frame the *patient*, or someone else?" so det
 - **Backend consumer** (`src/services/identity/`, renamed from `services/reid` 2026-07-27): `identity_client.py` reads `/state` (~ms), `result.py`/`observations.py` hold the verdict shapes, and `track_ledger.py` is the bind-once-hold sticky lock — every stable track is born UNKNOWN, binds PATIENT on a face/pool match, and is then held until the track dies (retire on grace / bounded scene-extension, `reid_scene_extension_max_s`). Two labels only: PATIENT or UNKNOWN.
 - **Enrollment** (stays in the backend): caregiver uploads 1–N selfies (`POST /v1/patients/{id}/face-embeddings`, 202 + background processing). `enrollment_processor.py` downloads from Supabase Storage, runs SCRFD face detection + ArcFace embedding (InsightFace), quality-gates on det score, and marks rows `ready`/`failed`. Embeddings (512-dim float32) live in Postgres `patient_face_embeddings`; the GPU-side gallery reads them back through the DB.
 - If identity can't run (no enrollment, sidecar down, timeout), the pipeline degrades to LLM-only presence — identity failure never blocks detection.
-
-## Pi camera ingest
-
-`src/services/ingest/pi/` makes a Raspberry Pi camera look identical to an iPhone from everything downstream. The Pi cannot be a LiveKit participant (CPU + NAT), so the backend acts as its publisher proxy:
-
-1. **Provisioning:** `tools/provision_pi.sh` → `scripts/pi/install.sh` sets up systemd units (`memoria-*` services, `/etc/memoria/` env files). Customer setup is a Wi-Fi captive portal (`Memoria-Setup-<MAC6>` AP at 192.168.4.1); once on home Wi-Fi, `announce_daemon.py` heartbeats `POST /v1/cameras/pi-announce` every 60s with its MAC-derived `hardware_id`.
-2. **Pairing:** caregiver sees unclaimed Pis via `GET /v1/cameras/discovered` (5-min freshness window) and provisions via `POST /v1/patients/{id}/cameras/pi-provision` — creates the `cameras` row (`source_type='pi'`), mints the ingest token, and stashes the plaintext on `pi_discoveries.pending_ingest_token`. The next announce response delivers it **exactly once** (`SELECT … FOR UPDATE`, column nulled in the same transaction); the Pi writes `/etc/memoria/ingest.env` and starts streaming.
-3. **Streaming:** the Pi holds one long-lived `POST /v1/cameras/me/frames` with `multipart/x-mixed-replace` MJPEG (outbound dial — home routers block inbound). `mjpeg_reader.py` parses the body, `jpeg_decoder.py` produces the Y-plane + I420 per frame, and `relay_publisher.py` republishes into LiveKit as a regular `cam_<…>` participant — plus the same `motion_state` heartbeat packets the iPhone sends, computed server-side by `motion_detector.py` (a port of the iOS SAD-tile algorithm with a Pi-specific threshold of 8.0 vs iOS 1.5, tuned for MJPEG re-compression noise). Most-recent-wins: a new connection for the same camera cancels the old relay task.
-4. **Pause:** caregiver disconnect flips `desired_state`; the push endpoint returns 423 LOCKED and `cancel_active_relay()` kills the in-flight relay. The Pi polls `GET /v1/cameras/me/ingest-status` (~5s) while paused.
-
-Audio for the Pi path is not wired yet (`audio_reader.py` is pull-mode vestigial; push audio is a planned follow-up endpoint).
 
 ## Caregiver Talk mode
 

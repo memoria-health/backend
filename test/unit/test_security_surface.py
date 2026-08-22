@@ -49,10 +49,11 @@ def test_pi_announce_route_does_not_exist(monkeypatch, env):
     It accepted anonymous writes keyed on a caller-supplied
     hardware_id and handed back a plaintext ingest bearer token, so an
     attacker who won the race against a real Pi could push frames as
-    that camera. The Pi path is dead code (see src/db/camera.py:126 —
-    the push refactor made pi_stream_url vestigial), so the fix is
-    deletion. Parametrised across envs because an env-gated version of
-    this route would still be one config mistake from being live.
+    that camera. The whole Pi path is now deleted — endpoints, tables,
+    columns and the `source_type` value — so this guards against it
+    being reintroduced rather than against it still being live.
+    Parametrised across envs because an env-gated version of this route
+    would still be one config mistake away from serving.
     """
     app = _app_for_env(monkeypatch, env)
     paths = _paths(app)

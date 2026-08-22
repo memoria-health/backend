@@ -92,7 +92,6 @@ from src.db import event as _event  # noqa: F401
 from src.db import feedback as _feedback  # noqa: F401
 from src.db import patient as _patient  # noqa: F401
 from src.db import patient_face_embedding as _patient_face_embedding  # noqa: F401
-from src.db import pi_discovery as _pi_discovery  # noqa: F401
 from src.db.session import get_engine, get_sessionmaker
 from src.services import clip_archival, email, event_gate, pager, push
 from src.services.data_collection import manager as recorder_manager
