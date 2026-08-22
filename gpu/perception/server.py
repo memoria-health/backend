@@ -92,11 +92,33 @@ def _require_auth(request: Request) -> None:
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
+def _require_admin_auth(request: Request) -> None:
+    """Same, but an UNSET token refuses instead of allowing.
+
+    An empty token disabling auth is a defensible default for /observe:
+    the pod binds loopback and the tunnel is the boundary. It is not
+    defensible for a route that kills the process. With the pod on the
+    tailnet and the token unset, anything that could reach the port could
+    restart it, and the boot warning only ever mentioned /observe and
+    /faces so nobody would have known.
+
+    Fails CLOSED: no token configured means the admin surface does not
+    exist, rather than existing for everyone.
+    """
+    if not _AUTH_TOKEN:
+        raise HTTPException(
+            status_code=404,
+            detail="admin surface disabled (NEMARA_PERCEPTION_TOKEN unset)",
+        )
+    _require_auth(request)
+
+
 if not _AUTH_TOKEN:
     log.warning(
         "perception.auth_disabled — NEMARA_PERCEPTION_TOKEN is unset, so "
-        "/observe and /faces accept EVERY caller. Safe only while bound to "
-        "loopback (host=%s). Set the token before exposing this port.",
+        "/observe and /faces accept EVERY caller and the /admin routes are "
+        "refused outright. Safe only while bound to loopback (host=%s). "
+        "Set the token before exposing this port.",
         os.environ.get("PERCEPTION_HOST", "127.0.0.1"),
     )
 
@@ -376,16 +398,46 @@ def _startup() -> None:
     )
 
 
+def _gpu_op_ok() -> "str | None":
+    """Run one trivial op on the GPU. None on success, the error otherwise.
+
+    `torch.cuda.is_available()` asks the driver whether a device exists.
+    It keeps saying yes after the CUDA context has been poisoned — an OOM,
+    an Xid, a device-side assert — which is the failure mode that actually
+    takes a pod out. So health said `cuda: true` while every observe
+    raised, and the pod stayed in the roster being handed work it could
+    not do.
+
+    An add on two 1-element tensors plus a synchronize is enough: the
+    sync is the part that surfaces a poisoned context, because launches
+    are async and the error is only reported when we wait for it.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return "cuda_unavailable"
+    try:
+        t = torch.ones(1, device="cuda")
+        _ = (t + t).item()          # .item() syncs
+        torch.cuda.synchronize()
+    except Exception as exc:        # noqa: BLE001 — any failure is a failure
+        return f"{type(exc).__name__}: {exc}"
+    return None
+
+
 @app.get("/health")
 def health():
     import torch
 
+    gpu_error = _gpu_op_ok()
     body = {
         "status": (
-            "degraded" if _sam_error else ("ok" if _ready else "warming")
+            "degraded" if (_sam_error or gpu_error)
+            else ("ok" if _ready else "warming")
         ),
         "contract": "observe-v2",
-        "cuda": torch.cuda.is_available(),
+        # Proven by running something, not by asking the driver.
+        "cuda": gpu_error is None,
         "gpu": (
             torch.cuda.get_device_name(0)
             if torch.cuda.is_available() else None
@@ -396,11 +448,15 @@ def health():
         # gallery's (review G4) — expose the name so it can check.
         "face_model": _FACE_MODEL,
     }
-    if _sam_error:
+    if _sam_error or gpu_error:
         # 503, not 200-with-a-sad-body: every existing consumer (boot
         # wait, gates, dashboards) checks with `curl -f` or status
-        # string — both must fail when the tracker cannot load.
-        body["sam_error"] = _sam_error
+        # string — both must fail when the tracker cannot load, and the
+        # same has to be true when the GPU itself is gone.
+        if _sam_error:
+            body["sam_error"] = _sam_error
+        if gpu_error:
+            body["gpu_error"] = gpu_error
         return JSONResponse(body, status_code=503)
     return body
 
@@ -419,7 +475,7 @@ _LOGDIR = os.environ.get("NEMARA_LOGDIR", "/persist/state/logs")
 async def admin_exit(request: Request) -> JSONResponse:
     """Exit(0) shortly after replying; the entrypoint supervisor
     relaunches (fresh dev code first when NEMARA_DEV_CODE=1)."""
-    _require_auth(request)
+    _require_admin_auth(request)
 
     def _die() -> None:
         time.sleep(0.3)
