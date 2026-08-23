@@ -477,6 +477,19 @@ async def _read_video(track: rtc.Track, cam_loop: CameraLoop) -> None:
             )
 
 
+def cam_selected(only_cam: str, ident: str) -> bool:
+    """Does `--only-cam` select this LiveKit participant?
+
+    Matched against the FULL identity (`cam_650ca94d`), never the
+    stripped camera id, so both shapes work: the roster passes
+    `camera_identity` verbatim and a human passes the bare `650ca94d`.
+    Comparing against the stripped id accepted only the human shape, so
+    every roster-started process skipped the one camera it existed for
+    and served an empty camera map while looking healthy (2026-08-23).
+    """
+    return not only_cam or only_cam in ident
+
+
 async def _run_livekit(
     url: str, token: str, home: IdentityHome, only_cam: str = "",
 ) -> None:
@@ -542,7 +555,7 @@ async def _run_livekit(
         if not ident.startswith("cam_"):
             return
         cam_id = ident.removeprefix("cam_")
-        if only_cam and only_cam not in cam_id:
+        if not cam_selected(only_cam, ident):
             log.info("identity.camera_skipped cam=%s (--only-cam)", cam_id)
             return
         cam_loop = home.cameras.get(cam_id)
@@ -606,7 +619,7 @@ async def _run_livekit(
                 if not p.identity.startswith("cam_"):
                     continue
                 cam_id = p.identity.removeprefix("cam_")
-                if only_cam and only_cam not in cam_id:
+                if not cam_selected(only_cam, p.identity):
                     continue
                 sp = home.cameras.get(cam_id)
                 last_ts = (

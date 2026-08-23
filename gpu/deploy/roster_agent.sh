@@ -86,6 +86,17 @@ _start_room() {
     backoff=3
     while true; do
       cd "$STATE_DIR/$key" || exit 1
+      # Same overlay entrypoint.sh applies before perception and before
+      # a static-mode identity process. Without it here, the documented
+      # iteration loop — rsync to /persist, POST /admin/exit — respawned
+      # the OLD code from /workspace and read as a successful deploy.
+      # Only `identity`: this script is itself under /workspace and bash
+      # reads it lazily, so replacing it underneath a running agent
+      # corrupts the agent. deploy/ lands on the next container boot.
+      if [ "${NEMARA_DEV_CODE:-}" = "1" ] && [ -d /persist/dev-code/nemara/identity ]; then
+        cp -a /persist/dev-code/nemara/identity/. /workspace/nemara/identity/ 2>/dev/null \
+          && log "dev-code overlay applied (identity) for camera=$key"
+      fi
       t0=$(date +%s)
       # No --patient (2026-08-20): the room's cameras name the residents,
       # because a shared camera watches more than one and a single flag
@@ -149,9 +160,14 @@ _stop_room() {
     pkill -9 -f -- "--only-cam .* --port $(cat "$RUN/$key.port" 2>/dev/null)" 2>/dev/null
     log "stopped camera=$key (FORCED — did not exit on TERM)"
   else
-    log "stopped room=$room (reassigned or released)"
+    log "stopped camera=$key (reassigned or released)"
   fi
-  rm -f "$RUN/$room.pid" "$RUN/$room.port"
+  # $key, not $room — $room is not a parameter here, so this removed
+  # nothing and the run-state file survived its process. A dead pid file
+  # is re-stopped every poll forever, and once the kernel recycles that
+  # pid, `_alive` vouches for an unrelated process and the camera is
+  # never started (or `kill` takes the unrelated process down).
+  rm -f "$RUN/$key.pid" "$RUN/$key.port"
 }
 
 _alive() {

@@ -190,6 +190,18 @@ def _get_edge():
             import torch
 
             try:
+                # The try/except below guards the WRAP, and wrapping
+                # never fails — torch.compile is lazy, so the real
+                # compile happens on the first observe, deep inside the
+                # request. When inductor choked there ('SymInt' object
+                # has no attribute 'size'), the exception surfaced as a
+                # 500 on every /observe_raw and tracking was simply
+                # down: an optimisation had become a dependency, which
+                # is exactly what the comment below says it must never
+                # be. This is the switch that actually delivers that —
+                # a failed compile falls back to eager and costs speed
+                # instead of taking the node's tracking with it.
+                torch._dynamo.config.suppress_errors = True
                 edge.image_encoder = torch.compile(
                     edge.image_encoder, dynamic=True,
                 )

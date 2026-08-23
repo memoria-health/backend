@@ -25,6 +25,7 @@ import asyncio
 import base64
 import logging
 import os
+import pathlib
 
 import httpx
 import numpy as np
@@ -40,6 +41,33 @@ from perception.rawwire import pack_frames
 log = logging.getLogger(__name__)
 
 _EMB_DIM = 512
+
+# Default matches perception/server.py's `_load_auth_token`.
+_TOKEN_FILE = "/persist/secrets/perception_token"
+
+
+def load_perception_token() -> str:
+    """The shared bearer for perception, from the environment or a file.
+
+    MUST mirror the server's resolution. Perception reads env-then-file
+    precisely so auth can be switched on by writing one file on the
+    shared volume — no pod recycle. This side read the env ALONE, so
+    writing that file turned auth on for the server and left the only
+    legitimate client sending no bearer at all: every /observe_raw came
+    back 401, every tracking step failed, and the service went on
+    answering /state as `ready` with an empty camera map (2026-08-23).
+
+    Not imported from `perception.server`: importing the server module
+    would start it. Eight duplicated lines beat that.
+    """
+    env = os.environ.get("NEMARA_PERCEPTION_TOKEN", "").strip()
+    if env:
+        return env
+    path = os.environ.get("NEMARA_PERCEPTION_TOKEN_FILE", _TOKEN_FILE)
+    try:
+        return pathlib.Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
 
 
 # Payload sanity caps (security review S5): the brain consumes rows
@@ -86,7 +114,7 @@ class SamServiceClient:
         # an unset token leaves dev exactly as it was. Sent on every request
         # via the client's default headers rather than per-call, so a new
         # endpoint cannot forget it.
-        _tok = os.environ.get("NEMARA_PERCEPTION_TOKEN", "").strip()
+        _tok = load_perception_token()
         if _tok:
             self._client.headers["Authorization"] = f"Bearer {_tok}"
         self._expected_face_model = expected_face_model
