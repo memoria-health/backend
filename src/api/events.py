@@ -11,7 +11,9 @@ never POSTs an event in v0.
 from datetime import datetime, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Query, status
+import logging
+
+from fastapi import APIRouter, HTTPException, Query, Response, status
 
 from src.api.deps import CaregiverAuth, SessionDep, SettingsDep
 from src.db.event import Event
@@ -26,6 +28,9 @@ from src.schemas.event import (
 from src.services import storage
 
 router = APIRouter(prefix="/v1", tags=["event"])
+
+
+log = logging.getLogger(__name__)
 
 
 def _to_response(e: Event) -> EventResponse:
@@ -150,12 +155,63 @@ async def get_event_clip_url(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="clip_not_ready",
         )
-    url = await storage.signed_url(
-        bucket=settings.storage_bucket_incident_clips,
-        key=e.clip_storage_key,
-        settings=settings,
-    )
+    # OUR origin, not storage's. `storage.signed_url` builds its absolute
+    # URL from `settings.supabase_url` — the address the BACKEND uses to
+    # reach Supabase. In Docker that is host.docker.internal, natively
+    # loopback or a LAN IP, and none of them resolve on a phone. The app
+    # got a URL it could never fetch and showed a player that silently
+    # refused to start, indistinguishable from a corrupt clip.
+    #
+    # The operator verdict page hit this first and already proxies
+    # (`/act/{token}/clip`). Same reasoning applies here, plus the same
+    # bonus: no separately-shareable storage URL for a household's
+    # footage exists at any point.
     return ClipURLResponse(
-        url=url,
+        url=f"/v1/events/{event_id}/clip",
         expires_in_seconds=settings.storage_signed_url_default_ttl_seconds,
+    )
+
+
+@router.get("/events/{event_id}/clip")
+async def get_event_clip(
+    event_id: UUID,
+    auth: CaregiverAuth,
+    session: SessionDep,
+    settings: SettingsDep,
+) -> Response:
+    """Stream the event's clip through the backend, under caregiver auth.
+
+    `find_by_id` is scoped by `caregiver_id`, so another household's
+    event is a 404 here exactly as it is everywhere else — proxying moves
+    the bytes behind OUR auth, which only helps if that auth is real.
+    """
+    e = await event_repo.find_by_id(session, event_id, caregiver_id=auth.id)
+    if e is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="event_not_found",
+        )
+    if not e.has_clip or e.clip_storage_key is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="clip_not_ready",
+        )
+    try:
+        data = await storage.download_object(
+            bucket=settings.storage_bucket_incident_clips,
+            key=e.clip_storage_key,
+            settings=settings,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("events.clip_proxy_failed event=%s", event_id)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail="clip_unavailable",
+        ) from exc
+    return Response(
+        content=data,
+        media_type="video/mp4",
+        headers={
+            # Short and private: a household's footage must not sit in a
+            # shared cache, and the player re-asks on each open anyway.
+            "Cache-Control": "private, max-age=60",
+            "Content-Disposition": "inline",
+        },
     )
