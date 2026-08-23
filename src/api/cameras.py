@@ -43,6 +43,7 @@ from src.schemas.camera import (
     UpdateMyDesiredStateRequest,
 )
 from src.schemas.pairing import (
+    CreateAccountPairingCodeRequest,
     CreatePairingCodeRequest,
     CreatePairingCodeResponse,
 )
@@ -298,6 +299,122 @@ async def create_pairing_code(
         pairing_code=code,
         expires_at=expires_at,
         camera_id=camera_id,
+    )
+
+
+@router.post(
+    "/cameras/pairing-code",
+    response_model=CreatePairingCodeResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def create_account_pairing_code(
+    body: CreateAccountPairingCodeRequest,
+    auth: CaregiverAuth,
+    session: SessionDep,
+    settings: SettingsDep,
+) -> CreatePairingCodeResponse:
+    """Mint a pairing code against the ACCOUNT, not a patient.
+
+    The patient-scoped twin above is kept for phones paired before
+    2026-08-23, which hold a `patient_<id>` room they will never
+    re-read. New pairings get the account room, so a wall phone is
+    created, named and covered by exactly the same rules as every
+    other sensor — and the roster can mint a code with no patient in
+    context at all, which the old shape made impossible.
+    """
+    requested = body.room.strip()
+
+    # Every named resident must be ours. Coverage is the attribution
+    # boundary, so it is also the place an account boundary could be
+    # crossed: without this, naming a stranger's patient would create a
+    # sensor quietly watching them.
+    for pid in body.patient_ids:
+        if await patient_repo.find_by_id(session, pid, caregiver_id=auth.id) is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="patient_not_found",
+            )
+
+    # Same orphan sweep as the patient-scoped path: a fresh attempt
+    # supersedes an abandoned one for the same name. `source_type`
+    # pins it to wall phones so it can never reach a live gateway or
+    # bridge sensor, every one of which also has api_key_hash NULL.
+    await session.execute(
+        delete(Camera)
+        .where(Camera.caregiver_id == auth.id)
+        .where(func.lower(Camera.room) == requested.lower())
+        .where(Camera.api_key_hash.is_(None))
+        .where(Camera.source_type == "iphone")
+    )
+
+    duplicate = (await session.execute(
+        select(Camera.id)
+        .where(Camera.caregiver_id == auth.id)
+        .where(func.lower(Camera.room) == requested.lower())
+        .limit(1)
+    )).scalar_one_or_none()
+    if duplicate is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="camera_room_duplicate",
+        )
+
+    # Per ACCOUNT, because an unassigned sensor has no patient to be
+    # numbered within.
+    next_display_id = (await session.execute(
+        select(func.coalesce(func.max(Camera.display_id), 0))
+        .where(Camera.caregiver_id == auth.id)
+    )).scalar_one() + 1
+
+    code: str | None = None
+    for _ in range(5):
+        candidate = str(secrets.randbelow(900_000) + 100_000)
+        clash = (await session.execute(
+            select(Camera.id).where(Camera.pairing_code == candidate).limit(1)
+        )).scalar_one_or_none()
+        if clash is None:
+            code = candidate
+            break
+    if code is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="could_not_generate_pairing_code",
+        )
+
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(seconds=settings.pairing_code_ttl_seconds)
+    camera_id = uuid4()
+
+    cam = Camera(
+        id=camera_id,
+        # The shim, kept in step with coverage by set_coverage below.
+        patient_id=body.patient_ids[0] if body.patient_ids else None,
+        caregiver_id=auth.id,
+        display_id=next_display_id,
+        room=body.room,
+        icon_name=body.icon_name,
+        online=False,
+        created_at=now,
+        pairing_code=code,
+        pairing_expires_at=expires_at,
+        api_key_hash=None,
+        livekit_identity=f"cam_{camera_id.hex[:8]}",
+        livekit_room=livekit_rooms.account_room(auth.id),
+        state="open",
+        no_people_count=0,
+        state_changed_at=now,
+        close_threshold=6,
+        battery_percent=None,
+        desired_state="disconnected",
+        source_type="iphone",
+    )
+    session.add(cam)
+    await session.flush()
+    await camera_coverage.set_coverage(session, cam.id, body.patient_ids)
+    for pid in body.patient_ids:
+        await camera_detector_repo.sync_links_for_patient(session, pid)
+    await session.commit()
+
+    return CreatePairingCodeResponse(
+        pairing_code=code, expires_at=expires_at, camera_id=camera_id,
     )
 
 
