@@ -22,9 +22,29 @@ tracking is on the soak dashboard at **:8010**.
 |---|---|
 | Tapo (`Aryaman Bedroom`) | online, publishing into `account_a30c505e…`, privacy ON |
 | Mini-PC gateway | polling the public URL, following the account room |
-| GPU node `7yettlzalhkkl0` | running the reshard, serving 1/1 ports |
+| GPU node `7yettlzalhkkl0` | 8012 + 8013 both answering (2026-08-24) |
 | Patients | Aryaman Darda, Margaret Ellis (+ your father, to add) |
-| Warner bridge sensor | not provisioned yet |
+| Warner bridge sensor | provisioned, publishing 2304x1296 H265 as `cam_c51733e6` |
+
+### Before Phase 3 — two things must land first
+
+**1. Merge `fix/analyses-patient-keying` and apply its delta.** Phase 3
+is the shared-sensor configuration, and until that branch is in, the
+second covered patient has NO observations at all — `analyses.patient_id`
+is the `cameras.patient_id` shim, so every row belongs to whichever
+resident sorted first. Running Phase 3 without it does not test
+attribution; it tests a known-broken join, and every "no event for the
+second patient" result will be indistinguishable from the gate working.
+
+```bash
+psql "$DB" -f scripts/deltas/apply_analyses_coverage_delta.sql   # DB first
+```
+
+**2. Revert the two soak overrides in `.env`.**
+`NEMARA_SENSITIVITY_SCREENING_ENABLED=false` and
+`NEMARA_SLEEP_CLIPS_DIR` are both dev instruments that write unscreened
+frames. They are local-only and ignored outside env=local/test, but they
+must be off before this stack points at anyone but its operator.
 
 The gateway stays as it is. It re-reads its room from the roster and
 never constructs one, so it follows the migration untouched — it only
@@ -107,11 +127,54 @@ gate suppresses when identity cannot say who is in frame. They prove the
 rules rather than merely running.
 
 **Sleep** needs a bedroom sensor and a night. It is *sustained*, so it
-exercises episode dedup, which reads `analyses.patient_id`. On a shared
-sensor the second patient previously had no analyses rows at all, so
-boundaries were never found and the event re-fired every tick. **Watch
+exercises episode dedup, which used to read `analyses.patient_id` — on a
+shared sensor the second patient had no analyses rows at all, so
+boundaries were never found and the event re-fired every tick.
+`fix/analyses-patient-keying` moves that lookback onto coverage. **Watch
 for one sleep event per episode, not one per tick** — that single number
-is the tell.
+is the tell, and it is now a real test rather than a known failure.
+
+---
+
+## Phase 5 — the masked capture test
+
+**Why this is its own phase: the first attempt was inconclusive.** The
+night of 2026-08-23 recorded 496 objects to B2, of which three sessions
+carried `masked=True` and most did not, and the one window that would
+have settled the question was not captured at all — a 24-minute gap sits
+exactly across it. Two sessions were pulled to `out/verify-masking/` for
+a side-by-side and neither answers whether the mask fires when it
+matters. So the pipeline is currently **unverified in both directions**:
+we have not seen it censor something sensitive, and we have not
+established what decides `masked`.
+
+Run it deliberately instead of hoping the night produces the case.
+
+| Step | Watch |
+|---|---|
+| 1. `NEMARA_SENSITIVITY_SCREENING_ENABLED` back to its default | it must be ON for this to mean anything |
+| 2. Bedroom camera, `privacy_enabled` on, data collection ON | the configuration a real household would run |
+| 3. Stage a sensitive moment on purpose, in frame, ~1 min | this is the case that has never been observed working |
+| 4. Stage a plainly non-sensitive minute right after | the control — a mask that fires on everything is not a mask |
+| 5. Pull BOTH sessions from B2 and watch them | pixelation present in (3), absent in (4) |
+
+Then answer the question the last run could not:
+
+- **What decides `masked`?** Three of ~10 sessions had it true. Until
+  that is a rule and not a coincidence, no household can be told what
+  their footage does.
+- **Does the screen fail closed in the dark?** `.env` records that it
+  censors full-frame on any doubt, and that in a dark bedroom this blurs
+  essentially everything. If that is what happens, collection at night is
+  paying for storage of a grey rectangle.
+- **What is the gap?** 02:40:24 to 03:05:38 with the recorder armed and a
+  person present. A recorder that stops for 24 minutes without saying so
+  is a bigger finding than the mask.
+
+**Do not delete the 496 existing objects until this runs** — they are the
+only evidence of what the pipeline did unsupervised, including the ~10
+unmasked bedroom sessions. Deciding their fate is Aryaman's call and it
+should be made after the mechanism is understood, not before.
 
 **Care / behaviour** — run the matrix above. Medication and drinking are
 the easiest to stage deliberately.
@@ -147,6 +210,8 @@ direction that takes detection down with the node.
 |---|---|---|
 | **Warner device selection** | the vendor's camera list only exists inside their JS SDK, in a browser | the real question is whether an installer signs into a *vendor* account per install, or we hold one across customers. Product decision, not scripting |
 | **Node code deploy** | `NEMARA_DEV_CODE=1` + dev-code overlay is a soak tool; production is an immutable tagged image | before prod: `git tag gpu-vN` → CI → `pod.sh release` |
+| **The overlay only works if the agent is newer than it** | `roster_agent.sh` applies the dev-code overlay, but the RUNNING agent started 07:56 and the overlay block was added to the file at 11:38 — bash reads a script lazily, so the live agent never had that code. Every `push_node_code.sh` since has been a silent no-op, and 2026-08-24's identity fix had to be `cp`'d into `/workspace` by hand. There is no log line for a push that did nothing | after any change to `gpu/deploy/`, restart the container (`pod.sh up`) before trusting a push. Better: have the agent log its own mtime at boot so "the agent predates the overlay" is visible |
+| **Orphaned supervisors** | the same stale agent predates the `_stop_room` fix, so re-provisioning a camera left the OLD supervisor subshell running and un-stoppable (its pid was no longer in the run state). Two supervisors for `c51733e6` each started an identity process for the same shard, which then evicted each other on `DuplicateIdentity` | fixed in the repo; lands on the next container restart. Until then check `ps -eo pid,ppid,args \| grep roster_agent` — one child per camera, no more |
 | **`.pod.env` goes stale** | RunPod reassigns the endpoint on every restart — it did again today, the node moved to a new tailnet IP | `pod.sh up` rediscovers; `push_node_code.sh` should read the reader endpoint from `.pod.env` instead of taking it as an argument |
 | **Mini-PC restart** | `sudo` needs an interactive password | the unit is `Restart=always` and runs as `potaton00b`, so `kill <pid>` is a clean restart |
 
