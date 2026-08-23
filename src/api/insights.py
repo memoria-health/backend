@@ -82,7 +82,8 @@ async def insight_patients(
                coalesce(json_agg(json_build_object('room', c.room, 'online', c.online)
                         ) filter (where c.id is not null), '[]') as cams
         from patients p
-        left join cameras c on c.patient_id = p.id and not c.disabled
+        left join public.camera_patients cp on cp.patient_id = p.id
+        left join cameras c on c.id = cp.camera_id and not c.disabled
         where p.id = any(:ids)
         group by p.id order by p.full_name
         """), {"ids": ids})).mappings().all()
@@ -109,7 +110,7 @@ async def activity_trend(
                round(100.0 * avg((motion_in_clip and people_present)::int)) as activity,
                count(*) as windows
         from analyses
-        where patient_id = any(:ids)
+        where camera_id in (select camera_id from public.camera_patients where patient_id = any(:ids))
           and captured_at >= now() - (:days * interval '1 day')
         group by 1 order by 1
         """), {"ids": ids, "days": _days(days)})).mappings().all()
@@ -163,7 +164,9 @@ async def uptime(
                 from analyses a
                 where a.camera_id = c.id
                   and a.captured_at >= now() - (:days * interval '1 day')) as hours
-        from cameras c where c.patient_id = any(:ids) and not c.disabled
+        from cameras c where c.id in (select camera_id from public.camera_patients
+                                       where patient_id = any(:ids))
+          and not c.disabled
         """), {"ids": ids, "days": _days(days)})).mappings().all()
     return [
         {
@@ -272,12 +275,13 @@ async def trend_facts(
                round(100.0 * avg((motion_in_clip and people_present)::int)
                  filter (where captured_at >= now() - interval '14 days'
                      and captured_at <  now() - interval '7 days')) as prev
-        from analyses where patient_id = any(:ids)
+        from analyses where camera_id in (select camera_id from public.camera_patients where patient_id = any(:ids))
         """), {"ids": ids})).mappings().one()
     offline = (await session.execute(text(
         """
         select count(*)::int as n from cameras
-        where not disabled and not online and patient_id = any(:ids)
+        where not disabled and not online and id in (
+          select camera_id from public.camera_patients where patient_id = any(:ids))
         """), {"ids": ids})).mappings().one()
     return {
         "events": {"cur": events["cur"], "prev": events["prev"]},
@@ -321,8 +325,10 @@ async def offline_cameras(
         """
         select coalesce(c.room, 'Camera') as room, p.full_name as patient,
                to_char(coalesce(c.last_seen_at, c.created_at), 'Mon DD HH24\:MI') as last_seen
-        from cameras c join patients p on p.id = c.patient_id
-        where not c.disabled and not c.online and c.patient_id = any(:ids)
+        from cameras c
+             join public.camera_patients cp on cp.camera_id = c.id
+             join patients p on p.id = cp.patient_id
+        where not c.disabled and not c.online and cp.patient_id = any(:ids)
         order by c.last_seen_at desc nulls last limit 40
         """), {"ids": ids})).mappings().all()
     return [dict(r) for r in rows]
@@ -361,7 +367,8 @@ async def home_data(
         {"pid": pid})).mappings().one()
     cams = (await session.execute(text(
         """select count(*)::int as total, count(*) filter (where online)::int as online
-           from cameras where not disabled and patient_id = :pid"""),
+           from cameras where not disabled and id in (
+             select camera_id from public.camera_patients where patient_id = :pid)"""),
         {"pid": pid})).mappings().one()
     serious = ("(title ilike '%fall%' or title ilike '%chok%' or "
                "title ilike '%stroke%' or title ilike '%heart%' or "
@@ -394,8 +401,9 @@ async def home_data(
         """select a.captured_at::date as day,
                   min(extract(hour from a.captured_at) + extract(minute from a.captured_at)/60.0)
                     filter (where a.people_present and extract(hour from a.captured_at) >= 4) as wake
-           from analyses a join cameras c on c.id = a.camera_id
-           where c.patient_id = :pid
+           from analyses a
+           where a.camera_id in (select camera_id from public.camera_patients
+                                  where patient_id = :pid)
              and a.captured_at >= now() - interval '14 days'
            group by 1 order by 1 desc"""),
         {"pid": pid})).mappings().all()

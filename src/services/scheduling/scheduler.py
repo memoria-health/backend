@@ -45,6 +45,7 @@ from src.db.patient import Patient
 from src.services import email, patient_tz, push
 from src.services.detection.scheduling.decision import episode_exit_gap_for
 from src.settings import Settings
+from src.services.camera_coverage import covered_cameras
 
 log = logging.getLogger(__name__)
 
@@ -240,7 +241,7 @@ class ScheduledDetectorRunner:
                 seen_stmt = (
                     select(Analysis.id)
                     .where(
-                        Analysis.patient_id == patient.id,
+                        Analysis.camera_id.in_(covered_cameras(patient.id)),
                         Analysis.captured_at >= start_utc,
                         Analysis.captured_at < end_utc,
                         Analysis.detector_fields[detected_key].astext == "true",
@@ -319,7 +320,7 @@ class ScheduledDetectorRunner:
         # detector doesn't scan all history every tick).
         last_seen = (await session.execute(
             select(func.max(Analysis.captured_at)).where(
-                Analysis.patient_id == patient.id,
+                Analysis.camera_id.in_(covered_cameras(patient.id)),
                 Analysis.captured_at >= now_utc - timedelta(seconds=_TRAILING_LOOKBACK_SECONDS),
                 Analysis.detector_fields[detected_key].astext == "true",
             )
@@ -386,7 +387,7 @@ class ScheduledDetectorRunner:
         caregiver can judge how much to trust an absence."""
         count = (await session.execute(
             select(func.count(Analysis.id)).where(
-                Analysis.patient_id == patient_id,
+                Analysis.camera_id.in_(covered_cameras(patient_id)),
                 Analysis.captured_at >= start_utc,
                 Analysis.captured_at < end_utc,
                 Analysis.provider != "skipped",

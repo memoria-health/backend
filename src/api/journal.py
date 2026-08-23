@@ -103,7 +103,7 @@ async def get_journal(
     ticks = (await session.execute(text("""
         select captured_at, detector_fields
         from analyses
-        where patient_id = :p
+        where camera_id in (select camera_id from public.camera_patients where patient_id = :p)
           and captured_at >= :s and captured_at < :e
         order by captured_at
         """), {"p": patient_id, "s": start, "e": end})).mappings().all()
@@ -137,7 +137,8 @@ async def get_journal(
     cov = (await session.execute(text("""
         select count(distinct date_trunc('hour', captured_at at time zone :tz))::int as n
         from analyses
-        where patient_id = :p and captured_at >= :s and captured_at < :e
+        where camera_id in (select camera_id from public.camera_patients where patient_id = :p)
+          and captured_at >= :s and captured_at < :e
           and provider <> 'skipped'
         """), {"p": patient_id, "s": start, "e": end,
                "tz": str(tz)})).mappings().one()

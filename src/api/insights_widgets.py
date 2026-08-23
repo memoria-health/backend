@@ -318,7 +318,7 @@ async def widget_data(
             select to_char(date_trunc(:gran, captured_at)::date, 'YYYY-MM-DD') as bucket,
                    count(*) filter (where (detector_fields->>:f) = 'true')::int as n
             from analyses
-            where patient_id = any(:ids)
+            where camera_id in (select camera_id from public.camera_patients where patient_id = any(:ids))
               and captured_at >= now() - (:days * interval '1 day')
             group by 1 order by 1
             """), {"ids": patient, "days": d, "gran": gran,
@@ -336,7 +336,7 @@ async def widget_data(
                 select extract(hour from captured_at)::int as h,
                        round(100.0 * avg((motion_in_clip and people_present)::int))::int as n
                 from analyses
-                where patient_id = any(:ids)
+                where camera_id in (select camera_id from public.camera_patients where patient_id = any(:ids))
                   and captured_at >= now() - (:days * interval '1 day')
                 group by 1 order by 1
                 """), {"ids": patient, "days": d})).mappings().all()
@@ -353,7 +353,7 @@ async def widget_data(
                 select to_char(date_trunc(:gran, captured_at)::date, 'YYYY-MM-DD') as bucket,
                        round(100.0 * avg((motion_in_clip and people_present)::int))::int as n
                 from analyses
-                where patient_id = any(:ids)
+                where camera_id in (select camera_id from public.camera_patients where patient_id = any(:ids))
                   and captured_at >= now() - (((:days)::int + (:off)::int) * interval '1 day')
                   and captured_at <  now() - (:off * interval '1 day')
                 group by 1 order by 1
@@ -390,7 +390,8 @@ async def widget_data(
                     where a.camera_id = c.id
                       and a.provider <> 'skipped'
                       and a.captured_at >= now() - (:days * interval '1 day')) as hours
-            from cameras c where not c.disabled and c.patient_id = any(:ids)
+            from cameras c where not c.disabled and c.id in (
+              select camera_id from public.camera_patients where patient_id = any(:ids))
             order by hours desc limit 12
             """), {"ids": patient, "days": d})).mappings().all()
         total = d * 24
@@ -412,8 +413,10 @@ async def widget_data(
         rows = (await session.execute(text("""
             select coalesce(c.room, 'Camera') as room, p.full_name as patient,
                    to_char(coalesce(c.last_seen_at, c.created_at), 'Mon DD HH24\:MI') as last_seen
-            from cameras c join patients p on p.id = c.patient_id
-            where not c.disabled and not c.online and c.patient_id = any(:ids)
+            from cameras c
+                 join public.camera_patients cp on cp.camera_id = c.id
+                 join patients p on p.id = cp.patient_id
+            where not c.disabled and not c.online and cp.patient_id = any(:ids)
             order by c.last_seen_at desc nulls last limit 40
             """), {"ids": patient})).mappings().all()
         return {"kind": "offline", "statValue": str(len(rows)),
@@ -487,7 +490,7 @@ async def widget_data(
             select to_char(date_trunc(:gran, captured_at)::date, 'YYYY-MM-DD') as bucket,
                    round(100.0 * avg(people_present::int))::int as n
             from analyses
-            where patient_id = any(:ids)
+            where camera_id in (select camera_id from public.camera_patients where patient_id = any(:ids))
               and captured_at >= now() - (:days * interval '1 day')
             group by 1 order by 1
             """), {"ids": patient, "days": d, "gran": gran})).mappings().all()
@@ -510,7 +513,7 @@ async def widget_data(
                    max(extract(hour from captured_at) + extract(minute from captured_at)/60.0)
                      filter (where people_present) as bed
             from analyses
-            where patient_id = any(:ids)
+            where camera_id in (select camera_id from public.camera_patients where patient_id = any(:ids))
               and captured_at >= now() - (:days * interval '1 day')
             group by 1 order by 1
             """), {"ids": patient, "days": d})).mappings().all()
@@ -750,7 +753,7 @@ async def widget_data(
             select to_char(date_trunc(:gran, captured_at)::date, 'YYYY-MM-DD') as bucket,
                    round(100.0 * avg((motion_in_clip and people_present)::int))::int as n
             from analyses
-            where patient_id = any(:ids)
+            where camera_id in (select camera_id from public.camera_patients where patient_id = any(:ids))
               and captured_at >= now() - (:days * interval '1 day')
             group by 1
             """), {"ids": patient, "days": d, "gran": gran})).mappings().all()
