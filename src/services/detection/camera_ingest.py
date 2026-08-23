@@ -32,7 +32,7 @@ import time
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -210,6 +210,7 @@ class CameraIngest:
         reid: IdentityProvider,
         livekit_identity: str | None = None,
         recorder: "RecorderManager | None" = None,
+        on_idle_change: "Callable[[bool], None] | None" = None,
     ) -> None:
         self.camera_id = camera_id
         self.patient_id = patient_id
@@ -249,6 +250,13 @@ class CameraIngest:
         # Retained for log identification; the actual reaper for a
         # vanished camera lives in `LiveKitRoomReconciler`.
         self._livekit_identity = livekit_identity
+        # Told on every tick whether this camera is idle, so the room
+        # worker can step the SUBSCRIBED simulcast layer down while
+        # nothing is being analyzed. Skipping the VLM call saved the
+        # model cost but not the bandwidth — LiveKit bills the
+        # subscription, and an empty room kept delivering its top layer
+        # all night. None in unit harnesses = inert.
+        self._on_idle_change = on_idle_change
         # Caregiver-local timezone for when_scope windows (2026-07-14).
         # Resolved once on first use and cached for the worker's life —
         # a caregiver timezone change picks up on the next worker
@@ -331,6 +339,18 @@ class CameraIngest:
         REST-presence signal to decide the column.
         """
         self._last_frame_at = monotonic_ts
+
+    def _note_idle(self, idle: bool) -> None:
+        """Tell the room worker whether this camera is worth full-rate
+        video right now. Best-effort: a bandwidth economy must never be
+        able to end a tick.
+        """
+        if self._on_idle_change is None:
+            return
+        try:
+            self._on_idle_change(idle)
+        except Exception:  # noqa: BLE001 — cost lever, not a dependency
+            log.warning("%s idle-layer hint failed", self._log_tag, exc_info=True)
 
     def _stamp_ingress(self, fields: dict) -> None:
         """Stash the video-ingress snapshot on whatever row this tick
@@ -1135,6 +1155,7 @@ class CameraIngest:
                         captured_at=captured_at,
                     )
                     await session.commit()
+                    self._note_idle(True)
                     log.info(
                         "%s SKIP closed-state, no motion (sad=%s block_max=%s) "
                         "— counter=%s/%s",
@@ -1143,6 +1164,15 @@ class CameraIngest:
                         state_after.no_people_count, state_after.close_threshold,
                     )
                     return
+
+            # Every path that reaches here is about to spend a real look,
+            # so ask for the full layer back. Placed before the window is
+            # built rather than in the wake branch alone: a camera that
+            # was never closed also passes through here, and the request
+            # is a no-op unless the layer actually changed. The window
+            # below is whatever was buffered DURING the idle period —
+            # this restores the next one, not this one.
+            self._note_idle(False)
 
             # Build the MP4 from the buffered window (video + audio).
             # at_fps: the buffer may retain a higher native rate for the

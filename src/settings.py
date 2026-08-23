@@ -830,6 +830,16 @@ class Settings(BaseSettings):
     # soak-1 crash-night triage — kept selectable for rollback.
     livekit_subscribe_quality: str = Field(default="high")
 
+    # Which layer a CLOSED camera drops to. The subscription is what
+    # LiveKit bills and it does not care that we skip the analysis, so
+    # an empty room delivered its top layer all night for nothing.
+    # "medium" (640x360) rather than "low" (320x180): the tick that
+    # WAKES us judges the window already buffered, so this is the
+    # resolution a fall is first seen at. Set "low" for another ~3x if
+    # that trade is acceptable, "high" to disable the step-down.
+    # No effect where the publisher does not simulcast.
+    livekit_idle_subscribe_quality: str = Field(default="medium")
+
     # ── APNs (Phase 4) ──────────────────────────────────────────
     # Apple Developer credentials for HTTP/2 push. team_id +
     # apns_key_id identify the auth key file; apns_auth_key is the
