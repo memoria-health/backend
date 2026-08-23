@@ -51,6 +51,14 @@ os.environ["NEMARA_RESEND_API_KEY"] = ""
 # → allow" to enforcing a key the tests don't send. Blank it so the
 # suite exercises the same local/test path it always did.
 os.environ["NEMARA_INTERNAL_SERVICE_KEY"] = ""
+# NEMARA_SUPABASE_URL (2026-08-23): the developer .env points this at
+# `host.docker.internal`, because the backend runs in Docker and needs
+# to reach Supabase on the Mac to fetch its JWKS. That name resolves
+# ONLY inside a container — the suite runs natively, so every auth test
+# died in DNS. Loopback is correct here for the same reason
+# host.docker.internal is correct there: both mean "this Mac", from
+# where the process happens to be standing.
+os.environ["NEMARA_SUPABASE_URL"] = "http://127.0.0.1:54341"
 
 from src.db.session import get_engine, get_sessionmaker
 from src.main import create_app
