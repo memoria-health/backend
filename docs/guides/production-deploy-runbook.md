@@ -36,10 +36,10 @@ unidentified and patient-scoped routine detectors never promote.
 
 ## Deploy order (backend)
 
-1. **DB deltas first.** `psql "<prod NEMARA_DB_URL>" -1 -v ON_ERROR_STOP=1 -f scripts/apply_<x>_delta.sql`
+1. **DB deltas first.** `psql "<prod NEMARA_DB_URL>" -1 -v ON_ERROR_STOP=1 -f scripts/deltas/apply_<x>_delta.sql`
    — one transaction per file, chronological order. Never `-f` a delta
    containing `drop column`/`delete from` without reading it first.
-2. **Prompt reseeds**: `NEMARA_DB_URL=<prod> PYTHONPATH=. .venv/bin/python scripts/reseed_prompt.py <identifiers…>`
+2. **Prompt reseeds**: `NEMARA_DB_URL=<prod> PYTHONPATH=. .venv/bin/python scripts/seed/reseed_prompt.py <identifiers…>`
 3. **Env vars** on Railway (`railway variables --set … --skip-deploys`
    from the repo dir — the link is per-directory).
 4. **Merge to main via PR.** The `main` ruleset requires a review;
@@ -51,7 +51,7 @@ unidentified and patient-scoped routine detectors never promote.
 
 ## Deploy order (identity node)
 
-**Always use `scripts/pod.sh release <image-tag>`. Never hand-roll the
+**Always use `scripts/pod/pod.sh release <image-tag>`. Never hand-roll the
 pod create.** The script encodes: `cloudType: SECURE` (community hosts
 get reclaimed within minutes), the CUDA ≥12.4 host filter, non-interruptible,
 the org registry path, the network volume + pinned datacenter, and the
@@ -63,7 +63,7 @@ full env contract (it refuses to release without the roster-mode vars).
   copy `.pod.env`, append overrides for `NEMARA_BACKEND_URL` (Railway
   public URL), `NEMARA_DB_URL`, `NEMARA_IDENTITY_STATE_TOKEN`,
   `NEMARA_LIVEKIT_*` (prod project), `TS_HOSTNAME`, then
-  `POD_ENV_FILE=<file> scripts/pod.sh release <tag>`.
+  `POD_ENV_FILE=<file> scripts/pod/pod.sh release <tag>`.
 - Do NOT set `NEMARA_DEV_CODE=1` on prod — that flag makes the
   entrypoint overlay `/persist/dev-code` over the image at boot.
 
@@ -113,5 +113,5 @@ full env contract (it refuses to release without the roster-mode vars).
   (outage hop only).
 - Debt, deliberate: dev and prod share `NEMARA_INTERNAL_SERVICE_KEY`
   and the gpu `TS_AUTHKEY` — rotate prod to its own values;
-  `scripts/apply_insights_readonly_revoke_delta.sql` is HELD until the
+  `scripts/deltas/apply_insights_readonly_revoke_delta.sql` is HELD until the
   web app stops querying Postgres directly.

@@ -121,7 +121,7 @@ class Camera(Base):
     # caregiver with more than one box gets only its own cameras — giving
     # per-box liveness and preventing two boxes from claiming one camera.
     # Plain UUID column (no ORM ForeignKey: the DB-level FK lives in
-    # scripts/apply_gateway_ownership_delta.sql, and there is no Gateway
+    # scripts/deltas/apply_gateway_ownership_delta.sql, and there is no Gateway
     # ORM model to reference here).
     gateway_id: Mapped[UUID | None] = mapped_column(default=None)
 

@@ -126,7 +126,7 @@ An attacker-supplied `current_url` (from the unauthenticated announce endpoint, 
 
 ### 8. Permanent reusable demo pairing code re-mints live-camera credentials
 
-**Files:** `src/settings.py:159` (`demo_pairing_code`), `src/api/pairing.py:59-98` / `_pair_demo_camera` (`pairing.py:101`), `scripts/seed_demo_camera.py` (documents `424242`). When `NEMARA_DEMO_PAIRING_CODE` is set (production only), `POST /v1/cameras/pair` special-cases it: the code never expires and is not single-use, and each call re-mints an `api_key` for the seeded demo camera (invalidating the prior device's key). Anyone who learns the code can repeatedly pair to — and receive the LiveKit credentials for — that live demo camera. Impact is bounded to the demo camera, hence Low.
+**Files:** `src/settings.py:159` (`demo_pairing_code`), `src/api/pairing.py:59-98` / `_pair_demo_camera` (`pairing.py:101`), `scripts/seed/seed_demo_camera.py` (documents `424242`). When `NEMARA_DEMO_PAIRING_CODE` is set (production only), `POST /v1/cameras/pair` special-cases it: the code never expires and is not single-use, and each call re-mints an `api_key` for the seeded demo camera (invalidating the prior device's key). Anyone who learns the code can repeatedly pair to — and receive the LiveKit credentials for — that live demo camera. Impact is bounded to the demo camera, hence Low.
 
 **Remediation:** Keep the demo camera pointed at non-sensitive content, rotate/retire the code after App Review, and prefer a long random value over a memorable one; ideally scope the demo path to a build/flag that is off in the general-availability production config.
 

@@ -163,7 +163,7 @@ jobs:
             echo ""
             echo "Deploy it with:"
             echo '```bash'
-            echo "scripts/pod.sh release ${{ steps.tag.outputs.value }}"
+            echo "scripts/pod/pod.sh release ${{ steps.tag.outputs.value }}"
             echo '```'
             echo ""
             echo "Checkpoints are NOT in this image — the node fetches them on"

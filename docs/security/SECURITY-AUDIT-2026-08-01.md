@@ -110,7 +110,7 @@ For a patient-safety monitoring product this is a data-integrity **and** safety 
 
 ### H1 — `public` tables shipped without Row-Level Security (`pi_discoveries`, `gateways`)
 
-**Files:** `supabase/schema.sql:435` (`pi_discoveries` — RLS never enabled); `scripts/apply_gateway_delta.sql:38` (`gateways` — RLS never enabled). Every other `public` table has `enable row level security` + a `has_patient_access`/owner policy (`schema.sql:855-922`); these two do not.
+**Files:** `supabase/schema.sql:435` (`pi_discoveries` — RLS never enabled); `scripts/deltas/apply_gateway_delta.sql:38` (`gateways` — RLS never enabled). Every other `public` table has `enable row level security` + a `has_patient_access`/owner policy (`schema.sql:855-922`); these two do not.
 
 Supabase exposes all `public` tables via PostgREST, and the anon/publishable key (`sb_publishable_…`) is shipped to the iOS client. A table with RLS disabled is fully readable/writable by anyone holding that public key — independent of the backend's own code paths.
 

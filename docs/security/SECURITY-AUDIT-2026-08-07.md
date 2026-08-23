@@ -76,7 +76,7 @@ From the `.env.bak.1783536884` blob:
 ### 2. Working production caregiver password hardcoded in tracked files
 
 **Where:**
-- `scripts/seed.py:48` — `DEMO_PASSWORD = "Mar9aret!2024"` (comment claims "local-dev only; never used in prod")
+- `scripts/seed/seed.py:48` — `DEMO_PASSWORD = "Mar9aret!2024"` (comment claims "local-dev only; never used in prod")
 - `docs/guides/setup-hosted-stack.md:74` — `password: Mar9aret!2024` for `jane@patel.co`
 - `README.md:26`, `README.md:106` — same credential pair for the web dashboard and iOS app
 

@@ -90,7 +90,7 @@ db-stop:
 
 db-reset:
 	supabase db reset
-	$(PY) python scripts/seed.py
+	$(PY) python scripts/seed/seed.py
 	@bash scripts/ensure_buckets.sh
 
 studio:

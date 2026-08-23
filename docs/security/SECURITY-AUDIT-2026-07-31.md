@@ -23,7 +23,7 @@ However, the audit found **two Critical issues** that undermine that foundation,
 
 ### High
 
-3. **`public.gateways` table has no Row-Level Security** (`scripts/apply_gateway_delta.sql:38`), unlike every table in `schema.sql`. If the Supabase REST API (PostgREST) is reachable with the public anon key, the table is fully readable/writable by anyone: read the caregiver↔gateway map, delete rows (DoS the gateway fleet), or insert a token binding pointed at a victim caregiver.
+3. **`public.gateways` table has no Row-Level Security** (`scripts/deltas/apply_gateway_delta.sql:38`), unlike every table in `schema.sql`. If the Supabase REST API (PostgREST) is reachable with the public anon key, the table is fully readable/writable by anyone: read the caregiver↔gateway map, delete rows (DoS the gateway fleet), or insert a token binding pointed at a victim caregiver.
 
 ### Medium / Low
 
@@ -109,7 +109,7 @@ The sibling caregiver-authenticated endpoint `POST /v1/patients/{id}/cameras/gat
 
 #### H1 — `public.gateways` table has no Row-Level Security (exposed via anon key)
 
-**Location:** `scripts/apply_gateway_delta.sql:38` (also `apply_gateway_tunnel_port_delta.sql`). No `ENABLE ROW LEVEL SECURITY` / policy is defined for `gateways` anywhere.
+**Location:** `scripts/deltas/apply_gateway_delta.sql:38` (also `apply_gateway_tunnel_port_delta.sql`). No `ENABLE ROW LEVEL SECURITY` / policy is defined for `gateways` anywhere.
 
 **Why it's exploitable:** Every table in `supabase/schema.sql` explicitly enables RLS and defines a membership/owner policy. The `gateways` table is created **only** by the prod delta scripts and never gets RLS. Supabase's PostgREST exposes the `public` schema to the `anon` and `authenticated` roles (`config.toml` → `schemas = ["public", ...]`), and the anon/publishable key is public by design (it ships in clients). A table with RLS disabled is, per Supabase semantics, fully accessible to those roles. An attacker with the public anon key can therefore hit `…/rest/v1/gateways` to:
 - **Read** the full caregiver↔gateway↔`tunnel_port` mapping (recon; `tunnel_port` reveals the ops reverse-SSH scheme).

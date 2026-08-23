@@ -5,7 +5,7 @@ per-camera continuous batches → pod EdgeTAM session → screen veto → track
 state → three-rule identity (calibrated scoring / single seat / solo
 harvest) → live MJPEG overlay + /state JSON.
 
-Prereqs: pod in EdgeTAM mode via the SSH tunnel (scripts/pod.sh health),
+Prereqs: pod in EdgeTAM mode via the SSH tunnel (scripts/pod/pod.sh health),
 LiveKit creds in env (NEMARA_LIVEKIT_URL/_API_KEY/_API_SECRET — or in
 .env, which Settings loads), DB reachable (face enrollment gallery).
 Stop the old live_tracker_view.py first — the identity service replaces it.

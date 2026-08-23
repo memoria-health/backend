@@ -7,7 +7,7 @@ best-effort founder email that must NOT fail the request.
 Mirrors test/integration/test_events.py for fixture usage (auth_user /
 auth_user_factory create real auth.users rows; mint_test_jwt signs a
 local HS256 token). Assumes a local Supabase is running and the schema
-delta has been applied (scripts/apply_feedback_delta.sql).
+delta has been applied (scripts/deltas/apply_feedback_delta.sql).
 
 Coverage:
 - a valid submit returns 200 / status="received" and persists a row

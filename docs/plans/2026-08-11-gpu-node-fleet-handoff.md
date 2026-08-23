@@ -30,7 +30,7 @@ reproducible, and the backend had to be able to address more than one of them.
 
 **A node is an image.** One container = perception + N identity processes,
 serving up to K homes. Built from a git tag by CI, released with
-`scripts/pod.sh release <tag>`. A lost node is replaced, never repaired.
+`scripts/pod/pod.sh release <tag>`. A lost node is replaced, never repaired.
 
 Perception and identity are **colocated deliberately**: identity ships ~13MB
 per cycle to perception, RunPod's inter-pod link is 100 Mbps (~1s/batch), and
@@ -78,8 +78,8 @@ only.
 | `src/api/identity_roster.py` | `POST /v1/identity/roster` |
 | `src/services/identity/identity_router.py` | per-patient routing |
 | `src/services/identity/fleet_watch.py` | dead-man alert |
-| `scripts/pod.sh` | `release` / `up` / `down` |
-| `scripts/apply_identity_nodes_delta.sql` | schema |
+| `scripts/pod/pod.sh` | `release` / `up` / `down` |
+| `scripts/deltas/apply_identity_nodes_delta.sql` | schema |
 | `infra/tailscale-acl.hujson` | network boundary |
 | `docs/runbooks/pod.md` | operator runbook (rewritten) |
 
@@ -132,8 +132,8 @@ binaries, and smoke imports, so a break should be loud and specific.
 ### Stage 1 — one node, one home (~2h, ~$0.80/hr)
 
 ```bash
-scripts/pod.sh release gpu-v1   # → new pod id, put it in .pod.env
-scripts/pod.sh up               # endpoint + host key re-pin
+scripts/pod/pod.sh release gpu-v1   # → new pod id, put it in .pod.env
+scripts/pod/pod.sh up               # endpoint + host key re-pin
 ```
 
 Assert, in order — each depends on the last:
@@ -173,7 +173,7 @@ explicitly "NOT VALIDATED FOR LATENCY".
 ### Stage 4 — production
 
 DB delta **before** backend deploy, per `docs/runbooks/` deploy order. The
-delta is idempotent and additive (`nemara-backend/scripts/apply_identity_nodes_delta.sql`):
+delta is idempotent and additive (`nemara-backend/scripts/deltas/apply_identity_nodes_delta.sql`):
 one new table, two nullable columns on `patients`, one partial unique index.
 It does not touch existing rows.
 

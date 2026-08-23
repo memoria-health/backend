@@ -233,7 +233,7 @@ Vercel re-enables SSO protection by default on each project; if a fresh deploy r
 
 **Database migrations**
 
-There is **no `supabase/migrations/` directory** — this repo uses an apply-deltas-only pattern. Schema changes go in `supabase/schema.sql` (the full schema, applied on local `supabase db reset`) AND in a matching one-shot delta file `scripts/apply_<change>_delta.sql` for the cloud DB. Deltas are run against prod manually (Supabase SQL editor for project `zgifmvjnggmgzvtnosnu`, or `psql "<prod NEMARA_DB_URL>" -f scripts/apply_x_delta.sql`), **before** the backend deploy that depends on them. **Never reset the prod DB** — deltas only.
+There is **no `supabase/migrations/` directory** — this repo uses an apply-deltas-only pattern. Schema changes go in `supabase/schema.sql` (the full schema, applied on local `supabase db reset`) AND in a matching one-shot delta file `scripts/deltas/apply_<change>_delta.sql` for the cloud DB. Deltas are run against prod manually (Supabase SQL editor for project `zgifmvjnggmgzvtnosnu`, or `psql "<prod NEMARA_DB_URL>" -f scripts/deltas/apply_x_delta.sql`), **before** the backend deploy that depends on them. **Never reset the prod DB** — deltas only.
 
 The cloud DB's connection string is the Railway `NEMARA_DB_URL` variable; you can connect directly with any postgres client.
 

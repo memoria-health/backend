@@ -41,7 +41,7 @@ PAIR_RATE_LIMIT = RateLimitPolicy(name="cameras_pair", limit=10, window_seconds=
 # path matches the camera by THIS, not by pairing_code — the caregiver
 # app rotates an unpaired camera's pairing_code whenever its detail screen
 # is opened, which would otherwise silently break the 424242 demo. The
-# seed (scripts/seed_demo_camera.py) stamps this identity on the demo row.
+# seed (scripts/seed/seed_demo_camera.py) stamps this identity on the demo row.
 DEMO_CAMERA_IDENTITY = "cam_demo"
 
 
@@ -130,7 +130,7 @@ async def _pair_demo_camera(
         # The setting is on but no camera carries the demo identity — the
         # demo camera wasn't seeded. Surface a distinct 404 so it's obvious
         # in logs (vs the opaque 401 the normal path returns). Run
-        # scripts/seed_demo_camera.py to provision it.
+        # scripts/seed/seed_demo_camera.py to provision it.
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="demo_camera_not_provisioned",

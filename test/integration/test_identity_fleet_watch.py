@@ -11,7 +11,7 @@ exists to break.
 Paging is stubbed out; what is asserted is the counting and the
 trigger/resolve decisions.
 
-Assumes a local Supabase with scripts/apply_identity_nodes_delta.sql applied.
+Assumes a local Supabase with scripts/deltas/apply_identity_nodes_delta.sql applied.
 """
 
 from __future__ import annotations

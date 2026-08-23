@@ -7,7 +7,7 @@ identity forever, with no error anywhere — so the behaviours below are
 tested against a real database rather than reasoned about.
 
 Assumes a local Supabase is running and
-scripts/apply_identity_nodes_delta.sql has been applied.
+scripts/deltas/apply_identity_nodes_delta.sql has been applied.
 
 Coverage:
 - a node is upserted and heartbeated by the act of polling

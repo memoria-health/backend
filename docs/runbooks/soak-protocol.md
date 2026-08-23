@@ -21,7 +21,7 @@ kept as a dial at 0.0, enrollment done fresh by Aryaman at rebuild.
 ## Setup (T−20 min)
 
 1. Local stack up on branch `feat/gateway-camera-ownership` (≥406b61a).
-2. Apply `scripts/apply_convulsion_rename_delta.sql` to the local DB
+2. Apply `scripts/deltas/apply_convulsion_rename_delta.sql` to the local DB
    (all other deltas already applied during P1).
 3. `.env`: `NEMARA_DETECTION_V2_SCHEDULER_ENABLED=true`,
    `NEMARA_DETECTION_V2_DECISION_ENABLED=true` → **recreate** the

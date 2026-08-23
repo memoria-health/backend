@@ -50,7 +50,7 @@
 ## Phase 1 — Per-patient flag + consent state (ships independently)
 
 ### Task 1: `data_collection_enabled` + `data_collection_decided_at` columns
-**Files:** `src/db/patient.py`, `supabase/schema.sql`, `scripts/apply_data_collection_delta.sql`, `test/integration/test_patient_data_collection_flag.py`.
+**Files:** `src/db/patient.py`, `supabase/schema.sql`, `scripts/deltas/apply_data_collection_delta.sql`, `test/integration/test_patient_data_collection_flag.py`.
 
 TDD: test that a new patient defaults `data_collection_enabled is False` and `data_collection_decided_at is None`. Implement:
 ```python
@@ -62,7 +62,7 @@ data_collection_decided_at: Mapped[datetime | None] = mapped_column(DateTime(tim
 -- supabase/schema.sql (patients table)
 data_collection_enabled  boolean not null default false,
 data_collection_decided_at timestamptz,
--- scripts/apply_data_collection_delta.sql  (idempotent prod delta)
+-- scripts/deltas/apply_data_collection_delta.sql  (idempotent prod delta)
 alter table public.patients add column if not exists data_collection_enabled boolean not null default false;
 alter table public.patients add column if not exists data_collection_decided_at timestamptz;
 ```
@@ -141,7 +141,7 @@ Unit-test cap + retry + shutdown-finalize. Commit.
 Synthetic tick sequence: flag on + motion + presence for N ticks → absence. Assert exactly one MP4 finalized, lead-in present, audio muxed, one B2 upload with the expected key. Commit.
 
 ### Task 13: deploy (DB delta BEFORE deploy — per the prod runbook)
-① `scripts/apply_data_collection_delta.sql` on prod Supabase → ② Railway env (`NEMARA_B2_*`) → ③ PR + merge → ④ `railway up` → ⑤ smoke-test one opted-in patient lands a clip in B2.
+① `scripts/deltas/apply_data_collection_delta.sql` on prod Supabase → ② Railway env (`NEMARA_B2_*`) → ③ PR + merge → ④ `railway up` → ⑤ smoke-test one opted-in patient lands a clip in B2.
 
 ---
 

@@ -1,5 +1,5 @@
 # GPU-box extras for the SAM identity A/B (2026-07-20).
-# Install AFTER the CUDA torch wheels (see scripts/gpu_setup.sh) —
+# Install AFTER the CUDA torch wheels (see scripts/pod/gpu_setup.sh) —
 # these must not pull the CPU torch that the main uv.lock pins.
 #
 # torch / torchvision: installed by gpu_setup.sh from the cu124 index,

@@ -111,7 +111,7 @@ async def test_demo_pairing_code_is_reusable(
     expiring or being cleared — each pair mints a fresh api_key."""
     headers, uid, pid = await _setup_caregiver_patient(client, auth_user)
     # Seed the demo camera: mint a normal row, then stamp it with the stable
-    # demo identity (what scripts/seed_demo_camera.py does). The demo-pair
+    # demo identity (what scripts/seed/seed_demo_camera.py does). The demo-pair
     # path matches on livekit_identity == DEMO_CAMERA_IDENTITY — NOT on
     # pairing_code (the caregiver app rotates an unpaired camera's code). We
     # also set the demo code on the row so the "pairing fields survive each

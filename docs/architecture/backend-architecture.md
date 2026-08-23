@@ -14,18 +14,18 @@ nemara-backend/
 ├── yolo11n.pt / yolo11s.pt       # YOLO11 person-detector weights
 ├── scripts/
 │   ├── local-start.sh            # one-command stack-up (Supabase + buckets + uvicorn :8002 + ngrok)
-│   ├── seed.py                   # programmatic demo seed (calls services, not raw SQL)
-│   ├── seed_demo_camera.py       # App Review demo camera (persistent reusable pairing code)
-│   ├── reseed_*_prompt.py        # refresh a preset detector's prompt in a live DB
-│   ├── apply_*_delta.sql         # idempotent prod schema patches (see Conventions)
+│   ├── soak_check.py             # soak run health check
 │   ├── backfill_detector_dims.py # backfill detection-v2 dimension columns from catalog_v2
-│   ├── pod.sh / pod_bootstrap.sh / pod_tunnel.sh / gpu_setup.sh   # GPU-pod ops (perception server)
-│   ├── e2e/cli.py                # `uv run e2e <command>` — fire-event, add-patient, flip-detector…
-│   └── pi/                       # Pi device-side: install.sh, captive portal, announce daemon, MJPEG pusher
+│   ├── deltas/apply_*_delta.sql  # idempotent prod schema patches (see Conventions)
+│   ├── seed/                     # DB seeders — seed.py (programmatic demo seed, calls services not raw
+│   │                             #   SQL), seed_demo_camera.py (App Review demo camera), reseed_*.py
+│   ├── pod/                      # GPU-pod ops — pod.sh / pod_tunnel.sh / gpu_setup.sh
+│   ├── push_node_code.sh         # rsync src/ onto a running identity node
+│   └── e2e/cli.py                # `uv run e2e <command>` — fire-event, add-patient, flip-detector…
 ├── supabase/
 │   ├── config.toml               # local Supabase config
 │   ├── schema.sql                # SINGLE-FILE canonical schema (local); prod patched via delta scripts
-│   └── seed.sql                  # empty; Python seeder runs in scripts/seed.py
+│   └── seed.sql                  # empty; Python seeder runs in scripts/seed/seed.py
 ├── tools/
 │   ├── lk_room_audit.py          # LiveKit room snapshot; flags zombie/idle detector workers
 │   ├── download_models.py        # pre-fetch model weights
@@ -94,7 +94,7 @@ nemara-backend/
 
 ## Conventions
 
-- **Schema changes are hybrid.** `supabase/schema.sql` is the canonical single-file schema for local dev (`make db-reset` re-applies it). Production is patched live with idempotent delta scripts in `scripts/apply_*_delta.sql` — new features land in schema.sql first, then get a delta backport. No migration framework yet.
+- **Schema changes are hybrid.** `supabase/schema.sql` is the canonical single-file schema for local dev (`make db-reset` re-applies it). Production is patched live with idempotent delta scripts in `scripts/deltas/apply_*_delta.sql` — new features land in schema.sql first, then get a delta backport. No migration framework yet.
 - **Repository pattern** — `repos/*` hold pure SQLAlchemy queries. Services own transactions and call `session.commit()`.
 - **RLS is on for every table.** Belt-and-braces against the FastAPI repo layer, **and** the filter Supabase Realtime applies when iOS subscribes to table changes. `analyses` uses `caregiver_id = auth.uid()` directly (denormalized for cheap reads); other tables filter via the patients-ownership subselect.
 - **Snake_case JSON** on the wire (FastAPI / Pydantic default). iOS Codable models map to camelCase via explicit `CodingKeys`.

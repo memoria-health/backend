@@ -51,7 +51,7 @@ What `make fresh-seed` does:
 1. Stops any stale uvicorn / ngrok / Supabase from a prior run.
 2. `supabase start` + `supabase db reset` (applies `supabase/schema.sql` + `supabase/seed.sql`).
 3. Creates the two private Storage buckets (`patient-photos`, `incident-clips`) via REST.
-4. Seeds demo data via `scripts/seed.py` — caregiver + patient + detectors + events.
+4. Seeds demo data via `scripts/seed/seed.py` — caregiver + patient + detectors + events.
 5. Auto-detects this Mac's LAN IP and exports `NEMARA_SUPABASE_URL=http://<lan>:54341` so iOS devices on the same Wi-Fi can hit local Supabase. (Falls back to the value in `.env` if no Wi-Fi.)
 6. Starts uvicorn `:8000` in the background (PID + log under `.dev/`).
 7. Starts ngrok in the background and prints the public webhook URL.

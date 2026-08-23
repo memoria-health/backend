@@ -64,7 +64,7 @@ The `.env` file is checked into the repo and contains genuine, billable producti
 
 ### H1 — `pi_discoveries` table is missing Row-Level Security (exposed via public anon key)
 
-**Files:** `supabase/schema.sql:310` (table definition) — and notably **absent** from the RLS section at `supabase/schema.sql:618–700`, despite the section's comment at line 621 asserting *"Every table is RLS-on."* `scripts/apply_pi_schema_delta.sql:85` creates the same table with no `enable row level security`.
+**Files:** `supabase/schema.sql:310` (table definition) — and notably **absent** from the RLS section at `supabase/schema.sql:618–700`, despite the section's comment at line 621 asserting *"Every table is RLS-on."* `scripts/deltas/apply_pi_schema_delta.sql:85` creates the same table with no `enable row level security`.
 
 Every other public table (`caregivers`, `patients`, `cameras`, `detectors`, `cameras_detectors`, `events`, `patient_face_embeddings`, `analyses`, `caregiver_devices`, `feedback`) has `alter table … enable row level security` plus an owner-scoped policy. `pi_discoveries` has neither. In a standard Supabase project the `anon` and `authenticated` roles hold default table grants, and the publishable/anon key is public (`.env:18`), so PostgREST exposes this table for read **and write** to anyone:
 

@@ -26,7 +26,7 @@ The remediation priorities, in order: **rotate every secret in git history and p
 | # | Severity | Title | Location |
 |---|----------|-------|----------|
 | 1 | Critical | Live secrets (incl. service_role key + APNs private key) committed to git history | git history (`.env`, removed in `cf36938`) |
-| 2 | Critical | `pi_discoveries` and `gateways` tables have no RLS; anon key can read plaintext ingest tokens & stream URLs | `supabase/schema.sql`, `scripts/apply_pi_schema_delta.sql`, `scripts/apply_gateway_delta.sql` |
+| 2 | Critical | `pi_discoveries` and `gateways` tables have no RLS; anon key can read plaintext ingest tokens & stream URLs | `supabase/schema.sql`, `scripts/deltas/apply_pi_schema_delta.sql`, `scripts/deltas/apply_gateway_delta.sql` |
 | 3 | High | Email-only gateway provisioning — self-asserted identity, no proof of email ownership | `src/api/cameras_ingest.py:460` |
 | 4 | Medium | `caregivers` RLS `FOR ALL` lets a user write privileged columns via PostgREST, bypassing the API allowlist | `supabase/schema.sql:705` |
 | 5 | Medium | No rate limiting anywhere; unauthenticated endpoints + linear-bcrypt camera auth enable CPU/abuse DoS | `src/api/deps.py:111`, `src/api/pairing.py`, `src/api/pi_discovery.py` |
@@ -65,8 +65,8 @@ The `.gitignore` comment claims "its leaked secrets rotated," but the audit cann
 ### 2. `pi_discoveries` and `gateways` tables have no Row-Level Security — anon key can read plaintext ingest tokens and home camera stream URLs
 
 **Location:**
-- `supabase/schema.sql:334` (table `pi_discoveries`) — no `enable row level security`, no policy anywhere in `schema.sql` or `scripts/apply_pi_schema_delta.sql`.
-- `scripts/apply_gateway_delta.sql:38` (table `gateways`) — no RLS in the delta that creates it.
+- `supabase/schema.sql:334` (table `pi_discoveries`) — no `enable row level security`, no policy anywhere in `schema.sql` or `scripts/deltas/apply_pi_schema_delta.sql`.
+- `scripts/deltas/apply_gateway_delta.sql:38` (table `gateways`) — no RLS in the delta that creates it.
 - Contrast: `supabase/schema.sql:696-786` enables RLS on all 11 other public tables, and the header comment even asserts *"Every table is RLS-on."* These two are the exceptions.
 
 **Why it is exploitable.** In Supabase, every table in the `public` schema is exposed through PostgREST and reachable with the **anon/publishable key**, which is public by design (it ships in the iOS app and web client). RLS is the only gate. A table with RLS disabled is fully readable *and writable* by anyone with that key.

@@ -339,7 +339,7 @@ class FleetWatch:
             self._occupancy_ok = False
             log.warning(
                 "identity.occupancy_sampling_disabled — table missing? "
-                "apply scripts/apply_identity_fleet_ops_delta.sql",
+                "apply scripts/deltas/apply_identity_fleet_ops_delta.sql",
                 exc_info=True,
             )
 
@@ -366,7 +366,7 @@ class FleetWatch:
                     "grace_s": UNASSIGNED_GRACE_S,
                     "remedy": (
                         "no node has spare capacity — release another with "
-                        "scripts/pod.sh release <tag>, or raise "
+                        "scripts/pod/pod.sh release <tag>, or raise "
                         "NEMARA_NODE_CAPACITY on an existing one"
                     ),
                 },

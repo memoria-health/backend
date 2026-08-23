@@ -78,11 +78,11 @@ over it.
 
 ```bash
 git tag gpu-v3 && git push origin gpu-v3      # CI builds + pushes to GHCR
-scripts/pod.sh release gpu-v3                 # create a node from that tag
+scripts/pod/pod.sh release gpu-v3                 # create a node from that tag
 # → prints the new pod id
 # set POD_ID=<new id> in .pod.env, then:
-scripts/pod.sh up                             # discover endpoint, re-pin host key
-scripts/pod.sh health                         # confirm ticks
+scripts/pod/pod.sh up                             # discover endpoint, re-pin host key
+scripts/pod/pod.sh health                         # confirm ticks
 curl -H "X-Internal-Key: $KEY" $BACKEND/ready  # confirm the fleet
 ```
 
@@ -135,7 +135,7 @@ medication, drinking, TV — fail quiet, and sleep/activity show a gap.
 
 ## 4. Daily cost control
 
-`scripts/pod.sh stop` halts billing, `up` resumes. Two traps, both of which
+`scripts/pod/pod.sh stop` halts billing, `up` resumes. Two traps, both of which
 have cost us a machine:
 
 - **A stopped pod may not resume.** On 2026-08-10 the host had reallocated
@@ -153,7 +153,7 @@ only the first boot pays the download.
 | check | what it tells you |
 |---|---|
 | `GET /ready` on the backend | one probe per registered node, through the tailnet. `degraded_1_of_3_nodes` names the count; failing nodes get their own line. |
-| `scripts/pod.sh health` | recent `continuous.tick` lines on that node. |
+| `scripts/pod/pod.sh health` | recent `continuous.tick` lines on that node. |
 | `identity.roster` in backend logs | logged only when a claim or a reclaim happens — the only two events that change which machine watches a home. |
 | perception 429 rate | admission gate saturated: this node is at capacity. |
 | `identity.node_down` / `identity.homes_blind` | FleetWatch. The second means families are receiving no identity right now. |
@@ -164,11 +164,11 @@ absent, not misconfigured.
 ## 6. Debugging a node
 
 ```bash
-scripts/pod.sh ssh 'tail -50 /persist/state/logs/roster.log'      # what it was told
-scripts/pod.sh ssh 'tail -50 /persist/state/logs/identity-patient_<uuid>.log'
-scripts/pod.sh ssh 'tail -50 /persist/state/logs/perception.log'
-scripts/pod.sh ssh 'tail -50 /persist/state/logs/tailscale.log'
-scripts/pod.sh ssh 'ls /persist/state/run/'                       # pid + port per room
+scripts/pod/pod.sh ssh 'tail -50 /persist/state/logs/roster.log'      # what it was told
+scripts/pod/pod.sh ssh 'tail -50 /persist/state/logs/identity-patient_<uuid>.log'
+scripts/pod/pod.sh ssh 'tail -50 /persist/state/logs/perception.log'
+scripts/pod/pod.sh ssh 'tail -50 /persist/state/logs/tailscale.log'
+scripts/pod/pod.sh ssh 'ls /persist/state/run/'                       # pid + port per room
 ```
 
 `roster.log` saying **"roster REJECTED this node (HTTP 4xx)"** is

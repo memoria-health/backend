@@ -11,9 +11,9 @@ Also covers `POST /v1/gateway/enroll`: how a service's token becomes
 known to the backend WITHOUT provisioning a camera, which is what makes
 the roster answer it at all.
 
-Requires the local DB to have `scripts/apply_gateway_delta.sql`,
-`scripts/apply_gateway_ownership_delta.sql` AND
-`scripts/apply_gateway_tunnel_port_delta.sql` applied, same as the
+Requires the local DB to have `scripts/deltas/apply_gateway_delta.sql`,
+`scripts/deltas/apply_gateway_ownership_delta.sql` AND
+`scripts/deltas/apply_gateway_tunnel_port_delta.sql` applied, same as the
 other delta-gated suites.
 """
 

@@ -102,7 +102,7 @@ This is a full broken-access-control / account-targeting flaw against a system t
 
 ### H-1 — `public.pi_discoveries` has no Row-Level Security (leaks plaintext Pi ingest tokens)
 
-**Where:** table defined in `supabase/schema.sql:334-377` and `scripts/apply_pi_schema_delta.sql:85`; **absent** from the RLS block (`supabase/schema.sql:720-801`). Confirmed: no `enable row level security` / `create policy` for this table in either file.
+**Where:** table defined in `supabase/schema.sql:334-377` and `scripts/deltas/apply_pi_schema_delta.sql:85`; **absent** from the RLS block (`supabase/schema.sql:720-801`). Confirmed: no `enable row level security` / `create policy` for this table in either file.
 
 **What / why exploitable:** `supabase/config.toml` exposes the `public` schema via the Supabase REST API, and clients (iOS) hit that API directly with the **publishable/anon key**, which is public by design (extractable from the app bundle). Every other table has RLS enabled; `pi_discoveries` does not, so it is fully readable and writable by anyone holding the anon key. The row contains **`pending_ingest_token`** — the *plaintext, one-shot* bearer a Pi uses to authenticate to `POST /v1/cameras/me/frames`. An attacker can:
 - `GET` all discovery rows and read `pending_ingest_token` before the Pi consumes it → steal a camera's ingest credential and push frames (same impact as C-2).
@@ -120,7 +120,7 @@ Also stop storing the ingest token in plaintext in an API-reachable table.
 
 ### H-2 — `public.gateways` has no Row-Level Security
 
-**Where:** `scripts/apply_gateway_delta.sql:38-60` creates the table with **no** `enable row level security` and no policy (every other delta — `caregiver_devices`, `patient_face_embeddings`, `feedback`, `ui_events` — does enable RLS).
+**Where:** `scripts/deltas/apply_gateway_delta.sql:38-60` creates the table with **no** `enable row level security` and no policy (every other delta — `caregiver_devices`, `patient_face_embeddings`, `feedback`, `ui_events` — does enable RLS).
 
 **What / why exploitable:** Same exposure vector as H-1 (public schema + anon key). `gateways` holds `token_hash` and `caregiver_id`. With no RLS an anon client can:
 - Read the full caregiver↔gateway mapping (which accounts have gateways).
@@ -163,7 +163,7 @@ There is no per-caregiver ceiling on how many cameras/detectors run or how many 
 
 ### M-3 — Schema drift: canonical `schema.sql` does not match production, hiding RLS gaps
 
-**Where:** `supabase/schema.sql` vs `scripts/apply_*_delta.sql`. Production tables/columns (`gateways`, `cameras.last_heartbeat_at`, `source_type='gateway'`) exist only in ad-hoc delta scripts, and `schema.sql`'s `cameras` CHECK constraint still forbids `'gateway'`. Because there is no single authoritative migrated schema, RLS coverage cannot be verified from one file — and this is exactly how H-1/H-2 slipped through. **Fix:** adopt real migrations (or regenerate `schema.sql` from prod) and add a CI check asserting every `public` table has RLS enabled (the `pg_tables` loop in the vibe-security database reference).
+**Where:** `supabase/schema.sql` vs `scripts/deltas/apply_*_delta.sql`. Production tables/columns (`gateways`, `cameras.last_heartbeat_at`, `source_type='gateway'`) exist only in ad-hoc delta scripts, and `schema.sql`'s `cameras` CHECK constraint still forbids `'gateway'`. Because there is no single authoritative migrated schema, RLS coverage cannot be verified from one file — and this is exactly how H-1/H-2 slipped through. **Fix:** adopt real migrations (or regenerate `schema.sql` from prod) and add a CI check asserting every `public` table has RLS enabled (the `pg_tables` loop in the vibe-security database reference).
 
 ---
 

@@ -54,7 +54,7 @@ give the Android repo a remote.
 
 ### C1 — Patient health tables world-writable via the public app key
 
-**FOUND AND FIXED TODAY** — `scripts/apply_rls_sleep_activity_review_delta.sql`,
+**FOUND AND FIXED TODAY** — `scripts/deltas/apply_rls_sleep_activity_review_delta.sql`,
 commit `cda6364`.
 
 `apply_sleep_activity_tables_delta.sql` and `apply_review_gate_delta.sql` create

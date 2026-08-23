@@ -39,7 +39,7 @@ New files (all additive):
   POST `/v1/review/device` (APNs registration). Admin allow-list
   `REVIEWER_EMAILS = {"admin@gmail.com"}` sees ALL patients (move to
   settings/DB before real use).
-- `scripts/apply_review_gate_delta.sql` — RUN BEFORE DEPLOY (additive):
+- `scripts/deltas/apply_review_gate_delta.sql` — RUN BEFORE DEPLOY (additive):
   patients.require_review, events.review_gate, events.review_clip_key,
   review_devices table.
 

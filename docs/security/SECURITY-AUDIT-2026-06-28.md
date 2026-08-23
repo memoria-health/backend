@@ -103,7 +103,7 @@ There is no per-account AI usage tracking or hard spend cap in the application (
 
 ### 4. Guessable, reusable, unauthenticated demo pairing code mints valid api_keys
 
-**File:** `src/api/pairing.py:59`–`61` / `_pair_demo_camera` `:101`–`145`; default value `424242` in `scripts/seed_demo_camera.py:129` and `src/api/pairing.py:35`.
+**File:** `src/api/pairing.py:59`–`61` / `_pair_demo_camera` `:101`–`145`; default value `424242` in `scripts/seed/seed_demo_camera.py:129` and `src/api/pairing.py:35`.
 
 When `NEMARA_DEMO_PAIRING_CODE` is set (per `src/settings.py:147`–`153`, "production is the only env that sets it"), `POST /v1/cameras/pair` special-cases that exact code: it pairs the seeded demo camera **without expiry and without single-use clearing**, re-minting a fresh `api_key` on every call. The code is unauthenticated (the code *is* the authorization) and the documented value is `424242` — trivially guessable. Anyone who submits it obtains a working camera `api_key` plus the LiveKit room/identity for the demo patient, granting LiveKit token-minting and room access (`src/api/livekit.py`). Impact is bounded to demo data (no real patient PII *if* the demo account is isolated), but it is a permanent, unauthenticated, low-entropy credential-minting endpoint in production.
 
@@ -155,7 +155,7 @@ The lockfile pins exact transitive versions (good for reproducibility), but `pyp
 - **SSRF:** No server-side fetch of client-controlled URLs. The pull-mode `pi_stream_url` is vestigial and empty in the current push architecture (`relay_publisher.py:149`).
 - **Unsafe deserialization:** No `eval`/`exec`/`pickle.load`/`yaml.load`.
 - **Mass assignment:** PATCH handlers use Pydantic request schemas + `model_dump(exclude_unset=True)` as an allowlist before reaching `update_partial` (`caregivers.py:53`, `events.py:84`, `detectors.py:415`); the `caregivers` table has no privilege/credit columns to escalate into.
-- **Secrets:** No hardcoded API keys/tokens in tracked source; `service_role` key is used only server-side (`storage.py`, `auth_admin.py`, `scripts/seed.py`) and never exposed to clients. `.env` is gitignored; `.env.example` is placeholder-only.
+- **Secrets:** No hardcoded API keys/tokens in tracked source; `service_role` key is used only server-side (`storage.py`, `auth_admin.py`, `scripts/seed/seed.py`) and never exposed to clients. `.env` is gitignored; `.env.example` is placeholder-only.
 - **JWT handling:** Signature + audience (`authenticated`) + required-claim validation; opaque `401` to prevent oracle behavior (`deps.py:39`). No bare `jwt.decode`.
 - **Payments:** No payment/Stripe surface present — the entire client-price-trust class is N/A.
 - **Webhooks:** LiveKit webhook verifies the signed `Authorization` JWT against the body via `WebhookReceiver`/`TokenVerifier` and returns `401` on failure (`livekit_webhooks.py:65`–`75`).

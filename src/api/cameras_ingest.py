@@ -188,7 +188,7 @@ async def gateway_roster(
     # is NULL — steady-state polls burn nothing — and the row lock serializes
     # concurrent first polls, so RETURNING always yields the final port.
     # nextval() never issues 22001 (reserved for the legacy box-01 unit); see
-    # scripts/apply_gateway_tunnel_port_delta.sql for the per-env port ranges.
+    # scripts/deltas/apply_gateway_tunnel_port_delta.sql for the per-env port ranges.
     tunnel_port = (await session.execute(
         text("UPDATE public.gateways SET last_seen_at = now(), "
              "tunnel_port = COALESCE(tunnel_port, "

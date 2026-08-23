@@ -27,7 +27,7 @@ Because this system watches vulnerable/elderly patients for falls, wandering, an
 |---|----------|-------|----------|
 | 1 | Critical | Production API keys & APNs signing key committed to git history | git history (`.env`, `.env.bak.1783536884`) |
 | 2 | Critical | `pi_discoveries` table has no RLS — plaintext ingest tokens + stream URLs exposed via anon key | `supabase/schema.sql:435`, RLS block `:855-922` |
-| 3 | Critical | `gateways` table has no RLS — gateway auth records exposed via anon key | `scripts/apply_gateway_delta.sql:38` |
+| 3 | Critical | `gateways` table has no RLS — gateway auth records exposed via anon key | `scripts/deltas/apply_gateway_delta.sql:38` |
 | 4 | High | Email-only gateway provisioning attaches a rogue camera to any account | `src/api/cameras_ingest.py:472-589` |
 | 5 | High | Unauthenticated `pi-announce` returns plaintext ingest token keyed by MAC | `src/api/pi_discovery.py:43-90` |
 | 6 | Medium | SSRF: attacker-influenced camera stream URL fetched server-side without validation | `src/services/ingest/pi/mjpeg_reader.py:322-366` |
@@ -78,7 +78,7 @@ The Supabase `service_role` key and `jwt_secret` in the same file are the well-k
 
 ### 2. `pi_discoveries` table has no Row-Level Security — plaintext ingest tokens exposed to the anon key
 
-**Location:** `supabase/schema.sql:435` (table), `supabase/schema.sql:855-922` (RLS block — table absent). Also created RLS-less in `scripts/apply_pi_schema_delta.sql:85` (prod path).
+**Location:** `supabase/schema.sql:435` (table), `supabase/schema.sql:855-922` (RLS block — table absent). Also created RLS-less in `scripts/deltas/apply_pi_schema_delta.sql:85` (prod path).
 
 Every other public table in the schema gets `alter table ... enable row level security` plus an owner/membership policy in the RLS block (`schema.sql:855-922`). The schema even asserts at `:815` *"Every table is RLS-on."* **`pi_discoveries` is the exception — it has neither `enable row level security` nor any policy.** In Supabase, tables in the `public` schema are exposed through PostgREST and granted to the `anon`/`authenticated` roles by default; a table with RLS disabled is fully readable and writable by anyone holding the anon (publishable) key — which is embedded in the shipped iOS apps and therefore public.
 
@@ -114,7 +114,7 @@ Additionally, **stop storing the ingest token in plaintext** — store only a ha
 
 ### 3. `gateways` table has no Row-Level Security
 
-**Location:** `scripts/apply_gateway_delta.sql:38-46` (definition; no `enable row level security`, no policy). Not present in `supabase/schema.sql` at all — it exists only via this prod delta.
+**Location:** `scripts/deltas/apply_gateway_delta.sql:38-46` (definition; no `enable row level security`, no policy). Not present in `supabase/schema.sql` at all — it exists only via this prod delta.
 
 ```sql
 CREATE TABLE IF NOT EXISTS public.gateways (

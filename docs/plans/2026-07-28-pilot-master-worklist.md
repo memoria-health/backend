@@ -437,7 +437,7 @@ Layer 1 — in-process recovery (each service saves itself first):
   - tunnel: gpu/deploy/tunnel_supervisor.sh active /health probe
     (3 fails → kill+relaunch; ssh stderr captured to
     /tmp/pod_tunnel.log). NOTE 2026-07-29: the legacy
-    scripts/pod_tunnel.sh loop from Jul 27 was found still running
+    scripts/pod/pod_tunnel.sh loop from Jul 27 was found still running
     and RACING it over port 8000 — killed; delete the script file.
   - identity supervisor: gpu/deploy/identity_supervisor.sh (existed).
 

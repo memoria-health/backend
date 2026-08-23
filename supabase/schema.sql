@@ -593,7 +593,7 @@ create table public.detectors (
   -- ── Detection v2 dimensions ────────────────────────────────────────
   -- Spec: docs/architecture/detection-architecture-v2.md. Python source of
   -- truth for built-in values: src/services/detection/catalog_v2.py (keep
-  -- the backfill block in scripts/apply_detector_v2_delta.sql in sync).
+  -- the backfill block in scripts/deltas/apply_detector_v2_delta.sql in sync).
   -- NULL = not yet classified (pre-backfill rows / legacy customs).
   -- Nothing before P3 reads these except severity (promotion prefers the
   -- row value, falls back to the in-code catalog map when NULL).
