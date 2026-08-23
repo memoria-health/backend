@@ -26,7 +26,7 @@ from httpx import AsyncClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from test.conftest import mint_test_jwt
+from test.conftest import mint_gateway_code, mint_test_jwt
 
 _PATIENT = {"full_name": "Margaret O'Brien", "preferred_name": "Maggie",
             "relation": "parent"}
@@ -40,8 +40,10 @@ async def _account(client: AsyncClient, auth_user, name: str):
     return headers, email, uid
 
 
-async def _provision(client, email, room, *, service_kind=None):
-    body = {"email": email, "room": room}
+async def _provision(client, email, room, *, service_kind=None, headers=None):
+    # Binding takes a code the caregiver generated (2026-08-23).
+    body = {"room": room,
+            "pairing_code": await mint_gateway_code(client, headers)}
     if service_kind is not None:
         body["service_kind"] = service_kind
     r = await client.post(
@@ -62,8 +64,8 @@ async def test_provisioning_as_a_bridge_marks_the_row_multi_tenant(
     declaration the row is born wrong and only a later enrol can repair
     it.
     """
-    _headers, email, _uid = await _account(client, auth_user, "Bridge Co")
-    await _provision(client, email, "Living Room", service_kind="camera-bridge")
+    headers, email, _uid = await _account(client, auth_user, "Bridge Co")
+    await _provision(client, email, "Living Room", headers=headers, service_kind="camera-bridge")
 
     multi = (await session.execute(
         text("SELECT multi_tenant FROM public.gateways "
@@ -83,8 +85,8 @@ async def test_a_box_provisioning_stays_single_tenant(
     different house, and on the `gateway_id IS NULL` fallback that 4 of
     the 5 gateway cameras in production still depend on.
     """
-    _headers, email, _uid = await _account(client, auth_user, "Box Co")
-    await _provision(client, email, "Living Room")
+    headers, email, _uid = await _account(client, auth_user, "Box Co")
+    await _provision(client, email, "Living Room", headers=headers)
 
     multi = (await session.execute(
         text("SELECT multi_tenant FROM public.gateways "

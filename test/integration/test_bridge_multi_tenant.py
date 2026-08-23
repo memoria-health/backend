@@ -24,7 +24,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.services.fleet_auth import hash_ingest_token
-from test.conftest import mint_test_jwt
+from test.conftest import mint_test_jwt, mint_gateway_code
 
 _BODY = {"full_name": "Margaret O'Brien", "preferred_name": "Maggie",
          "relation": "parent"}
@@ -38,11 +38,19 @@ async def _caregiver(client: AsyncClient, uid, email) -> tuple[dict, str]:
     return headers, p["id"]
 
 
-async def _enroll(client: AsyncClient, email: str, kind: str | None = None):
-    body = {"email": email}
+async def _enroll(client: AsyncClient, headers, kind: str | None = None):
+    """Bind the bridge by provisioning — `/gateway/enroll` is gone.
+
+    One hosted bridge serves many customers, so each provision carries
+    the CODE of the customer it is for; the gateways row is bound once
+    and never rewritten, which is what stopped the previous customer's
+    sensors vanishing from the roster.
+    """
+    body = {"pairing_code": await mint_gateway_code(client, headers),
+            "room": "Bind"}
     if kind:
         body["service_kind"] = kind
-    return await client.post("/v1/gateway/enroll",
+    return await client.post("/v1/gateway/provision-camera",
                              headers={"Authorization": f"Bearer {BRIDGE}"},
                              json=body)
 
@@ -51,11 +59,11 @@ async def _provision(client: AsyncClient, email: str, headers, patient_id,
                      room: str) -> str:
     r = await client.post("/v1/gateway/provision-camera",
                           headers={"Authorization": f"Bearer {BRIDGE}"},
-                          json={"email": email, "room": room})
+                          json={"pairing_code": await mint_gateway_code(client, headers), "room": room})
     assert r.status_code == 201, r.text
     camera_id = r.json()["cameras"][0]["camera_id"]
     a = await client.post(f"/v1/cameras/{camera_id}/coverage", headers=headers,
-                          json={"primary_patient_id": patient_id})
+                          json={"patient_ids": [patient_id]})
     assert a.status_code == 200, a.text
     return camera_id
 
@@ -76,7 +84,7 @@ async def test_a_bridge_keeps_cameras_from_every_customer(
     b = await auth_user_factory()
     h_a, p_a = await _caregiver(client, *a)
     h_b, p_b = await _caregiver(client, *b)
-    await _enroll(client, a[1], kind="camera-bridge")
+    await _enroll(client, h_a, kind="camera-bridge")
 
     cam_a = await _provision(client, a[1], h_a, p_a, "A Living Room")
     assert cam_a in await _roster_ids(client)
@@ -98,7 +106,7 @@ async def test_a_bridge_is_not_rebound_by_provisioning(
     b = await auth_user_factory()
     h_a, p_a = await _caregiver(client, *a)
     h_b, p_b = await _caregiver(client, *b)
-    await _enroll(client, a[1], kind="camera-bridge")
+    await _enroll(client, h_a, kind="camera-bridge")
     await _provision(client, a[1], h_a, p_a, "A Room")
     before = (await session.execute(
         text("SELECT caregiver_id FROM public.gateways WHERE token_hash = :h"),
@@ -119,7 +127,7 @@ async def test_a_bridge_sees_only_cameras_it_provisioned(
     its own gateway_id and nothing else — including none of the older
     rows that predate ownership and have gateway_id NULL."""
     headers, patient_id = await _caregiver(client, *auth_user)
-    await _enroll(client, auth_user[1], kind="camera-bridge")
+    await _enroll(client, headers, kind="camera-bridge")
     mine = await _provision(client, auth_user[1], headers, patient_id, "Mine")
 
     orphan = (await session.execute(
@@ -138,16 +146,15 @@ async def test_a_plain_box_still_gets_the_unowned_fallback(
     NULL. Removing that fallback for everyone would take them dark, so a
     service that does NOT declare itself a bridge keeps the old rule."""
     headers, patient_id = await _caregiver(client, *auth_user)
-    r = await client.post("/v1/gateway/enroll",
-                          headers={"Authorization": "Bearer plain-box-token"},
-                          json={"email": auth_user[1]})
-    assert r.status_code == 200, r.text
+    # Binding and creating are one call now, so the box provisions
+    # straight away — declaring no service_kind, which is what keeps it
+    # on the box rule.
     cam = (await client.post(
         "/v1/gateway/provision-camera",
         headers={"Authorization": "Bearer plain-box-token"},
-        json={"email": auth_user[1], "room": "Box Room"})).json()["cameras"][0]
+        json={"pairing_code": await mint_gateway_code(client, headers), "room": "Box Room"})).json()["cameras"][0]
     await client.post(f"/v1/cameras/{cam['camera_id']}/coverage",
-                      headers=headers, json={"primary_patient_id": patient_id})
+                      headers=headers, json={"patient_ids": [patient_id]})
     await session.execute(
         text("UPDATE public.cameras SET gateway_id = NULL WHERE id = :c"),
         {"c": cam["camera_id"]})

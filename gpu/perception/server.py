@@ -33,6 +33,7 @@ import base64
 import hmac
 import logging
 import os
+import pathlib
 import threading
 import time
 
@@ -64,7 +65,28 @@ app = FastAPI(title="nemara-sam-perception-v2")
 # layer and must not depend on the brain. Eight lines of hmac is a better
 # trade than that coupling. Same semantics as contract.auth_ok, including
 # "empty token disables auth" — see the boot warning below.
-_AUTH_TOKEN = os.environ.get("NEMARA_PERCEPTION_TOKEN", "").strip()
+def _load_auth_token() -> str:
+    """The shared bearer, from the environment or from a file.
+
+    The file path exists because the node's env is fixed at container
+    start and the entrypoint sources nothing from the volume — so setting
+    this via RunPod means recycling the pod, while the dev-code overlay
+    can ship code in seconds. A file on the shared volume can be written
+    once and picked up by the next service restart, which is what makes
+    turning auth ON not require taking the node down.
+    """
+    env = os.environ.get("NEMARA_PERCEPTION_TOKEN", "").strip()
+    if env:
+        return env
+    path = os.environ.get(
+        "NEMARA_PERCEPTION_TOKEN_FILE", "/persist/secrets/perception_token")
+    try:
+        return pathlib.Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+_AUTH_TOKEN = _load_auth_token()
 
 
 def _auth_ok(header_value: str | None) -> bool:

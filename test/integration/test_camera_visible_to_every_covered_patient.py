@@ -19,7 +19,7 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from test.conftest import mint_test_jwt
+from test.conftest import mint_test_jwt, mint_gateway_code
 
 _BODY = {"full_name": "Margaret O'Brien", "preferred_name": "Maggie",
          "relation": "parent"}
@@ -39,7 +39,7 @@ async def _shared_camera(client, email, headers, first, second) -> dict:
     r = await client.post(
         "/v1/gateway/provision-camera",
         headers={"Authorization": "Bearer gw-shared-cam"},
-        json={"email": email, "room": "Living Room"})
+        json={"pairing_code": await mint_gateway_code(client, headers), "room": "Living Room"})
     assert r.status_code == 201, r.text
     camera = r.json()["cameras"][0]
     c = await client.post(

@@ -26,7 +26,7 @@ from httpx import AsyncClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from test.conftest import mint_test_jwt
+from test.conftest import mint_test_jwt, provision_sensor
 
 _PATIENT = {"full_name": "Margaret O'Brien", "preferred_name": "Maggie",
             "relation": "parent"}
@@ -47,13 +47,13 @@ async def _add_patient(client, headers, name="Margaret O'Brien") -> str:
     return r.json()["id"]
 
 
-async def _provision(client, email, token="gw-sensor-flow") -> dict:
-    r = await client.post(
-        "/v1/gateway/provision-camera",
-        headers={"Authorization": f"Bearer {token}"},
-        json={"email": email, "room": "Living Room"})
-    assert r.status_code == 201, r.text
-    return r.json()["cameras"][0]
+async def _provision(client, email, token="gw-sensor-flow", *,
+                     headers=None) -> dict:
+    """Binding takes a pairing code now, so the caller needs caregiver
+    headers. `email` is kept as the typo check the endpoint accepts."""
+    body = await provision_sensor(client, headers, token=token,
+                                  room="Living Room")
+    return body["cameras"][0]
 
 
 async def _roster(client, token="gw-sensor-flow") -> list[dict]:
@@ -74,8 +74,8 @@ async def test_a_sensor_gets_its_room_at_provision_with_no_patient(
     client: AsyncClient, auth_user, session: AsyncSession,
 ) -> None:
     """The account is known at provision, so the room is too."""
-    _headers, email, uid = await _account(client, auth_user)
-    camera = await _provision(client, email)
+    headers, email, uid = await _account(client, auth_user)
+    camera = await _provision(client, email, headers=headers)
     assert camera["livekit_room"] == f"account_{str(uid).lower()}"
     assert camera["patient_id"] is None
 
@@ -85,8 +85,8 @@ async def test_an_unassigned_sensor_is_on_the_roster_and_publishes(
     client: AsyncClient, auth_user, session: AsyncSession,
 ) -> None:
     """The installer's whole ask: see it work before leaving the house."""
-    _headers, email, _uid = await _account(client, auth_user)
-    camera = await _provision(client, email)
+    headers, email, _uid = await _account(client, auth_user)
+    camera = await _provision(client, email, headers=headers)
 
     roster = await _roster(client)
     mine = [c for c in roster if c["camera_id"] == camera["camera_id"]]
@@ -101,7 +101,7 @@ async def test_assigning_a_patient_does_not_move_the_stream(
 ) -> None:
     """Assignment is attribution, not plumbing. The video never pauses."""
     headers, email, _uid = await _account(client, auth_user)
-    camera = await _provision(client, email)
+    camera = await _provision(client, email, headers=headers)
     room_before = camera["livekit_room"]
 
     patient = await _add_patient(client, headers)
@@ -120,7 +120,7 @@ async def test_two_patients_on_one_sensor_are_equals(
 ) -> None:
     """No primary. Neither patient owns the stream; both are watched by it."""
     headers, email, _uid = await _account(client, auth_user)
-    camera = await _provision(client, email)
+    camera = await _provision(client, email, headers=headers)
     a = await _add_patient(client, headers, "Margaret O'Brien")
     b = await _add_patient(client, headers, "Arthur O'Brien")
 
@@ -152,7 +152,7 @@ async def test_unassigning_leaves_the_sensor_streaming(
     it. Previously this dropped it off the roster entirely.
     """
     headers, email, _uid = await _account(client, auth_user)
-    camera = await _provision(client, email)
+    camera = await _provision(client, email, headers=headers)
     patient = await _add_patient(client, headers)
     await client.post(f"/v1/cameras/{camera['camera_id']}/coverage",
                       headers=headers, json={"patient_ids": [patient]})
@@ -181,7 +181,7 @@ async def test_the_audio_kill_actually_persists(
     than no switch, which is the reason the field moved here at all.
     """
     headers, email, _uid = await _account(client, auth_user)
-    camera = await _provision(client, email)
+    camera = await _provision(client, email, headers=headers)
 
     r = await client.patch(f"/v1/cameras/{camera['camera_id']}",
                            headers=headers,
@@ -210,7 +210,7 @@ async def test_minting_a_pairing_code_cannot_delete_a_sensor(
     phone after one deleted it outright.
     """
     headers, email, _uid = await _account(client, auth_user)
-    camera = await _provision(client, email)
+    camera = await _provision(client, email, headers=headers)
     patient = await _add_patient(client, headers)
 
     r = await client.post(
@@ -224,3 +224,25 @@ async def test_minting_a_pairing_code_cannot_delete_a_sensor(
         {"i": camera["camera_id"]},
     )).scalar_one()
     assert survives == 1, "the bridge sensor was deleted by a pairing code"
+
+
+@pytest.mark.asyncio
+async def test_the_mini_pc_setup_page_also_provisions_into_the_account_room(
+    client: AsyncClient, auth_user, session: AsyncSession,
+) -> None:
+    """`gateway-provision` is the live Tapo path, not a dead endpoint.
+
+    nemara-gateway/setup_server.py calls it, so it is how every mini-PC
+    camera is created. It still built `patient_<id>` after the migration
+    moved every other gateway sensor to the account's room — which put
+    two sensors on one account into DIFFERENT rooms, the one combination
+    the migration assumes cannot happen.
+    """
+    headers, _email, uid = await _account(client, auth_user)
+    patient = await _add_patient(client, headers)
+
+    r = await client.post(
+        f"/v1/patients/{patient}/cameras/gateway-provision",
+        headers=headers, json={"room": "Hallway", "icon_name": "tv"})
+    assert r.status_code == 201, r.text
+    assert r.json()["livekit_room"] == f"account_{str(uid).lower()}"

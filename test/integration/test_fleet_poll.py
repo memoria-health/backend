@@ -26,7 +26,7 @@ from httpx import AsyncClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from test.conftest import mint_test_jwt
+from test.conftest import mint_test_jwt, mint_gateway_code
 
 _PATIENT_BODY = {
     "full_name": "Margaret O'Brien",
@@ -80,7 +80,7 @@ async def _provision(client: AsyncClient, email: str, headers: dict,
     r = await client.post(
         "/v1/gateway/provision-camera",
         headers={"Authorization": f"Bearer {TOKEN}"},
-        json={"email": email, "room": room},
+        json={"pairing_code": await mint_gateway_code(client, headers), "room": room},
     )
     assert r.status_code == 201, r.text
     camera_id = r.json()["cameras"][0]["camera_id"]
@@ -90,13 +90,20 @@ async def _provision(client: AsyncClient, email: str, headers: dict,
     return camera_id
 
 
-async def _enroll(client: AsyncClient, email: str, token: str = TOKEN) -> None:
-    """Make the bridge's token known. Its own endpoint now, so a service
-    with nothing to provision can still be told what to run."""
-    r = await client.post("/v1/gateway/enroll",
-                          headers={"Authorization": f"Bearer {token}"},
-                          json={"email": email})
-    assert r.status_code == 200, r.text
+async def _enroll(client: AsyncClient, headers: dict, token: str = TOKEN) -> None:
+    """Bind the bridge's token to this account.
+
+    `/gateway/enroll` is gone (2026-08-23) — binding happens once, at
+    provision, by redeeming a code. A service with nothing to provision
+    has nothing to be told to run either, so the case it existed for
+    stopped existing.
+    """
+    r = await client.post(
+        "/v1/gateway/provision-camera",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"pairing_code": await mint_gateway_code(client, headers),
+              "room": f"Bind {token[-6:]}"})
+    assert r.status_code == 201, r.text
 
 
 async def _poll(client: AsyncClient, body: dict, token: str = TOKEN):
@@ -144,8 +151,8 @@ async def test_a_poll_with_no_report_is_refused(
     """The whole point. Instruction is the response to a report, so a
     service that can ask for orders without saying what it did with the
     last ones is exactly how the bridge ignored disconnect for months."""
-    _headers, email, _pid = await _setup(client, auth_user)
-    await _enroll(client, email)
+    headers, email, _pid = await _setup(client, auth_user)
+    await _enroll(client, headers)
     r = await _poll(client, {})
     assert r.status_code == 400
     assert "report" in r.json()["detail"]
@@ -158,8 +165,8 @@ async def test_a_report_from_an_unknown_contract_is_refused(
     """A consumer that would misread a newer body must say so rather
     than silently misparse it — the same rule the identity contract
     already applies, where a version mismatch means "no verdict"."""
-    _headers, email, _pid = await _setup(client, auth_user)
-    await _enroll(client, email)
+    headers, email, _pid = await _setup(client, auth_user)
+    await _enroll(client, headers)
     r = await _poll(client, {**report([]), "contract": "fleet-v99"})
     assert r.status_code == 400
     assert "contract" in r.json()["detail"]
@@ -250,8 +257,8 @@ async def test_a_bridge_cannot_stamp_a_camera_it_does_not_own(
 async def test_an_unknown_token_cannot_poll(
     client: AsyncClient, auth_user, session: AsyncSession,
 ) -> None:
-    _headers, email, _pid = await _setup(client, auth_user)
-    await _enroll(client, email)
+    headers, email, _pid = await _setup(client, auth_user)
+    await _enroll(client, headers)
     r = await _poll(client, report([]), token="not-a-real-bridge-token")
     assert r.status_code == 401
 
@@ -260,7 +267,7 @@ async def test_an_unknown_token_cannot_poll(
 async def test_a_missing_bearer_cannot_poll(
     client: AsyncClient, auth_user, session: AsyncSession,
 ) -> None:
-    _headers, email, _pid = await _setup(client, auth_user)
-    await _enroll(client, email)
+    headers, email, _pid = await _setup(client, auth_user)
+    await _enroll(client, headers)
     r = await client.post("/v1/fleet/poll", json=report([]))
     assert r.status_code == 401

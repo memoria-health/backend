@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import time
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Header, HTTPException, Request, status
@@ -24,7 +25,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api import health as health_mod
-from src.api.deps import SessionDep, SettingsDep
+from src.api.deps import CaregiverAuth, SessionDep, SettingsDep
 from src.db.camera import Camera
 from src.repos import camera_detector_repo
 from src.services import livekit_rooms
@@ -313,20 +314,25 @@ async def gateway_wait(
     return {"changed": False, "fingerprint": fp}
 
 
-class GatewayEnrollRequest(BaseModel):
-    """Body for the email-only enrolment of a service's bearer token.
+class GatewayProvisionRequest(BaseModel):
+    """Bind a service and create a sensor, in one call.
+
+    `pairing_code` is what proves the account. Required the first time a
+    token is seen and ignored afterwards, so mounting a second sensor in
+    the same home does not send the installer back for another code.
+
+    `email` is an optional TYPO CHECK. The code already names the
+    account; if the email disagrees, the install is wrong in a way that
+    picking one of them cannot fix.
 
     `service_kind` is how a HOSTED service says it serves many accounts.
-    Declaring it narrows what the service can see — cameras carrying its
+    Declaring it NARROWS what the service can see — sensors carrying its
     own gateway_id and nothing else — so it grants nothing.
     """
 
+    pairing_code: str | None = None
+    email: str | None = None
     service_kind: str | None = None
-    email: str
-
-
-class GatewayProvisionRequest(GatewayEnrollRequest):
-    """Body for the email-only gateway provision (no caregiver password)."""
     room: str = "Camera"
     icon_name: str = "tv"
 
@@ -386,121 +392,182 @@ def _is_multi_tenant(service_kind: str | None) -> bool:
     return (service_kind or "").strip().lower() in _MULTI_TENANT_KINDS
 
 
-async def _enroll_gateway_token(
-    session: AsyncSession, authorization: str, email: str, now: datetime,
-    service_kind: str | None = None,
-) -> tuple[UUID, UUID, bool]:
-    """Tie the presented bearer token to a caregiver account, idempotently.
+async def _redeem_pairing_code(
+    session: AsyncSession, pairing_code: str, now: datetime,
+    *, email: str | None, gateway_id: UUID | None,
+) -> UUID:
+    """Consume a code and return the account that issued it.
 
-    Returns `(gateway_id, caregiver_id, already_enrolled)`.
+    Atomic: the UPDATE is the claim, so two services racing on one code
+    cannot both win. Unknown, expired and already-used collapse to one
+    answer — a caller probing codes learns nothing from the difference.
+    """
+    code_hash = hash_ingest_token(pairing_code.strip())
+    claimed = (await session.execute(
+        text("UPDATE public.gateway_pairing_codes "
+             "   SET consumed_at = :now, consumed_by = COALESCE(:g, consumed_by) "
+             " WHERE code_hash = :h AND consumed_at IS NULL "
+             "   AND expires_at > :now "
+             "RETURNING caregiver_id"),
+        {"h": code_hash, "now": now, "g": gateway_id},
+    )).first()
+    if claimed is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="invalid_pairing_code",
+        )
+    caregiver_id = claimed[0]
 
-    This is the ONE place a `public.gateways` row is written. It used to
-    live inside provision-camera, which meant provisioning a camera was
-    the only way a token could ever become known — so a service with
-    nothing to provision (a bridge watching no cameras, or any box that
-    had just rotated its token) could not enrol at all, and 401d on the
-    roster forever. Both callers share this so the two paths cannot drift
-    into disagreeing about what "enrolled" means.
+    if email:
+        owner = (await session.execute(
+            text("SELECT lower(email) FROM public.caregivers WHERE id = :c"),
+            {"c": caregiver_id},
+        )).scalar_one_or_none()
+        if owner != email.strip().lower():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="email_does_not_match_pairing_code",
+            )
+    return caregiver_id
+
+
+async def _bind_service_token(
+    session: AsyncSession, authorization: str, now: datetime,
+    *, pairing_code: str | None, email: str | None,
+    service_kind: str | None,
+) -> tuple[UUID, UUID]:
+    """Resolve this service's token to an account, binding it if new.
+
+    ONE door. A token the backend has never seen binds only by redeeming
+    a pairing code the caregiver just generated; a token it already knows
+    needs nothing, so an installer mounting a second sensor ten minutes
+    later does not have to walk back for another code.
+
+    This took the caregiver's EMAIL until 2026-08-23. An email is on the
+    invoice and in the signature, so it proved nothing — anyone who knew
+    one could bind a token and poll that account's roster. It is now
+    accepted only as a typo check: if it disagrees with the code, the
+    install is wrong in a way that guessing cannot fix.
     """
     if not authorization.lower().startswith("bearer "):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="missing_bearer_token",
         )
-    box_token = authorization[len("bearer "):].strip()
-    if not box_token:
+    token = authorization[len("bearer "):].strip()
+    if not token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="empty_bearer_token",
         )
-    cg = (await session.execute(
-        text("SELECT id FROM public.caregivers WHERE lower(email) = lower(:e)"),
-        {"e": email.strip()},
-    )).first()
-    if cg is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="caregiver_not_found",
-        )
-    caregiver_id = cg[0]
+    token_hash = hash_ingest_token(token)
 
-    # Only the hash is ever stored, and it is what the roster looks up. The
-    # SELECT-then-INSERT is what makes a re-enrol land on the same row
-    # instead of adding a second one for the same token.
-    token_hash = hash_ingest_token(box_token)
     existing = (await session.execute(
-        text("SELECT id, multi_tenant FROM public.gateways "
+        text("SELECT id, caregiver_id, multi_tenant FROM public.gateways "
              " WHERE token_hash = :h"),
         {"h": token_hash},
     )).first()
-    if existing is None:
-        # ON CONFLICT because the SELECT above and this INSERT are not
-        # atomic: two concurrent first-enrols with the same token both
-        # miss the SELECT. Without the unique index that produced two
-        # rows for one credential and the lookups do `.first()`, so which
-        # account a service was bound to came down to row order. With the
-        # index and without this, the loser gets a 500 instead. A bridge
-        # re-enrols on every boot, so a restart loop is exactly this.
-        gateway_id = (await session.execute(
-            text("INSERT INTO public.gateways "
-                 " (caregiver_id, token_hash, created_at, multi_tenant) "
-                 "VALUES (:c, :h, :n, :mt) "
-                 "ON CONFLICT (token_hash) DO NOTHING RETURNING id"),
-            {"c": caregiver_id, "h": token_hash, "n": now,
-             "mt": _is_multi_tenant(service_kind)},
-        )).scalar_one_or_none()
-        if gateway_id is not None:
-            return gateway_id, caregiver_id, False
-        # Lost the race. The winner's row is the one row, so read it and
-        # fall through to the same update path a re-enrol takes.
-        existing = (await session.execute(
-            text("SELECT id, multi_tenant FROM public.gateways "
-                 " WHERE token_hash = :h"),
-            {"h": token_hash},
-        )).first()
-    gateway_id, was_multi_tenant = existing[0], bool(existing[1])
-    if not was_multi_tenant and not _is_multi_tenant(service_kind):
-        # A BOX moves house: re-provisioned into a different home, so the
-        # binding follows. A hosted service must never be rewritten this
-        # way — it serves many accounts at once, and rebinding it to
-        # whoever was provisioned last made every other customer's
-        # cameras vanish from its roster, silently.
-        await session.execute(
-            text("UPDATE public.gateways SET caregiver_id = :c "
-                 " WHERE token_hash = :h"),
-            {"c": caregiver_id, "h": token_hash},
+
+    if existing is not None:
+        gateway_id, bound_caregiver, was_mt = (
+            existing[0], existing[1], bool(existing[2]))
+        # Re-declared on every call, so a row created before the service
+        # knew its own kind repairs itself without a human.
+        if _is_multi_tenant(service_kind) and not was_mt:
+            await session.execute(
+                text("UPDATE public.gateways SET multi_tenant = true "
+                     " WHERE token_hash = :h"), {"h": token_hash})
+        if not pairing_code:
+            # No code: this sensor belongs to the account the service is
+            # bound to. That is the second-sensor-in-the-same-home case.
+            return gateway_id, bound_caregiver
+        # A code IS presented, so this sensor belongs to whoever issued
+        # it — which is how ONE hosted bridge serves many customers. The
+        # gateways row is NOT rebound: it is the service's identity, and
+        # rewriting it is exactly what used to drop the previous
+        # customer's sensors off the roster. Ownership of a SENSOR is
+        # `cameras.caregiver_id`; ownership of the SERVICE is this row.
+        code_caregiver = await _redeem_pairing_code(
+            session, pairing_code, now, email=email, gateway_id=gateway_id)
+        return gateway_id, code_caregiver
+
+    if not pairing_code:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="pairing_code_required",
         )
-    if _is_multi_tenant(service_kind) and not was_multi_tenant:
-        await session.execute(
-            text("UPDATE public.gateways SET multi_tenant = true "
-                 " WHERE token_hash = :h"), {"h": token_hash})
-    return gateway_id, caregiver_id, True
+
+    caregiver_id = await _redeem_pairing_code(
+        session, pairing_code, now, email=email, gateway_id=None)
+
+    gateway_id = (await session.execute(
+        text("INSERT INTO public.gateways "
+             " (caregiver_id, token_hash, created_at, multi_tenant) "
+             "VALUES (:c, :h, :n, :mt) "
+             "ON CONFLICT (token_hash) DO NOTHING RETURNING id"),
+        {"c": caregiver_id, "h": token_hash, "n": now,
+         "mt": _is_multi_tenant(service_kind)},
+    )).scalar_one_or_none()
+    if gateway_id is None:
+        gateway_id = (await session.execute(
+            text("SELECT id FROM public.gateways WHERE token_hash = :h"),
+            {"h": token_hash},
+        )).scalar_one()
+    await session.execute(
+        text("UPDATE public.gateway_pairing_codes SET consumed_by = :g "
+             " WHERE code_hash = :h"),
+        {"g": gateway_id, "h": hash_ingest_token(pairing_code.strip())})
+    return gateway_id, caregiver_id
+
+
+class GatewayPairingCodeResponse(BaseModel):
+    pairing_code: str
+    expires_in_seconds: int
+
+
+# Five minutes. Long enough to read six digits down a phone line and type
+# them; short enough that a code left on a screen is not a standing key
+# to somebody's home.
+_PAIRING_TTL_S = 300
 
 
 @router.post(
-    "/gateway/enroll",
+    "/gateway/pairing-code",
     status_code=status.HTTP_200_OK,
+    response_model=GatewayPairingCodeResponse,
 )
-async def gateway_enroll(
-    body: GatewayEnrollRequest,
+async def create_gateway_pairing_code(
+    auth: CaregiverAuth,
     session: SessionDep,
-    authorization: str = Header(default=""),
-) -> dict:
-    """Make this service's bearer token known to the backend. No camera.
+) -> GatewayPairingCodeResponse:
+    """Mint the code an installer types to bind a service to THIS account.
 
-    Same handshake as provision-camera — Bearer <the service's own token>
-    plus the caregiver's email — minus the camera. That was the missing
-    half: a token only ever got its `gateways` row by provisioning
-    something, so rotating a credential meant creating a junk camera row,
-    and a bridge with zero cameras could not enrol at all.
+    Caregiver-authenticated, so the person granting access is the person
+    who owns the home — which is the whole point, and is what an email
+    could never establish.
 
-    Idempotent, because a service re-POSTs this on every boot. Returns
-    neither the token nor its hash: the caller already holds the
-    plaintext, and echoing it only spreads it into logs.
+    Only the sha256 is stored; the plaintext is returned once and never
+    again. Six digits over a five-minute window is ~3.3 codes per million
+    guesses per attempt, and a code dies the moment it is used.
     """
-    _gw, _cg, already = await _enroll_gateway_token(
-        session, authorization, body.email, datetime.now(timezone.utc),
-        service_kind=body.service_kind,
-    )
-    await session.commit()
-    return {"ok": True, "already_enrolled": already}
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(seconds=_PAIRING_TTL_S)
+    for _ in range(5):
+        code = f"{secrets.randbelow(900_000) + 100_000}"
+        inserted = (await session.execute(
+            text("INSERT INTO public.gateway_pairing_codes "
+                 " (code_hash, caregiver_id, created_at, expires_at) "
+                 "VALUES (:h, :c, :n, :e) "
+                 "ON CONFLICT (code_hash) DO NOTHING RETURNING code_hash"),
+            {"h": hash_ingest_token(code), "c": auth.id, "n": now, "e": expires},
+        )).first()
+        if inserted is not None:
+            await session.commit()
+            return GatewayPairingCodeResponse(
+                pairing_code=code, expires_in_seconds=_PAIRING_TTL_S)
+    # Five collisions against a live-code set this small means something
+    # is wrong with the entropy, not with luck.
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="could_not_allocate_pairing_code")
 
 
 @router.post(
@@ -523,19 +590,13 @@ async def gateway_provision_camera(
     learns its account HERE, at setup.
     """
     now = datetime.now(timezone.utc)
-    # Tie THIS box's unique token to the caregiver, same idempotent upsert
-    # POST /v1/gateway/enroll performs on its own — provisioning a camera is
-    # now one of two ways to enrol, not the only one.
-    gateway_id, caregiver_id, _already = await _enroll_gateway_token(
-        session, authorization, body.email, now,
-        # Honoured here too, not only at /gateway/enroll. The field was
-        # already on the body (inherited from GatewayEnrollRequest) and
-        # was silently dropped, which made the whole multi-tenant path
-        # unreachable for the one caller that needs it: a bridge's FIRST
-        # contact is a provision, so its row was born single-tenant and
-        # the next customer's provision rebound the entire service to
-        # them. Every multi-tenancy test passed because they all enrol
-        # first and provision second — the order the bridge never used.
+    # Bind and create in ONE call, which is also the only moment the
+    # installer and the caregiver are together. A new token redeems the
+    # code; a token already bound just provisions.
+    gateway_id, caregiver_id = await _bind_service_token(
+        session, authorization, now,
+        pairing_code=body.pairing_code,
+        email=body.email,
         service_kind=body.service_kind,
     )
 

@@ -311,3 +311,36 @@ async def seed_camera(
         )
     await session.commit()
     return camera_id
+
+
+async def mint_gateway_code(client, headers) -> str:
+    """A fresh pairing code for this caregiver.
+
+    Binding a service takes a code the caregiver just generated, so every
+    test that provisions needs one. Centralised for the same reason
+    `seed_camera` is: the email-based handshake lived inline in a dozen
+    suites, and changing it meant editing all of them.
+    """
+    r = await client.post("/v1/gateway/pairing-code", headers=headers, json={})
+    assert r.status_code == 200, r.text
+    return r.json()["pairing_code"]
+
+
+async def provision_sensor(
+    client, headers, *, token: str, room: str = "Living Room",
+    service_kind: str | None = None, expect: int = 201,
+) -> dict:
+    """Bind `token` to this account (first time) and create a sensor.
+
+    Mints a code per call. A token already bound ignores it, which is the
+    real behaviour — an installer mounting a second sensor does not go
+    back for a second code.
+    """
+    body: dict = {"room": room, "pairing_code": await mint_gateway_code(client, headers)}
+    if service_kind is not None:
+        body["service_kind"] = service_kind
+    r = await client.post(
+        "/v1/gateway/provision-camera",
+        headers={"Authorization": f"Bearer {token}"}, json=body)
+    assert r.status_code == expect, r.text
+    return r.json() if r.status_code == 201 else {}

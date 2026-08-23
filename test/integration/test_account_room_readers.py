@@ -23,7 +23,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.services import livekit_rooms
-from test.conftest import mint_test_jwt
+from test.conftest import mint_test_jwt, mint_gateway_code
 
 _PATIENT = {"full_name": "Margaret O'Brien", "preferred_name": "Maggie",
             "relation": "parent"}
@@ -36,7 +36,7 @@ async def _account_with_sensor(client, auth_user, token="gw-readers"):
     r = await client.post(
         "/v1/gateway/provision-camera",
         headers={"Authorization": f"Bearer {token}"},
-        json={"email": email, "room": "Living Room"})
+        json={"pairing_code": await mint_gateway_code(client, headers), "room": "Living Room"})
     assert r.status_code == 201, r.text
     return headers, email, uid, r.json()["cameras"][0]
 

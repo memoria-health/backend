@@ -23,7 +23,7 @@ from sqlalchemy import delete, func, select, text
 log = logging.getLogger(__name__)
 
 from src.api.deps import CameraAuth, CaregiverAuth, SessionDep, SettingsDep
-from src.services import camera_coverage, room_classifier
+from src.services import camera_coverage, livekit_rooms, room_classifier
 from src.services.detection import censor, frame_codec
 from src.services.fleet_auth import mint_ingest_token
 from src.db.camera import Camera
@@ -330,7 +330,14 @@ async def provision_gateway_camera(
     camera_id = uuid4()
     short = camera_id.hex[:8]
     livekit_identity = f"cam_{short}"
-    livekit_room = f"patient_{patient_id}"
+    # The ACCOUNT's room, same as the bridge path. This still built a
+    # patient room after the migration moved every other gateway sensor
+    # to the account's, so provisioning a second Tapo through the mini-PC
+    # setup page put two sensors on one account into DIFFERENT rooms —
+    # the one combination the migration assumes cannot exist. It is the
+    # endpoint nemara-gateway/setup_server.py calls, so it is the live
+    # Tapo provisioning path, not a dead one.
+    livekit_room = livekit_rooms.account_room(auth.id)
     next_display_id = (await session.execute(
         select(func.coalesce(func.max(Camera.display_id), 0)).where(
             Camera.patient_id == patient_id)
