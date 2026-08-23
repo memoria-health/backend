@@ -141,7 +141,13 @@ async def _live_baseline(session: AsyncSession, settings) -> int:
     Supabase is ALSO the database a real production fleet node heartbeats
     into every ~10s (2026-08-17), so absolute nodes_live assertions must
     measure the pre-existing live count instead of assuming it. Mirrors
-    check()'s exact liveness cutoff."""
+    check()'s exact liveness cutoff.
+
+    Call this AFTER check(), never before: the node keeps beating, so a
+    baseline taken first can disagree with the count check() produced a
+    moment later. That is a false failure indistinguishable from a real
+    regression, which is the worst kind to leave in a suite people are
+    about to run on a loop during a soak."""
     return (await session.execute(
         text(
             "SELECT count(*) FROM public.identity_nodes "
@@ -346,11 +352,15 @@ async def test_dead_node_is_a_warning_not_a_critical(
     pid = await _mk_home(session, cid, age_mins=60)
     await _assign(session, pid, "node-dead", seen_mins_ago=30)
 
-    baseline = await _live_baseline(session, settings)
     watch = _watch(settings, get_sessionmaker())
     counts = await watch.check()
+    # Baselines measured AFTER check(), not before. The dev database is
+    # shared with a real fleet node that heartbeats every ~10s, so a node
+    # can cross the liveness cutoff between a before-snapshot and the
+    # assertion — which failed this test intermittently for a reason that
+    # had nothing to do with the behaviour under test.
     assert counts["nodes_down"] == 1 + await _down_baseline(session, settings)
-    assert counts["nodes_live"] == baseline
+    assert counts["nodes_live"] == await _live_baseline(session, settings)
     # One stale cycle is a heartbeat gap, not an incident (every backend
     # restart produces one) — the node-down page holds for a streak.
     assert "identity-fleet:node-down:node-dead" not in pages.triggered

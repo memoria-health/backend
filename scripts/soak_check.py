@@ -228,11 +228,17 @@ async def check_identity(session, rep: Report) -> None:
         if not ports:
             rep.add(SKIP, f"identity: {node_id} serving", "holds no sensors")
             continue
+        # /state is bearer-protected. Without the header every node reads
+        # as 0/N serving, which is a false alarm indistinguishable from
+        # the real failure this check exists to catch.
+        token = (getattr(settings, "identity_state_token", "") or "").strip()
+        auth = {"Authorization": f"Bearer {token}"} if token else {}
         reachable = 0
         async with httpx.AsyncClient(timeout=5) as client:
             for (port,) in ports:
                 try:
-                    r = await client.get(f"{base_url.rstrip('/')}:{port}/state")
+                    r = await client.get(
+                        f"{base_url.rstrip('/')}:{port}/state", headers=auth)
                     if r.status_code == 200:
                         reachable += 1
                 except Exception:  # noqa: BLE001 — unreachable is the finding

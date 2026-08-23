@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 import time
@@ -76,14 +77,16 @@ _TRACE_PATH = Path("out/track_trace.jsonl")
 # from 8012 up, across several nodes. This dashboard follows ONE home; it
 # is a local soak tool, not an operations console.
 #
-# The address is resolved from the ROSTER (patients.identity_node_id ->
-# identity_nodes.base_url + patients.identity_port), cached 30s, so the
+# The address is resolved from the ROSTER (cameras.identity_node_id ->
+# identity_nodes.base_url + cameras.identity_port), cached 30s, so the
 # dashboard follows fleet swaps instead of pointing at dead nodes — on
 # 2026-08-13 it sat aimed at a terminated node until restarted by hand.
 # SOAK_IDENTITY_BASE remains as an explicit override (rigs with no DB);
 # SOAK_PATIENT_NAME picks the home.
 IDENTITY_BASE = os.environ.get("SOAK_IDENTITY_BASE", "").rstrip("/")
 _PATIENT_NAME = os.environ.get("SOAK_PATIENT_NAME", "Aryaman Darda")
+log = logging.getLogger(__name__)
+
 _ib_cache: dict = {"t": 0.0, "v": None}
 
 
@@ -97,17 +100,28 @@ async def IB() -> str:
     try:
         sm = get_sessionmaker()
         async with sm() as session:
+            # Through the SENSOR, not the patient: the identity slot moved
+            # to cameras on 2026-08-22. This still selected
+            # patients.identity_port, which no longer exists — and the
+            # bare except below meant the dashboard silently fell back to
+            # localhost:8012 forever and simply never showed tracking.
             row = (await session.execute(text(
-                "SELECT n.base_url, p.identity_port "
-                "  FROM public.patients p "
+                "SELECT n.base_url, c.identity_port "
+                "  FROM public.cameras c "
+                "  JOIN public.camera_patients cp ON cp.camera_id = c.id "
+                "  JOIN public.patients p ON p.id = cp.patient_id "
                 "  JOIN public.identity_nodes n "
-                "    ON n.node_id = p.identity_node_id "
-                " WHERE p.preferred_name = :name"
+                "    ON n.node_id = c.identity_node_id "
+                " WHERE p.preferred_name = :name "
+                "   AND c.identity_port IS NOT NULL "
+                " ORDER BY c.identity_port LIMIT 1"
             ), {"name": _PATIENT_NAME})).first()
         if row and row[0] and row[1]:
             _ib_cache.update(t=now, v=f"{row[0].rstrip('/')}:{row[1]}")
     except Exception:  # noqa: BLE001 — keep serving the last-known node
-        pass
+        # Logged, not swallowed. Silent fallback to localhost is how a
+        # schema change made this dashboard useless without saying so.
+        log.warning("soak_dashboard: identity node lookup failed", exc_info=True)
     return _ib_cache["v"] or "http://localhost:8012"
 
 # All displayed times are LAPTOP-LOCAL (Aryaman 2026-07-19 — the UTC
