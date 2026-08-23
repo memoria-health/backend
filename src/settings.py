@@ -821,7 +821,17 @@ class Settings(BaseSettings):
     # Which simulcast layer the detector bot subscribes to. "high" =
     # the top layer (the camera's full resolution). "medium" was the
     # soak-1 crash-night triage — kept selectable for rollback.
-    livekit_subscribe_quality: str = Field(default="high")
+    #
+    # Reverted to "medium" (2026-08-23, LiveKit bandwidth cost review):
+    # none of the downstream consumers need "high" — VLM tokens are
+    # resolution-independent, reid runs at 640w, block motion is a
+    # 32x18 grid (see room_worker._request_layer). "high" was only
+    # needed to dodge the 2026-07-18 OOM class, which is now fixed by
+    # JPEG-in-buffer storage instead. Paying full-resolution bandwidth
+    # for accuracy nothing consumes was the single largest lever on the
+    # LiveKit bill ($196.75 in August, 75% of it overage). Rollback:
+    # set back to "high" if this regresses detection quality.
+    livekit_subscribe_quality: str = Field(default="medium")
 
     # ── APNs (Phase 4) ──────────────────────────────────────────
     # Apple Developer credentials for HTTP/2 push. team_id +
