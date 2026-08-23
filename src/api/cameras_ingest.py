@@ -742,8 +742,25 @@ async def fleet_poll(
             detail="report must name the reporting instance",
         )
 
-    healthy = [e.get("id") for e in body.entities
-               if isinstance(e, dict) and e.get("healthy") and e.get("id")]
+    # Parsed, not passed through. These ids are client data and go into a
+    # `uuid[]` bind: one non-uuid among them ("warner_8d2506f65170d9f3",
+    # a bridge sending its own vendor key) failed the whole statement, so
+    # the poll 500'd and NOT ONE camera on that service got its heartbeat
+    # stamped. The camera was publishing fine and read as never-seen —
+    # the exact state the staleness sweep exists to catch, produced by
+    # the reporting path itself. A malformed id is now that one entity's
+    # problem; every well-formed sibling is still stamped.
+    healthy: list[str] = []
+    for e in body.entities:
+        if not (isinstance(e, dict) and e.get("healthy") and e.get("id")):
+            continue
+        try:
+            healthy.append(str(UUID(str(e["id"]))))
+        except (ValueError, AttributeError, TypeError):
+            log.warning(
+                "fleet.poll_entity_id_not_a_uuid gateway=%s id=%r",
+                gateway_id, e.get("id"),
+            )
     if healthy:
         # Scoped by the ownership predicate as well as by the reported
         # ids: the report is data from a client, so trusting the ids
