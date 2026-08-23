@@ -8,7 +8,7 @@
 -- The web ALSO gates on a global SHOW_LIVE_ANALYSES kill-switch, so this column
 -- is the per-account dial under that master switch.
 --
--- Apply locally:  psql "$NEMARA_DB_URL_without_+asyncpg" -f scripts/apply_live_analyses_delta.sql
+-- Apply locally:  psql "$NEMARA_DB_URL_without_+asyncpg" -f scripts/deltas/apply_live_analyses_delta.sql
 -- or paste into the Supabase SQL editor / run via the Management API.
 
 alter table public.caregivers

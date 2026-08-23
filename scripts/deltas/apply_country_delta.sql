@@ -15,7 +15,7 @@
 -- default — no backfill needed. Both columns are immutable from the client path
 -- (the region-immutability triggers below now also freeze country).
 --
--- Apply locally:  psql "$NEMARA_DB_URL_without_+asyncpg" -f scripts/apply_country_delta.sql
+-- Apply locally:  psql "$NEMARA_DB_URL_without_+asyncpg" -f scripts/deltas/apply_country_delta.sql
 -- or paste into the Supabase SQL editor. Run DB-before-deploy (see docs/PROD_MIGRATION_RUNBOOK.md).
 
 alter table public.caregivers

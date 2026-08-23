@@ -30,7 +30,7 @@
 -- `select id, last_seen_at from gateways`):
 --
 --   begin;
---     \i scripts/apply_gateway_tunnel_port_delta.sql
+--     \i scripts/deltas/apply_gateway_tunnel_port_delta.sql
 --     update public.gateways set tunnel_port = 22001
 --       where id = '<box-01 row id>';
 --   commit;

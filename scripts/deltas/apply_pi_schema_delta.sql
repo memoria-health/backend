@@ -1,7 +1,7 @@
 -- One-shot, idempotent schema delta to add Pi-camera ingest support
 -- to a running Supabase WITHOUT a full db reset. Apply via:
 --   psql "$(supabase status -o env | grep ^DB_URL= | cut -d= -f2- | tr -d '\"')" \
---     -f scripts/apply_pi_schema_delta.sql
+--     -f scripts/deltas/apply_pi_schema_delta.sql
 
 begin;
 

@@ -2,7 +2,7 @@
 patient, leaving their OTHER patients untouched.
 
 WHY THIS EXISTS (and why it does NOT reuse seed.py):
-  * scripts/seed.py wipes ALL patients owned by the demo caregiver. In
+  * scripts/seed/seed.py wipes ALL patients owned by the demo caregiver. In
     prod that demo account owns THREE (Joe Thomas, Margaret O'Brien, Soph).
   * seed.py resolves the demo user via the GoTrue admin REST API with a
     `?email=` filter. That filter is IGNORED by the admin LIST endpoint in
@@ -21,7 +21,7 @@ So this script:
 Joe Thomas + Soph are never touched; no other account is ever in scope.
 
 Run against PROD with prod env injected:
-    PYTHONPATH=. railway run uv run python scripts/reseed_margaret_prod.py
+    PYTHONPATH=. railway run uv run python scripts/seed/reseed_margaret_prod.py
 """
 
 from __future__ import annotations

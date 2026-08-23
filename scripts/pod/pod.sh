@@ -9,15 +9,15 @@
 # in this script or in git.
 #
 # Usage:
-#   scripts/pod.sh release <tag>     # create a NEW node from a GHCR image tag
-#   scripts/pod.sh up                # start + rediscover endpoint + repin + wait healthy
-#   scripts/pod.sh down              # alias for stop (billing off)
-#   scripts/pod.sh status            # RunPod desiredStatus + $/hr
-#   scripts/pod.sh start             # resume a STOPPED pod (billing on)
-#   scripts/pod.sh stop              # stop the pod (billing off, disk kept)
-#   scripts/pod.sh ssh "<cmd>"       # run a command on the pod
-#   scripts/pod.sh logs [N]          # tail N lines of the sam server log
-#   scripts/pod.sh health            # recent continuous.tick cadence
+#   scripts/pod/pod.sh release <tag>     # create a NEW node from a GHCR image tag
+#   scripts/pod/pod.sh up                # start + rediscover endpoint + repin + wait healthy
+#   scripts/pod/pod.sh down              # alias for stop (billing off)
+#   scripts/pod/pod.sh status            # RunPod desiredStatus + $/hr
+#   scripts/pod/pod.sh start             # resume a STOPPED pod (billing on)
+#   scripts/pod/pod.sh stop              # stop the pod (billing off, disk kept)
+#   scripts/pod/pod.sh ssh "<cmd>"       # run a command on the pod
+#   scripts/pod/pod.sh logs [N]          # tail N lines of the sam server log
+#   scripts/pod/pod.sh health            # recent continuous.tick cadence
 #
 # USE `up`, NOT `start`. RunPod assigns the direct-TCP endpoint only when
 # the pod reaches RUNNING, and reassigns it across restarts — while the pod
@@ -38,7 +38,7 @@
 # ─────────────────────────────────────────────────────────────────────
 set -uo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ENV_FILE="${POD_ENV_FILE:-$HERE/.pod.env}"
 
 if [[ ! -f "$ENV_FILE" ]]; then
@@ -282,8 +282,8 @@ print(d.get("id") or "")
     echo
     echo "next:"
     echo "  1. set POD_ID=$NEW_ID in $ENV_FILE"
-    echo "  2. scripts/pod.sh up          # discovers the endpoint, re-pins the host key"
-    echo "  3. scripts/pod.sh health      # confirm ticks"
+    echo "  2. scripts/pod/pod.sh up          # discovers the endpoint, re-pins the host key"
+    echo "  3. scripts/pod/pod.sh health      # confirm ticks"
     echo
     echo "the OLD pod ($POD_ID) is untouched and still billing if RUNNING."
     echo "terminate it deliberately once the new node is verified."
@@ -394,7 +394,7 @@ except Exception: print("unknown error")' <<<"$resp")"
     echo "  next     : nothing to launch by hand. The node polls the backend"
     echo "             for its homes and starts one identity process per room;"
     echo "             the backend reaches them over the tailnet, not a tunnel."
-    echo "             scripts/pod.sh health                  # confirm ticks"
+    echo "             scripts/pod/pod.sh health                  # confirm ticks"
     echo "             curl \$NEMARA_BACKEND_URL/ready         # confirm the fleet"
     ;;
 
@@ -424,8 +424,8 @@ except Exception: print("unknown error")' <<<"$resp")"
     echo "pod.sh deploy: removed — the node is built from an image now." >&2
     echo >&2
     echo "  1. git tag gpu-vN && git push origin gpu-vN   # CI builds + pushes" >&2
-    echo "  2. scripts/pod.sh release gpu-vN              # new node from that tag" >&2
-    echo "  3. scripts/pod.sh up                          # endpoint + host key" >&2
+    echo "  2. scripts/pod/pod.sh release gpu-vN              # new node from that tag" >&2
+    echo "  3. scripts/pod/pod.sh up                          # endpoint + host key" >&2
     echo >&2
     echo "to iterate WITHOUT a release, ssh in and edit under /workspace —" >&2
     echo "but know that the next node will not have your change." >&2

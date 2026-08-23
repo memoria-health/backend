@@ -3,7 +3,7 @@
 -- for fresh creates; this delta is for a DB that predates the column.
 --
 -- Idempotent. Apply locally with:
---   psql "$NEMARA_DB_URL_without_+asyncpg" -f scripts/apply_vlm_provider_delta.sql
+--   psql "$NEMARA_DB_URL_without_+asyncpg" -f scripts/deltas/apply_vlm_provider_delta.sql
 -- or paste into the Supabase SQL editor.
 --
 -- vlm_provider: 'gemini' | 'openai' | 'openrouter'. NULL = use the

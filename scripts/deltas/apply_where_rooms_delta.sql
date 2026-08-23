@@ -13,7 +13,7 @@
 -- treats as "all rooms" — matching their current single where_scope behavior,
 -- so nothing changes for them until a caregiver edits the rooms.
 --
--- Apply locally:  psql "$NEMARA_DB_URL_without_+asyncpg" -f scripts/apply_where_rooms_delta.sql
+-- Apply locally:  psql "$NEMARA_DB_URL_without_+asyncpg" -f scripts/deltas/apply_where_rooms_delta.sql
 -- or paste into the Supabase SQL editor. Run DB-before-deploy (see docs/PROD_MIGRATION_RUNBOOK.md).
 
 alter table public.detectors

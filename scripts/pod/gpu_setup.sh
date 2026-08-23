@@ -4,7 +4,7 @@
 # 12.4" template (torch+CUDA already present). Idempotent-ish; safe to
 # re-run.
 #
-#   bash scripts/gpu_setup.sh
+#   bash scripts/pod/gpu_setup.sh
 #
 # Needs env: HUGGINGFACE_TOKEN (for gated SAM 3.1 / AdaFace weights).
 set -euo pipefail

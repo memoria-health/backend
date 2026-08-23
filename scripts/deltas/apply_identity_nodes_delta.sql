@@ -104,7 +104,7 @@ create index if not exists patients_identity_node_idx
 -- Supabase grants anon/authenticated full access to every table in `public`,
 -- and anon is the PUBLISHABLE key shipped inside the iOS binary and the web
 -- bundle — so RLS is the only access control. See
--- scripts/apply_auto_enable_rls_delta.sql; the trigger there would catch this
+-- scripts/deltas/apply_auto_enable_rls_delta.sql; the trigger there would catch this
 -- anyway, but a table should not rely on a safety net it could outlive.
 --
 -- NO POLICY IS CREATED, deliberately. RLS with no policy denies all non-owner

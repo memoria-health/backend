@@ -13,7 +13,7 @@
 -- the gate re-prompts them on next login — the desired behavior. Do NOT
 -- backfill them as accepted.
 --
--- Apply locally:  psql "$NEMARA_DB_URL_without_+asyncpg" -f scripts/apply_tos_acceptance_delta.sql
+-- Apply locally:  psql "$NEMARA_DB_URL_without_+asyncpg" -f scripts/deltas/apply_tos_acceptance_delta.sql
 -- or paste into the Supabase SQL editor. Run DB-before-deploy (see docs/PROD_MIGRATION_RUNBOOK.md).
 
 alter table public.caregivers

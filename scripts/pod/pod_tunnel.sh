@@ -3,9 +3,9 @@
 # mid-soak and the identity service ran blind against localhost:8000).
 # Reads .pod.env; reconnects forever with backoff. Run detached:
 #
-#   nohup scripts/pod_tunnel.sh >/tmp/pod_tunnel.log 2>&1 &
+#   nohup scripts/pod/pod_tunnel.sh >/tmp/pod_tunnel.log 2>&1 &
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 # shellcheck disable=SC1091
 source .pod.env
 while true; do

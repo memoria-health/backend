@@ -21,11 +21,11 @@ a demo camera found attached to any other patient.
 Run AFTER the prod schema migration + deploy (the Camera ORM model uses
 `source_type`, which older prod schemas lack):
 
-    NEMARA_DEMO_PAIRING_CODE=424242 uv run python scripts/seed_demo_camera.py
+    NEMARA_DEMO_PAIRING_CODE=424242 uv run python scripts/seed/seed_demo_camera.py
 
 or explicitly:
 
-    uv run python scripts/seed_demo_camera.py --email jane@patel.co --code 424242
+    uv run python scripts/seed/seed_demo_camera.py --email jane@patel.co --code 424242
 
 Reads the same database the backend uses (NEMARA_DB_URL).
 """

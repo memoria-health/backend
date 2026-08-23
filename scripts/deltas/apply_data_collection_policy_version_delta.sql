@@ -12,7 +12,7 @@
 -- meaning "decided before versioning existed". Stamping them with the
 -- current version would assert they saw wording that did not exist yet.
 --
--- Apply locally:  psql "$NEMARA_DB_URL_without_+asyncpg" -f scripts/apply_data_collection_policy_version_delta.sql
+-- Apply locally:  psql "$NEMARA_DB_URL_without_+asyncpg" -f scripts/deltas/apply_data_collection_policy_version_delta.sql
 -- Run DB-before-deploy (see docs/PROD_MIGRATION_RUNBOOK.md).
 
 alter table public.patients

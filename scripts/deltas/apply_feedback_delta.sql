@@ -1,11 +1,11 @@
 -- One-shot, idempotent schema delta to add the product-feedback table
 -- to a running Supabase WITHOUT a full db reset. Companion to
--- scripts/apply_caregiver_devices_delta.sql + apply_face_embeddings_delta.sql.
+-- scripts/deltas/apply_caregiver_devices_delta.sql + apply_face_embeddings_delta.sql.
 --
 -- Backs POST /v1/feedback (Settings → Send feedback in the iOS app).
 -- Every statement is guarded (IF NOT EXISTS / pg_policies check) so
 -- re-running is a no-op. Apply via:
---   psql "<connection string>" -f scripts/apply_feedback_delta.sql
+--   psql "<connection string>" -f scripts/deltas/apply_feedback_delta.sql
 -- or paste into the Supabase SQL editor.
 
 begin;

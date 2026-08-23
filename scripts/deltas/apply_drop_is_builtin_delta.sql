@@ -13,7 +13,7 @@
 -- the old DB in the meantime: the column has a default, so the new
 -- backend's INSERTs work fine before the drop.
 --
---   psql "$NEMARA_DB_URL_without_+asyncpg" -f scripts/apply_drop_is_builtin_delta.sql
+--   psql "$NEMARA_DB_URL_without_+asyncpg" -f scripts/deltas/apply_drop_is_builtin_delta.sql
 --
 -- Idempotent: `if exists` makes re-runs a no-op.
 

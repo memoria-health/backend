@@ -1,10 +1,10 @@
 -- One-shot, idempotent schema delta to add the Re-ID face-embeddings
 -- table to a running Supabase WITHOUT a full db reset. Companion to
--- scripts/apply_pi_schema_delta.sql; together they bring an older prod
+-- scripts/deltas/apply_pi_schema_delta.sql; together they bring an older prod
 -- schema up to main's supabase/schema.sql. Apply via:
 --   psql "$(supabase status -o env | grep ^DB_URL= | cut -d= -f2- | tr -d '\"')" \
---     -f scripts/apply_face_embeddings_delta.sql
--- (or `railway run psql "$NEMARA_DB_URL" -f scripts/apply_face_embeddings_delta.sql`
+--     -f scripts/deltas/apply_face_embeddings_delta.sql
+-- (or `railway run psql "$NEMARA_DB_URL" -f scripts/deltas/apply_face_embeddings_delta.sql`
 --  once psql is available; prod has no source_type/face tables until this runs.)
 
 begin;

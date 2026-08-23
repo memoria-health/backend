@@ -1,12 +1,12 @@
 -- One-shot, idempotent schema delta to add the APNs push-token table to
 -- a running Supabase WITHOUT a full db reset. Companion to
--- scripts/apply_pi_schema_delta.sql + scripts/apply_face_embeddings_delta.sql.
+-- scripts/deltas/apply_pi_schema_delta.sql + scripts/deltas/apply_face_embeddings_delta.sql.
 --
 -- caregiver_devices predates the pi-ingest merge, so a prod DB that already
 -- has source_type almost certainly already has this table — in which case
 -- every statement below is a no-op. Run it anyway; it is safe either way.
 -- Apply via:
---   psql "<prod connection string>" -f scripts/apply_caregiver_devices_delta.sql
+--   psql "<prod connection string>" -f scripts/deltas/apply_caregiver_devices_delta.sql
 -- or paste into the Supabase SQL editor (prod project).
 
 begin;

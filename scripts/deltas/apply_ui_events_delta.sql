@@ -1,6 +1,6 @@
 -- One-shot, idempotent schema delta to add the ui_events analytics table
 -- to a running Supabase WITHOUT a full db reset. Companion to
--- scripts/apply_feedback_delta.sql + apply_caregiver_devices_delta.sql.
+-- scripts/deltas/apply_feedback_delta.sql + apply_caregiver_devices_delta.sql.
 --
 -- Backs the iOS caregiver app's UI-interaction analytics: the app flushes
 -- batches of button/screen/toggle/lifecycle events straight into this
@@ -9,7 +9,7 @@
 --
 -- Every statement is guarded (IF NOT EXISTS / pg_policies check) so
 -- re-running is a no-op. Apply via:
---   psql "<connection string>" -f scripts/apply_ui_events_delta.sql
+--   psql "<connection string>" -f scripts/deltas/apply_ui_events_delta.sql
 -- or paste into the Supabase SQL editor.
 
 begin;

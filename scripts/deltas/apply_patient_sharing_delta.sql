@@ -2,7 +2,7 @@
 -- Introduces patient_members + has_patient_access() and swaps the patient-scoped
 -- RLS policies from ownership → membership. Idempotent (safe to re-run).
 --
--- Local:  psql "postgresql://postgres:postgres@127.0.0.1:54342/postgres" -f scripts/apply_patient_sharing_delta.sql
+-- Local:  psql "postgresql://postgres:postgres@127.0.0.1:54342/postgres" -f scripts/deltas/apply_patient_sharing_delta.sql
 -- Prod:   via Supabase Management API (never reset prod).
 
 begin;

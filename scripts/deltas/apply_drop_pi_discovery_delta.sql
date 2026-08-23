@@ -50,6 +50,6 @@ DROP TABLE IF EXISTS public.pi_discoveries;
 COMMIT;
 
 -- ── Rollback note ───────────────────────────────────────────────────
--- Recreate from scripts/apply_pi_schema_delta.sql, which still holds the
+-- Recreate from scripts/deltas/apply_pi_schema_delta.sql, which still holds the
 -- original definition. There is no data to restore: the guard above
 -- refuses to run if there ever was any.

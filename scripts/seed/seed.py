@@ -7,7 +7,7 @@ tab's state matrix (unopened safety, opened safety, unopened routine,
 reviewed safety, etc).
 
 Run via `make db-reset` (which calls this after the SQL schema apply)
-or directly: `uv run python scripts/seed.py`.
+or directly: `uv run python scripts/seed/seed.py`.
 
 Wire shape:
 1. Create a Supabase auth user via the GoTrue admin REST API. We need

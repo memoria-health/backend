@@ -13,7 +13,7 @@
 -- The wandering prompt_fragment is regenerated from this so the per-tick VLM
 -- only counts leaving through THAT doorway as wandering.
 --
--- Apply locally:  psql "$NEMARA_DB_URL_without_+asyncpg" -f scripts/apply_wandering_door_delta.sql
+-- Apply locally:  psql "$NEMARA_DB_URL_without_+asyncpg" -f scripts/deltas/apply_wandering_door_delta.sql
 -- or paste into the Supabase SQL editor / run via the Management API.
 
 alter table public.detectors

@@ -1,7 +1,7 @@
 -- Identity-fleet operations delta. Idempotent. PREPARED ONLY — do NOT
 -- apply to production until the deploy batch (Aryaman, 2026-08-14);
 -- apply locally for development:
---   psql "$NEMARA_DB_URL_without_+asyncpg" -f scripts/apply_identity_fleet_ops_delta.sql
+--   psql "$NEMARA_DB_URL_without_+asyncpg" -f scripts/deltas/apply_identity_fleet_ops_delta.sql
 --
 -- 1. identity_occupancy_samples — one row per node per FleetWatch cycle:
 --    how many cameras existed and how many were OCCUPIED (had live

@@ -2,7 +2,7 @@
 -- an EXISTING database, and backfills the 24 built-ins. Idempotent. Apply
 -- BEFORE deploying the P1 backend (DB-before-deploy — see
 -- docs/PROD_MIGRATION_RUNBOOK.md):
---   psql "$NEMARA_DB_URL_without_+asyncpg" -f scripts/apply_detector_v2_delta.sql
+--   psql "$NEMARA_DB_URL_without_+asyncpg" -f scripts/deltas/apply_detector_v2_delta.sql
 --
 -- NOTHING reads these columns until P3 (scheduler/packer) except `severity`
 -- (event promotion prefers the row value, falling back to the in-code

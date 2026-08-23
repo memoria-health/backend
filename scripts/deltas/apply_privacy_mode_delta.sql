@@ -1,7 +1,7 @@
 -- Adds the per-patient privacy-mode column to an EXISTING database.
 -- Idempotent. Apply BEFORE deploying the privacy-mode backend
 -- (DB-before-deploy — see docs/PROD_MIGRATION_RUNBOOK.md):
---   psql "$NEMARA_DB_URL_without_+asyncpg" -f scripts/apply_privacy_mode_delta.sql
+--   psql "$NEMARA_DB_URL_without_+asyncpg" -f scripts/deltas/apply_privacy_mode_delta.sql
 --
 -- privacy_mode_enabled — per-patient dignity override. While ON it
 --   overrides data collection (no clips stored, in-flight sessions

@@ -1,7 +1,7 @@
 -- Adds the per-CAMERA room-derived privacy columns to an EXISTING database.
 -- Idempotent. Apply BEFORE deploying the room-privacy backend
 -- (DB-before-deploy — see docs/PROD_MIGRATION_RUNBOOK.md):
---   psql "$NEMARA_DB_URL_without_+asyncpg" -f scripts/apply_camera_privacy_delta.sql
+--   psql "$NEMARA_DB_URL_without_+asyncpg" -f scripts/deltas/apply_camera_privacy_delta.sql
 --
 -- Privacy moves from the patient level (patients.privacy_mode_enabled,
 -- now DEPRECATED below) to per-camera, derived from the ROOM the camera

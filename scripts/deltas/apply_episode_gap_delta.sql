@@ -8,7 +8,7 @@
 -- ABSENT before a resumption counts as a NEW event (rising-edge episode
 -- promotion). Null for point_in_time / scheduled detectors.
 --
--- Apply locally:  psql "$NEMARA_DB_URL_without_+asyncpg" -f scripts/apply_episode_gap_delta.sql
+-- Apply locally:  psql "$NEMARA_DB_URL_without_+asyncpg" -f scripts/deltas/apply_episode_gap_delta.sql
 -- or paste into the Supabase SQL editor / run via the Management API.
 
 alter table public.detectors
