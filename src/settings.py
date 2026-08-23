@@ -410,6 +410,13 @@ class Settings(BaseSettings):
     soak_id_frames_enabled: bool = Field(default=False)
     soak_id_frames_dir: str = Field(default="out/id_frames")
 
+    # Sleep is `record_only`: it fires no event, so clip_archival — which
+    # hangs off a fired event — never runs for it, and a night of sleep
+    # data leaves nothing to look at. Set this to a directory and the tick
+    # a disturbance is marked on, plus the one after, is written there.
+    # Empty (default) = off. DEV ONLY: raw frames, no sensitivity screen.
+    sleep_clips_dir: str = Field(default="")
+
     # ── Detection v2 decision layer (P4) ─────────────────────────
     # OFF = legacy decision logic byte-for-byte (30s global dedup,
     # on-sight state entry, absence runner's own counting). ON = the

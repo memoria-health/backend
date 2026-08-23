@@ -318,9 +318,28 @@ def stream(cam_id: str, request: Request):
 
 
 # ── LiveKit intake (the proven viewer pattern) ───────────────────────
-def _mint_token(key: str, secret: str, room: str) -> str:
+def _mint_token(key: str, secret: str, room: str, shard: str = "") -> str:
     import datetime as _dt
 
+    # UNIQUE PER SHARD (2026-08-24). LiveKit allows one participant per
+    # identity per room: a second join with the same identity DISCONNECTS
+    # the first. Under `patient_<id>` rooms there was exactly one identity
+    # service per room, so a constant "identity-service" was safe. Account
+    # rooms put every one of a caregiver's cameras in ONE room while the
+    # fleet still shards identity PER CAMERA, so two processes joined the
+    # same room under the same name and evicted each other on a ~60s
+    # cycle — each ran ~66s, was kicked when the other restarted, exited
+    # rc=1, and the backend read `reid_unavailable_llm` in the gaps.
+    #
+    # `--only-cam` is the shard key and is globally unique (it is the
+    # camera's LiveKit identity), so it stays distinct across NODES too,
+    # which a port could not. Empty means one service owns the whole
+    # room, where the bare name is still correct.
+    #
+    # The suffix is safe for consumers: the gateway and the bridge
+    # allow-list AI subscribers by PREFIX (`identity-service`), not by
+    # equality, so a suffixed name still gets track permission.
+    ident = f"identity-service-{shard}" if shard else "identity-service"
     return (
         lkapi.AccessToken(key, secret)
         # LONG TTL (2026-07-25): the SDK re-presents the ORIGINAL token
@@ -328,7 +347,7 @@ def _mint_token(key: str, secret: str, room: str) -> str:
         # network blip hit at 12:23, reconnect got 401 → "not
         # retrying" → the service ran blind for 6h on a frozen frame.
         .with_ttl(_dt.timedelta(days=14))
-        .with_identity("identity-service")
+        .with_identity(ident)
         .with_name("Identity Service")
         .with_grants(lkapi.VideoGrants(
             room_join=True, room=room, can_subscribe=True, can_publish=False,
@@ -870,8 +889,8 @@ async def _amain(args: argparse.Namespace) -> None:
     )
     await asyncio.gather(
         _run_livekit(
-            url, _mint_token(key, secret, args.room), home,
-            only_cam=args.only_cam,
+            url, _mint_token(key, secret, args.room, shard=args.only_cam),
+            home, only_cam=args.only_cam,
         ),
         _refresh_gallery(home, args.room),
         _timeline_sampler(),

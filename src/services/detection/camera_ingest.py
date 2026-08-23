@@ -47,6 +47,7 @@ from src.services.detection.audio_buffer import AudioBuffer
 from src.services.detection.event_promotion import maybe_promote_analysis
 from src.services.detection.frame_buffer import FrameBuffer
 from src.services.detection.id_evidence import dump_id_evidence
+from src.services.detection import sleep_clips
 from src.services.detection.ingress_meter import IngressMeter
 from src.services.detection.motion import (
     BlockMotion,
@@ -2077,6 +2078,16 @@ class CameraIngest:
             #     one resident's routine onto another is not recoverable.
             # The second rule lives in `event_promotion`; what changed
             # here is that it now receives the right patient's flag.
+            # Sleep fires no event (record_only), so nothing downstream
+            # would ever keep footage of a disturbance. Save it here,
+            # beside the fields that judged it. Never raises.
+            await sleep_clips.save_if_disturbance(
+                camera_id=self.camera_id,
+                detector_fields=result.detector_fields,
+                mp4_bytes=vlm_mp4,
+                settings=self._settings,
+            )
+
             promotions: list = []
             promotion = None
             for pid in covered:
