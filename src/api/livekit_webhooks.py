@@ -159,7 +159,13 @@ async def receive_livekit_webhook(
             get_sessionmaker(), participant_identity,
         )
         if worker is not None:
-            await worker.ensure_room_left_if_empty(room_name)
+            # Naming the leaver is what lets the worker tell "this room is
+            # now empty" from "one of several sensors on this account went
+            # away". Without it, a shared account room lost detection on
+            # every surviving camera.
+            await worker.ensure_room_left_if_empty(
+                room_name, departed=participant_identity,
+            )
         log.info(
             "livekit_webhook participant_left room=%s identity=%s -> offline",
             room_name, participant_identity,
@@ -171,7 +177,13 @@ async def receive_livekit_webhook(
             get_sessionmaker(), room_name,
         )
         if worker is not None:
-            await worker.ensure_room_left_if_empty(room_name)
+            # UNCONDITIONAL, unlike participant_left. The room itself is
+            # gone, so there is nothing left to publish into it and no
+            # survivor to protect — and the worker's ingest map may still
+            # be populated simply because the SDK has not caught up, which
+            # the emptiness check would read as "someone is still here"
+            # and leave the worker running against a dead room forever.
+            await worker._evict_room(room_name)
         log.info(
             "livekit_webhook room_finished room=%s -> %d offline",
             room_name, flipped,

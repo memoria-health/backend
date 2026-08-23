@@ -352,6 +352,22 @@ class RoomWorker:
         # `room_reconciler.py` for the design rationale.
         await self._reconciler.start()
 
+    def live_camera_identities(self) -> set[str]:
+        """The `cam_*` identities this worker is currently consuming.
+
+        Read by `ensure_room_left_if_empty` to answer the question its
+        name has always implied: is anyone still publishing here? An
+        account room routinely holds several sensors, so one leaving
+        says nothing about the others.
+
+        `_ingests_by_identity` rather than the SDK's participant list:
+        an ingest exists only once a track is actually subscribed and
+        being consumed, which is the thing worth keeping the worker
+        alive for. A participant that has joined but published nothing
+        would otherwise hold the room open indefinitely.
+        """
+        return set(self._ingests_by_identity)
+
     async def stop(self) -> None:
         if self._stopped:
             return
