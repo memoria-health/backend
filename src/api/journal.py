@@ -2,7 +2,7 @@
 
 One page per local day: every active detector contributes a line built
 by src/services/journal/day.py (pure), grouped into category sections.
-Day boundary is the CAREGIVER's timezone. No summary sentence, no LLM.
+Day boundary is the PATIENT's home timezone. No summary sentence, no LLM.
 """
 
 from __future__ import annotations
@@ -18,20 +18,21 @@ from sqlalchemy import or_, select, text
 from src.api.deps import CaregiverAuth, SessionDep
 from src.db.event import Event
 from src.repos import detector_repo, patient_repo
+from src.services import patient_tz
 from src.services.journal import day as journal_day
 
 router = APIRouter(prefix="/v1", tags=["journal"])
 
 
-async def _caregiver_tz(session, caregiver_id) -> ZoneInfo:
+async def _home_tz(session, caregiver_id, patient) -> ZoneInfo:
+    """The day boundary belongs to the PATIENT's home, not the reader's
+    phone — see services/patient_tz.py. Falls back to the caregiver's
+    zone, which is what this used to read directly."""
     row = (await session.execute(
         text("select timezone from caregivers where id = :c"),
         {"c": caregiver_id})).first()
-    name = (row[0] if row else None) or "UTC"
-    try:
-        return ZoneInfo(name)
-    except Exception:
-        return ZoneInfo("UTC")
+    return patient_tz.zone_for(
+        getattr(patient, "timezone", None), row[0] if row else None)
 
 
 @router.get("/patients/{patient_id}/journal")
@@ -53,7 +54,7 @@ async def get_journal(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="bad_date")
 
-    tz = await _caregiver_tz(session, auth.id)
+    tz = await _home_tz(session, auth.id, patient)
     start = datetime(day.year, day.month, day.day, tzinfo=tz)
     end = start + timedelta(days=1)
     today_local = datetime.now(tz).date()
@@ -124,7 +125,7 @@ async def get_journal(
     # Coverage: hours of the day with any analysis at all.
     # Hours the AI actually analyzed (analyses rows only exist when a
     # tick ran — camera-online-but-paused contributes nothing), bucketed
-    # in the CAREGIVER's timezone. Truncating in UTC counted 25 buckets
+    # in the HOME's timezone. Truncating in UTC counted 25 buckets
     # on a fully-watched IST day: the local day spans 18:30->18:30 UTC,
     # clipping two PARTIAL utc-hour buckets at the edges ("cameras
     # watched 25 of 24 hours", live 2026-08-17).

@@ -59,6 +59,43 @@ def test_luma_thumbnail_dims():
     assert abs(float(arr.mean()) - 90) < 3
 
 
+# ── odd frame dimensions ───────────────────────────────────────
+# A congested publisher downscales to sizes like 213x120, where I420
+# rounds each colour plane UP to ceil(w/2) x ceil(h/2). The buffer is
+# then bigger than the packed (h*3/2, w) block, which used to raise
+# "cannot reshape array of size 38400 into shape (180,213)" once per
+# frame in prod.
+
+
+def _true_i420(w: int, h: int, y_val: int) -> bytes:
+    """Correctly sized I420 for ANY dims (chroma planes rounded up)."""
+    y = np.full((h, w), y_val, dtype=np.uint8)
+    uv = np.full(((h + 1) // 2, (w + 1) // 2), 128, dtype=np.uint8)
+    return y.tobytes() + uv.tobytes() * 2
+
+
+@pytest.mark.parametrize("w,h", [(213, 120), (200, 113), (213, 113)])
+def test_i420_to_bgr_handles_odd_dimensions(w, h):
+    bgr = frame_codec.i420_to_bgr(w, h, _true_i420(w, h, 150))
+    assert bgr.shape == (h, w, 3)          # pad is trimmed back off
+
+
+def test_odd_width_uses_same_colour_math_as_even():
+    # The odd path pads Y and reuses cv2's I420 conversion, so dropping
+    # one column must not shift the colours.
+    odd = frame_codec.i420_to_bgr(213, 120, _true_i420(213, 120, 150))
+    even = frame_codec.i420_to_bgr(212, 120, _true_i420(212, 120, 150))
+    assert abs(float(odd.mean()) - float(even.mean())) < 1.0
+
+
+def test_compress_for_buffer_odd_width_prod_repro():
+    raw = _true_i420(213, 120, 150)
+    assert len(raw) == 38400               # the size from the traceback
+    jpeg, luma = frame_codec.compress_for_buffer(213, 120, raw, quality=88)
+    assert frame_codec.is_jpeg(jpeg)
+    assert len(luma) == frame_codec.LUMA_W * frame_codec.LUMA_H
+
+
 # ── mp4 builder: MJPEG input ───────────────────────────────────
 
 

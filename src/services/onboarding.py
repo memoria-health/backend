@@ -130,7 +130,14 @@ async def seed_detectors_for_patient(
     patient_id: UUID,
     date_of_birth: date | None = None,
 ) -> Sequence[Detector]:
-    """Create the recommended preset detectors for a freshly-created patient.
+    """Create the auto-seeded detectors for a freshly-created patient.
+
+    Since 2026-08-19 that is ONLY the hidden internal detectors (the setup
+    self-test). The caregiver picks every visible detector from the library
+    on add, so a new patient starts with an empty detector list rather than
+    a set nobody chose. The self-test still has to be seeded here because it
+    is `hidden` — it is excluded from the library, so there is no way for a
+    caregiver to add it themselves and onboarding's test alert depends on it.
 
     The set is `catalog.seeded_for_cohort(...)` for the patient's cohort
     (under 18 → child set; 18+ or unknown birthday → adult set). An absent

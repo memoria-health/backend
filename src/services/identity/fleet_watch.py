@@ -188,8 +188,20 @@ class FleetWatch:
             ), {"stale": stale_s, "grace": UNASSIGNED_GRACE_S})).scalar() or 0
 
             # Nodes that were serving homes and have stopped polling.
+            # Counts only homes with a live camera, same as `blind` and
+            # `overdue` above. Without the filter this counted every
+            # patient row ever pinned to the node — dormant test accounts
+            # included — so the page reported "142 home(s) held" on a dev
+            # box with one real camera, and would have said 8 instead of 2
+            # on prod. A blast radius nobody believes is one nobody reads.
             down = (await session.execute(text(
-                "SELECT n.node_id, count(c.id), "
+                # Only LIVE sensors (fix/general-fixes): a node holding
+                # nothing but dormant homes is not an outage worth paging
+                # for. Kept on `c` rather than the old `p` — identity is
+                # sharded per SENSOR now, so the thing a node holds is a
+                # camera, and _LIVE_SENSOR is the same predicate the blind
+                # and overdue queries above already use.
+                "SELECT n.node_id, count(c.id) FILTER (WHERE " + _LIVE_SENSOR + "), "
                 "       EXTRACT(EPOCH FROM now() - n.last_seen_at)::int "
                 "  FROM public.identity_nodes n "
                 "  LEFT JOIN public.cameras c ON c.identity_node_id = n.node_id "

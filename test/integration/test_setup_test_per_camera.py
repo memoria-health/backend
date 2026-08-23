@@ -97,6 +97,14 @@ async def test_passing_leaves_every_other_detector_running(
     """The stamp arms the setup test and nothing else — it must never
     read as a gate on the detectors that actually watch the patient."""
     headers, pid = await _setup_patient(client, auth_user)
+    # A real detector has to exist for "leaves every OTHER detector
+    # running" to mean anything. Patient create no longer seeds any
+    # (1cd354e), so without this the assertion passes vacuously against
+    # an empty loadout — which is the very thing it is guarding against.
+    await client.post(
+        f"/v1/patients/{pid}/detectors/from-library",
+        headers=headers, json={"keys": ["fall"]},
+    )
     cam = await _create_camera(client, headers, pid, "LIVING ROOM")
     before = await _identifiers_for(session, cam)
 

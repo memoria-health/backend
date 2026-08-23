@@ -83,13 +83,14 @@ async def create_patient(
 ) -> PatientResponse:
     """Create a patient under the current caregiver.
 
-    Auto-seeds preset detectors via `services.onboarding.seed_detectors_for_patient`
-    in the same transaction. The set is age-based: 18+ or unknown birthday get
-    the older-adult set (Falls / Agitation / Wandering / Medication adherence);
-    under-18 patients get only the both-cohort safety net (Falls) — the child
-    preset set was deleted 2026-08-16 (adult-only product).
+    Creates NO visible detectors: the caregiver picks those from the library
+    on add (2026-08-19). `services.onboarding.seed_detectors_for_patient` still
+    runs in the same transaction, but it now only creates the hidden internal
+    setup self-test, which is not in the library and so cannot be picked.
     """
     now = datetime.now(timezone.utc)
+    # The JWT principal carries no timezone, so read the caregiver row.
+    creator = await caregiver_repo.find_by_id(session, auth.id)
     p = Patient(
         id=uuid4(),
         caregiver_id=auth.id,
@@ -104,6 +105,10 @@ async def create_patient(
         date_of_birth=body.date_of_birth,
         gender=body.gender,
         home_address=body.home_address,
+        # Default the home's zone to the creating caregiver's. Right when
+        # they live together, and a sane start when they do not — the
+        # caregiver can move the patient's zone afterwards.
+        timezone=body.timezone or (creator.timezone if creator else None),
         # Record the picked country verbatim; the residency region collapses to
         # what we physically support (region_for_country) — client never sets it.
         country=body.country,

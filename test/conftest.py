@@ -352,3 +352,74 @@ async def provision_sensor(
         headers={"Authorization": f"Bearer {token}"}, json=body)
     assert r.status_code == expect, r.text
     return r.json() if r.status_code == 201 else {}
+
+
+# Presets a patient used to be born with. `1cd354e` stopped auto-seeding
+# them — the caregiver picks from the library instead, and the seeded rows
+# were a second, competing source of truth that showed up in the picker as
+# "already added". Tests that need a preset must now ask for it, exactly
+# as the app does.
+#
+# Named by CATALOG key; the tests read them back by display name.
+PRESET_KEYS = ("fall", "agitation", "wandering", "medication")
+
+
+async def add_library_detectors(
+    client, headers: dict, patient_id: str, keys=PRESET_KEYS,
+) -> dict:
+    """Instantiate catalog detectors for a patient, returned by NAME.
+
+    Mirrors what the app does on add: POST the catalog keys, then read the
+    list back. Keys the patient already has are skipped server-side, so
+    this is safe to call twice.
+    """
+    r = await client.post(
+        f"/v1/patients/{patient_id}/detectors/from-library",
+        headers=headers, json={"keys": list(keys)},
+    )
+    assert r.status_code == 201, r.text
+    listed = await client.get(
+        f"/v1/patients/{patient_id}/detectors", headers=headers)
+    assert listed.status_code == 200, listed.text
+    return {d["name"]: d for d in listed.json()}
+
+
+async def seed_catalog_detectors(session, patient_id, keys):
+    """Create catalog presets directly, for tests that work at DB level.
+
+    The API route (`/detectors/from-library`) is the caregiver's path and
+    `add_library_detectors` above covers it. Some suites operate on the
+    session with no client — they only need the ROWS to exist so they can
+    assert scheduling or linking behaviour, and used to get them free
+    from onboarding's auto-seed (removed in 1cd354e).
+
+    Built from the same CATALOG entry the endpoint uses, so a change to a
+    preset's shape cannot make these tests disagree with production.
+    """
+    from datetime import datetime, timedelta, timezone
+    from uuid import uuid4
+
+    from src.db.detector import Detector
+    from src.services.detection import catalog
+
+    base = datetime.now(timezone.utc)
+    made = []
+    for i, key in enumerate(keys):
+        e = next(c for c in catalog.CATALOG if c.key == key)
+        now = base + timedelta(microseconds=i)
+        det = Detector(
+            id=uuid4(), patient_id=patient_id, name=e.name,
+            icon_name=e.icon_name, description=e.description,
+            category=e.category, source="preset",
+            alert_trigger=e.alert_trigger, is_sustained=e.is_sustained,
+            duration_seconds=e.duration_seconds,
+            where_rooms=(None if e.where_scope == "ALL ROOMS" else [e.where_scope]),
+            when_scope=e.when_scope, sensitivity="standard", is_on=True,
+            created_at=now, updated_at=now, custom_prompt=None,
+            identifier=e.key, prompt_fragment=e.prompt_fragment,
+            schema_json=e.schema_json, always_on=False,
+        )
+        session.add(det)
+        made.append(det)
+    await session.flush()
+    return made

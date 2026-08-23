@@ -25,7 +25,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.repos import camera_detector_repo
-from test.conftest import mint_test_jwt
+from test.conftest import add_library_detectors, mint_test_jwt
 
 
 _PATIENT_BODY = {
@@ -67,9 +67,16 @@ async def _create_camera(
 async def _detectors_by_name(
     client: AsyncClient, headers: dict[str, str], patient_id: str,
 ) -> dict[str, dict]:
-    r = await client.get(f"/v1/patients/{patient_id}/detectors", headers=headers)
-    assert r.status_code == 200
-    return {d["name"]: d for d in r.json()}
+    """Presets, by display name.
+
+    Adds them from the library first. A new patient is born with NO
+    visible detectors since 1cd354e — the caregiver picks them, and the
+    auto-seeded rows were a second source of truth that showed up in the
+    picker as "already added". These tests are about camera<->detector
+    LINKING, so they need the presets to exist; how they got there is
+    not what they assert.
+    """
+    return await add_library_detectors(client, headers, patient_id)
 
 
 async def _camera_ids_linked_to(session: AsyncSession, detector_id: str) -> set[str]:

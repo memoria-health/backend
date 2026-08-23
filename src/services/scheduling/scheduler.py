@@ -17,7 +17,8 @@ parallel to the DetectorWorker). Once per `scheduler_tick_seconds` it:
      dispatchers) if the signal was absent,
   5. records `last_scheduled_eval_date` so it runs exactly once per day.
 
-Timezone is per-caregiver (detector → patient → caregiver.timezone).
+Timezone is the home's (patients.timezone, falling back to the
+caregiver's) — see services/patient_tz.py.
 
 Limitations (v1, by design):
   - windows assumed within a single local day (window_start < window_end);
@@ -41,7 +42,7 @@ from src.db.caregiver import Caregiver
 from src.db.detector import Detector
 from src.db.event import Event
 from src.db.patient import Patient
-from src.services import email, push
+from src.services import email, patient_tz, push
 from src.services.detection.scheduling.decision import episode_exit_gap_for
 from src.settings import Settings
 
@@ -120,14 +121,13 @@ class ScheduledDetectorRunner:
                 except Exception:  # noqa: BLE001
                     log.exception("scheduled_runner.evaluate_failed detector=%s", det.id)
 
-    async def _resolve_tz(self, session: AsyncSession, caregiver_id) -> ZoneInfo:
-        cg = await session.get(Caregiver, caregiver_id)
-        name = (cg.timezone if cg else None) or _FALLBACK_TZ
-        try:
-            return ZoneInfo(name)
-        except ZoneInfoNotFoundError:
-            log.warning("scheduled_runner.bad_tz %r — falling back", name)
-            return ZoneInfo(_FALLBACK_TZ)
+    async def _resolve_tz(self, session: AsyncSession, patient) -> ZoneInfo:
+        """Windows are the HOME's local time: "medication by 5pm" means
+        5pm where the patient lives, not where the caregiver is reading
+        from. Falls back to the caregiver's zone (the old behaviour)."""
+        cg = await session.get(Caregiver, patient.caregiver_id)
+        return patient_tz.zone_for(
+            getattr(patient, "timezone", None), cg.timezone if cg else None)
 
     async def _evaluate_one(self, session: AsyncSession, det: Detector) -> None:
         # schedule_config dissolution (2026-07-18) + MULTI-WINDOW support
@@ -182,7 +182,7 @@ class ScheduledDetectorRunner:
         patient = await session.get(Patient, det.patient_id)
         if patient is None:
             return
-        tz = await self._resolve_tz(session, patient.caregiver_id)
+        tz = await self._resolve_tz(session, patient)
         now_local = datetime.now(tz)
         today = now_local.date()
 
