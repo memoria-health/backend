@@ -1400,7 +1400,11 @@ async function pollIdTimeline(){
     const byCamTick={};
     for(const cam of Object.keys(probesByCam)){
       for(const p of probesByCam[cam]){
-        if(p.ts<samples[0][0]-10) continue;
+        // NOT dropped when older than the timeline window. That ring
+        // lives in the identity process and every restart empties it,
+        // so after one the window is minutes long and this quietly
+        // emptied the whole score table — which reads as "identity is
+        // not probing" when it is probing fine.
         const tick=tickOf(p.ts);
         (byCamTick[cam+'|'+tick]=byCamTick[cam+'|'+tick]||[]).push(p);
         probeRows.push({cam,tick,p});
@@ -1430,21 +1434,32 @@ async function pollIdTimeline(){
         const x=fmtProbe(p);
         return `<tr><td class="mono">${hms(new Date(p.ts*1000))}</td><td class="mono">#${tick}</td><td>${tnm(cam)}</td><td class="mono">${p.tracks}</td><td class="mono">${x.f}</td><td class="mono">${x.b}</td><td class="mono">${x.cd}</td><td>${p.locked?'locked':'searching'}</td></tr>`;
       }).join('')+`</table>`
-      :'<div class="mut" style="font-size:11px">no probe scores yet — identity service restart pending (activates tomorrow morning; the probe ring starts recording then)</div>';
+      :'<div class="mut" style="font-size:11px">no probe scores — identity is running but returning none. It probes only while a track is live, so an empty room is expected; if somebody IS in frame, check :8012/probes directly.</div>';
   }catch(e){}
 }
 pollIdTimeline(); setInterval(pollIdTimeline, 10000);
 async function pollCrops(){
-  for(const k of ["person"]){
+  // Person crop FIRST, full scene as the fallback. A person crop only
+  // exists when a person-bucket detector actually ran, which needs a
+  // located body to crop to — so with a scene-only loadout, or nobody
+  // seated, none is ever built. Showing an empty box in that case reads
+  // as "the dashboard is broken" when the truthful answer is "this tick
+  // had no person crop". The label always says which one you are
+  // looking at, because confusing the two would misread the evidence.
+  const m=document.getElementById("croppersonmeta");
+  const v=document.getElementById("cropperson");
+  for(const k of ["person","full"]){
     try{
       const r=await fetch("/crops/"+k+"?t="+Date.now());
-      const m=document.getElementById("crop"+k+"meta");
-      if(!r.ok){m.textContent="gemini input · "+k+": (none this tick)";continue;}
-      m.textContent="gemini input · "+k+" · "+r.headers.get("X-Age-S")+"s ago · "+(r.headers.get("X-Detectors")||"");
-      const v=document.getElementById("crop"+k), old=v.src;
+      if(!r.ok) continue;
+      m.textContent="gemini input · "+(k==="person"?"PERSON CROP":"full scene (no person crop this tick)")
+        +" · "+r.headers.get("X-Age-S")+"s ago · "+(r.headers.get("X-Detectors")||"");
+      const old=v.src;
       v.src=URL.createObjectURL(await r.blob()); if(old)URL.revokeObjectURL(old);
+      return;
     }catch(e){}
   }
+  m.textContent="gemini input · no artifact this tick";
 }
 pollCrops(); setInterval(pollCrops, 8000);
 </script></div></body></html>"""

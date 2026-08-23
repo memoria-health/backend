@@ -146,10 +146,31 @@ WORKERS="${NEMARA_PERCEPTION_WORKERS:-1}"
 # not an image build (30 min). EXPERIMENT NODES ONLY: production runs
 # immutable tagged images, which is why pod.sh-style rsync deploys
 # were deleted in the first place.
+#
+# COVERS src/ TOO (2026-08-23). It did not, and gpu/identity/gallery.py
+# imports src.services.identity.trace — so an overlay could put today's
+# identity code next to the image's three-day-old src/ and the pair
+# would not agree. It cost a day: `body_score() got an unexpected
+# keyword argument 'scores'` on every probe, while the service went on
+# answering /state as ready. A partial overlay is worse than none,
+# because "deployed" stops meaning "running what I wrote".
 dev_code_overlay() {
-  if [ "${NEMARA_DEV_CODE:-}" = "1" ] && [ -d /persist/dev-code/nemara ]; then
+  [ "${NEMARA_DEV_CODE:-}" = "1" ] || return 0
+  if [ -d /persist/dev-code/nemara ]; then
     cp -a /persist/dev-code/nemara/. /workspace/nemara/ 2>/dev/null \
       && log "dev-code overlay applied from /persist/dev-code/nemara"
+  fi
+  # MIRROR, not merge. src/ is wholly image-owned, so replacing the tree
+  # is what makes a DELETED module actually disappear — `cp` alone left
+  # ten dead Pi files behind on the first run. Staged into a sibling and
+  # swapped so a half-copied src/ is never importable.
+  if [ -d /persist/dev-code/src ]; then
+    rm -rf /workspace/.src.staging \
+      && cp -a /persist/dev-code/src /workspace/.src.staging \
+      && rm -rf /workspace/src.prev \
+      && mv /workspace/src /workspace/src.prev \
+      && mv /workspace/.src.staging /workspace/src \
+      && log "dev-code overlay applied from /persist/dev-code/src (mirrored)"
   fi
 }
 
