@@ -1372,7 +1372,11 @@ async function pollIdTimeline(){
     try{pj=await (await fetch('/identity_probes')).json();}catch(e){}
     const probesByCam=pj.probes||{};
     let samples=j.samples||[];
-    if(!samples.length){$("idtl").innerHTML='';return;}
+    // No early return. The timeline ring lives in the identity process
+    // and is empty for the first ~10s after every restart — returning
+    // here blanked the score table too, which has its own source and
+    // was fine.
+    const hasTl=samples.length>0;
     // NATIVE 10s samples — no bucketing. The old 30s max-priority
     // buckets (patient > people > empty) swallowed real transitions:
     // live 2026-07-26 02:19, a seat death + 35s of empty/people + a
@@ -1380,16 +1384,27 @@ async function pollIdTimeline(){
     // contained one patient sample. Every sample is a cell now; a
     // lost lock is VISIBLE as the empty/yellow sliver it really was.
     const cams=[...new Set(samples.flatMap(s=>Object.keys(s[1])))].sort();const tnm=c=>(j.names||{})[c.slice(0,8)]||((window._camnames||{})[c.slice(0,8)])||c.slice(0,8);
-    const t0=new Date(samples[0][0]*1000),t1=new Date(samples[samples.length-1][0]*1000);
+    const t0=hasTl?new Date(samples[0][0]*1000):null,t1=hasTl?new Date(samples[samples.length-1][0]*1000):null;
     const hm=d=>`${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
     // Probe → tick correlation: tick #N is the sample's index in this
     // window (labels shared by cell tooltips AND the score table).
     // A probe belongs to the first sample at-or-after its timestamp.
     const hms=d=>`${hm(d)}:${String(d.getSeconds()).padStart(2,'0')}`;
+    // EVERY tuple carries the patient it scored AGAINST (loop.py ~1294).
+    // A camera can watch several residents, so a score is meaningless
+    // without saying whose gallery produced it — that is the whole point
+    // of the shared-sensor attribution matrix.
+    //
+    // This read faces as [tid,cos,px], body as [tid,cos] and cands as
+    // [tid,score,anchor,prov] — every one short by the patient added on
+    // 2026-08-20. So `cos` was the patient-id STRING and .toFixed threw,
+    // inside the one try/catch wrapping this whole function. That is why
+    // the timeline and the score table vanished TOGETHER: neither was
+    // broken, the render aborted before reaching either.
     const fmtProbe=p=>{
-      const f=(p.faces||[]).map(([tid,c,px])=>`t${tid} ${c.toFixed(2)}@${px}px`).join(' ')||'—';
-      const b=(p.body||[]).map(([tid,c])=>`t${tid} ${c.toFixed(2)}`).join(' ')||'—';
-      const cd=(p.cands||[]).map(([tid,s,a,pr])=>`t${tid} ${s.toFixed(2)} ${a}${pr?'?':''}`).join(' ')||'—';
+      const f=(p.faces||[]).map(([tid,pid,c,px])=>`t${tid}→${pid} ${(+c).toFixed(2)}@${px}px`).join(' ')||'—';
+      const b=(p.body||[]).map(([tid,pid,c])=>`t${tid}→${pid} ${(+c).toFixed(2)}`).join(' ')||'—';
+      const cd=(p.cands||[]).map(([tid,pid,s,a,pr])=>`t${tid}→${pid} ${(+s).toFixed(2)} ${a}${pr?'?':''}`).join(' ')||'—';
       return {f,b,cd};
     };
     const tickOf=ts=>{
@@ -1410,7 +1425,7 @@ async function pollIdTimeline(){
         probeRows.push({cam,tick,p});
       }
     }
-    $("idtl").innerHTML=cams.map(cam=>{
+    $("idtl").innerHTML=!hasTl?'<div class="mut" style="font-size:11px">no timeline samples yet — the ring lives in the identity process and refills ~10s after a restart</div>':cams.map(cam=>{
       const cells=samples.map(([ts,row],i)=>{
         const st=row[cam]||'empty';
         const cls=st==='patient'?'ok':(st==='people'?'warn':'emp');
