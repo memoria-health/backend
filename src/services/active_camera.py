@@ -27,6 +27,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.analysis import Analysis
+from src.services.camera_coverage import covered_cameras
 
 # How recent an "active" analyses row must be to count. Two detector
 # ticks (~20s) plus a buffer for clock skew + LLM latency.
@@ -48,7 +49,7 @@ async def get_active_camera(
     stmt = (
         select(Analysis.camera_id)
         .where(
-            Analysis.patient_id == patient_id,
+            Analysis.camera_id.in_(covered_cameras(patient_id)),
             Analysis.people_present.is_(True),
             Analysis.captured_at >= cutoff,
         )

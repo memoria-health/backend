@@ -22,10 +22,58 @@ it.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from uuid import UUID
 
-from sqlalchemy import text
+from sqlalchemy import Select, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.db.camera_patient import CameraPatient
+
+# ── Reading a patient's OBSERVATIONS ─────────────────────────────────
+# `analyses` rows carry a `patient_id`, and it is `cameras.patient_id`
+# at the moment of the tick -- the shim, so the earliest-added covered
+# patient and nobody else. Filtering on it therefore answers "what the
+# sensor saw" only for whichever resident happens to sort first. On a
+# SHARED sensor the second patient has no analyses at all: no episode
+# boundary can resolve for them, `home_report` reports a covered
+# resident as having no camera and no activity, and every insights
+# widget is empty. For an eldercare product that reads as reassurance.
+#
+# The fix is to stop asking a row who it is about and ask which sensors
+# watch this person, which is what `camera_patients` is for. These two
+# are the predicate: `<table>.camera_id.in_(covered_cameras(pid))`
+# replaces `<table>.patient_id == pid`.
+#
+# This can only ever ADD rows, never lose them: `set_coverage` is the
+# sole writer of `cameras.patient_id` and sets it to `wanted[0] if
+# wanted else None`, so a non-null shim implies a coverage row exists.
+# `apply_analyses_coverage_delta.sql` backfills any row that predates
+# that invariant before this ships.
+
+
+def covered_cameras(patient_id: UUID) -> Select:
+    """Every sensor watching this patient, as a subquery."""
+    return select(CameraPatient.camera_id).where(
+        CameraPatient.patient_id == patient_id,
+    )
+
+
+def covered_cameras_any(patient_ids: Sequence[UUID]) -> Select:
+    """`covered_cameras` for a set of patients — the household read."""
+    return select(CameraPatient.camera_id).where(
+        CameraPatient.patient_id.in_(list(patient_ids)),
+    )
+
+
+# The same predicate for the raw-SQL readers, which are most of them.
+# Bind `:p` for one patient and `:ids` for a list.
+COVERED_CAMERAS_SQL = (
+    "select camera_id from public.camera_patients where patient_id = :p"
+)
+COVERED_CAMERAS_ANY_SQL = (
+    "select camera_id from public.camera_patients where patient_id = any(:ids)"
+)
 
 
 async def coverage(session: AsyncSession, camera_id: UUID) -> list[UUID]:

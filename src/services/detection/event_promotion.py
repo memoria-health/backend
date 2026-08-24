@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from src.settings import Settings
 from src.services.detection import catalog
 from src.services import pager
+from src.services.camera_coverage import covered_cameras
 
 _log = logging.getLogger(__name__)
 
@@ -309,7 +310,7 @@ async def _episode_boundary(
         )
         .where(
             and_(
-                Analysis.patient_id == patient_id,
+                Analysis.camera_id.in_(covered_cameras(patient_id)),
                 Analysis.captured_at > lookback_start,
                 Analysis.captured_at <= now,
                 Analysis.detector_fields[detected_field].astext == "true",

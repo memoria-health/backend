@@ -52,6 +52,13 @@ async def add_analysis(
     row = Analysis(
         id=uuid4(),
         caregiver_id=patient.caregiver_id,
+        # `cameras.patient_id`, so the earliest-added covered patient and
+        # nobody else. A tick is a fact about a SENSOR, not about a
+        # person, and this column cannot say otherwise on a shared
+        # sensor. It stays for RLS scoping beside `caregiver_id`; NOTHING
+        # filters a person's observations on it any more — those resolve
+        # through `camera_patients` (see `camera_coverage.covered_cameras`),
+        # which is the only answer that includes the second resident.
         patient_id=patient.id,
         camera_id=camera_id,
         provider=provider,
