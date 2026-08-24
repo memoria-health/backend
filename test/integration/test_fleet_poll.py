@@ -271,3 +271,63 @@ async def test_a_missing_bearer_cannot_poll(
     await _enroll(client, headers)
     r = await client.post("/v1/fleet/poll", json=report([]))
     assert r.status_code == 401
+
+
+# ── the SERVICE's own heartbeat ───────────────────────────────────
+#
+# Camera liveness above is per entity, deliberately. But it can only ever
+# speak for cameras that EXIST, and `gateways.last_seen_at` was never
+# stamped on this path at all — so a bridge with no cameras, or one that
+# died, was indistinguishable from a healthy one. Live on 2026-08-24: the
+# running bridge's row read `last_seen_at = NULL` beside the mini-PC
+# gateway's `12:09`, and soak_check's bridge assertion passed on it.
+async def _last_seen(session: AsyncSession, token: str = TOKEN):
+    import hashlib
+
+    return (await session.execute(
+        text("select last_seen_at from public.gateways where token_hash = :h"),
+        {"h": hashlib.sha256(token.encode()).hexdigest()},
+    )).scalar()
+
+
+@pytest.mark.asyncio
+async def test_a_poll_marks_the_service_as_seen(
+    client: AsyncClient, auth_user, session: AsyncSession,
+) -> None:
+    """THE regression. Without this there is no way to tell a dead bridge
+    from a live one."""
+    headers, email, pid = await _setup(client, auth_user)
+    camera_id = await _provision(client, email, headers, pid)
+
+    assert await _last_seen(session) is None, "nothing has polled yet"
+    assert (await _poll(client, report([entity(camera_id)]))).status_code == 200
+    assert await _last_seen(session) is not None
+
+
+@pytest.mark.asyncio
+async def test_a_service_with_no_cameras_is_still_seen(
+    client: AsyncClient, auth_user, session: AsyncSession,
+) -> None:
+    """The case per-camera heartbeats can never cover: a freshly
+    installed bridge, or one whose last camera was deleted. It polls
+    every few seconds and used to leave no trace anywhere."""
+    headers, email, pid = await _setup(client, auth_user)
+    await _enroll(client, headers)
+
+    assert (await _poll(client, report([]))).status_code == 200
+    assert await _last_seen(session) is not None
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_poll_is_not_liveness(
+    client: AsyncClient, auth_user, session: AsyncSession,
+) -> None:
+    """Reporting is a PRECONDITION of instruction here, so a poll this
+    endpoint refuses must not count as the service being healthy —
+    otherwise a bridge stuck on an old contract looks alive forever."""
+    headers, email, pid = await _setup(client, auth_user)
+    await _enroll(client, headers)
+
+    r = await _poll(client, {**report([]), "contract": "fleet-v0"})
+    assert r.status_code == 400
+    assert await _last_seen(session) is None

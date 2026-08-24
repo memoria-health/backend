@@ -163,17 +163,34 @@ async def check_fleet(session, rep: Report) -> None:
                               f"publishing but the backend cannot see it, "
                               f"or the publisher is down")
 
-    mt = await _rows(session,
-                     "select multi_tenant, count(*) from public.gateways "
-                     " group by 1")
-    kinds = {bool(m): n for m, n in mt}
-    if kinds.get(True):
-        rep.add(PASS, "fleet: a bridge is enrolled multi-tenant",
-                f"{kinds[True]} service(s)")
-    else:
+    # ENROLLED, and then SEEN. These are two different questions and this
+    # check used to conflate them: it counted rows with multi_tenant set
+    # and passed. On 2026-08-24 that passed on a row whose `last_seen_at`
+    # had been NULL since it was created, because `/fleet/poll` — the
+    # only endpoint a bridge calls — never stamped the service row. A
+    # dead bridge and a live one were the same row, so this check could
+    # not fail no matter what happened to the fleet.
+    mt = await _rows(
+        session,
+        "select multi_tenant, count(*), "
+        "  count(*) filter (where last_seen_at > now() - interval '2 minutes') "
+        " from public.gateways group by 1")
+    kinds = {bool(m): (n, fresh) for m, n, fresh in mt}
+    total, fresh = kinds.get(True, (0, 0))
+    if not total:
         rep.add(SKIP, "fleet: a bridge is enrolled multi-tenant",
                 "no camera-bridge enrolled yet (Tapo gateway is single-tenant "
                 "by design)")
+    elif fresh:
+        rep.add(PASS, "fleet: a bridge is enrolled and polling",
+                f"{fresh}/{total} service(s) seen within 2 min")
+    else:
+        # Poll interval is ~3s, so two minutes of silence is a service
+        # that has stopped, not one that is between polls.
+        rep.add(FAIL, "fleet: a bridge is enrolled and polling",
+                f"{total} bridge(s) enrolled, NONE seen in the last 2 min — "
+                f"the service is down, or it is polling an endpoint that "
+                f"does not stamp gateways.last_seen_at")
 
 
 async def check_identity(session, rep: Report) -> None:

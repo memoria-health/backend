@@ -742,6 +742,30 @@ async def fleet_poll(
             detail="report must name the reporting instance",
         )
 
+    # THE SERVICE'S OWN HEARTBEAT. Camera liveness below is per camera
+    # and deliberately so, but it can only ever speak for cameras that
+    # exist: a service with none — freshly installed, or one whose last
+    # camera was deleted — produced no signal at all, and its
+    # `gateways.last_seen_at` stayed NULL forever while it polled every
+    # few seconds. `/gateway/roster` has always stamped this; the fleet
+    # path never did, so the entire bridge fleet was invisible at the
+    # service level. On 2026-08-24 the live bridge's row read
+    # `last_seen_at = NULL` next to the mini-PC's `12:09`, and
+    # soak_check's "a bridge is enrolled multi-tenant" passed on it —
+    # a dead bridge and a healthy one are the same row.
+    #
+    # Placed AFTER the contract and instance checks, so a malformed poll
+    # is not liveness: this endpoint's whole design is that reporting is
+    # a precondition of being told what to run.
+    #
+    # Nothing here says the cameras are healthy. It says the SERVICE is
+    # answering — which is the question "is the bridge up?", and the one
+    # nothing could answer.
+    await session.execute(
+        text("UPDATE public.gateways SET last_seen_at = now() WHERE id = :id"),
+        {"id": gateway_id},
+    )
+
     # Parsed, not passed through. These ids are client data and go into a
     # `uuid[]` bind: one non-uuid among them ("warner_8d2506f65170d9f3",
     # a bridge sending its own vendor key) failed the whole statement, so
