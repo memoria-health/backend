@@ -504,7 +504,8 @@ def health():
             "ok": _SCREEN_FAIL["ok"], "failed": _SCREEN_FAIL["n"],
             "last_error": _SCREEN_FAIL["last"] or None,
             "last_found": _SCREEN_FAIL["found"],
-            "concept": _screen_params()[0], "thr": _screen_params()[1],
+            "concepts": list(_SCREEN_CONCEPTS_DEFAULT),
+            "thr": _SCREEN_THR_DEFAULT,
         },
         # Which levers this process actually booted with. The 2026-08-16
         # capacity result was measured WITH these; a pod recreate used
@@ -627,9 +628,54 @@ _SCREEN_FAIL = {"n": 0, "ok": 0, "last": "", "found": -1}
 # The threshold is exposed for the same reason: 0.3 was chosen against a
 # laptop screen filling much of the frame, and a framed picture on a far
 # wall is a much weaker match.
-_SCREEN_CONCEPT_DEFAULT = (
-    "television, laptop, or phone screen, framed painting, "
-    "framed photograph, or poster on a wall"
+# ONE CONCEPT PER PASS, ROTATED — not one compound string.
+#
+# Measured 2026-08-24 on the live TV Room frame: "television" finds the
+# bedroom television; "television screen or framed picture hanging on a
+# wall" finds NOTHING, on either camera. Adding words destroyed a
+# detection that worked. The old comment here claimed compound prompts
+# win in SAM3 grounding; on this model and these frames the opposite is
+# true, so the list is the fix and each entry stays short.
+#
+# Rotated rather than run together because the pass happens INSIDE the
+# analysis call, holding the GPU slot, and costs ~0.5s. Three at once is
+# a 1.5s stall every couple of minutes on a rig whose normal step is
+# 100-500ms. One per pass costs exactly what today costs and simply
+# re-confirms each object more slowly — which is free, because these
+# things are furniture. ScreenMap's TTL is 900s against a 360s full
+# cycle at three concepts, so a region never expires mid-rotation.
+#
+# WHAT IS ACTUALLY IN THESE ROOMS (looked at the frame, 2026-08-24):
+# the TV Room's phantom faces come from ONE LARGE UNFRAMED CANVAS of
+# painted faces, not framed pictures — which is why every wording built
+# around "framed" was describing the wrong object. There are also pink
+# figurative statues on a console table, the next most likely thing to
+# be read as a person.
+# MEASURED against the live rooms, 2026-08-24. Short beats descriptive,
+# every time:
+#
+#   "television"                                        -> 1
+#   "television or computer screen"                     -> 2
+#   "painting"                                          -> 11
+#   "television screen or framed picture hanging on a wall" -> 0
+#   "painted artwork on a wall" / "mural" / "art" / "poster" -> 0
+#
+# The last two lines are why the earlier attempts failed: adding words
+# destroyed detections that a single word found, and "framed" described
+# the wrong object entirely — the TV Room's phantom faces come from ONE
+# LARGE UNFRAMED CANVAS, not framed pictures.
+#
+# "painting" also caught the one genuinely framed picture by the door,
+# which is the behaviour we want and did not have to ask for.
+#
+# "statue" finds nothing yet and stays in the rotation because the room
+# has pink figurative statues on a console table that are the next most
+# likely thing to be read as a person. A pass that finds nothing costs
+# ~0.5s once per rotation; a phantom track costs ~1.3s every batch.
+_SCREEN_CONCEPTS_DEFAULT = (
+    "television or computer screen",
+    "painting",
+    "statue",
 )
 _SCREEN_THR_DEFAULT = 0.3
 # A FILE on the shared volume, re-read per pass — same idea as
@@ -645,24 +691,35 @@ _SCREEN_CONCEPT_FILE = "/persist/state/screen_concept"
 _SCREEN_THR_FILE = "/persist/state/screen_thr"
 
 
-def _read_line(path: str) -> str:
+def _read_line(path: str, whole: bool = False) -> str:
     try:
-        return pathlib.Path(path).read_text(encoding="utf-8").strip()
+        text = pathlib.Path(path).read_text(encoding="utf-8")
+        return text if whole else text.strip()
     except OSError:
         return ""
 
 
+_screen_turn = 0
+
+
 def _screen_params() -> tuple[str, float]:
-    """(concept, threshold) — file first, then env, then the default."""
-    concept = _read_line(_SCREEN_CONCEPT_FILE) or os.environ.get(
+    """(concept for THIS pass, threshold). File first, then env, then
+    the defaults. The file may hold one concept per line."""
+    global _screen_turn
+    raw = _read_line(_SCREEN_CONCEPT_FILE, whole=True) or os.environ.get(
         "NEMARA_SCREEN_CONCEPT", "")
+    concepts = tuple(
+        c.strip() for c in raw.splitlines() if c.strip()
+    ) or _SCREEN_CONCEPTS_DEFAULT
     thr_raw = _read_line(_SCREEN_THR_FILE) or os.environ.get(
         "NEMARA_SCREEN_THR", "")
     try:
         thr = float(thr_raw) if thr_raw else _SCREEN_THR_DEFAULT
     except ValueError:
         thr = _SCREEN_THR_DEFAULT
-    return (concept or _SCREEN_CONCEPT_DEFAULT), thr
+    concept = concepts[_screen_turn % len(concepts)]
+    _screen_turn += 1
+    return concept, thr
 
 
 def _observe_sync(
