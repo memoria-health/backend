@@ -32,13 +32,21 @@ neutral biases the answer. Only a positive `leaving_bed` crossing ends
 occupancy, and only positive wakefulness ends sleep. Nothing is ever
 inferred from an absent observation.
 
-## Identity: asked once, at the crossing
+## Identity: asked once, around the crossing
 
 A visitor asleep in the bed must not become the patient's night, so the
 first `entering_bed` must be identity-confirmed. After that it is never
 consulted again — identity needs a visible upright person and a sleeper
 is neither (08-02: 110 confirmed ticks while awake, then zero across
 three hours of solid sleep).
+
+"Around", not "on". The crossing tick itself is already too late:
+somebody climbing into bed is bent, turned away and half under a duvet,
+so identity fails there for the same reason it fails afterwards. The
+confirmation may come from any tick in the preceding
+`IDENTITY_LOOKBACK_SECONDS` — the person walking in and getting ready,
+while they are still upright and visible. Nothing is relaxed about WHO
+must be confirmed; only when we are allowed to have seen them.
 
 Pure function — no I/O, no clock reads.
 """
@@ -91,6 +99,50 @@ MIN_CONFIDENCE = 0.6
 # 08-02 return produced hundreds in a row.
 REENTRY_MIN_TICKS = 3
 
+# How far back the admissibility gate may look for an identity
+# confirmation IN THIS ROOM before accepting a bed entry.
+#
+# The gate demands the patient be identity-confirmed before their night
+# can open, and it used to demand it ON the crossing tick. Measured on
+# the night of 2026-08-23, bedroom camera, ticks with a person visible:
+#
+#     entering_bed     9    identity true 1    false 8
+#     leaving_bed     17    identity true 0    false 17
+#     awake_in_bed   807    identity true 1    false 806
+#
+# Identity answered "not the patient" for 806 of 807 ticks of the
+# resident lying in his own bed. That is not a visitor. It is this
+# module's own premise — "identity needs a visible upright person and a
+# sleeper is neither" — arriving one step earlier than expected, because
+# somebody climbing into bed is already bent, turned away and half under
+# a duvet. So the gate asked the one question identity cannot answer at
+# the one moment it cannot answer it, and the night was thrown away: the
+# only confirmed crossing landed near dawn, leaving all 856 asleep ticks
+# outside any occupancy span.
+#
+# Asking earlier changes nothing about WHO must be confirmed. A visitor
+# is never identity-confirmed as the patient in this room, so they still
+# cannot open the night. The patient walks in, is confirmed while
+# upright, gets ready, and lies down — and stops being recognisable as
+# themselves at exactly the point this gate used to start looking.
+#
+# One hour, chosen from the same night. The real bed entry was at
+# 21:56:30; the last identity confirmation was 21:07:27, 49 minutes
+# earlier, because he was in his room reading in between. Every window
+# from one hour to twenty-four gives the IDENTICAL answer — 11 spans, 4
+# runs, 306 minutes of sleep — so this is not a threshold balanced on an
+# edge, it is the difference between allowing an earlier sighting or
+# not. Ten and thirty minutes both recover nothing at all:
+#
+#     lookback    600s   spans 1    runs 0    sleep   0m
+#     lookback   1800s   spans 1    runs 0    sleep   0m
+#     lookback   3600s   spans 11   runs 4    sleep 306m
+#     lookback  86400s   spans 11   runs 4    sleep 306m
+#
+# The smallest window that works is the one to keep: it still requires
+# the patient to have been seen in that room within the hour.
+IDENTITY_LOOKBACK_SECONDS = 3600  # 1 h
+
 _ENTER = "entering_bed"
 _LEAVE = "leaving_bed"
 
@@ -116,6 +168,26 @@ def _in_bed(t: SleepTick) -> bool:
     return t.asleep or t.activity in ("stirring", "sitting_up", "awake_in_bed")
 
 
+def _identity_lookback(ts: list[SleepTick]) -> list[bool]:
+    """For each tick: was the patient identity-confirmed on this camera
+    within the last `IDENTITY_LOOKBACK_SECONDS`?
+
+    One backward pass, so the gate costs nothing to widen. A tick that is
+    itself confirmed answers True for itself, which keeps the original
+    behaviour as a special case of this one.
+    """
+    out = [False] * len(ts)
+    last_ok: datetime | None = None
+    for i, t in enumerate(ts):
+        if t.patient_confirmed:
+            last_ok = t.at
+        out[i] = (
+            last_ok is not None
+            and (t.at - last_ok).total_seconds() <= IDENTITY_LOOKBACK_SECONDS
+        )
+    return out
+
+
 def _in_bed_spans(ts: list[SleepTick]) -> list[tuple[int, int]]:
     """(start_idx, end_idx) index spans during which the patient is in bed.
 
@@ -133,6 +205,7 @@ def _in_bed_spans(ts: list[SleepTick]) -> list[tuple[int, int]]:
     is NOT re-checked on a re-entry — it was established at the gate,
     and a sleeper cannot be face-confirmed anyway.
     """
+    confirmed_recently = _identity_lookback(ts)
     spans: list[tuple[int, int]] = []
     start: int | None = None
     opened_once = False
@@ -146,7 +219,7 @@ def _in_bed_spans(ts: list[SleepTick]) -> list[tuple[int, int]]:
             continue
         if start is not None:
             continue                     # already in bed; nothing to do
-        if t.activity == _ENTER and (opened_once or t.patient_confirmed):
+        if t.activity == _ENTER and (opened_once or confirmed_recently[i]):
             start, run, opened_once = i, 0, True
             continue
         # Evidence-based opening. Before the gate has ever been passed
@@ -159,7 +232,7 @@ def _in_bed_spans(ts: list[SleepTick]) -> list[tuple[int, int]]:
         # ticks on the 08-02 night it fired ZERO times while
         # `leaving_bed` fired three times, all correct. Hanging the whole
         # night on the crossing that does not fire yields a blank record.
-        ok = _in_bed(t) and (opened_once or t.patient_confirmed)
+        ok = _in_bed(t) and (opened_once or confirmed_recently[i])
         run = run + 1 if ok else 0
         if run >= REENTRY_MIN_TICKS:
             start = i - run + 1

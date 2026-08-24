@@ -100,6 +100,7 @@ from src.services.detection.presence_sweeper import PresenceSweeper
 from src.services.identity.fleet_watch import FleetWatch
 from src.services.detection.worker import DetectorWorker
 from src.services.scheduling.scheduler import ScheduledDetectorRunner
+from src.services.summaries.nightly import NightlySummaryRunner
 from src.settings import get_settings
 
 
@@ -177,6 +178,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.scheduler = scheduler
     await scheduler.start()
+    # Sleep and activity fire no events, so nothing in the alerting path
+    # carries them anywhere. This is their only route to a caregiver: a
+    # row per night, re-folded every half hour so the night in progress
+    # is already there at 03:00 and finished by breakfast. It ran by
+    # hand until 2026-08-25, which meant seven nights were collected and
+    # never summarised without anything appearing to fail.
+    summaries = NightlySummaryRunner(sessionmaker=get_sessionmaker())
+    app.state.summaries = summaries
+    await summaries.start()
     # `cameras.online` is now owned by each `RoomWorker`'s
     # `LiveKitRoomReconciler` (see room_reconciler.py). The standalone
     # `StaleOnlineSweeper` was removed because REST polling produces
@@ -227,6 +237,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await fleet_watch.stop()
         await gate_sweeper.stop()
         await presence_sweeper.stop()
+        await summaries.stop()
         await scheduler.stop()
         await worker.stop()
         await push.close()
