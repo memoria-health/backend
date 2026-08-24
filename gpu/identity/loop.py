@@ -132,7 +132,8 @@ JPEG_QUALITY = 80
 # (encode p50 391ms at 3 cams, plus the pod's decode out of the same
 # starved cores). "jpeg" is the one-env revert: NEMARA_FRAME_WIRE=jpeg.
 FRAME_WIRE = os.environ.get("NEMARA_FRAME_WIRE", "raw").strip().lower()
-SCREEN_REFRESH_S = 120.0       # screens are furniture
+SCREEN_REFRESH_S = float(os.environ.get(
+    "NEMARA_SCREEN_REFRESH_S", "120"))   # screens are furniture
 SEAT_FLOOR = 0.4               # combined-score floor to take an empty seat
                                # (calibrated with scoring.py 2026-07-24 so
                                # the legacy brain's proven face locks clear it)

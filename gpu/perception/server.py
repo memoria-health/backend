@@ -504,7 +504,7 @@ def health():
             "ok": _SCREEN_FAIL["ok"], "failed": _SCREEN_FAIL["n"],
             "last_error": _SCREEN_FAIL["last"] or None,
             "last_found": _SCREEN_FAIL["found"],
-            "concept": _SCREEN_CONCEPT, "thr": _SCREEN_THR,
+            "concept": _screen_params()[0], "thr": _screen_params()[1],
         },
         # Which levers this process actually booted with. The 2026-08-16
         # capacity result was measured WITH these; a pod recreate used
@@ -627,12 +627,42 @@ _SCREEN_FAIL = {"n": 0, "ok": 0, "last": "", "found": -1}
 # The threshold is exposed for the same reason: 0.3 was chosen against a
 # laptop screen filling much of the frame, and a framed picture on a far
 # wall is a much weaker match.
-_SCREEN_CONCEPT = os.environ.get(
-    "NEMARA_SCREEN_CONCEPT",
+_SCREEN_CONCEPT_DEFAULT = (
     "television, laptop, or phone screen, framed painting, "
-    "framed photograph, or poster on a wall",
+    "framed photograph, or poster on a wall"
 )
-_SCREEN_THR = float(os.environ.get("NEMARA_SCREEN_THR", "0.3"))
+_SCREEN_THR_DEFAULT = 0.3
+# A FILE on the shared volume, re-read per pass — same idea as
+# _load_auth_token above. The pass runs every couple of minutes and
+# "found nothing" is indistinguishable from "wrong wording" until you
+# can try another one, and a container rebuild per attempt turns a
+# ten-minute question into a day. Write one line and the next pass uses
+# it; delete the file and the default returns.
+#
+#   echo 'television or framed picture' > /persist/state/screen_concept
+#   echo '0.15'                         > /persist/state/screen_thr
+_SCREEN_CONCEPT_FILE = "/persist/state/screen_concept"
+_SCREEN_THR_FILE = "/persist/state/screen_thr"
+
+
+def _read_line(path: str) -> str:
+    try:
+        return pathlib.Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _screen_params() -> tuple[str, float]:
+    """(concept, threshold) — file first, then env, then the default."""
+    concept = _read_line(_SCREEN_CONCEPT_FILE) or os.environ.get(
+        "NEMARA_SCREEN_CONCEPT", "")
+    thr_raw = _read_line(_SCREEN_THR_FILE) or os.environ.get(
+        "NEMARA_SCREEN_THR", "")
+    try:
+        thr = float(thr_raw) if thr_raw else _SCREEN_THR_DEFAULT
+    except ValueError:
+        thr = _SCREEN_THR_DEFAULT
+    return (concept or _SCREEN_CONCEPT_DEFAULT), thr
 
 
 def _observe_sync(
@@ -871,10 +901,11 @@ def _observe_sync(
         screen_regions: list[list[float]] = []
         screens_ms = 0.0
         if screen_src is not None:
+            _concept, _thr = _screen_params()
             t_sc = time.time()
             try:
                 for _pos, dets in sam_track.track_stream(
-                    pred, [screen_src], concept=_SCREEN_CONCEPT, thr=_SCREEN_THR,
+                    pred, [screen_src], concept=_concept, thr=_thr,
                 ):
                     for _tid, bbox, _m, p in dets:
                         screen_regions.append(
@@ -899,7 +930,7 @@ def _observe_sync(
                 _SCREEN_FAIL["found"] = len(screen_regions)
                 log.warning(
                     "perception.screen_pass concept=%r thr=%.2f found=%d",
-                    _SCREEN_CONCEPT, _SCREEN_THR, len(screen_regions),
+                    _concept, _thr, len(screen_regions),
                 )
             screens_ms = (time.time() - t_sc) * 1000.0
         total_ms = (time.time() - t_start) * 1000.0
