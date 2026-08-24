@@ -848,6 +848,11 @@ async def identity_snap(name: str):
         return Response(status_code=502)
 
 
+# The identity services sample on this period (service.py
+# _timeline_sampler). The merge buckets to it.
+_TIMELINE_PERIOD_S = 10
+
+
 async def _fan_out(path: str, timeout: float = 2.5) -> list[tuple[str, dict]]:
     """Ask EVERY identity service the same question, in parallel.
 
@@ -895,11 +900,32 @@ async def _fan_out(path: str, timeout: float = 2.5) -> list[tuple[str, dict]]:
 
 @app.get("/identity_timeline")
 async def identity_timeline():
-    """Every service's 10s status samples, merged — the lane view."""
-    merged: list = []
+    """Every service's 10s status samples, merged BY TIME.
+
+    Each service only ever reports its own camera, so concatenating
+    them produced one row per camera per instant — 172 rows, every one
+    holding a single camera. The strip is drawn per camera as
+    `row[cam] || 'empty'`, so on the bedroom's strip every row that
+    belonged to the TV Room rendered as EMPTY, and vice versa. Both
+    strips alternated no matter what the cameras were doing, and it
+    read as the system losing the person every other tick.
+
+    Bucketed to the sample period so two services that sampled the same
+    instant land in one row. Timestamps drift a little between
+    processes, so the bucket is the alignment — not equality.
+    """
+    buckets: dict[int, dict] = {}
     for _cam8, j in await _fan_out("/timeline?n=720"):
-        merged.extend(j.get("samples") or [])
-    merged.sort(key=lambda s: s[0] if isinstance(s, (list, tuple)) else 0)
+        for sample in (j.get("samples") or []):
+            if not isinstance(sample, (list, tuple)) or len(sample) < 2:
+                continue
+            ts, row = sample[0], sample[1]
+            if not isinstance(row, dict):
+                continue
+            key = int(round(float(ts) / _TIMELINE_PERIOD_S))
+            buckets.setdefault(key, {}).update(row)
+    merged = [[k * _TIMELINE_PERIOD_S, row]
+              for k, row in sorted(buckets.items())]
     return JSONResponse({"samples": merged})
 
 

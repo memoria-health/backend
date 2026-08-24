@@ -551,9 +551,25 @@ _pubs: dict[str, Any] = {}
 _layer: dict[str, str] = {}
 
 
+_PIN_LAYER = os.environ.get("NEMARA_IDENTITY_PIN_LAYER", "1").strip() not in (
+    "0", "false", "no")
+
+
 def request_layer(cam_id: str, quality: str) -> None:
     """Ask the SFU for one rung. Best-effort — on failure we keep
-    whatever we were getting, which is the pre-2026-08-24 behaviour."""
+    whatever we were getting, which is the pre-2026-08-24 behaviour.
+
+    KILL-SWITCH, because this call is itself a suspect. Identity never
+    made it before 2026-08-24, and the camera that oscillates
+    2304 -> 320 -> 2304 does so on almost exactly the period at which we
+    send it — with the publisher healthy (all three layers active,
+    quality_limitation_reason=0), 312 Mbps of headroom on the node, and
+    the same behaviour when that camera is the only subscription on the
+    box. Every other explanation has been measured and eliminated, which
+    leaves the request. `NEMARA_IDENTITY_PIN_LAYER=0` removes it so that
+    can be tested rather than argued about."""
+    if not _PIN_LAYER:
+        return
     if _layer.get(cam_id) == quality:
         return
     pub = _pubs.get(cam_id)
@@ -803,7 +819,30 @@ async def _run_livekit(
                     log.info(
                         "identity.subscription %s cam=%s",
                         "restored" if want else "SEVERED (ai_paused)", cam_id)
-                if not want:
+                if want:
+                    # ENFORCE the layer every pass, not once at
+                    # subscribe. `set_subscribed(True)` resets the track
+                    # settings and the SDK default is a width-0 request
+                    # the SFU reads as the SMALLEST rung, so the walk's
+                    # own repair shrank the picture every time it ran —
+                    # and `request_layer` would not undo it, because it
+                    # acts only on a change and still believed HIGH was
+                    # in force.
+                    #
+                    # Asserting it right after the subscribe was not
+                    # enough: the settings reset lands at the SFU AFTER
+                    # our request and overwrites it. The collapse then
+                    # lasted exactly one walk period, 10s, every time —
+                    # which is what says it is a race and not congestion.
+                    #
+                    # So this is a reconcile, not a one-shot. Forgetting
+                    # the remembered value is what makes the request
+                    # actually go out; one settings message per camera
+                    # per 10s is nothing, and the desired state is now
+                    # continuously true instead of true at subscribe.
+                    _layer.pop(cam_id, None)
+                    request_layer(cam_id, _LAYER_ACTIVE)
+                else:
                     # Nothing to police on a camera we are not pulling —
                     # and the intake-quiet strike counter below would
                     # otherwise read our own silence as a fault and
