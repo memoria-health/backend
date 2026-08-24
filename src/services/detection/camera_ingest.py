@@ -71,7 +71,9 @@ from src.services.detection.scheduling import (
     resolve_dims,
     resolve_due,
 )
-from src.services.detection.scheduling.executor import run_scheduled_calls
+from src.services.detection.scheduling.executor import (
+    ConfirmBudget, run_scheduled_calls,
+)
 from src.services.detection.signals.tick_signals import TickSignals, compute_tick_signals
 from src.services.detection.speech_filter import sanitize_speech_fields
 from src.services.detection.vlm_routing import resolve_vlm_provider, run_vlm
@@ -376,6 +378,15 @@ class CameraIngest:
         # zero the moment anyone else appears; see
         # `note_solo_confirmations`.
         self._solo_streaks: dict[UUID, int] = {}
+        # Last tick's `<ident>_detected` values, so the confirmer can
+        # tell a new claim from a continuing one. None until the first
+        # tick completes, which reads as "everything true right now just
+        # became true" — the safe direction, since it can only cause an
+        # extra check, never a skipped one.
+        self._prev_detected: dict | None = None
+        # Hard ceiling on confirm votes for THIS camera, per hour.
+        self._confirm_budget = ConfirmBudget(
+            getattr(settings, "confirm_votes_per_hour", 60))
         # Monotonic timestamp of the most recent frame pushed into
         # `frame_buffer` (set by RoomWorker._consume_video →
         # record_frame_arrival). Read by `LiveKitRoomReconciler` to
@@ -1908,6 +1919,11 @@ class CameraIngest:
                             run_main_vlm=run_vlm,
                             flash_provider=gemini_provider,
                             log_tag=self._log_tag,
+                            # Last tick's verdicts, so the confirmer can
+                            # re-check a CHANGE instead of re-checking a
+                            # state that has not moved for eight hours.
+                            prev_detected=self._prev_detected,
+                            confirm_budget=self._confirm_budget,
                         )
                     except Exception:  # noqa: BLE001
                         log.error(
@@ -2252,6 +2268,16 @@ class CameraIngest:
                 if promotion is None or pid == self.patient_id:
                     promotion = result_for_patient
             await session.commit()
+
+            # Remember this tick's verdicts for the next one's confirm
+            # edge. Taken AFTER promotion so it records what the tick
+            # actually concluded, and stored even when nothing fired —
+            # a false is exactly as load-bearing as a true here, since
+            # the edge is the transition between them.
+            self._prev_detected = {
+                k: bool(v) for k, v in result.detector_fields.items()
+                if k.endswith("_detected")
+            }
 
             # High-signal confirmation that a real analysis landed — grep
             # "analysis SAVED" to watch live ticks; its absence (with no

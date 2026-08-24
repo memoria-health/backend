@@ -155,6 +155,69 @@ class _PreparedCall:
     degraded_artifact: bool
 
 
+class ConfirmBudget:
+    """A hard ceiling on confirm votes, per camera, per rolling hour.
+
+    The confirmer spends a model call per vote on the SAME clip the
+    primary already paid for, so its cost is invisible next to the tick
+    it rides on and unbounded in the same breath. Armed on sleep for one
+    night it made 905 rounds of 3 votes and burned 33M input tokens
+    confirming that a sleeping man was still asleep.
+
+    Edge-triggering (below) is the fix. This is the backstop for when
+    the fix is wrong: a detector that flaps faster than anyone expected
+    still cannot spend more than `cap` votes an hour, and it says so in
+    the log rather than quietly draining an account overnight.
+    """
+
+    def __init__(self, cap_per_hour: int) -> None:
+        self._cap = max(0, int(cap_per_hour))
+        self._spent: list[float] = []
+
+    def take(self, want: int) -> int:
+        """Grant up to `want` votes. Returns how many are allowed."""
+        if want <= 0:
+            return 0
+        now = time.monotonic()
+        cutoff = now - 3600.0
+        self._spent = [t for t in self._spent if t > cutoff]
+        room = self._cap - len(self._spent)
+        granted = max(0, min(want, room))
+        self._spent.extend([now] * granted)
+        return granted
+
+    @property
+    def spent_last_hour(self) -> int:
+        cutoff = time.monotonic() - 3600.0
+        return sum(1 for t in self._spent if t > cutoff)
+
+
+def _confirm_is_due(ident: str, fields: dict, prev: dict | None) -> bool:
+    """Should this detector be re-checked THIS tick?
+
+    Only when its verdict CHANGED. `<ident>_detected` is a level, and
+    the confirmer used to vote on the level: true today, true in ten
+    seconds, true all night. For a fall that reads the same either way,
+    because a fall is over by the next tick. For a state detector it is
+    the difference between checking a claim and re-checking a fact.
+
+    Sleep is the case that proved it. `sleep_detected` means ASLEEP —
+    the ordinary, desired condition that holds for eight hours — so
+    arming a confirmer to check disturbances instead re-confirmed the
+    quiet state 905 times in one night. What a caregiver wanted checked
+    was the MOMENT it changed, which is exactly this edge.
+
+    No previous tick means treat it as an edge: a detector that comes up
+    true on the first tick after a restart has genuinely just changed as
+    far as anything here can tell, and guessing the other way would skip
+    the one check that matters.
+    """
+    now_true = bool(fields.get(ident))
+    if prev is None:
+        return now_true
+    return now_true and not bool(prev.get(ident))
+
+
 async def run_scheduled_calls(
     plans: Sequence[CallPlan],
     *,
@@ -171,6 +234,8 @@ async def run_scheduled_calls(
     run_main_vlm: Callable[..., Awaitable],
     flash_provider: Callable[..., Awaitable[ProviderResult]],
     log_tag: str,
+    prev_detected: dict | None = None,
+    confirm_budget: "ConfirmBudget | None" = None,
 ) -> SchedulerTickResult:
     """Execute every plan; merge into one tick-shaped result.
 
@@ -599,7 +664,22 @@ async def run_scheduled_calls(
         for ident, (due, artifact, plan, art_fps) in winning_call.items():
             k, n = due.dims.confirm_k, due.dims.confirm_n
             detected_key, _conf_key = detection_keys_for(ident)
-            if n <= 0 or not merged_fields.get(detected_key):
+            if n <= 0:
+                continue
+            # ON THE CHANGE, not on the state. See `_confirm_is_due`.
+            if not _confirm_is_due(detected_key, merged_fields, prev_detected):
+                continue
+            # And never more than the hour's allowance, however often it
+            # changes. A partial grant is refused outright rather than
+            # run short: k-of-n with fewer than n votes is a different,
+            # stricter test than the one the caregiver configured, and
+            # silently applying it would suppress real fires.
+            if confirm_budget is not None and confirm_budget.take(n) < n:
+                log.warning(
+                    "%s confirm BUDGET EXHAUSTED %s — %d votes spent this "
+                    "hour, not re-checking (the fire stands unconfirmed)",
+                    log_tag, ident, confirm_budget.spent_last_hour,
+                )
                 continue
             confirm_kn[ident] = (k, n)
             for i in range(n):

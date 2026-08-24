@@ -394,6 +394,16 @@ class Settings(BaseSettings):
     scheduler_person_requires_track: bool = Field(default=False)
     # duty_cycle='sampled' detectors run every k-th tick. 1 = parity.
     scheduler_sample_every_k: int = Field(ge=1, le=60, default=1)
+    # Hard ceiling on k-of-N confirm votes per camera per rolling hour.
+    # The confirmer spends a model call per vote on a clip already paid
+    # for, so it is invisible next to the tick it rides on and unbounded
+    # in the same breath: armed on sleep for one night it made 905
+    # rounds of 3 and burned 33M input tokens confirming that a sleeping
+    # man was still asleep. Edge-triggering is the fix; this is the
+    # backstop for when the fix is wrong. 60/hour is one round of three
+    # every three minutes, far above any real detector and far below an
+    # accident.
+    confirm_votes_per_hour: int = Field(ge=0, le=10_000, default=60)
     # Page record-only positives (rising edge) for verification. Off in prod.
     record_only_paging: bool = Field(default=False)
     # Dump every VLM artifact (exact Gemini input bytes) here. "" = off.
