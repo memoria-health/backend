@@ -668,16 +668,27 @@ _SCREEN_FAIL = {"n": 0, "ok": 0, "last": "", "found": -1}
 # "painting" also caught the one genuinely framed picture by the door,
 # which is the behaviour we want and did not have to ask for.
 #
-# "statue" finds nothing yet and stays in the rotation because the room
-# has pink figurative statues on a console table that are the next most
-# likely thing to be read as a person. A pass that finds nothing costs
-# ~0.5s once per rotation; a phantom track costs ~1.3s every batch.
+# "statue" was in this rotation and is gone (Aryaman 2026-08-25). It
+# never returned a region on the room's pink figurative statues in any
+# wording tried, so it spent a third of every rotation asking a question
+# with no answer and slowed the two concepts that do work. Statues going
+# unvetoed is the accepted cost.
 _SCREEN_CONCEPTS_DEFAULT = (
     "television or computer screen",
     "painting",
-    "statue",
 )
-_SCREEN_THR_DEFAULT = 0.3
+# 0.05, not 0.3. Measured on the TV Room wall 2026-08-24: at 0.3 the
+# grounding pass returned nothing and the veto never engaged, so the
+# painted faces kept generating tracks — 6-8 of them, and a pod time of
+# ~1.3s every batch. At 0.05 the same wall came back as regions, tracks
+# went to 0 and the pod to 162ms.
+#
+# The node has run 0.05 since that afternoon, written into
+# /persist/state/screen_thr by hand. This constant said 0.3 the whole
+# time, which meant the committed code and the running code disagreed
+# about the one number the feature depends on, and deleting the override
+# to "restore the defaults" would have turned the veto off (2026-08-25).
+_SCREEN_THR_DEFAULT = 0.05
 # A FILE on the shared volume, re-read per pass — same idea as
 # _load_auth_token above. The pass runs every couple of minutes and
 # "found nothing" is indistinguishable from "wrong wording" until you
