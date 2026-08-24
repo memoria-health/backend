@@ -1371,17 +1371,37 @@ async function pollIdentity(){
       cams.forEach(c=>{
         const el=document.getElementById("live_"+c);
         if(!el || el._poll) return;
-        el._poll=setInterval(()=>{
+        // SELF-CLOCKING, not a fixed timer. Each frame is ~350KB of
+        // full-resolution JPEG relayed from a node in another
+        // continent and measured at 2.4-4.5s per fetch, against a
+        // 700ms interval — so requests piled up faster than they
+        // completed, the browser's per-host connection limit
+        // saturated, and the picture simply stopped moving. It read as
+        // "the stream is down" while the pipeline was perfectly
+        // healthy.
+        //
+        // Asking for the next frame only once the last one has ARRIVED
+        // cannot pile up, whatever the round trip costs, and it
+        // degrades to "slower" instead of "stuck".
+        const tick=()=>{
           const pre=new Image();
           // BOTH handlers. `onload` alone meant a failing fetch never
           // swapped the image and never said so, so the tile held its
           // last good frame indefinitely — the node was restarted for
           // 15 minutes on 2026-08-24 and this card showed a live-looking
           // picture throughout. A frozen frame must announce itself.
-          pre.onload=()=>{ el.src=pre.src; window._frameOk[c]=Date.now(); };
-          pre.onerror=()=>{};
+          const again=()=>{ el._poll=setTimeout(tick, 250); };
+          pre.onload=()=>{
+            el.src=pre.src; window._frameOk[c]=Date.now(); again();
+          };
+          // A failed fetch must re-arm too, or one blip ends the feed
+          // for good — which is the same silent stop, arrived at from
+          // the other direction.
+          pre.onerror=again;
           pre.src=`/identity_live/${c}?t=${Date.now()}`;
-        }, 700);
+        };
+        el._poll=true;
+        tick();
       });
       idStreams=camKey;
     }
