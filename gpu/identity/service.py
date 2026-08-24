@@ -24,6 +24,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 _repo = Path(__file__).resolve().parents[2]
@@ -496,6 +497,62 @@ async def _read_video(track: rtc.Track, cam_loop: CameraLoop) -> None:
             )
 
 
+# ── Subscribed layer: pinned, and stepped down on an empty room ──────
+#
+# TWO jobs, and the first one is not optional.
+#
+# PIN IT. With no explicit request the SFU picks the rung, and it
+# re-picks whenever its congestion estimate twitches — measured
+# backend-side as sharp<->blurry flapping that blinds YOLO and face
+# matching (soak #2: blur<->identity r=0.52). That flapping is why the
+# gateway ships `.simulcast-off` at all. Every subscriber that pins its
+# layer takes the choice away from the SFU, which is what makes putting
+# the ladder back a safe thing to do.
+#
+# THEN STEP IT DOWN WHEN THE ROOM IS EMPTY. LiveKit bills the
+# subscription and does not care that we are doing nothing with the
+# frames. An empty room delivered 5 Mbps to this process all night for
+# no reason — and this is the SECOND copy, because the backend holds
+# its own subscription to the same camera.
+#
+# The step-down must never cost a detection. Two reasons it does not:
+# the motion latch that ends the idle period runs on a 64x36 gray
+# thumbnail and cannot tell the layers apart, and unlike the backend
+# this process has no buffered window to judge in retrospect — it reads
+# frames continuously, so the tick after the step-up is already native.
+# gpu/identity/loop.py's 2026-07-26 finding — that shipping 640px costs
+# "the small-distant-person detection risk" — is about the layer we
+# work AT, not the layer we idle at.
+_LAYER_ACTIVE = "high"
+_LAYER_IDLE = os.environ.get("NEMARA_IDENTITY_IDLE_QUALITY", "medium").strip().lower()
+_QUALITY = {
+    "low": rtc.VideoQuality.VIDEO_QUALITY_LOW,
+    "medium": rtc.VideoQuality.VIDEO_QUALITY_MEDIUM,
+    "high": rtc.VideoQuality.VIDEO_QUALITY_HIGH,
+}
+# Publication + last-requested layer per camera. Transitions only: a
+# layer request is a signalling round-trip and this is consulted on
+# every intake decision.
+_pubs: dict[str, Any] = {}
+_layer: dict[str, str] = {}
+
+
+def request_layer(cam_id: str, quality: str) -> None:
+    """Ask the SFU for one rung. Best-effort — on failure we keep
+    whatever we were getting, which is the pre-2026-08-24 behaviour."""
+    if _layer.get(cam_id) == quality:
+        return
+    pub = _pubs.get(cam_id)
+    if pub is None:
+        return
+    _layer[cam_id] = quality
+    try:
+        pub.set_video_quality(_QUALITY.get(quality, _QUALITY["high"]))
+        log.info("identity.layer_request cam=%s quality=%s", cam_id, quality.upper())
+    except Exception:  # noqa: BLE001 — an economy must not break intake
+        log.warning("identity.layer_request_failed cam=%s", cam_id, exc_info=True)
+
+
 def cam_selected(only_cam: str, ident: str) -> bool:
     """Does `--only-cam` select this LiveKit participant?
 
@@ -585,8 +642,20 @@ async def _run_livekit(
             cams = dict(home.cameras)
             cams[cam_id] = cam_loop
             home.cameras = cams
+            cam_loop.on_idle = (
+                lambda idle, c=cam_id: request_layer(
+                    c, _LAYER_IDLE if idle else _LAYER_ACTIVE)
+            )
             loop_tasks[cam_id] = asyncio.ensure_future(cam_loop.run())
             log.info("identity.camera_started cam=%s", cam_id)
+        # PIN the layer on every (re)subscribe, before any frame arrives.
+        # Unpinned, the SFU chooses and re-chooses, and that flapping is
+        # what blinds face matching. A re-subscribe also resets the SFU's
+        # idea of what we asked for, so the remembered value must go with
+        # it or the next request looks redundant and gets skipped.
+        _pubs[cam_id] = pub
+        _layer.pop(cam_id, None)
+        request_layer(cam_id, _LAYER_ACTIVE)
         # ONE reader per camera: a re-subscribe replaces the old reader
         # instead of racing it (double intake = double convert cost +
         # ring churn).

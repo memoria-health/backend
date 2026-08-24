@@ -22,7 +22,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 from uuid import UUID
 
 import cv2
@@ -619,6 +619,12 @@ class CameraLoop:
         # presence in the request is what switches the worker).
         self._session_state: dict = {}
         self._probe_task: Optional[asyncio.Task] = None
+        # Told on every step whether this camera is worth full-rate
+        # video. Set by service.py, which owns the LiveKit publication;
+        # the loop only knows WHEN the room is empty, not what to do
+        # about it. None = nobody listening (unit harnesses).
+        self.on_idle: Optional[Callable[[bool], None]] = None
+        self._idle: Optional[bool] = None
         self.stage_ms: dict = {}     # per-batch stage timings (measured)
         self.probe_ms: dict = {}     # per-probe stage timings (measured)
         self._body_cos: dict[int, float] = {}   # latest probe body scores
@@ -779,6 +785,20 @@ class CameraLoop:
                 self.state.apply({}, now=now)
             return
         empty_poll = not self.state.tracks and self._last_shipped is not None
+        # Nothing tracked and nothing moved is exactly why the pod is
+        # skipped below — and the same reason the SFU should not be
+        # sending us full-resolution video for it. Transitions only.
+        idle = empty_poll and not self.motion_pending
+        if idle is not self._idle:
+            self._idle = idle
+            if self.on_idle is not None:
+                try:
+                    self.on_idle(idle)
+                except Exception:      # noqa: BLE001 — economy, not a dependency
+                    log.warning(
+                        "identity.idle_hint_failed cam=%s", self.camera_id,
+                        exc_info=True,
+                    )
         if empty_poll:
             # Stamp the ATTEMPT before anything can fail — run()'s nap
             # floors off this, and a pod error that returns in
