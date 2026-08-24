@@ -504,8 +504,15 @@ def health():
             "ok": _SCREEN_FAIL["ok"], "failed": _SCREEN_FAIL["n"],
             "last_error": _SCREEN_FAIL["last"] or None,
             "last_found": _SCREEN_FAIL["found"],
-            "concepts": list(_SCREEN_CONCEPTS_DEFAULT),
-            "thr": _SCREEN_THR_DEFAULT,
+            # The LIVE values, not the constants. This reads the same
+            # override files the pass reads, because reporting the
+            # defaults meant /health said thr=0.3 for a day while every
+            # pass ran at 0.05 from /persist/state/screen_thr. The one
+            # number the veto depends on was unobservable from outside
+            # the box, and the disagreement was only found by reading
+            # both by hand (2026-08-25).
+            "concepts": list(_screen_config()[0]),
+            "thr": _screen_config()[1],
         },
         # Which levers this process actually booted with. The 2026-08-16
         # capacity result was measured WITH these; a pod recreate used
@@ -713,10 +720,15 @@ def _read_line(path: str, whole: bool = False) -> str:
 _screen_turn = 0
 
 
-def _screen_params() -> tuple[str, float]:
-    """(concept for THIS pass, threshold). File first, then env, then
-    the defaults. The file may hold one concept per line."""
-    global _screen_turn
+def _screen_config() -> tuple[tuple[str, ...], float]:
+    """(every concept in the rotation, threshold), resolved the way the
+    pass resolves them: file first, then env, then the defaults. The
+    file may hold one concept per line.
+
+    Split out from `_screen_params` so /health can report what is
+    actually in force without advancing the rotation — reading it used
+    to mean skipping a concept.
+    """
     raw = _read_line(_SCREEN_CONCEPT_FILE, whole=True) or os.environ.get(
         "NEMARA_SCREEN_CONCEPT", "")
     concepts = tuple(
@@ -728,6 +740,13 @@ def _screen_params() -> tuple[str, float]:
         thr = float(thr_raw) if thr_raw else _SCREEN_THR_DEFAULT
     except ValueError:
         thr = _SCREEN_THR_DEFAULT
+    return concepts, thr
+
+
+def _screen_params() -> tuple[str, float]:
+    """(concept for THIS pass, threshold). Advances the rotation."""
+    global _screen_turn
+    concepts, thr = _screen_config()
     concept = concepts[_screen_turn % len(concepts)]
     _screen_turn += 1
     return concept, thr
