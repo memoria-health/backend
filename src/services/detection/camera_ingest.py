@@ -191,6 +191,36 @@ def compute_reid_mode(
     return "full"
 
 
+def other_patient_confirmed(
+    identity_by_patient: dict[UUID, IdentityResult],
+    patient_id: UUID,
+) -> bool:
+    """Did identity place a DIFFERENT resident of this sensor in the clip?
+
+    True only when identity actually ran, actually attributed, and saw
+    ONE person. Two people in frame means nobody knows which of them a
+    detector fired on, so this stays False and the caller alerts
+    everyone the sensor covers, as before.
+
+    Every failure mode answers False: identity down, attribution off,
+    nobody located, a crowd. The caller uses this to STOP an alert, so
+    not knowing has to mean "carry on and alert".
+    """
+    for other_id, res in identity_by_patient.items():
+        if other_id == patient_id or res is None:
+            continue
+        if not (res.reid_ran and res.attribution_ran and res.patient_in_clip):
+            continue
+        # Exactly one, not "at most one". A count of 0 alongside a lock
+        # contradicts itself, and this gate is not the place to guess
+        # which half is right — `identity_client` sets the count from
+        # the track list, so a real lock always brings a real 1.
+        if res.people_count_reid != 1:
+            continue
+        return True
+    return False
+
+
 class CameraIngest:
     """One per camera. Owns the frame buffer, the tick scheduler, and
     the per-camera lock. Lifecycle is controlled by the parent
@@ -2143,6 +2173,15 @@ class CameraIngest:
                     fields_for_patient["identity_patient_in_clip"] = (
                         per_patient.reid_ran and per_patient.patient_in_clip
                     )
+                # Whether SOMEONE ELSE on this sensor was located here.
+                # Safety detectors read it to stay quiet for the people
+                # who were not the one in the room; every other detector
+                # ignores it. Answered from the per-patient identity
+                # results this tick already gathered — the ones that,
+                # until now, were computed and then dropped.
+                fields_for_patient["identity_other_patient_confirmed"] = (
+                    other_patient_confirmed(identity_by_patient, pid)
+                )
                 result_for_patient = await maybe_promote_analysis(
                     session,
                     patient_id=pid,

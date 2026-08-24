@@ -156,3 +156,95 @@ async def test_deleting_one_patient_leaves_the_shared_sensor(
         {"c": cam},
     )).scalars().all()
     assert [str(p) for p in still_covered] == [str(b)]
+
+
+# ── Rule 1, the half that was never implemented ──────────────────────
+# "identity locates a patient -> the event is theirs" was only ever true
+# for non-safety detectors. Safety skipped the identity check entirely,
+# so a fall belonging to a located resident ALSO fired for everyone else
+# the sensor covers. Found live 2026-08-25.
+
+def _identity(*, in_clip: bool, people: int = 1, ran: bool = True,
+              attributed: bool = True):
+    from src.services.identity.result import IdentityResult
+    return IdentityResult(
+        reid_ran=ran,
+        patient_in_clip=in_clip,
+        confidence=0.74 if in_clip else 0.0,
+        best_frame_index=None,
+        face_count=0,
+        people_present_reid=people > 0,
+        people_count_reid=people,
+        attribution_ran=attributed,
+    )
+
+
+def test_a_located_resident_owns_their_own_emergency() -> None:
+    """B alone in the room, located. A must not be told A fell."""
+    from src.services.detection.camera_ingest import other_patient_confirmed
+
+    a, b = uuid4(), uuid4()
+    by_patient = {a: _identity(in_clip=False), b: _identity(in_clip=True)}
+
+    assert other_patient_confirmed(by_patient, a) is True
+    # And B, who was actually there, is unaffected — nobody else is
+    # confirmed, so B's own detectors run normally.
+    assert other_patient_confirmed(by_patient, b) is False
+
+
+def test_a_crowd_alerts_everybody() -> None:
+    """Two people in frame: which of them fell is unanswerable.
+
+    Suppressing here would drop a real fall on the strength of a lock
+    held on the person who did NOT fall.
+    """
+    from src.services.detection.camera_ingest import other_patient_confirmed
+
+    a, b = uuid4(), uuid4()
+    by_patient = {
+        a: _identity(in_clip=False, people=2),
+        b: _identity(in_clip=True, people=2),
+    }
+    assert other_patient_confirmed(by_patient, a) is False
+
+
+def test_every_uncertain_answer_stays_loud() -> None:
+    """Identity down, attribution off, or nobody located -> alert.
+
+    This gate STOPS an emergency alert, so not knowing must never be
+    mistaken for knowing.
+    """
+    from src.services.detection.camera_ingest import other_patient_confirmed
+
+    a, b = uuid4(), uuid4()
+    for other in (
+        _identity(in_clip=True, ran=False),         # identity crashed
+        _identity(in_clip=True, attributed=False),  # could not attribute
+        _identity(in_clip=False),                   # nobody located
+        _identity(in_clip=True, people=0),          # located, saw no one
+    ):
+        got = other_patient_confirmed({a: _identity(in_clip=False), b: other}, a)
+        assert got is False, other
+
+
+def test_a_solo_sensor_can_never_suppress() -> None:
+    """One covered patient means there is no "someone else" to find."""
+    from src.services.detection.camera_ingest import other_patient_confirmed
+
+    a = uuid4()
+    assert other_patient_confirmed({a: _identity(in_clip=True)}, a) is False
+
+
+def test_only_patient_scoped_safety_is_narrowed() -> None:
+    """The guard's literal shape, so an edit cannot quietly widen it.
+
+    An environment hazard is not about a person and must keep firing for
+    everyone; `anyone`-scoped detectors say so in their scope.
+    """
+    from src.services.detection import event_promotion
+
+    with open(event_promotion.__file__, encoding="utf-8") as fh:
+        body = fh.read()
+    assert 'det.category == "safety"' in body
+    assert "identity_other_patient_confirmed" in body
+    assert "other_patient_confirmed" in body

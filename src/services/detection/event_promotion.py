@@ -645,6 +645,41 @@ async def maybe_promote_analysis(
         if float(conf) < threshold:
             continue
 
+        # The fail-loud rule above is for when identity CANNOT say who
+        # it was. It is not a licence to be loud when identity CAN. A
+        # fall that identity seated on another resident of this same
+        # sensor is that resident's fall; filing it here puts one
+        # person's emergency on another person's record and phone, and
+        # the caregiver has no way to tell the difference.
+        #
+        # Found 2026-08-25: the second resident of the TV Room acted out
+        # a fall while the identity service held a continuous lock on
+        # him, and it arrived as the first resident's fall. Identity had
+        # the answer the whole time; nothing asked for it.
+        #
+        # Deliberately NARROW. `identity_other_patient_confirmed` is set
+        # only when identity ran, attributed, and saw exactly one
+        # person. A crowd, a timeout, or no lock all leave it false and
+        # the alert goes to everyone as before. Being wrong here costs a
+        # fall nobody hears about, so every uncertain case stays loud.
+        #
+        # Sits AFTER the detection and confidence checks so it can say
+        # so out loud: reaching it means the detector really did fire
+        # and this is the only thing stopping the alert. Before them it
+        # would run on every quiet tick and could not be logged.
+        if (det.subject_scope == "patient"
+                and det.category == "safety"
+                and _is_truthy_bool(
+                    detector_fields.get("identity_other_patient_confirmed"))):
+            _log.info(
+                "[event_promotion] %s fired on camera %s but identity placed "
+                "another resident of this sensor in the room, alone — not "
+                "alerting patient %s",
+                ident, camera_id, patient_id,
+            )
+            skipped.append(f"{ident}(other_patient_confirmed)")
+            continue
+
         # Continuous ("state") detectors fire ONCE PER EPISODE. An episode
         # runs from its first positive tick until positive evidence stops
         # for the exit gap; one event is filed at entry and everything
