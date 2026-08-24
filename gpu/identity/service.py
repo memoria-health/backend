@@ -553,6 +553,47 @@ def request_layer(cam_id: str, quality: str) -> None:
         log.warning("identity.layer_request_failed cam=%s", cam_id, exc_info=True)
 
 
+_paused_cache: dict = {"t": 0.0, "v": set()}
+_PAUSED_TTL_S = 8.0
+
+
+async def paused_cameras() -> set[str]:
+    """Cam-id prefixes whose analysis the user has switched off.
+
+    THE SAME RULE AS THE BACKEND. Pausing AI stops the detector worker
+    pulling video; this process holds a SECOND subscription to the same
+    camera, so leaving it running means pausing halves the bill instead
+    of ending it. Nothing here will be looked at while the flag is set,
+    and the flag is the resume signal, so there is nothing to wait for.
+
+    Polled rather than passed as a flag: `--only-cam` is fixed at launch
+    and pause state is not, and the alternative — dropping paused
+    cameras from the node roster so the supervisor stops the process —
+    costs a full model reload on resume. An unsubscribed process is
+    already ~zero GPU (the empty-room economy), so keeping it alive and
+    idle buys a fast resume for nothing.
+
+    Fails OPEN: an unreachable database must never blind a camera whose
+    user has NOT paused it.
+    """
+    now = time.time()
+    if now - _paused_cache["t"] < _PAUSED_TTL_S:
+        return _paused_cache["v"]
+    try:
+        sm = get_sessionmaker()
+        async with sm() as session:
+            from sqlalchemy import text as _sql_text
+            rows = (await session.execute(_sql_text(
+                "SELECT substr(id::text, 1, 8) FROM public.cameras "
+                " WHERE ai_paused OR disabled"
+            ))).all()
+        _paused_cache.update(t=now, v={r[0] for r in rows})
+    except Exception:  # noqa: BLE001 — never blind an unpaused camera
+        log.warning("identity.paused_lookup_failed", exc_info=True)
+        _paused_cache["t"] = now
+    return _paused_cache["v"]
+
+
 def cam_selected(only_cam: str, ident: str) -> bool:
     """Does `--only-cam` select this LiveKit participant?
 
@@ -718,15 +759,42 @@ async def _run_livekit(
     # room-disconnect handler above.
     walk_strikes: dict[str, int] = {}
     walk_max_strikes = 6
+    # Last subscription state we asked for, per camera. Transitions only.
+    _subscribed: dict[str, bool] = {}
     while True:
         await asyncio.sleep(walk_every_s)
         try:
             now = time.time()
+            paused = await paused_cameras()
             for p in list(room.remote_participants.values()):
                 if not p.identity.startswith("cam_"):
                     continue
                 cam_id = p.identity.removeprefix("cam_")
                 if not cam_selected(only_cam, p.identity):
+                    continue
+                # Pause follows the user, not the launch flags, so it is
+                # polled here rather than passed in. The walk already
+                # runs every 10s over exactly these publications, so the
+                # check costs one cached query and resume is ~10s.
+                want = cam_id[:8] not in paused
+                if _subscribed.get(cam_id) is not want:
+                    _subscribed[cam_id] = want
+                    for pub in p.track_publications.values():
+                        try:
+                            pub.set_subscribed(want)
+                        except Exception:  # noqa: BLE001 — never break the walk
+                            log.warning(
+                                "identity.pause_subscribe_failed cam=%s want=%s",
+                                cam_id, want, exc_info=True)
+                    log.info(
+                        "identity.subscription %s cam=%s",
+                        "restored" if want else "SEVERED (ai_paused)", cam_id)
+                if not want:
+                    # Nothing to police on a camera we are not pulling —
+                    # and the intake-quiet strike counter below would
+                    # otherwise read our own silence as a fault and
+                    # exit(5) into a supervisor restart loop.
+                    walk_strikes.pop(cam_id, None)
                     continue
                 sp = home.cameras.get(cam_id)
                 last_ts = (
