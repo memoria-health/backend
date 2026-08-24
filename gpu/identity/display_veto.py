@@ -26,6 +26,7 @@ binding, no pool harvest, no face checks downstream.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 
@@ -36,6 +37,23 @@ log = logging.getLogger(__name__)
 # Veto only tracks with at least this many observed frames — a 1-frame
 # flicker inside a region is not enough signal to suppress.
 _MIN_FRAMES = 2
+
+
+def _drift(boxes: list[tuple]) -> float:
+    """Largest distance the box centre travelled across its frames.
+
+    Centre rather than corners: a mask boundary flickers by a pixel or
+    two on a static object and both corners wobble with it, while the
+    centre of a genuinely still thing stays put.
+    """
+    if len(boxes) < 2:
+        return 0.0
+    cx = [(b[0] + b[2]) / 2.0 for b in boxes]
+    cy = [(b[1] + b[3]) / 2.0 for b in boxes]
+    return float(max(
+        ((x - cx[0]) ** 2 + (y - cy[0]) ** 2) ** 0.5
+        for x, y in zip(cx, cy)
+    ))
 
 
 def containment(inner, outer) -> float:
@@ -52,6 +70,12 @@ class ScreenMap:
     """Per-camera temporal union of detected display regions."""
 
     ttl_s: float = 900.0
+    # How far a box may wander and still count as furniture. Measured
+    # from the live rooms rather than guessed — see the note in
+    # veto_track_ids. Tunable because the right value depends on the
+    # camera's noise floor, and erring low only costs a phantom track
+    # while erring high can discard a person.
+    move_px: float = float(os.environ.get("NEMARA_VETO_MOVE_PX", "6"))
     containment_floor: float = 0.8
     _regions: list[tuple[tuple[float, float, float, float], float]] = field(
         default_factory=list,
@@ -89,6 +113,7 @@ class ScreenMap:
         if not live:
             return set()
         per_tid: dict[int, list[float]] = {}
+        boxes: dict[int, list[tuple]] = {}
         for rows in rows_by_frame.values():
             for row in rows:
                 tid = int(row[4])
@@ -96,11 +121,35 @@ class ScreenMap:
                        float(row[2]), float(row[3]))
                 best = max(containment(box, s) for s in live)
                 per_tid.setdefault(tid, []).append(best)
-        return {
-            tid for tid, scores in per_tid.items()
-            if len(scores) >= _MIN_FRAMES
-            and min(scores) >= self.containment_floor
-        }
+                boxes.setdefault(tid, []).append(box)
+        vetoed = set()
+        for tid, scores in per_tid.items():
+            if len(scores) < _MIN_FRAMES:
+                continue
+            if min(scores) < self.containment_floor:
+                continue
+            drift = _drift(boxes[tid])
+            if drift > self.move_px:
+                # IT MOVED, SO IT IS NOT ART. The camera has no depth —
+                # one lens, no stereo, no sensor — so a person standing
+                # against a painted wall and a face painted ON it are
+                # the same pixels, and containment alone cannot separate
+                # them. Movement can: a painting is nailed to a wall and
+                # a person cannot hold still to the pixel.
+                #
+                # Deliberately the SAFE direction. A false "it moved"
+                # keeps a real person and costs one phantom track; a
+                # false "it is art" discards a resident standing in
+                # front of their own wall, and nothing downstream would
+                # ever know they were there.
+                log.info(
+                    "reid.display_veto_spared tid=%s drift=%.1fpx "
+                    "containment=%.2f — moved, so not art",
+                    tid, drift, min(scores),
+                )
+                continue
+            vetoed.add(tid)
+        return vetoed
 
 
 def apply_veto(obs, screen_map: ScreenMap, *, now: float | None = None):
