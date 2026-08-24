@@ -59,6 +59,13 @@ os.environ["NEMARA_INTERNAL_SERVICE_KEY"] = ""
 # host.docker.internal is correct there: both mean "this Mac", from
 # where the process happens to be standing.
 os.environ["NEMARA_SUPABASE_URL"] = "http://127.0.0.1:54341"
+# NEMARA_SENSITIVITY_SCREENING_ENABLED (2026-08-25): a developer who
+# turns screening off locally — a normal thing to do while working on
+# something else — silently broke three clip-archival tests, because
+# they assert the censoring behaviour the flag governs. The suite must
+# test the shipped default (True), not whatever a laptop happens to
+# hold; a test that wants it off can override it explicitly.
+os.environ["NEMARA_SENSITIVITY_SCREENING_ENABLED"] = "true"
 
 from src.db.session import get_engine, get_sessionmaker
 from src.main import create_app
