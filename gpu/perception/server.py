@@ -327,6 +327,31 @@ _REQUIRE_GPU_FACES = os.environ.get(
 ).strip() not in ("0", "false", "")
 
 
+def _lever_on(name: str, default: str = "1") -> bool:
+    """Levers default ON since 2026-08-24, and here is why.
+
+    These were `NEMARA_EXP_*` experiment flags in the 2026-08-16
+    concurrency work, proved there, applied by patching a pod in place,
+    and never promoted. So every pod recreate silently dropped them —
+    including one today — and the fleet quietly ran a configuration that
+    had never been measured. Nothing reported the difference: capacity
+    just looked worse than the accepted result and nobody could say why.
+
+    Opt-OUT now (`NEMARA_SDP_PIN=0`), so the validated configuration is
+    what a fresh pod boots with and turning it off is a deliberate act.
+
+    The plan doc still names these `NEMARA_EXP_SDP_PIN` /
+    `NEMARA_EXP_SAM3_NO_GC`, which nothing has ever read — set those and
+    you get no lever and no error. Both spellings are accepted here so
+    following the older runbook cannot silently do nothing.
+    """
+    for env_name in (name, name.replace("NEMARA_", "NEMARA_EXP_")):
+        raw = os.environ.get(env_name, "").strip().lower()
+        if raw:
+            return raw in ("1", "true", "yes", "on")
+    return default in ("1", "true")
+
+
 @app.on_event("startup")
 def _startup() -> None:
     global _ready
@@ -339,7 +364,7 @@ def _startup() -> None:
     # ground plus a device-wide torch.cuda.empty_cache() under VRAM
     # pressure — a whole-GPU stall per ground. Stub both process-wide.
     # Needs a memory-growth soak before becoming fleet default.
-    if os.environ.get("NEMARA_SAM3_NO_GC", "").strip() in ("1", "true"):
+    if _lever_on("NEMARA_SAM3_NO_GC"):
         import gc as _gc
 
         import torch as _torch
@@ -354,7 +379,7 @@ def _startup() -> None:
     # tax). Pin all three ON once, no-op the setters; EdgeTAM's
     # flag-flipping context is neutralized in continuous._get_edge
     # (same env).
-    if os.environ.get("NEMARA_SDP_PIN", "").strip() in ("1", "true"):
+    if _lever_on("NEMARA_SDP_PIN"):
         import torch as _torch
         _torch.backends.cuda.enable_flash_sdp(True)
         _torch.backends.cuda.enable_math_sdp(True)
@@ -469,6 +494,24 @@ def health():
         # observations embedded by a different model than its enrolled
         # gallery's (review G4) — expose the name so it can check.
         "face_model": _FACE_MODEL,
+        # The display veto's health. `ok=0` with `fail>0` means every
+        # screen pass is throwing — tracking looks fine, /health said
+        # "ok", and meanwhile every TV and every framed face in the
+        # fleet is minting phantom people. That state ran undetected
+        # until 2026-08-24; it is on the surface now so a monitor can
+        # fail on it.
+        "screen_pass": {
+            "ok": _SCREEN_FAIL["ok"], "failed": _SCREEN_FAIL["n"],
+            "last_error": _SCREEN_FAIL["last"] or None,
+        },
+        # Which levers this process actually booted with. The 2026-08-16
+        # capacity result was measured WITH these; a pod recreate used
+        # to drop them silently and nobody could tell by looking.
+        "levers": {
+            "sdp_pin": _lever_on("NEMARA_SDP_PIN"),
+            "sam3_no_gc": _lever_on("NEMARA_SAM3_NO_GC"),
+            "concurrency": _PERCEPTION_CONCURRENCY,
+        },
     }
     if _sam_error or gpu_error:
         # 503, not 200-with-a-sad-body: every existing consumer (boot
@@ -553,7 +596,28 @@ async def logs(request: Request, file: str = "", tail: int = 400):
 # the incident frames — finds displays reliably; phantom containment
 # 1.0 vs patient 0.13. Compound prompts win in SAM3 grounding (same
 # lesson as the face countersign).
-_SCREEN_CONCEPT = "television, laptop, or phone screen"
+#
+# WIDENED 2026-08-24 to rendered people that are not on a screen. The
+# TV Room's wall of ~12 painted faces minted up to SEVEN phantom person
+# tracks at once (`covered=1` on every probe, so exactly one was real),
+# each flicker birthing a fresh track and paying a fresh ground —
+# measured at ~1.3s against ~130ms to propagate an existing one. That
+# is what made a second camera look like a capacity problem.
+#
+# The veto machinery does not care what kind of surface it is: a
+# rendered person is pinned inside the region on EVERY observed frame
+# while a real one crossing in front dips out within a clip. A painting
+# is more furniture than a television is, so the 120s refresh is if
+# anything too eager for it.
+#
+# Deliberately NOT "picture" or "image" alone — both ground far too
+# broadly and would swallow the room. Framed wall art is the concept.
+_SCREEN_FAIL = {"n": 0, "ok": 0, "last": ""}
+
+_SCREEN_CONCEPT = (
+    "television, laptop, or phone screen, framed painting, "
+    "framed photograph, or poster on a wall"
+)
 
 
 def _observe_sync(
@@ -801,8 +865,22 @@ def _observe_sync(
                         screen_regions.append(
                             [*(float(v) for v in bbox), float(p)],
                         )
-            except Exception:  # noqa: BLE001
-                log.exception("perception.screen_pass_failed")
+            except Exception as exc:  # noqa: BLE001
+                # COUNTED, not just logged. This threw on every attempt
+                # for an unknown length of time — `RuntimeError: No
+                # available kernel` out of the text encoder, because the
+                # SDPA pin was off and the two models were fighting over
+                # the process-global backend flags. A dead veto is
+                # invisible from outside: tracking still works, /health
+                # still says ok, and TVs and wall art quietly mint
+                # phantom people on every camera in the fleet. It rides
+                # /health now so a monitor can see it.
+                _SCREEN_FAIL["n"] += 1
+                _SCREEN_FAIL["last"] = f"{type(exc).__name__}: {exc}"[:200]
+                log.exception("perception.screen_pass_failed n=%d",
+                              _SCREEN_FAIL["n"])
+            else:
+                _SCREEN_FAIL["ok"] += 1
             screens_ms = (time.time() - t_sc) * 1000.0
         total_ms = (time.time() - t_start) * 1000.0
 

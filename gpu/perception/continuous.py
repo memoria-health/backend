@@ -177,7 +177,8 @@ def _get_edge():
         # all-on at startup the context is pure per-call overhead
         # (measured a large cadence tax), so neutralize it at the
         # module (looked up per call, so patching any time works).
-        if os.environ.get("NEMARA_SDP_PIN", "").strip() in ("1", "true"):
+        from perception.server import _lever_on as _lv
+        if _lv("NEMARA_SDP_PIN"):
             from sam2.modeling.sam import transformer as _s2t
             _s2t.sdp_kernel_context = (
                 lambda dropout_p: _contextlib.nullcontext()
