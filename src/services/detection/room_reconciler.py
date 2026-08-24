@@ -526,17 +526,6 @@ class LiveKitRoomReconciler:
         within `_liveness_grace_s`? Reads `_last_frame_at` (set by
         `CameraIngest.record_frame_arrival` from the video consumer
         callback) directly — same process, no locking required."""
-        # UNLESS WE STOPPED ASKING. A paused camera has its subscription
-        # severed to stop paying LiveKit for video nobody will look at,
-        # so no frames arrive BY OUR OWN CHOICE. The two-signal rule
-        # exists to stop "joined but not yet publishing" reading as
-        # online; it says nothing about a publisher we deliberately
-        # stopped listening to, and applying it here would flip a
-        # perfectly healthy camera to offline in the app about thirty
-        # seconds after a caregiver pressed pause. REST presence — the
-        # publisher IS in the room — is the whole truth in that case.
-        if getattr(ingest, "subscription_severed", False):
-            return True
         last_frame_at = getattr(ingest, "_last_frame_at", 0.0)
         if last_frame_at <= 0.0:
             # No frame has ever been pushed; cannot be considered live.
