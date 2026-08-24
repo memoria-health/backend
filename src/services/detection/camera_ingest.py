@@ -1033,6 +1033,22 @@ class CameraIngest:
                     captured_at=captured_at,
                 )
                 await session.commit()
+                # A camera nobody is analyzing is the STRONGEST case for
+                # the low layer, and this path was missing it. The
+                # step-down lived only in the closed-state branch below,
+                # which this `return` never reaches — so pausing AI, the
+                # one action a user takes explicitly to stop spending,
+                # left the video arriving at full rate and quietly
+                # DISABLED the bandwidth saving. Measured 2026-08-24:
+                # 2.06 GB/hr with both cameras paused, against 2.22 with
+                # one merely idle.
+                #
+                # Unlike the closed-state case there is no first-look
+                # regret to trade against: nothing will judge these
+                # frames at any resolution until the user unpauses, and
+                # unpausing runs a full tick which asks for the top layer
+                # back before it builds anything.
+                self._note_idle(True)
                 log.info(
                     "%s SKIP user-off (%s) — state preserved at %s/%s",
                     self._log_tag,
