@@ -503,6 +503,8 @@ def health():
         "screen_pass": {
             "ok": _SCREEN_FAIL["ok"], "failed": _SCREEN_FAIL["n"],
             "last_error": _SCREEN_FAIL["last"] or None,
+            "last_found": _SCREEN_FAIL["found"],
+            "concept": _SCREEN_CONCEPT, "thr": _SCREEN_THR,
         },
         # Which levers this process actually booted with. The 2026-08-16
         # capacity result was measured WITH these; a pod recreate used
@@ -612,12 +614,25 @@ async def logs(request: Request, file: str = "", tail: int = 400):
 #
 # Deliberately NOT "picture" or "image" alone — both ground far too
 # broadly and would swallow the room. Framed wall art is the concept.
-_SCREEN_FAIL = {"n": 0, "ok": 0, "last": ""}
+_SCREEN_FAIL = {"n": 0, "ok": 0, "last": "", "found": -1}
 
-_SCREEN_CONCEPT = (
+# TUNABLE, because it has to be. The pass now runs and finds NOTHING —
+# `found=0` on a bedroom frame with a large television in it — and there
+# is no baseline for the original wording on this build, since it threw
+# on every call until today. Deciding between "my longer wording diluted
+# the grounding" and "grounding was never finding these anyway" needs
+# both tried against the same live frame, and a container rebuild per
+# attempt makes that a day's work instead of ten minutes.
+#
+# The threshold is exposed for the same reason: 0.3 was chosen against a
+# laptop screen filling much of the frame, and a framed picture on a far
+# wall is a much weaker match.
+_SCREEN_CONCEPT = os.environ.get(
+    "NEMARA_SCREEN_CONCEPT",
     "television, laptop, or phone screen, framed painting, "
-    "framed photograph, or poster on a wall"
+    "framed photograph, or poster on a wall",
 )
+_SCREEN_THR = float(os.environ.get("NEMARA_SCREEN_THR", "0.3"))
 
 
 def _observe_sync(
@@ -859,7 +874,7 @@ def _observe_sync(
             t_sc = time.time()
             try:
                 for _pos, dets in sam_track.track_stream(
-                    pred, [screen_src], concept=_SCREEN_CONCEPT, thr=0.3,
+                    pred, [screen_src], concept=_SCREEN_CONCEPT, thr=_SCREEN_THR,
                 ):
                     for _tid, bbox, _m, p in dets:
                         screen_regions.append(
@@ -881,6 +896,11 @@ def _observe_sync(
                               _SCREEN_FAIL["n"])
             else:
                 _SCREEN_FAIL["ok"] += 1
+                _SCREEN_FAIL["found"] = len(screen_regions)
+                log.warning(
+                    "perception.screen_pass concept=%r thr=%.2f found=%d",
+                    _SCREEN_CONCEPT, _SCREEN_THR, len(screen_regions),
+                )
             screens_ms = (time.time() - t_sc) * 1000.0
         total_ms = (time.time() - t_start) * 1000.0
 

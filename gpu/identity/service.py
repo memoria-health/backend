@@ -449,6 +449,20 @@ async def _read_video(track: rtc.Track, cam_loop: CameraLoop) -> None:
             # probe — the camera is ~3400px wide and the 1280 ring
             # resize was crushing faces to ~22px (measured 2026-07-24:
             # probe found faces but they scored as untrustworthy).
+            # What size is ACTUALLY arriving. The overlay for one camera
+            # rendered 640 wide while another rendered 1920, and nothing
+            # in the pipeline resizes (TRACK_SEND_W is uncapped), so the
+            # difference had to be at intake — but the node's inbound
+            # bandwidth said both were on the top rung. Two measurements
+            # that cannot both be right, and no way to tell which was
+            # lying without this line. Once per size change, not per
+            # frame.
+            if bgr.shape[:2] != getattr(cam_loop, "_last_shape", None):
+                cam_loop._last_shape = bgr.shape[:2]
+                log.warning(
+                    "identity.intake_frame_size cam=%s %dx%d",
+                    cam_loop.camera_id, bgr.shape[1], bgr.shape[0],
+                )
             cam_loop.latest_native = (now, bgr)
             # Bound memory + pod upload (INTAKE_MAX_W=0 = ship native,
             # the yesterday-replica behavior).

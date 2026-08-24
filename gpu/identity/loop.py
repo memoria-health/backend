@@ -908,6 +908,16 @@ class CameraLoop:
             self.screen_map.add(
                 [r[:4] for r in obs.screen_regions], now=time.monotonic(),
             )
+            # HOW MANY did the pod actually find. `screen_pass ok` on the
+            # pod only says the call did not throw — an empty result
+            # counts as a success there, so "the check is running" and
+            # "the check found anything" looked identical from outside
+            # and the veto suppressed nothing with no way to see why.
+            log.warning(
+                "identity.screen_regions cam=%s found=%d live=%d",
+                self.camera_id, len(obs.screen_regions),
+                len(self.screen_map.live(time.monotonic())),
+            )
         obs, vetoed = apply_veto(obs, self.screen_map, now=time.monotonic())
 
         prev_boxes = {t: tv.bbox for t, tv in self.state.tracks.items()}
