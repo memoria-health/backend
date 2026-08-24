@@ -211,6 +211,7 @@ class CameraIngest:
         livekit_identity: str | None = None,
         recorder: "RecorderManager | None" = None,
         on_idle_change: "Callable[[bool], None] | None" = None,
+        on_subscribe_change: "Callable[[bool], None] | None" = None,
     ) -> None:
         self.camera_id = camera_id
         self.patient_id = patient_id
@@ -257,6 +258,12 @@ class CameraIngest:
         # subscription, and an empty room kept delivering its top layer
         # all night. None in unit harnesses = inert.
         self._on_idle_change = on_idle_change
+        # Told to drop or take back this camera's LiveKit tracks when
+        # the user pauses or resumes the AI. None in unit harnesses.
+        self._on_subscribe_change = on_subscribe_change
+        # Read by the room reconciler. While true, the absence of
+        # frames is OUR doing and must not flip `cameras.online`.
+        self.subscription_severed = False
         # Caregiver-local timezone for when_scope windows (2026-07-14).
         # Resolved once on first use and cached for the worker's life —
         # a caregiver timezone change picks up on the next worker
@@ -339,6 +346,22 @@ class CameraIngest:
         REST-presence signal to decide the column.
         """
         self._last_frame_at = monotonic_ts
+
+    def _set_subscription(self, want: bool) -> None:
+        """Take this camera's LiveKit tracks, or drop them.
+
+        Only the pause path uses this. Best-effort, like every other
+        economy here: it must never be able to end a tick.
+        """
+        if self._on_subscribe_change is None:
+            return
+        try:
+            self._on_subscribe_change(want)
+        except Exception:  # noqa: BLE001 — cost lever, not a dependency
+            log.warning(
+                "%s subscription change failed (want=%s)",
+                self._log_tag, want, exc_info=True,
+            )
 
     def _note_idle(self, idle: bool) -> None:
         """Tell the room worker whether this camera is worth full-rate
@@ -1033,22 +1056,16 @@ class CameraIngest:
                     captured_at=captured_at,
                 )
                 await session.commit()
-                # A camera nobody is analyzing is the STRONGEST case for
-                # the low layer, and this path was missing it. The
-                # step-down lived only in the closed-state branch below,
-                # which this `return` never reaches — so pausing AI, the
-                # one action a user takes explicitly to stop spending,
-                # left the video arriving at full rate and quietly
-                # DISABLED the bandwidth saving. Measured 2026-08-24:
-                # 2.06 GB/hr with both cameras paused, against 2.22 with
-                # one merely idle.
-                #
-                # Unlike the closed-state case there is no first-look
-                # regret to trade against: nothing will judge these
-                # frames at any resolution until the user unpauses, and
-                # unpausing runs a full tick which asks for the top layer
-                # back before it builds anything.
-                self._note_idle(True)
+                # SEVER, don't merely step down. A closed camera is one
+                # we are still watching — it sleeps at a lower rung so
+                # block motion can wake it from the frames still
+                # arriving. A PAUSED camera is not being watched at all:
+                # the user turned the analysis off, so no wake can come
+                # from the video, and the resume signal is the `cam` row
+                # this loop already re-reads every tick. Nothing is lost
+                # by stopping the pull, and it takes the bandwidth to
+                # zero rather than to 0.45 GB/hr.
+                self._set_subscription(False)
                 log.info(
                     "%s SKIP user-off (%s) — state preserved at %s/%s",
                     self._log_tag,
@@ -1057,6 +1074,14 @@ class CameraIngest:
                     cam.no_people_count,
                 )
                 return
+
+            # Not paused, so take the tracks back. First thing after the
+            # pause branch, not down beside the layer restore: this tick
+            # cannot analyze anything until frames are flowing again, and
+            # the buffer is cold for a few seconds either way — the
+            # `SKIP no frames in window` guard below covers exactly that
+            # and the next tick has a full window.
+            self._set_subscription(True)
 
             if cam.state == "closed":
                 # Closed-state wake — ONE authority for hint and

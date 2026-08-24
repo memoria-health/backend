@@ -258,6 +258,12 @@ class RoomWorker:
         # Last layer asked for, per publisher, so the 10s tick only
         # signals on a transition.
         self._layer_by_identity: dict[str, str] = {}
+        # The audio publication, kept for the same reason as the video
+        # one: severing a paused camera has to drop BOTH tracks or the
+        # audio lane keeps streaming on its own.
+        self._audio_pubs_by_identity: dict[str, rtc.RemoteTrackPublication] = {}
+        # True while we have deliberately dropped this camera's tracks.
+        self._severed_by_identity: dict[str, bool] = {}
         self._stopped = False
         # Supervisor task that owns the connect → wait-for-disconnect →
         # cleanup → reconnect lifecycle. Spawned by start(), cancelled
@@ -822,6 +828,64 @@ class RoomWorker:
                 continue
             await self._handle_track_subscribed(track, publication, participant)
 
+    def set_camera_subscribed(self, identity: str, want: bool) -> None:
+        """Sever this camera's tracks entirely, or take them back.
+
+        WHY SEVER RATHER THAN STEP DOWN. `request_idle_layer` below is
+        for a camera we are still WATCHING — it sleeps at a lower rung so
+        the block-motion wake authority keeps working on the frames
+        already in the buffer. A PAUSED camera is a different thing: the
+        user turned the analysis off, so no wake will ever come from the
+        video, and the resume signal is a database flag the tick loop
+        already polls every 10s. There is nothing to lose by dropping the
+        subscription and nothing to wait for. 0.45 GB/hr -> 0.
+
+        NOT a room disconnect. This worker serves every camera in an
+        account room, so leaving would take the others with it — and we
+        must stay present to be re-subscribed when the flag flips back.
+
+        The reader task is cancelled explicitly rather than left to die.
+        Unsubscribing ends the track stream WITHOUT waking a reader
+        parked on its queue (the lesson `identity/service.py`'s recovery
+        walk records), so it would hang for the whole pause; a
+        re-subscribe cancels it, but a pause can last days.
+
+        Best-effort: an economy must never be able to end a tick.
+        """
+        if self._severed_by_identity.get(identity, False) == (not want):
+            return
+        pub = self._video_pubs_by_identity.get(identity)
+        if pub is None and want:
+            return                       # nothing to take back yet
+        self._severed_by_identity[identity] = not want
+        ingest = self._ingests_by_identity.get(identity)
+        if ingest is not None:
+            # Read by the reconciler: no frames is our own doing, not the
+            # camera's, so it must not flip `cameras.online` to false.
+            ingest.subscription_severed = not want
+        try:
+            for p in (pub, self._audio_pubs_by_identity.get(identity)):
+                if p is not None:
+                    p.set_subscribed(want)
+            if not want:
+                for task_map in (self._video_tasks_by_identity,
+                                 self._audio_tasks_by_identity):
+                    task = task_map.pop(identity, None)
+                    if task is not None and not task.done():
+                        task.cancel()
+                # The layer we last asked for dies with the subscription;
+                # a re-subscribe starts fresh and must re-request.
+                self._layer_by_identity.pop(identity, None)
+            log.info(
+                "room_worker.subscription %s camera=%s",
+                "restored" if want else "SEVERED (paused)", identity,
+            )
+        except Exception:  # noqa: BLE001 — cost lever, not a dependency
+            log.warning(
+                "room_worker.subscription_change FAILED camera=%s want=%s",
+                identity, want, exc_info=True,
+            )
+
     def request_idle_layer(self, identity: str, idle: bool) -> None:
         """Step this camera's subscribed layer down while it is closed.
 
@@ -987,6 +1051,7 @@ class RoomWorker:
                 self.room_name, ingest.camera_id, identity,
             )
         elif track.kind == rtc.TrackKind.KIND_AUDIO:
+            self._audio_pubs_by_identity[identity] = publication
             prev = self._audio_tasks_by_identity.get(identity)
             if prev is not None and not prev.done():
                 prev.cancel()
@@ -1006,7 +1071,9 @@ class RoomWorker:
         if ingest is None:
             return
         self._video_pubs_by_identity.pop(identity, None)
+        self._audio_pubs_by_identity.pop(identity, None)
         self._layer_by_identity.pop(identity, None)
+        self._severed_by_identity.pop(identity, None)
         for task_map in (self._video_tasks_by_identity, self._audio_tasks_by_identity):
             task = task_map.pop(identity, None)
             if task is not None and not task.done():
@@ -1322,6 +1389,9 @@ class RoomWorker:
             on_idle_change=lambda idle, ident=identity: (
                 self.request_idle_layer(ident, idle)
             ),
+            on_subscribe_change=lambda want, ident=identity: (
+                self.set_camera_subscribed(ident, want)
+            ),
         )
         await ingest.start()
         self._ingests_by_identity[identity] = ingest
@@ -1363,7 +1433,9 @@ class RoomWorker:
         # the asyncio tasks and they'd keep trying to write to the now-
         # stopped ingest's buffers (harmless but noisy).
         self._video_pubs_by_identity.pop(identity, None)
+        self._audio_pubs_by_identity.pop(identity, None)
         self._layer_by_identity.pop(identity, None)
+        self._severed_by_identity.pop(identity, None)
         for task_map in (self._video_tasks_by_identity, self._audio_tasks_by_identity):
             task = task_map.pop(identity, None)
             if task is not None and not task.done():
