@@ -25,8 +25,10 @@ binding, no pool harvest, no face checks downstream.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import pathlib
 import time
 from dataclasses import dataclass, field
 
@@ -200,6 +202,47 @@ class ScreenMap:
             )
             vetoed.add(tid)
         return vetoed
+
+
+def load_regions(path: str) -> list[tuple[tuple[float, ...], str]]:
+    """Regions remembered from a previous run of this process.
+
+    These are FURNITURE — a television and a painting are in the same
+    place after a restart as before it — but the map lived only in
+    memory, so every restart began blind and re-tracked every painted
+    face on the wall until the next search two minutes later. Tracks
+    born in that window then live on. Measured 2026-08-24: seven
+    phantom tracks, all with the same 17.6s age, seconds after a
+    restart.
+
+    Restarts are not rare and are not all deliberate: the pod-progress
+    watchdog exits rc=4 on its own several times a day.
+    """
+    try:
+        raw = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    out = []
+    for row in raw[:16]:
+        try:
+            box = tuple(float(v) for v in row["box"][:4])
+            if len(box) == 4:
+                out.append((box, str(row.get("kind", KIND_STATIC))))
+        except (TypeError, KeyError, ValueError):
+            continue
+    return out
+
+
+def save_regions(path: str, regions) -> None:
+    """Best-effort: losing the file costs one blind window, never a tick."""
+    try:
+        tmp = f"{path}.tmp"
+        pathlib.Path(tmp).write_text(json.dumps([
+            {"box": list(box), "kind": kind} for box, kind in regions
+        ]), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        log.warning("display_veto.save_failed path=%s", path, exc_info=True)
 
 
 def apply_veto(obs, screen_map: ScreenMap, *, now: float | None = None):

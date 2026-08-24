@@ -32,6 +32,7 @@ from identity.gallery import CrossClipBodyGallery
 from identity.body_embeddings import extract_body_embedding
 from identity.display_veto import (
     KIND_SCREEN, KIND_STATIC, ScreenMap, apply_veto,
+    load_regions, save_regions,
 )
 from identity.matching import topk_mean_cosine_match
 from identity.wire import RemoteObservations
@@ -604,7 +605,18 @@ class CameraLoop:
         self.camera_id = camera_id
         self.home = home
         self.state = CameraState(camera_id=camera_id)
+        # Furniture survives a restart, so the regions do too. Without
+        # this, every restart begins blind and re-tracks every painted
+        # face until the next search two minutes later — and the tracks
+        # born in that window live on. Restarts are not all deliberate:
+        # the pod watchdog exits on its own several times a day.
+        self._screen_path = os.path.join(
+            os.environ.get("NEMARA_STATE_DIR", "/persist/state"),
+            f"screen_regions_{camera_id}.json",
+        )
         self.screen_map = ScreenMap()
+        for _box, _kind in load_regions(self._screen_path):
+            self.screen_map.add([_box], kind=_kind)
         self.ring: list[tuple[int, float, np.ndarray]] = []  # fed by intake
         # Frame idx is OWNED HERE, not by the intake reader — a LiveKit
         # re-subscribe spawns a fresh reader, and a reader-local counter
@@ -933,6 +945,10 @@ class CameraLoop:
             # counts as a success there, so "the check is running" and
             # "the check found anything" looked identical from outside
             # and the veto suppressed nothing with no way to see why.
+            save_regions(
+                self._screen_path,
+                self.screen_map.live_kinds(time.monotonic()),
+            )
             log.warning(
                 "identity.screen_regions cam=%s kind=%s found=%d live=%d",
                 self.camera_id, _kind, len(obs.screen_regions),

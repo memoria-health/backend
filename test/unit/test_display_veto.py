@@ -177,3 +177,64 @@ def test_the_containment_floor_is_above_the_measured_paintings():
     0.957-1.000, so a floor of 0.93 loses none of them — and a person
     has to be engulfed far more completely before they are at risk."""
     assert 0.93 <= ScreenMap().containment_floor <= 0.95
+
+
+# ── regions survive a restart (2026-08-24) ────────────────────────
+#
+# The map lived only in memory, so every restart began blind and
+# re-tracked every painted face on the wall until the next search two
+# minutes later — and the tracks born in that window live on. Measured:
+# seven phantom tracks, all with the same 17.6s age, seconds after a
+# restart. Restarts are not rare and not all deliberate; the pod
+# watchdog exits on its own several times a day.
+import json
+import tempfile
+from pathlib import Path
+
+from identity.display_veto import load_regions, save_regions
+
+
+def _tmp() -> str:
+    return str(Path(tempfile.mkdtemp()) / "regions.json")
+
+
+def test_regions_and_their_kinds_survive():
+    """The kind must survive too, or a television comes back as a
+    painting and a moving face on it stops being suppressed."""
+    path = _tmp()
+    m = ScreenMap()
+    m.add([(1.0, 2.0, 3.0, 4.0)], kind=KIND_SCREEN)
+    m.add([(5.0, 6.0, 7.0, 8.0)], kind=KIND_STATIC)
+    save_regions(path, m.live_kinds())
+
+    assert load_regions(path) == [
+        ((1.0, 2.0, 3.0, 4.0), KIND_SCREEN),
+        ((5.0, 6.0, 7.0, 8.0), KIND_STATIC),
+    ]
+
+
+def test_a_missing_file_is_not_an_error():
+    """First boot on a fresh node. Blind for one search interval is the
+    correct outcome; refusing to start is not."""
+    assert load_regions("/nonexistent/regions.json") == []
+
+
+def test_a_corrupt_file_is_not_an_error():
+    """A half-written file must cost one blind window, never a tick."""
+    path = _tmp()
+    Path(path).write_text("{{{ not json")
+    assert load_regions(path) == []
+
+
+def test_rows_that_make_no_sense_are_skipped_individually():
+    """One bad row must not discard the good ones alongside it."""
+    path = _tmp()
+    Path(path).write_text(json.dumps([
+        {"box": [1.0, 2.0, 3.0, 4.0], "kind": KIND_SCREEN},
+        {"box": ["x", "y"], "kind": KIND_STATIC},
+        {"nope": True},
+        {"box": [9.0, 9.0, 9.0, 9.0]},
+    ]))
+    got = load_regions(path)
+    assert got == [((1.0, 2.0, 3.0, 4.0), KIND_SCREEN),
+                   ((9.0, 9.0, 9.0, 9.0), KIND_STATIC)]
