@@ -632,7 +632,26 @@ async def _run_livekit(
             return
         cam_id = ident.removeprefix("cam_")
         if not cam_selected(only_cam, ident):
-            log.info("identity.camera_skipped cam=%s (--only-cam)", cam_id)
+            # UNSUBSCRIBE, do not merely ignore. `auto_subscribe=True`
+            # pulls every publisher in the room, and returning here only
+            # skipped the PROCESSING — the SFU kept delivering this
+            # camera's full stream to a process that dropped every frame
+            # on the floor.
+            #
+            # It is quadratic. One process per SENSOR, all in one account
+            # room, each subscribed to all N cameras = N^2 streams for N
+            # cameras. Measured 2026-08-24 with N=2: the node pulled
+            # 2,259 KB/s (~18 Mbps) where the two top layers total
+            # 9 Mbps. At N=8, the node's port capacity, that is 64
+            # streams to do the work of 8.
+            try:
+                pub.set_subscribed(False)
+                log.info(
+                    "identity.camera_unsubscribed cam=%s (--only-cam)", cam_id)
+            except Exception:  # noqa: BLE001 — never break the callback
+                log.warning(
+                    "identity.unsubscribe_failed cam=%s — still paying for "
+                    "this stream", cam_id, exc_info=True)
             return
         cam_loop = home.cameras.get(cam_id)
         if cam_loop is None:
