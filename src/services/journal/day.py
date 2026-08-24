@@ -183,8 +183,17 @@ def _sleep_spans(bed, wake, out_of_bed, tz: tzinfo) -> list[list[float]]:
     gaps: list[tuple[float, float]] = []
     for item in (out_of_bed or []):
         try:
-            gs = datetime.fromisoformat(str(item["start"]))
-            ge = datetime.fromisoformat(str(item.get("end") or item["start"]))
+            # "from"/"to" is what the summarizer writes; "start"/"end"
+            # is the older spelling still present in rows computed
+            # before 2026-08-03. Reading only the old one meant every
+            # gap raised KeyError into the except below and the band
+            # came out unbroken — a night with three wake-ups drawn as
+            # uninterrupted sleep, silently, because the fallback is
+            # the honest-looking answer (2026-08-25).
+            start_raw = item.get("from") or item.get("start")
+            end_raw = item.get("to") or item.get("end") or start_raw
+            gs = datetime.fromisoformat(str(start_raw))
+            ge = datetime.fromisoformat(str(end_raw))
             g0, g1 = hour_x(gs, tz, "noon"), hour_x(ge, tz, "noon")
             if b < g0 < w:
                 gaps.append((g0, max(g0 + 0.15, min(g1, w))))

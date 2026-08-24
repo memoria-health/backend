@@ -54,7 +54,7 @@ Pure function — no I/O, no clock reads.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Both thresholds come from ACTIGRAPHY, the clinical standard for
 # scoring sleep from the outside, validated against polysomnography.
@@ -326,6 +326,20 @@ def _merge_across_spans(
     return [(a, b) for a, b in merged]
 
 
+def _iso_utc(dt: datetime) -> str:
+    """ISO 8601 with an explicit +00:00.
+
+    This module works in NAIVE UTC, and `.isoformat()` on a naive value
+    produces a string with no offset — which every reader is then free to
+    interpret in its own zone. The `timestamptz` COLUMNS are stamped
+    through `_as_utc` for exactly this reason; the jsonb windows were
+    not, so they went out naked (2026-08-25). An iOS decoder that
+    requires an offset rejects them outright, and one that does not
+    silently shifts the whole night by the phone's zone.
+    """
+    return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).isoformat()
+
+
 def _gap(ts: list[SleepTick], a: int, b: int) -> float:
     return (ts[b].at - ts[a].at).total_seconds()
 
@@ -384,8 +398,8 @@ def summarize_night(ticks: list[SleepTick], *, window_end: datetime) -> dict:
     # a count cannot be checked against what the person remembers).
     awakenings = [
         {
-            "from": ts[prev[1]].at.isoformat(),
-            "to": ts[nxt[0]].at.isoformat(),
+            "from": _iso_utc(ts[prev[1]].at),
+            "to": _iso_utc(ts[nxt[0]].at),
             "duration_minutes": round(_gap(ts, prev[1], nxt[0]) / 60),
         }
         for prev, nxt in zip(runs, runs[1:])
@@ -398,8 +412,8 @@ def summarize_night(ticks: list[SleepTick], *, window_end: datetime) -> dict:
 
     out["sleep_windows"] = [
         {
-            "from": ts[a].at.isoformat(),
-            "to": ts[b].at.isoformat(),
+            "from": _iso_utc(ts[a].at),
+            "to": _iso_utc(ts[b].at),
             "duration_minutes": round(_gap(ts, a, b) / 60),
         }
         for a, b in runs
