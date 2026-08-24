@@ -79,6 +79,9 @@ class RemoteObservations:
     # on ticks where the backend requested one): (x0, y0, x1, y1, prob)
     # in extracted-frame pixels. Feeds the per-camera ScreenMap.
     screen_regions: tuple[tuple[float, float, float, float, float], ...] = ()
+    # Which concept found those regions. A screen can show a moving
+    # person; a painting cannot. The veto needs to tell them apart.
+    screen_concept: str = ""
     # Stateless-worker mode (2026-08-16): the camera's updated cross-
     # tick session snapshot, returned only when the request carried one.
     # The CameraLoop stores it and sends it with the next tick — that

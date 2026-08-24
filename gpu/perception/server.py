@@ -1027,6 +1027,11 @@ def _observe_sync(
                 "total": round(total_ms, 1),
             },
             "screen_regions": screen_regions,
+            # WHICH concept found them. A screen can show a moving
+            # person and a painting cannot, so the consumer must be
+            # able to tell the two kinds of region apart — see
+            # display_veto.veto_track_ids.
+            "screen_concept": (_concept if screen_src is not None else ""),
         }
         if stateless:
             # The caller owns this camera's continuity — hand back the

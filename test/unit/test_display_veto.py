@@ -97,3 +97,83 @@ def test_empty_map_is_inert():
     o = obs({0: rows((1, PHANTOM))})
     _o, dropped = apply_veto(o, m, now=10.0)
     assert dropped == set()
+
+
+# ── movement, and why a screen is different (2026-08-24) ───────────
+#
+# The camera has no depth — one lens, no stereo, no sensor — so a person
+# standing against a painted wall and a face painted ON it are the same
+# pixels. Containment alone cannot separate them, and the rule discards
+# anything sitting >=80% inside a region on every frame it is seen.
+#
+# Movement separates them: a painting is nailed to a wall. But that
+# reasoning does NOT transfer to a screen, because a screen shows people
+# who walk about — which is the 8:44 incident this whole file exists
+# for, a face on a laptop minting person tracks and parking a lock for
+# eleven minutes. So the two kinds of region are judged differently.
+import numpy as np
+
+from identity.display_veto import KIND_SCREEN, KIND_STATIC, ScreenMap
+
+_REGION = (100.0, 100.0, 400.0, 400.0)
+
+
+def _track(dx: float, tid: int = 7):
+    """A small box moving `dx` per frame, always INSIDE _REGION."""
+    return {
+        i: np.array([[150.0 + i * dx, 150.0, 200.0 + i * dx, 250.0, tid]])
+        for i in range(3)
+    }
+
+
+def _veto(kind: str, dx: float) -> bool:
+    m = ScreenMap()
+    m.add([_REGION], now=0.0, kind=kind)
+    return bool(m.veto_track_ids(_track(dx), now=1.0))
+
+
+def test_a_still_thing_inside_a_painting_is_dropped():
+    """The phantom case: painted faces on a wall, which do not move."""
+    assert _veto(KIND_STATIC, dx=0) is True
+
+
+def test_a_moving_thing_inside_a_painting_is_kept():
+    """THE guard. A person standing in front of their own artwork is
+    contained exactly like the artwork is, and discarding them is
+    silent — nothing downstream ever learns they were in the room."""
+    assert _veto(KIND_STATIC, dx=30) is False
+
+
+def test_a_moving_thing_inside_a_SCREEN_is_still_dropped():
+    """The 8:44 incident. A televised person walks about, so movement
+    proves nothing on a display and the containment rule must stand on
+    its own. Without this the movement guard would re-open the exact
+    hole this file was written to close."""
+    assert _veto(KIND_SCREEN, dx=30) is True
+
+
+def test_a_still_thing_inside_a_screen_is_dropped():
+    assert _veto(KIND_SCREEN, dx=0) is True
+
+
+def test_screen_wins_when_a_region_is_seen_as_both():
+    """Concepts are searched one per pass and can land on the same box.
+    The stricter rule has an incident behind it, so it wins."""
+    m = ScreenMap()
+    m.add([_REGION], now=0.0, kind=KIND_STATIC)
+    m.add([_REGION], now=0.0, kind=KIND_SCREEN)
+    assert bool(m.veto_track_ids(_track(30), now=1.0)) is True
+
+
+def test_the_movement_floor_is_above_measured_jitter():
+    """Static painted faces drifted 6.5-9.0px with the room EMPTY —
+    mask jitter, not motion. A floor at or below that spares the very
+    things the veto exists to drop."""
+    assert ScreenMap().move_px > 9.0
+
+
+def test_the_containment_floor_is_above_the_measured_paintings():
+    """Every painted face actually dropped in the TV Room scored
+    0.957-1.000, so a floor of 0.93 loses none of them — and a person
+    has to be engulfed far more completely before they are at risk."""
+    assert 0.93 <= ScreenMap().containment_floor <= 0.95

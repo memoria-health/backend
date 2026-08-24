@@ -38,6 +38,11 @@ log = logging.getLogger(__name__)
 # flicker inside a region is not enough signal to suppress.
 _MIN_FRAMES = 2
 
+# Region kinds. A screen shows moving content; a painting or statue
+# cannot move. That difference decides whether movement is evidence.
+KIND_SCREEN = "screen"
+KIND_STATIC = "static"
+
 
 def _drift(boxes: list[tuple]) -> float:
     """Largest distance the box centre travelled across its frames.
@@ -75,24 +80,42 @@ class ScreenMap:
     # veto_track_ids. Tunable because the right value depends on the
     # camera's noise floor, and erring low only costs a phantom track
     # while erring high can discard a person.
-    move_px: float = float(os.environ.get("NEMARA_VETO_MOVE_PX", "6"))
-    containment_floor: float = 0.8
-    _regions: list[tuple[tuple[float, float, float, float], float]] = field(
+    # MEASURED, not guessed. With the TV Room empty, static painted
+    # faces drifted 6.5-9.0px at containment 0.89-0.97 — pure mask
+    # jitter, no motion. A 6px threshold was therefore sparing the very
+    # things it exists to discard. 15px sits above that noise floor and
+    # well under any real step.
+    move_px: float = float(os.environ.get("NEMARA_VETO_MOVE_PX", "15"))
+    # 0.93, raised from 0.8 on 2026-08-24 and MEASURED rather than
+    # picked. Every painted face actually being dropped in the TV Room
+    # scored 0.957-1.000 containment — the lowest was 0.957 — so the
+    # extra margin costs nothing real while making it markedly harder
+    # for a person to be caught by accident. A perfectly still human
+    # engulfed 93% inside one painted head is not a case this room can
+    # produce; at 0.8 it was at least arguable.
+    containment_floor: float = 0.93
+    _regions: list[tuple[tuple[float, float, float, float], float, str]] = field(
         default_factory=list,
     )
 
-    def add(self, regions, now: float | None = None) -> None:
+    def add(self, regions, now: float | None = None,
+            kind: str = KIND_STATIC) -> None:
         now = time.monotonic() if now is None else now
         for r in regions:
             box = (float(r[0]), float(r[1]), float(r[2]), float(r[3]))
             # Refresh an existing region if this is essentially the
             # same display seen again; else append.
-            for i, (old, _ts) in enumerate(self._regions):
+            for i, (old, _ts, old_kind) in enumerate(self._regions):
                 if containment(box, old) > 0.7 and containment(old, box) > 0.7:
-                    self._regions[i] = (box, now)
+                    # A region seen as BOTH a screen and something static
+                    # keeps the screen kind: screens are the stricter
+                    # rule and the one with an incident behind it.
+                    keep = (KIND_SCREEN if KIND_SCREEN in (old_kind, kind)
+                            else kind)
+                    self._regions[i] = (box, now, keep)
                     break
             else:
-                self._regions.append((box, now))
+                self._regions.append((box, now, kind))
         # Bound the map — a pathological prompt can't grow it forever.
         if len(self._regions) > 16:
             self._regions = sorted(
@@ -101,7 +124,12 @@ class ScreenMap:
 
     def live(self, now: float | None = None):
         now = time.monotonic() if now is None else now
-        return [b for b, ts in self._regions if now - ts <= self.ttl_s]
+        return [b for b, ts, _k in self._regions if now - ts <= self.ttl_s]
+
+    def live_kinds(self, now: float | None = None):
+        """(box, kind) for every live region."""
+        now = time.monotonic() if now is None else now
+        return [(b, k) for b, ts, k in self._regions if now - ts <= self.ttl_s]
 
     def veto_track_ids(
         self, rows_by_frame: dict[int, np.ndarray],
@@ -109,7 +137,8 @@ class ScreenMap:
     ) -> set[int]:
         """Track ids whose EVERY observed bbox is contained in a live
         screen region."""
-        live = self.live(now)
+        kinds = self.live_kinds(now)
+        live = [b for b, _k in kinds]
         if not live:
             return set()
         per_tid: dict[int, list[float]] = {}
@@ -128,7 +157,23 @@ class ScreenMap:
                 continue
             if min(scores) < self.containment_floor:
                 continue
+            # WHICH KIND of region is this track sitting in? A SCREEN
+            # can show a person who walks about — that is the whole 8:44
+            # incident, a face on a laptop minting tracks — so movement
+            # proves nothing there and the containment rule stands alone.
+            # A painting or a statue cannot move, so movement there is
+            # real evidence of a real thing.
+            best_kind = KIND_STATIC
+            best_c = -1.0
+            for box in boxes[tid]:
+                for region, kind in kinds:
+                    c = containment(box, region)
+                    if c > best_c:
+                        best_c, best_kind = c, kind
             drift = _drift(boxes[tid])
+            if best_kind == KIND_SCREEN:
+                vetoed.add(tid)
+                continue
             if drift > self.move_px:
                 # IT MOVED, SO IT IS NOT ART. The camera has no depth —
                 # one lens, no stereo, no sensor — so a person standing
@@ -148,6 +193,11 @@ class ScreenMap:
                     tid, drift, min(scores),
                 )
                 continue
+            log.info(
+                "reid.display_veto_drop tid=%s kind=%s containment=%.3f "
+                "drift=%.1fpx",
+                tid, best_kind, min(scores), drift,
+            )
             vetoed.add(tid)
         return vetoed
 

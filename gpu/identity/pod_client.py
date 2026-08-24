@@ -357,6 +357,7 @@ def _parse_observe(j: dict) -> RemoteObservations:
             k: float(v) for k, v in j.get("timings_ms", {}).items()
         },
         screen_regions=tuple(screen_regions),
+        screen_concept=str(j.get("screen_concept", "")),
         session_state=(
             j["session_state"]
             if isinstance(j.get("session_state"), dict) else None

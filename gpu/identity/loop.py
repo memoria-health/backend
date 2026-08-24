@@ -30,7 +30,9 @@ import numpy as np
 
 from identity.gallery import CrossClipBodyGallery
 from identity.body_embeddings import extract_body_embedding
-from identity.display_veto import ScreenMap, apply_veto
+from identity.display_veto import (
+    KIND_SCREEN, KIND_STATIC, ScreenMap, apply_veto,
+)
 from identity.matching import topk_mean_cosine_match
 from identity.wire import RemoteObservations
 from identity.pod_client import SamServiceClient
@@ -906,8 +908,25 @@ class CameraLoop:
         self._last_shipped = batch[-1]
         if want_screens:
             self._screens_at = now
+            # Tag by what found them. Anything screen-like keeps the
+            # strict rule (movement proves nothing on a display); art and
+            # statues get the movement exemption, because they cannot
+            # move and a person in front of them can.
+            # getattr: older pod builds and unit fakes have no such
+            # field, and a missing concept must not break a tick.
+            # Absent means "assume static", which is the LENIENT
+            # kind — a screen wrongly treated as static merely
+            # spares a moving track for one batch, where a painting
+            # wrongly treated as a screen would discard a person.
+            _c = (getattr(obs, "screen_concept", "") or "").lower()
+            _kind = (KIND_SCREEN
+                     if ("screen" in _c or "television" in _c
+                         or "monitor" in _c or "laptop" in _c
+                         or "phone" in _c)
+                     else KIND_STATIC)
             self.screen_map.add(
                 [r[:4] for r in obs.screen_regions], now=time.monotonic(),
+                kind=_kind,
             )
             # HOW MANY did the pod actually find. `screen_pass ok` on the
             # pod only says the call did not throw — an empty result
@@ -915,8 +934,8 @@ class CameraLoop:
             # "the check found anything" looked identical from outside
             # and the veto suppressed nothing with no way to see why.
             log.warning(
-                "identity.screen_regions cam=%s found=%d live=%d",
-                self.camera_id, len(obs.screen_regions),
+                "identity.screen_regions cam=%s kind=%s found=%d live=%d",
+                self.camera_id, _kind, len(obs.screen_regions),
                 len(self.screen_map.live(time.monotonic())),
             )
         obs, vetoed = apply_veto(obs, self.screen_map, now=time.monotonic())
