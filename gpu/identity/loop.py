@@ -135,6 +135,19 @@ JPEG_QUALITY = 80
 # (encode p50 391ms at 3 cams, plus the pod's decode out of the same
 # starved cores). "jpeg" is the one-env revert: NEMARA_FRAME_WIRE=jpeg.
 FRAME_WIRE = os.environ.get("NEMARA_FRAME_WIRE", "raw").strip().lower()
+# Face harvest (2026-08-24). Learned only from a face-confirmed lock —
+# see _harvest_face. Off by a single flag if it ever misbehaves.
+FACE_HARVEST_ENABLED = os.environ.get(
+    "NEMARA_FACE_HARVEST", "1").strip() not in ("0", "false", "no")
+FACE_HARVEST_MIN_DET = float(os.environ.get("NEMARA_FACE_HARVEST_DET", "0.7"))
+FACE_HARVEST_MIN_PX = float(os.environ.get("NEMARA_FACE_HARVEST_PX", "60"))
+# Too close to a row already held = a view we have. Keeps the gallery N
+# distinct looks rather than N copies of one lock.
+FACE_HARVEST_DEDUP = float(os.environ.get("NEMARA_FACE_HARVEST_DEDUP", "0.75"))
+# Learned rows can never swamp the 25 enrolled selfies.
+FACE_HARVEST_MAX_ROWS = int(os.environ.get("NEMARA_FACE_HARVEST_MAX", "60"))
+FACE_HARVEST_MIN_GAP_S = float(os.environ.get("NEMARA_FACE_HARVEST_GAP_S", "60"))
+
 SCREEN_REFRESH_S = float(os.environ.get(
     "NEMARA_SCREEN_REFRESH_S", "120"))   # screens are furniture
 SEAT_FLOOR = 0.4               # combined-score floor to take an empty seat
@@ -627,6 +640,10 @@ class CameraLoop:
         self._overflow_warned_at = 0.0
         self._screens_at = 0.0
         self._probed_at = 0.0
+        self._face_harvested_at = 0.0
+        # Face harvests decided inside the threaded fold,
+        # written by the async loop that called it.
+        self._pending_face: list = []
         self._scanned_to = 0.0   # coverage-scan high-water mark (ring ts)
         self._pod_epoch: Optional[str] = None  # session-id-reuse guard
         # Stateless-worker mode: THIS loop owns the camera's cross-tick
@@ -1236,6 +1253,8 @@ class CameraLoop:
                 await asyncio.to_thread(
                     self._fold_probe, hits, frame, boxes, now,
                 )
+                while self._pending_face:
+                    await self._write_face(*self._pending_face.pop(0))
                 self.probe_ms = {
                     "encode": round((t_w - t_e) * 1000.0, 1),
                     "faces_wire": round((t_b - t_w) * 1000.0, 1),
@@ -1243,6 +1262,79 @@ class CameraLoop:
                 }
             except Exception:                # noqa: BLE001 — keep probing
                 log.exception("identity.probe_failed cam=%s", self.camera_id)
+
+    def _harvest_face(
+        self, patient_id: "UUID", best: "tuple | None",
+    ) -> None:
+        """Add this locked look at the patient to their face gallery.
+
+        Caller has already passed `harvest_eligible`: face-confirmed,
+        confirmed at least twice, solo in frame, track old enough. So
+        WHO this is has been settled by the strongest signal available;
+        all that is decided here is whether the sample is worth keeping.
+
+        Two rules, both borrowed from the body pool because it learned
+        them the hard way:
+
+        DIVERSITY, not repetition. A lock that lingers would otherwise
+        deposit a hundred near-identical embeddings and crowd out every
+        other view. Anything too close to a row already held is dropped.
+
+        A CAP, so the learned rows can never swamp the enrolled ones.
+        `source='selfie'` is ground truth — a human said this is them —
+        and `source='harvested'` is the system's own opinion. They stay
+        distinguishable in the table forever, so a bad run is undone by
+        deleting one source rather than by re-enrolling.
+
+        Never raises: teaching the gallery must not be able to cost a
+        probe.
+        """
+        if best is None or not FACE_HARVEST_ENABLED:
+            return
+        emb, det, px = best
+        if det < FACE_HARVEST_MIN_DET or px < FACE_HARVEST_MIN_PX:
+            return
+        now = time.monotonic()
+        if now - self._face_harvested_at < FACE_HARVEST_MIN_GAP_S:
+            return
+        matrix = self.home.face_galleries.get(patient_id)
+        if matrix is not None and matrix.size:
+            # Already have this view. `topk_mean_cosine_match` is the
+            # same comparison the matcher uses, so "too similar to keep"
+            # means the same thing here as it does there.
+            if topk_mean_cosine_match(emb, matrix).score >= FACE_HARVEST_DEDUP:
+                return
+            if int(matrix.shape[0]) >= FACE_HARVEST_MAX_ROWS:
+                return
+        self._face_harvested_at = now
+        # QUEUED, not scheduled here. `_fold_probe` runs inside
+        # asyncio.to_thread, so there is no event loop in this thread and
+        # `ensure_future` would raise — the probe's own except would then
+        # swallow it and the harvest would silently never happen. The
+        # async caller drains this straight after the fold returns.
+        self._pending_face.append((patient_id, emb, det, px))
+
+    async def _write_face(
+        self, patient_id: "UUID", emb, det: float, px: float,
+    ) -> None:
+        try:
+            from src.db.session import get_sessionmaker
+            from src.repos import face_embedding_repo
+
+            sm = get_sessionmaker()
+            async with sm() as session:
+                await face_embedding_repo.insert_harvested(
+                    session, patient_id=patient_id,
+                    embedding=emb.astype(np.float32).tobytes(),
+                    det_score=float(det),
+                )
+                await session.commit()
+            log.warning(
+                "identity.face_harvested patient=%s det=%.2f px=%.0f cam=%s",
+                str(patient_id)[:8], det, px, self.camera_id,
+            )
+        except Exception:  # noqa: BLE001 — learning must not cost a probe
+            log.warning("identity.face_harvest_failed", exc_info=True)
 
     def _fold_probe(
         self, hits: list, frame: np.ndarray, boxes: list, now: float,
@@ -1255,6 +1347,11 @@ class CameraLoop:
         covered = self.home.covered(self.camera_id)
         # (track_id, patient_id) → best (cosine, face_px) this probe.
         faces_by_key: dict[tuple[int, UUID], tuple[float, float]] = {}
+        # track_id → (embedding, det) for the best face seen this probe.
+        # Kept for the face harvest at the bottom, which learns only from
+        # a face-confirmed lock and therefore needs the embedding that
+        # was in front of it at that moment.
+        face_emb_by_tid: dict[int, tuple[np.ndarray, float, float]] = {}
         for tid, emb, px, det, cx, cy in hits:
             if tid == -1:
                 # Full-frame hit — assign to a track, never guess: it
@@ -1273,6 +1370,11 @@ class CameraLoop:
             # keeping them apart means a resident's top-K mean is
             # computed over their OWN enrollment — stacking would let a
             # crowded gallery borrow another person's best rows.
+            # Biggest face this probe wins — the harvest below wants the
+            # best look at the person, not the last one parsed.
+            keep = face_emb_by_tid.get(tid)
+            if keep is None or px > keep[2]:
+                face_emb_by_tid[tid] = (emb, det, px)
             for pid in covered:
                 matrix = self.home.face_galleries.get(pid)
                 if matrix is None or not matrix.size:
@@ -1401,6 +1503,32 @@ class CameraLoop:
                 solo=self.state.solo, track_age_s=tv.age(now=now),
                 min_age_s=HARVEST_MIN_AGE_S,
             ):
+                # FACE HARVEST — same gate, same moment, one more write.
+                #
+                # The enrolled gallery is selfies (source='selfie', 25 of
+                # them from one session) and this camera is on a wall
+                # looking down across a room. Measured on a two-minute
+                # walk: 55 face sightings, best cosine 0.39 against a
+                # ~0.40 bar, and size did not help — a 132px face scored
+                # 0.20 while a 48px one scored 0.39. That is a viewpoint
+                # gap, not a recognition failure, and no amount of extra
+                # frames or pixels closes it.
+                #
+                # A face-confirmed lock is the one moment we KNOW who
+                # this is and have their face in front of us at this
+                # camera's angle, distance and light. Learning there
+                # widens the gallery toward the walking case over days.
+                #
+                # Learned FROM A FACE LOCK, deliberately — not from the
+                # body lock that would bootstrap faster. Face is the
+                # decisive signal, so its gallery must never be taught
+                # by a weaker one; that inversion is where poisoning
+                # lives, and `harvest_eligible` (face_confirmed, two
+                # confirmations, solo, track age) is already hardened
+                # against it for the body pool.
+                self._harvest_face(seat_pid, face_emb_by_tid.get(
+                    seat.track_id))
+
                 emb = extract_body_embedding(frame_bgr=frame, bbox=tv.bbox)
                 if emb is not None:
                     # Harvest into the pool of the resident who actually
