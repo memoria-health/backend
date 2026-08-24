@@ -191,34 +191,72 @@ def compute_reid_mode(
     return "full"
 
 
-def other_patient_confirmed(
-    identity_by_patient: dict[UUID, IdentityResult],
-    patient_id: UUID,
-) -> bool:
-    """Did identity place a DIFFERENT resident of this sensor in the clip?
+# How many ticks in a row a resident must be the only person identity
+# can see before their presence is allowed to silence somebody else's
+# safety alert. Ticks are ~10s, so this is about half a minute of
+# uninterrupted solo occupancy.
+#
+# The number is the whole defence against the way this gate can kill a
+# real fall. Two residents share a room; both are tracked, so the count
+# is 2 and nothing is suppressed. One of them falls — and a fall is
+# exactly what breaks a body tracker, because the person goes from
+# upright to prone in a few frames and furniture takes them out of view
+# on the way down. Their track dies, the count drops to 1, and the
+# resident still standing looks like a clean solo confirmation. Judged
+# on that instant alone, the faller's own alert is cancelled by the
+# person who did not fall.
+#
+# A streak cannot be fooled that way: the survivor's solo run starts at
+# one tick, because every tick before the fall had two people in it.
+SOLO_TICKS_BEFORE_SUPPRESSING = 3
 
-    True only when identity actually ran, actually attributed, and saw
-    ONE person. Two people in frame means nobody knows which of them a
-    detector fired on, so this stays False and the caller alerts
-    everyone the sensor covers, as before.
+
+def note_solo_confirmations(
+    streaks: dict[UUID, int],
+    identity_by_patient: dict[UUID, IdentityResult],
+) -> dict[UUID, int]:
+    """Count the ticks in a row identity has seen each resident alone.
+
+    A resident who is located, attributed, and the only person in frame
+    extends their run by one. Anything else — a second person, a
+    timeout, no lock — resets them to zero. Residents the sensor no
+    longer covers fall out entirely, because they are not in
+    `identity_by_patient`.
+    """
+    updated: dict[UUID, int] = {}
+    for pid, res in identity_by_patient.items():
+        alone = bool(
+            res is not None
+            and res.reid_ran
+            and res.attribution_ran
+            and res.patient_in_clip
+            # Exactly one, not "at most one". A count of 0 beside a lock
+            # contradicts itself, and this is not the place to guess
+            # which half is right — `identity_client` sets the count
+            # from the track list, so a real lock brings a real 1.
+            and res.people_count_reid == 1
+        )
+        updated[pid] = (streaks.get(pid, 0) + 1) if alone else 0
+    return updated
+
+
+def other_patient_confirmed(
+    solo_streaks: dict[UUID, int],
+    patient_id: UUID,
+    min_ticks: int = SOLO_TICKS_BEFORE_SUPPRESSING,
+) -> bool:
+    """Has a DIFFERENT resident of this sensor been alone here, and for
+    long enough to be believed?
 
     Every failure mode answers False: identity down, attribution off,
-    nobody located, a crowd. The caller uses this to STOP an alert, so
-    not knowing has to mean "carry on and alert".
+    nobody located, a crowd, or a solo run that has not lasted. The
+    caller uses this to STOP an alert, so not knowing has to mean
+    "carry on and alert".
     """
-    for other_id, res in identity_by_patient.items():
-        if other_id == patient_id or res is None:
-            continue
-        if not (res.reid_ran and res.attribution_ran and res.patient_in_clip):
-            continue
-        # Exactly one, not "at most one". A count of 0 alongside a lock
-        # contradicts itself, and this gate is not the place to guess
-        # which half is right — `identity_client` sets the count from
-        # the track list, so a real lock always brings a real 1.
-        if res.people_count_reid != 1:
-            continue
-        return True
-    return False
+    return any(
+        other_id != patient_id and ticks >= min_ticks
+        for other_id, ticks in solo_streaks.items()
+    )
 
 
 class CameraIngest:
@@ -331,6 +369,13 @@ class CameraIngest:
         # Monotonic per-camera tick counter — drives the scheduler's
         # sampled duty cycle (v2 P3). Single-writer within the loop.
         self._tick_counter = 0
+        # Ticks in a row each covered resident has been the only person
+        # identity could see here. Read only by the safety gate, which
+        # will not let a resident's presence silence another resident's
+        # emergency until that run is long enough to trust. Reset to
+        # zero the moment anyone else appears; see
+        # `note_solo_confirmations`.
+        self._solo_streaks: dict[UUID, int] = {}
         # Monotonic timestamp of the most recent frame pushed into
         # `frame_buffer` (set by RoomWorker._consume_video →
         # record_frame_arrival). Read by `LiveKitRoomReconciler` to
@@ -1399,6 +1444,16 @@ class CameraIngest:
                         self._log_tag, _pid,
                     )
                     identity_by_patient[_pid] = IdentityResult.empty()
+            # Extend or reset each resident's run of being alone here,
+            # before the sticky lock is folded in below. The RAW answer
+            # is the honest one for this: the lock exists to hold a
+            # patient present through blur and track death, which is
+            # exactly the evidence a gate that CANCELS an alert must not
+            # accept. Reading it pre-lock can only shorten a run, never
+            # invent one, so it errs toward alerting.
+            self._solo_streaks = note_solo_confirmations(
+                self._solo_streaks, identity_by_patient,
+            )
             # W3 identity lock: fold this tick into the sticky lock —
             # fresh PATIENT evidence (re)enters it; a held lock rides
             # through blur/track-death and upgrades the result so every
@@ -2173,14 +2228,15 @@ class CameraIngest:
                     fields_for_patient["identity_patient_in_clip"] = (
                         per_patient.reid_ran and per_patient.patient_in_clip
                     )
-                # Whether SOMEONE ELSE on this sensor was located here.
-                # Safety detectors read it to stay quiet for the people
-                # who were not the one in the room; every other detector
-                # ignores it. Answered from the per-patient identity
-                # results this tick already gathered — the ones that,
-                # until now, were computed and then dropped.
+                # Whether SOMEONE ELSE on this sensor has been alone here
+                # long enough to be believed. Safety detectors read it to
+                # stay quiet for the people who were not the one in the
+                # room; every other detector ignores it. Answered from
+                # the per-patient identity results this tick already
+                # gathered — the ones that, until now, were computed and
+                # then dropped.
                 fields_for_patient["identity_other_patient_confirmed"] = (
-                    other_patient_confirmed(identity_by_patient, pid)
+                    other_patient_confirmed(self._solo_streaks, pid)
                 )
                 result_for_patient = await maybe_promote_analysis(
                     session,

@@ -179,17 +179,88 @@ def _identity(*, in_clip: bool, people: int = 1, ran: bool = True,
     )
 
 
+def _streaks(by_patient, ticks=1):
+    """Run the same identity answer for `ticks` ticks in a row."""
+    from src.services.detection.camera_ingest import note_solo_confirmations
+    streaks = {}
+    for _ in range(ticks):
+        streaks = note_solo_confirmations(streaks, by_patient)
+    return streaks
+
+
 def test_a_located_resident_owns_their_own_emergency() -> None:
-    """B alone in the room, located. A must not be told A fell."""
-    from src.services.detection.camera_ingest import other_patient_confirmed
+    """B alone in the room, and alone for a while. A must not be told A fell."""
+    from src.services.detection.camera_ingest import (
+        SOLO_TICKS_BEFORE_SUPPRESSING, other_patient_confirmed,
+    )
 
     a, b = uuid4(), uuid4()
     by_patient = {a: _identity(in_clip=False), b: _identity(in_clip=True)}
+    streaks = _streaks(by_patient, ticks=SOLO_TICKS_BEFORE_SUPPRESSING)
 
-    assert other_patient_confirmed(by_patient, a) is True
+    assert other_patient_confirmed(streaks, a) is True
     # And B, who was actually there, is unaffected — nobody else is
     # confirmed, so B's own detectors run normally.
-    assert other_patient_confirmed(by_patient, b) is False
+    assert other_patient_confirmed(streaks, b) is False
+
+
+def test_a_fall_that_kills_the_tracker_still_alerts() -> None:
+    """The way this gate could kill a real fall, asserted directly.
+
+    A and B share the room, so nothing is suppressed. A falls — and a
+    fall is what breaks a body tracker, because the person drops out of
+    frame geometry in a few frames. A's track dies, the count drops to
+    1, and B looks like a clean solo confirmation on that instant.
+
+    Judged on the instant alone, A's own fall alert would be cancelled
+    by the person who did not fall. The run length is what stops it: B
+    has been alone for exactly one tick.
+    """
+    from src.services.detection.camera_ingest import other_patient_confirmed
+
+    a, b = uuid4(), uuid4()
+    # Minutes of both of them in the room.
+    together = {
+        a: _identity(in_clip=True, people=2),
+        b: _identity(in_clip=True, people=2),
+    }
+    streaks = _streaks(together, ticks=30)
+    assert other_patient_confirmed(streaks, a) is False
+
+    # The tick A falls on: A's track is gone, B is the only one left.
+    from src.services.detection.camera_ingest import note_solo_confirmations
+    streaks = note_solo_confirmations(streaks, {
+        a: _identity(in_clip=False, people=1),
+        b: _identity(in_clip=True, people=1),
+    })
+    assert other_patient_confirmed(streaks, a) is False, (
+        "B being the last one standing cancelled A's fall"
+    )
+
+
+def test_a_run_of_being_alone_is_broken_by_anyone_walking_in() -> None:
+    """A long solo run does not survive company, and does not resume it."""
+    from src.services.detection.camera_ingest import (
+        SOLO_TICKS_BEFORE_SUPPRESSING, note_solo_confirmations,
+        other_patient_confirmed,
+    )
+
+    a, b = uuid4(), uuid4()
+    solo = {a: _identity(in_clip=False), b: _identity(in_clip=True)}
+    streaks = _streaks(solo, ticks=50)
+    assert other_patient_confirmed(streaks, a) is True
+
+    streaks = note_solo_confirmations(streaks, {
+        a: _identity(in_clip=True, people=2),
+        b: _identity(in_clip=True, people=2),
+    })
+    assert other_patient_confirmed(streaks, a) is False
+    # And it has to earn the run back from zero, not from 50.
+    for _ in range(SOLO_TICKS_BEFORE_SUPPRESSING - 1):
+        streaks = note_solo_confirmations(streaks, solo)
+        assert other_patient_confirmed(streaks, a) is False
+    streaks = note_solo_confirmations(streaks, solo)
+    assert other_patient_confirmed(streaks, a) is True
 
 
 def test_a_crowd_alerts_everybody() -> None:
@@ -205,14 +276,15 @@ def test_a_crowd_alerts_everybody() -> None:
         a: _identity(in_clip=False, people=2),
         b: _identity(in_clip=True, people=2),
     }
-    assert other_patient_confirmed(by_patient, a) is False
+    assert other_patient_confirmed(_streaks(by_patient, ticks=50), a) is False
 
 
 def test_every_uncertain_answer_stays_loud() -> None:
     """Identity down, attribution off, or nobody located -> alert.
 
     This gate STOPS an emergency alert, so not knowing must never be
-    mistaken for knowing.
+    mistaken for knowing. Run long enough that a short run cannot be
+    what is doing the work.
     """
     from src.services.detection.camera_ingest import other_patient_confirmed
 
@@ -223,8 +295,8 @@ def test_every_uncertain_answer_stays_loud() -> None:
         _identity(in_clip=False),                   # nobody located
         _identity(in_clip=True, people=0),          # located, saw no one
     ):
-        got = other_patient_confirmed({a: _identity(in_clip=False), b: other}, a)
-        assert got is False, other
+        streaks = _streaks({a: _identity(in_clip=False), b: other}, ticks=50)
+        assert other_patient_confirmed(streaks, a) is False, other
 
 
 def test_a_solo_sensor_can_never_suppress() -> None:
@@ -232,7 +304,8 @@ def test_a_solo_sensor_can_never_suppress() -> None:
     from src.services.detection.camera_ingest import other_patient_confirmed
 
     a = uuid4()
-    assert other_patient_confirmed({a: _identity(in_clip=True)}, a) is False
+    streaks = _streaks({a: _identity(in_clip=True)}, ticks=50)
+    assert other_patient_confirmed(streaks, a) is False
 
 
 def test_only_patient_scoped_safety_is_narrowed() -> None:
