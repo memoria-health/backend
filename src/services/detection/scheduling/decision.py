@@ -36,6 +36,7 @@ from uuid import UUID
 from sqlalchemy import Float, and_, cast, func, select
 
 from src.db.analysis import Analysis
+from src.services.camera_coverage import covered_cameras
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -154,7 +155,7 @@ async def qualifying_tick_count(
     counting implementation for state entry AND (flag-on) absence:
     one query to soak, one to trust."""
     preds = [
-        Analysis.patient_id == patient_id,
+        Analysis.camera_id.in_(covered_cameras(patient_id)),
         Analysis.captured_at >= since,
         Analysis.captured_at < before,
         Analysis.detector_fields[detected_field].astext == "true",

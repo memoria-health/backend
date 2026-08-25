@@ -13,10 +13,11 @@ from uuid import UUID, uuid4
 
 import numpy as np
 from httpx import AsyncClient
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.services.identity.embeddings import embedding_to_bytes
-from test.conftest import mint_test_jwt
+from test.conftest import mint_test_jwt, seed_camera
 
 _PATIENT_BODY = {
     "full_name": "Maggie",
@@ -44,50 +45,41 @@ async def _setup_patient_with_camera(
         "/v1/patients", headers=headers, json=_PATIENT_BODY,
     )).json()
     patient_id = UUID(p["id"])
-    from sqlalchemy import insert
-
-    from src.db.camera import Camera
-    camera_id = uuid4()
-    await session.execute(
-        insert(Camera).values(
-            id=camera_id,
-            patient_id=patient_id,
-            display_id=1,
-            room="Test Room",
-            icon_name="bed.double",
-            online=True,
-            api_key_hash="test_hash",
-            livekit_identity=f"cam_{camera_id.hex[:8]}",
-            state="open",
-            no_people_count=0,
-            close_threshold=6,
-            state_changed_at=datetime.now(timezone.utc),
-            disabled=False,
-            desired_state="connected",
-            created_at=datetime.now(timezone.utc),
-        )
+    camera_id = await seed_camera(
+        session, patient_id=patient_id, caregiver_id=uid,
+        room="Test Room", icon_name="bed.double", online=True,
+        api_key_hash="test_hash", state="open", no_people_count=0,
+        close_threshold=6, state_changed_at=datetime.now(timezone.utc),
+        disabled=False, desired_state="connected",
     )
-    await session.commit()
+    # seed_camera writes the camera->patient link too — coverage is what
+    # the account view and the identity gate read, not cameras.patient_id.
     return patient_id, camera_id
 
 
-async def _enroll_face(session, patient_id) -> None:
-    """Give a home a usable face enrollment.
+async def _share_camera_with_another_patient(session, camera_id, patient_id) -> UUID:
+    """Make a camera cover a SECOND patient.
 
-    The fail-quiet identity gate only ARMS for a home that can actually
-    identify someone (2026-08-19). Tests asserting that an unconfirmed
-    person is suppressed must therefore enroll first — otherwise they are
-    asserting the pre-fix behaviour, where an unenrolled household had
-    every routine detector silenced forever by a confirmation that could
-    never arrive.
+    The fail-quiet identity gate arms only where a camera watches more
+    than one person — that is the only case where an unattributed routine
+    event could land on the wrong record.
     """
-    from sqlalchemy import text
+    other = uuid4()
     await session.execute(
         text(
-            "INSERT INTO public.patient_face_embeddings "
-            "  (patient_id, embedding, det_score, source, status) "
-            "VALUES (:p, :e, 0.99, 'selfie', 'ready')"
+            "INSERT INTO public.patients "
+            "  (id, caregiver_id, full_name, preferred_name, relation) "
+            "SELECT :o, caregiver_id, 'Housemate', 'Housemate', 'other' "
+            "  FROM public.patients WHERE id = :p"
         ),
-        {"p": patient_id, "e": b"\x00" * 2048},
+        {"o": other, "p": patient_id},
+    )
+    await session.execute(
+        text(
+            "INSERT INTO public.camera_patients (camera_id, patient_id) "
+            "VALUES (:c, :o) ON CONFLICT DO NOTHING"
+        ),
+        {"c": camera_id, "o": other},
     )
     await session.commit()
+    return other

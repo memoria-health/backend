@@ -17,6 +17,8 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from test.conftest import seed_camera
+
 from src.api import event_gate as api_gate
 from src.services import event_gate, pager
 from src.settings import Settings
@@ -473,10 +475,9 @@ async def test_tick_reject_stamps_the_analysis_row(
         """insert into patients (id, caregiver_id, full_name, preferred_name, relation)
            values (:p, :c, 'Tick Test', 'Tick', 'parent')"""),
         {"p": str(pid := uuid4()), "c": str(cid)})
-    await session.execute(sa_text(
-        """insert into cameras (id, patient_id, display_id, room, api_key_hash)
-           values (:id, :p, 91, 'Test', 'x')"""),
-        {"id": str(cam_id), "p": str(pid)})
+    await seed_camera(
+        session, patient_id=pid, camera_id=cam_id, display_id=91,
+        room="Test", api_key_hash="x")
     await session.execute(sa_text(
         """insert into analyses (camera_id, patient_id, caregiver_id, provider,
                                  description, detector_fields, captured_at,

@@ -50,11 +50,11 @@ exactly the frames the model judged** — that is the point, keep it.
 - `src/services/review_gate.py` — the gate itself
 - `src/api/review.py` — `GET /v1/review/queue`, `POST /v1/review/{id}`,
   `POST /v1/review/toggle`, `POST /v1/review/device`
-- `scripts/apply_review_gate_delta.sql` — `patients.require_review`,
+- `scripts/deltas/apply_review_gate_delta.sql` — `patients.require_review`,
   `events.review_gate`, `events.review_clip_key`, `review_devices` table
 - Fast-path clip upload in `src/services/clip_archival.py`
 - RLS on `review_devices` — **added 2026-08-03**, see
-  `scripts/apply_rls_sleep_activity_review_delta.sql`. That table holds APNs
+  `scripts/deltas/apply_rls_sleep_activity_review_delta.sql`. That table holds APNs
   tokens and shipped without RLS; do not undo it.
 
 ---
@@ -104,7 +104,7 @@ especially for private rooms. That is a product decision, not yours to assume.
 ## Verification
 
 1. `.venv/bin/pytest test/unit -q` — baseline **996 passed, 0 failed, 0 errors**. A clean suite is the bar — anything failing is yours.
-2. Apply `scripts/apply_review_gate_delta.sql` locally (it has **not** run on
+2. Apply `scripts/deltas/apply_review_gate_delta.sql` locally (it has **not** run on
    prod — it is one of 23 pending deltas).
 3. Full loop by hand: turn `require_review` on for one patient → fire a detector
    → confirm the event holds → confirm a push actually arrives (this is the bit

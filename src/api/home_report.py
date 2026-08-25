@@ -101,7 +101,9 @@ async def home_report(
         {"cg": str(auth.id)})).all()
     for pid, name in pats:
         cams = (await session.execute(text(
-            "select room, online, ai_paused, livekit_identity from cameras where patient_id=:p and not disabled"),
+            "select room, online, ai_paused, livekit_identity from cameras"
+            " where id in (select camera_id from public.camera_patients"
+            "               where patient_id = :p) and not disabled"),
             {"p": str(pid)})).all()
         events = (await session.execute(text(
             """select title, occurred_at at time zone :tz, reviewed from events
@@ -112,7 +114,7 @@ async def home_report(
         seen = (await session.execute(text(
             """select max(captured_at) filter (where people_present) at time zone :tz,
                       max(captured_at) at time zone :tz
-               from analyses where patient_id=:p"""),
+               from analyses where camera_id in (select camera_id from public.camera_patients where patient_id = :p)"""),
             {"p": str(pid), "tz": body.timezone})).first()
         week = (await session.execute(text(
             """select initcap(replace(lower(title),'possible ','')), count(*)::int
@@ -122,7 +124,8 @@ async def home_report(
         act_rows = (await session.execute(text(
             """select (captured_at at time zone :tz)::date, count(*),
                       round(100.0*avg((motion_in_clip and people_present)::int))
-               from analyses where patient_id=:p and captured_at > now() - interval '3 days'
+               from analyses where camera_id in (select camera_id from public.camera_patients where patient_id = :p)
+                 and captured_at > now() - interval '3 days'
                group by 1 order by 1 desc"""), {"p": str(pid), "tz": body.timezone})).all()
         def _label(ticks: int, pct: float) -> str | None:
             # deterministic, honest label — the model must not interpret numbers

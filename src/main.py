@@ -52,6 +52,8 @@ class _AccessLogQuietFilter(logging.Filter):
 
 logging.getLogger("uvicorn.access").addFilter(_AccessLogQuietFilter())
 
+log = logging.getLogger(__name__)
+
 # Register every ORM model in SQLAlchemy metadata at startup so foreign
 # keys resolve when the first INSERT/SELECT runs. Imported for side
 # effects only.
@@ -92,7 +94,6 @@ from src.db import event as _event  # noqa: F401
 from src.db import feedback as _feedback  # noqa: F401
 from src.db import patient as _patient  # noqa: F401
 from src.db import patient_face_embedding as _patient_face_embedding  # noqa: F401
-from src.db import pi_discovery as _pi_discovery  # noqa: F401
 from src.db.session import get_engine, get_sessionmaker
 from src.services import clip_archival, email, event_gate, pager, push
 from src.services.data_collection import manager as recorder_manager
@@ -101,6 +102,7 @@ from src.services.detection.presence_sweeper import PresenceSweeper
 from src.services.identity.fleet_watch import FleetWatch
 from src.services.detection.worker import DetectorWorker
 from src.services.scheduling.scheduler import ScheduledDetectorRunner
+from src.services.summaries.nightly import NightlySummaryRunner
 from src.settings import get_settings
 
 
@@ -178,6 +180,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.scheduler = scheduler
     await scheduler.start()
+    # Sleep and activity fire no events, so nothing in the alerting path
+    # carries them anywhere. This is their only route to a caregiver: a
+    # row per night, re-folded every half hour so the night in progress
+    # is already there at 03:00 and finished by breakfast. It ran by
+    # hand until 2026-08-25, which meant seven nights were collected and
+    # never summarised without anything appearing to fail.
+    summaries = NightlySummaryRunner(sessionmaker=get_sessionmaker())
+    app.state.summaries = summaries
+    if get_settings().nightly_summaries_enabled:
+        await summaries.start()
+    else:
+        log.warning(
+            "[summaries] nightly fold DISABLED — the sleep detector cannot "
+            "yet separate real sleep from stray verdicts, and a wrong night "
+            "is worse than no night. Set NEMARA_NIGHTLY_SUMMARIES_ENABLED=1 "
+            "to re-enable.",
+        )
     # `cameras.online` is now owned by each `RoomWorker`'s
     # `LiveKitRoomReconciler` (see room_reconciler.py). The standalone
     # `StaleOnlineSweeper` was removed because REST polling produces
@@ -228,6 +247,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await fleet_watch.stop()
         await gate_sweeper.stop()
         await presence_sweeper.stop()
+        await summaries.stop()
         await scheduler.stop()
         await worker.stop()
         await push.close()

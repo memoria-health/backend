@@ -30,9 +30,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hmac
 import logging
 import os
+import pathlib
 import threading
 import time
 
@@ -64,7 +66,28 @@ app = FastAPI(title="nemara-sam-perception-v2")
 # layer and must not depend on the brain. Eight lines of hmac is a better
 # trade than that coupling. Same semantics as contract.auth_ok, including
 # "empty token disables auth" — see the boot warning below.
-_AUTH_TOKEN = os.environ.get("NEMARA_PERCEPTION_TOKEN", "").strip()
+def _load_auth_token() -> str:
+    """The shared bearer, from the environment or from a file.
+
+    The file path exists because the node's env is fixed at container
+    start and the entrypoint sources nothing from the volume — so setting
+    this via RunPod means recycling the pod, while the dev-code overlay
+    can ship code in seconds. A file on the shared volume can be written
+    once and picked up by the next service restart, which is what makes
+    turning auth ON not require taking the node down.
+    """
+    env = os.environ.get("NEMARA_PERCEPTION_TOKEN", "").strip()
+    if env:
+        return env
+    path = os.environ.get(
+        "NEMARA_PERCEPTION_TOKEN_FILE", "/persist/secrets/perception_token")
+    try:
+        return pathlib.Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+_AUTH_TOKEN = _load_auth_token()
 
 
 def _auth_ok(header_value: str | None) -> bool:
@@ -92,11 +115,33 @@ def _require_auth(request: Request) -> None:
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
+def _require_admin_auth(request: Request) -> None:
+    """Same, but an UNSET token refuses instead of allowing.
+
+    An empty token disabling auth is a defensible default for /observe:
+    the pod binds loopback and the tunnel is the boundary. It is not
+    defensible for a route that kills the process. With the pod on the
+    tailnet and the token unset, anything that could reach the port could
+    restart it, and the boot warning only ever mentioned /observe and
+    /faces so nobody would have known.
+
+    Fails CLOSED: no token configured means the admin surface does not
+    exist, rather than existing for everyone.
+    """
+    if not _AUTH_TOKEN:
+        raise HTTPException(
+            status_code=404,
+            detail="admin surface disabled (NEMARA_PERCEPTION_TOKEN unset)",
+        )
+    _require_auth(request)
+
+
 if not _AUTH_TOKEN:
     log.warning(
         "perception.auth_disabled — NEMARA_PERCEPTION_TOKEN is unset, so "
-        "/observe and /faces accept EVERY caller. Safe only while bound to "
-        "loopback (host=%s). Set the token before exposing this port.",
+        "/observe and /faces accept EVERY caller and the /admin routes are "
+        "refused outright. Safe only while bound to loopback (host=%s). "
+        "Set the token before exposing this port.",
         os.environ.get("PERCEPTION_HOST", "127.0.0.1"),
     )
 
@@ -283,6 +328,46 @@ _REQUIRE_GPU_FACES = os.environ.get(
 ).strip() not in ("0", "false", "")
 
 
+def _int_set(raw) -> "set[int]":
+    """Track ids off the wire. Anything malformed is simply not in the
+    set — this only ever suppresses a COUNT, so a bad value costs one
+    unnecessary re-look, never a lost person."""
+    out: "set[int]" = set()
+    if not isinstance(raw, (list, tuple)):
+        return out
+    for v in raw[:64]:
+        try:
+            out.add(int(v))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _lever_on(name: str, default: str = "1") -> bool:
+    """Levers default ON since 2026-08-24, and here is why.
+
+    These were `NEMARA_EXP_*` experiment flags in the 2026-08-16
+    concurrency work, proved there, applied by patching a pod in place,
+    and never promoted. So every pod recreate silently dropped them —
+    including one today — and the fleet quietly ran a configuration that
+    had never been measured. Nothing reported the difference: capacity
+    just looked worse than the accepted result and nobody could say why.
+
+    Opt-OUT now (`NEMARA_SDP_PIN=0`), so the validated configuration is
+    what a fresh pod boots with and turning it off is a deliberate act.
+
+    The plan doc still names these `NEMARA_EXP_SDP_PIN` /
+    `NEMARA_EXP_SAM3_NO_GC`, which nothing has ever read — set those and
+    you get no lever and no error. Both spellings are accepted here so
+    following the older runbook cannot silently do nothing.
+    """
+    for env_name in (name, name.replace("NEMARA_", "NEMARA_EXP_")):
+        raw = os.environ.get(env_name, "").strip().lower()
+        if raw:
+            return raw in ("1", "true", "yes", "on")
+    return default in ("1", "true")
+
+
 @app.on_event("startup")
 def _startup() -> None:
     global _ready
@@ -295,7 +380,7 @@ def _startup() -> None:
     # ground plus a device-wide torch.cuda.empty_cache() under VRAM
     # pressure — a whole-GPU stall per ground. Stub both process-wide.
     # Needs a memory-growth soak before becoming fleet default.
-    if os.environ.get("NEMARA_SAM3_NO_GC", "").strip() in ("1", "true"):
+    if _lever_on("NEMARA_SAM3_NO_GC"):
         import gc as _gc
 
         import torch as _torch
@@ -310,7 +395,7 @@ def _startup() -> None:
     # tax). Pin all three ON once, no-op the setters; EdgeTAM's
     # flag-flipping context is neutralized in continuous._get_edge
     # (same env).
-    if os.environ.get("NEMARA_SDP_PIN", "").strip() in ("1", "true"):
+    if _lever_on("NEMARA_SDP_PIN"):
         import torch as _torch
         _torch.backends.cuda.enable_flash_sdp(True)
         _torch.backends.cuda.enable_math_sdp(True)
@@ -318,8 +403,24 @@ def _startup() -> None:
         _torch.backends.cuda.enable_flash_sdp = lambda *a, **k: None
         _torch.backends.cuda.enable_math_sdp = lambda *a, **k: None
         _torch.backends.cuda.enable_mem_efficient_sdp = lambda *a, **k: None
+        # The setters are not the only door. On torch 2.4.1
+        # `backends.cuda.sdp_kernel` forwards to
+        # `nn.attention.sdpa_kernel`, which sets the backend list without
+        # touching the functions patched above — so EdgeTAM could still
+        # disable math SDP process-wide and a concurrent SAM3 attention
+        # found no usable kernel. Both spellings, because the deprecated
+        # one imports the new one at call time.
+        def _nullctx(*_a, **_k):
+            return contextlib.nullcontext()
+        _torch.backends.cuda.sdp_kernel = _nullctx
+        try:
+            import torch.nn.attention as _tna
+            _tna.sdpa_kernel = _nullctx
+        except ImportError:      # older torch: the new spelling is absent
+            pass
         log.warning(
-            "lever: SDPA backend flags pinned all-on, setters no-oped",
+            "lever: SDPA backend flags pinned all-on, setters AND the "
+            "sdp_kernel/sdpa_kernel context managers no-oped",
         )
     t0 = time.time()
     provider = "worker-failed"
@@ -376,16 +477,46 @@ def _startup() -> None:
     )
 
 
+def _gpu_op_ok() -> "str | None":
+    """Run one trivial op on the GPU. None on success, the error otherwise.
+
+    `torch.cuda.is_available()` asks the driver whether a device exists.
+    It keeps saying yes after the CUDA context has been poisoned — an OOM,
+    an Xid, a device-side assert — which is the failure mode that actually
+    takes a pod out. So health said `cuda: true` while every observe
+    raised, and the pod stayed in the roster being handed work it could
+    not do.
+
+    An add on two 1-element tensors plus a synchronize is enough: the
+    sync is the part that surfaces a poisoned context, because launches
+    are async and the error is only reported when we wait for it.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return "cuda_unavailable"
+    try:
+        t = torch.ones(1, device="cuda")
+        _ = (t + t).item()          # .item() syncs
+        torch.cuda.synchronize()
+    except Exception as exc:        # noqa: BLE001 — any failure is a failure
+        return f"{type(exc).__name__}: {exc}"
+    return None
+
+
 @app.get("/health")
 def health():
     import torch
 
+    gpu_error = _gpu_op_ok()
     body = {
         "status": (
-            "degraded" if _sam_error else ("ok" if _ready else "warming")
+            "degraded" if (_sam_error or gpu_error)
+            else ("ok" if _ready else "warming")
         ),
         "contract": "observe-v2",
-        "cuda": torch.cuda.is_available(),
+        # Proven by running something, not by asking the driver.
+        "cuda": gpu_error is None,
         "gpu": (
             torch.cuda.get_device_name(0)
             if torch.cuda.is_available() else None
@@ -395,12 +526,44 @@ def health():
         # observations embedded by a different model than its enrolled
         # gallery's (review G4) — expose the name so it can check.
         "face_model": _FACE_MODEL,
+        # The display veto's health. `ok=0` with `fail>0` means every
+        # screen pass is throwing — tracking looks fine, /health said
+        # "ok", and meanwhile every TV and every framed face in the
+        # fleet is minting phantom people. That state ran undetected
+        # until 2026-08-24; it is on the surface now so a monitor can
+        # fail on it.
+        "screen_pass": {
+            "ok": _SCREEN_FAIL["ok"], "failed": _SCREEN_FAIL["n"],
+            "last_error": _SCREEN_FAIL["last"] or None,
+            "last_found": _SCREEN_FAIL["found"],
+            # The LIVE values, not the constants. This reads the same
+            # override files the pass reads, because reporting the
+            # defaults meant /health said thr=0.3 for a day while every
+            # pass ran at 0.05 from /persist/state/screen_thr. The one
+            # number the veto depends on was unobservable from outside
+            # the box, and the disagreement was only found by reading
+            # both by hand (2026-08-25).
+            "concepts": list(_screen_config()[0]),
+            "thr": _screen_config()[1],
+        },
+        # Which levers this process actually booted with. The 2026-08-16
+        # capacity result was measured WITH these; a pod recreate used
+        # to drop them silently and nobody could tell by looking.
+        "levers": {
+            "sdp_pin": _lever_on("NEMARA_SDP_PIN"),
+            "sam3_no_gc": _lever_on("NEMARA_SAM3_NO_GC"),
+            "concurrency": _PERCEPTION_CONCURRENCY,
+        },
     }
-    if _sam_error:
+    if _sam_error or gpu_error:
         # 503, not 200-with-a-sad-body: every existing consumer (boot
         # wait, gates, dashboards) checks with `curl -f` or status
-        # string — both must fail when the tracker cannot load.
-        body["sam_error"] = _sam_error
+        # string — both must fail when the tracker cannot load, and the
+        # same has to be true when the GPU itself is gone.
+        if _sam_error:
+            body["sam_error"] = _sam_error
+        if gpu_error:
+            body["gpu_error"] = gpu_error
         return JSONResponse(body, status_code=503)
     return body
 
@@ -419,7 +582,7 @@ _LOGDIR = os.environ.get("NEMARA_LOGDIR", "/persist/state/logs")
 async def admin_exit(request: Request) -> JSONResponse:
     """Exit(0) shortly after replying; the entrypoint supervisor
     relaunches (fresh dev code first when NEMARA_DEV_CODE=1)."""
-    _require_auth(request)
+    _require_admin_auth(request)
 
     def _die() -> None:
         time.sleep(0.3)
@@ -475,7 +638,174 @@ async def logs(request: Request, file: str = "", tail: int = 400):
 # the incident frames — finds displays reliably; phantom containment
 # 1.0 vs patient 0.13. Compound prompts win in SAM3 grounding (same
 # lesson as the face countersign).
-_SCREEN_CONCEPT = "television, laptop, or phone screen"
+#
+# WIDENED 2026-08-24 to rendered people that are not on a screen. The
+# TV Room's wall of ~12 painted faces minted up to SEVEN phantom person
+# tracks at once (`covered=1` on every probe, so exactly one was real),
+# each flicker birthing a fresh track and paying a fresh ground —
+# measured at ~1.3s against ~130ms to propagate an existing one. That
+# is what made a second camera look like a capacity problem.
+#
+# The veto machinery does not care what kind of surface it is: a
+# rendered person is pinned inside the region on EVERY observed frame
+# while a real one crossing in front dips out within a clip. A painting
+# is more furniture than a television is, so the 120s refresh is if
+# anything too eager for it.
+#
+# Deliberately NOT "picture" or "image" alone — both ground far too
+# broadly and would swallow the room. Framed wall art is the concept.
+_SCREEN_FAIL = {"n": 0, "ok": 0, "last": "", "found": -1}
+
+# TUNABLE, because it has to be. The pass now runs and finds NOTHING —
+# `found=0` on a bedroom frame with a large television in it — and there
+# is no baseline for the original wording on this build, since it threw
+# on every call until today. Deciding between "my longer wording diluted
+# the grounding" and "grounding was never finding these anyway" needs
+# both tried against the same live frame, and a container rebuild per
+# attempt makes that a day's work instead of ten minutes.
+#
+# The threshold is exposed for the same reason: 0.3 was chosen against a
+# laptop screen filling much of the frame, and a framed picture on a far
+# wall is a much weaker match.
+# ONE CONCEPT PER PASS, ROTATED — not one compound string.
+#
+# Measured 2026-08-24 on the live TV Room frame: "television" finds the
+# bedroom television; "television screen or framed picture hanging on a
+# wall" finds NOTHING, on either camera. Adding words destroyed a
+# detection that worked. The old comment here claimed compound prompts
+# win in SAM3 grounding; on this model and these frames the opposite is
+# true, so the list is the fix and each entry stays short.
+#
+# Rotated rather than run together because the pass happens INSIDE the
+# analysis call, holding the GPU slot, and costs ~0.5s. Three at once is
+# a 1.5s stall every couple of minutes on a rig whose normal step is
+# 100-500ms. One per pass costs exactly what today costs and simply
+# re-confirms each object more slowly — which is free, because these
+# things are furniture. ScreenMap's TTL is 900s against a 360s full
+# cycle at three concepts, so a region never expires mid-rotation.
+#
+# WHAT IS ACTUALLY IN THESE ROOMS (looked at the frame, 2026-08-24):
+# the TV Room's phantom faces come from ONE LARGE UNFRAMED CANVAS of
+# painted faces, not framed pictures — which is why every wording built
+# around "framed" was describing the wrong object. There are also pink
+# figurative statues on a console table, the next most likely thing to
+# be read as a person.
+# MEASURED against the live rooms, 2026-08-24. Short beats descriptive,
+# every time:
+#
+#   "television"                                        -> 1
+#   "television or computer screen"                     -> 2
+#   "painting"                                          -> 11
+#   "television screen or framed picture hanging on a wall" -> 0
+#   "painted artwork on a wall" / "mural" / "art" / "poster" -> 0
+#
+# The last two lines are why the earlier attempts failed: adding words
+# destroyed detections that a single word found, and "framed" described
+# the wrong object entirely — the TV Room's phantom faces come from ONE
+# LARGE UNFRAMED CANVAS, not framed pictures.
+#
+# "painting" also caught the one genuinely framed picture by the door,
+# which is the behaviour we want and did not have to ask for.
+#
+# "statue" was in this rotation and is gone (Aryaman 2026-08-25). It
+# never returned a region on the room's pink figurative statues in any
+# wording tried, so it spent a third of every rotation asking a question
+# with no answer and slowed the two concepts that do work. Statues going
+# unvetoed is the accepted cost.
+_SCREEN_CONCEPTS_DEFAULT = (
+    "television or computer screen",
+    "painting",
+)
+# 0.05, not 0.3. Measured on the TV Room wall 2026-08-24: at 0.3 the
+# grounding pass returned nothing and the veto never engaged, so the
+# painted faces kept generating tracks — 6-8 of them, and a pod time of
+# ~1.3s every batch. At 0.05 the same wall came back as regions, tracks
+# went to 0 and the pod to 162ms.
+#
+# The node has run 0.05 since that afternoon, written into
+# /persist/state/screen_thr by hand. This constant said 0.3 the whole
+# time, which meant the committed code and the running code disagreed
+# about the one number the feature depends on, and deleting the override
+# to "restore the defaults" would have turned the veto off (2026-08-25).
+_SCREEN_THR_DEFAULT = 0.05
+# A FILE on the shared volume, re-read per pass — same idea as
+# _load_auth_token above. The pass runs every couple of minutes and
+# "found nothing" is indistinguishable from "wrong wording" until you
+# can try another one, and a container rebuild per attempt turns a
+# ten-minute question into a day. Write one line and the next pass uses
+# it; delete the file and the default returns.
+#
+#   echo 'television or framed picture' > /persist/state/screen_concept
+#   echo '0.15'                         > /persist/state/screen_thr
+_SCREEN_CONCEPT_FILE = "/persist/state/screen_concept"
+_SCREEN_THR_FILE = "/persist/state/screen_thr"
+
+
+def _read_line(path: str, whole: bool = False) -> str:
+    try:
+        text = pathlib.Path(path).read_text(encoding="utf-8")
+        return text if whole else text.strip()
+    except OSError:
+        return ""
+
+
+# One turn counter PER CAMERA, not one for the whole process.
+#
+# A single global counter looks equivalent and is not. Each camera makes
+# one screen pass per rotation, so a shared counter hands out concepts
+# by arrival order — and when the number of cameras shares a factor with
+# the number of concepts, every camera lands on the same index forever.
+#
+# Measured 2026-08-25, and caused by this file: the rotation was
+# ("television or computer screen", "painting", "statue") with two
+# cameras. 3 and 2 are coprime, so both cameras saw all three concepts
+# over time and it worked. Dropping "statue" that morning — because it
+# never grounded anything — left 2 concepts and 2 cameras, and the
+# parity locked instantly:
+#
+#     bedroom  kind=static  every pass    (painting, forever)
+#     TV Room  kind=screen  every pass    (never painting, forever)
+#
+# The TV Room's painted faces could no longer be grounded, its regions
+# aged out (live 12 -> 11 -> 0), and the phantom people came back. The
+# concept list is now free to be any length without the camera count
+# silently deciding what each camera is allowed to look for.
+_screen_turn: dict[str, int] = {}
+
+
+def _screen_config() -> tuple[tuple[str, ...], float]:
+    """(every concept in the rotation, threshold), resolved the way the
+    pass resolves them: file first, then env, then the defaults. The
+    file may hold one concept per line.
+
+    Split out from `_screen_params` so /health can report what is
+    actually in force without advancing the rotation — reading it used
+    to mean skipping a concept.
+    """
+    raw = _read_line(_SCREEN_CONCEPT_FILE, whole=True) or os.environ.get(
+        "NEMARA_SCREEN_CONCEPT", "")
+    concepts = tuple(
+        c.strip() for c in raw.splitlines() if c.strip()
+    ) or _SCREEN_CONCEPTS_DEFAULT
+    thr_raw = _read_line(_SCREEN_THR_FILE) or os.environ.get(
+        "NEMARA_SCREEN_THR", "")
+    try:
+        thr = float(thr_raw) if thr_raw else _SCREEN_THR_DEFAULT
+    except ValueError:
+        thr = _SCREEN_THR_DEFAULT
+    return concepts, thr
+
+
+def _screen_params(camera_id: str = "default") -> tuple[str, float]:
+    """(concept for THIS camera's next pass, threshold).
+
+    Advances only THIS camera's turn, so every camera walks the whole
+    rotation regardless of how many cameras or concepts there are.
+    """
+    concepts, thr = _screen_config()
+    turn = _screen_turn.get(camera_id, 0)
+    _screen_turn[camera_id] = turn + 1
+    return concepts[turn % len(concepts)], thr
 
 
 def _observe_sync(
@@ -487,6 +817,7 @@ def _observe_sync(
     camera_id: str = "default",
     client_stamp: str = "UNSTAMPED",
     session_state: "dict | None" = None,
+    not_people: "set[int] | None" = None,
 ) -> dict:
     """The whole perception pass, run in a worker thread under
     `_perception_lock` so /health stays responsive while SAM grinds
@@ -594,6 +925,7 @@ def _observe_sync(
             session = continuous.get_session(camera_id)
         session_out = session.observe(
             imgs, person_thr=person_thr, sam_pred=pred,
+            not_people=not_people,
         )
         for pos in sorted(session_out):
             if pos >= len(pos_to_orig):
@@ -714,17 +1046,37 @@ def _observe_sync(
         screen_regions: list[list[float]] = []
         screens_ms = 0.0
         if screen_src is not None:
+            _concept, _thr = _screen_params(camera_id)
             t_sc = time.time()
             try:
                 for _pos, dets in sam_track.track_stream(
-                    pred, [screen_src], concept=_SCREEN_CONCEPT, thr=0.3,
+                    pred, [screen_src], concept=_concept, thr=_thr,
                 ):
                     for _tid, bbox, _m, p in dets:
                         screen_regions.append(
                             [*(float(v) for v in bbox), float(p)],
                         )
-            except Exception:  # noqa: BLE001
-                log.exception("perception.screen_pass_failed")
+            except Exception as exc:  # noqa: BLE001
+                # COUNTED, not just logged. This threw on every attempt
+                # for an unknown length of time — `RuntimeError: No
+                # available kernel` out of the text encoder, because the
+                # SDPA pin was off and the two models were fighting over
+                # the process-global backend flags. A dead veto is
+                # invisible from outside: tracking still works, /health
+                # still says ok, and TVs and wall art quietly mint
+                # phantom people on every camera in the fleet. It rides
+                # /health now so a monitor can see it.
+                _SCREEN_FAIL["n"] += 1
+                _SCREEN_FAIL["last"] = f"{type(exc).__name__}: {exc}"[:200]
+                log.exception("perception.screen_pass_failed n=%d",
+                              _SCREEN_FAIL["n"])
+            else:
+                _SCREEN_FAIL["ok"] += 1
+                _SCREEN_FAIL["found"] = len(screen_regions)
+                log.warning(
+                    "perception.screen_pass concept=%r thr=%.2f found=%d",
+                    _concept, _thr, len(screen_regions),
+                )
             screens_ms = (time.time() - t_sc) * 1000.0
         total_ms = (time.time() - t_start) * 1000.0
 
@@ -762,7 +1114,38 @@ def _observe_sync(
                 "screens": round(screens_ms, 1),
                 "total": round(total_ms, 1),
             },
+            # YOLO's person boxes for this tick, already NORMALISED to
+            # fractions of the frame they were measured in — a second,
+            # independent opinion on which tracks are really people.
+            # Empty means "YOLO saw nobody" AND "YOLO is unavailable";
+            # the consumer treats both as no-signal, so a dead detector
+            # degrades to the behaviour we had before this existed.
+            "person_boxes": [
+                [round(v, 5) for v in b]
+                for b in getattr(session, "person_boxes_frac", ())
+            ],
             "screen_regions": screen_regions,
+            # WHICH concept found them. A screen can show a moving
+            # person and a painting cannot, so the consumer must be
+            # able to tell the two kinds of region apart — see
+            # display_veto.veto_track_ids.
+            "screen_concept": (_concept if screen_src is not None else ""),
+            # The frame these boxes were MEASURED IN, so the consumer
+            # can normalise them without guessing.
+            #
+            # It used to guess, and got it wrong whenever the SFU
+            # changed rung: identity divided by the last size its INTAKE
+            # reader had seen, while the regions came from `imgs[-1]` of
+            # a batch that could be a different size entirely. A
+            # painting at 0.82 of a 640-wide grounding frame is pixel
+            # 525; divided by 2304 that is 0.23, so every region landed
+            # in the empty top-left of the frame and the veto covered
+            # nothing (2026-08-25, TV Room: 16 regions grounded, painted
+            # faces still tracked).
+            "screen_frame_wh": (
+                [int(screen_src.shape[1]), int(screen_src.shape[0])]
+                if screen_src is not None else None
+            ),
         }
         if stateless:
             # The caller owns this camera's continuity — hand back the
@@ -1007,6 +1390,7 @@ async def observe_raw(request: Request) -> JSONResponse:
             str(header.get("camera_id", "default")),
             client_stamp,
             _sess if isinstance(_sess, dict) else None,
+            _int_set(header.get("not_people")),
         )
     finally:
         global _last_request_ts

@@ -8,14 +8,23 @@ Two plausible candidates on an empty seat → lock neither.
 
 from __future__ import annotations
 
+from uuid import UUID
+
 from identity.seat import Candidate, update_seat
 
 FLOOR = 0.5
 DELTA = 0.1
+# `update_seat` answers "which TRACK is this person", one person at a
+# time, so every candidate here belongs to the same resident. The
+# separate "which PERSON is this track" question lives in
+# test_identity_seat_multipatient.py.
+P = UUID("11111111-1111-1111-1111-111111111111")
 
 
 def _c(cam, tid, score, anchor="face"):
-    return Candidate(camera_id=cam, track_id=tid, score=score, anchor=anchor)
+    return Candidate(
+        camera_id=cam, track_id=tid, patient_id=P, score=score, anchor=anchor,
+    )
 
 
 def _live(*keys):

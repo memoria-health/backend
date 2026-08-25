@@ -338,6 +338,14 @@ async def _archive_one(
     # compression (the old encode played frame-count/clip_fps seconds:
     # short, sped-up clips that teleported across still stretches).
     clip_ends_at = target_wall_time if post_available else pre_end_captured_at
+    # The fps the caregiver's alert clip actually plays at: frames over
+    # the clip's real wall duration, since the encode is VFR.
+    _dur = clip_ends_at - clip_frames[0].captured_at if clip_frames else 0.0
+    log.debug(
+        "clip_archival.clip_fps event=%s frames=%d dur=%.1fs fps=%.1f",
+        event_id, len(clip_frames), _dur,
+        len(clip_frames) / _dur if _dur > 0 else 0.0,
+    )
     try:
         combined_mp4 = await frames_to_vfr_mp4(
             clip_frames,

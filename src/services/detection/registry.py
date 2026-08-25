@@ -38,6 +38,10 @@ from src.services.detection.prompt import DetectorSpec, detector_spec_from_row
 # selection (stored on cameras_detectors.door_config).
 _WANDERING_IDENTIFIERS = {"wandering", "child_wandering"}
 
+# Detectors armed once per camera rather than once per patient (the setup
+# self-test). Their arming lives on `cameras.setup_test_passed_at`.
+_FIRE_ONCE_IDENTIFIERS = frozenset(catalog.fire_once_keys())
+
 
 class CameraVanishedError(ValueError):
     """The detector tick referenced a `cameras` row that no longer
@@ -108,6 +112,16 @@ async def get_enabled_loadout_for_camera(
         # This matches the app's "inactive until exit doors are set" promise;
         # the old grandfathered generic any-doorway prompt fired on every
         # room exit (2026-07-28 soak: two false events in 2.5 minutes).
+        # Setup self-test is armed PER CAMERA: it stops running on the one
+        # camera that already passed, and its restart clears the stamp.
+        # Other cameras in the home are untouched — each proves its own
+        # alert path.
+        if det.identifier in _FIRE_ONCE_IDENTIFIERS:
+            if cam.setup_test_passed_at is not None:
+                continue
+            loadout.append((detector_spec_from_row(det), det))
+            continue
+
         if det.identifier in _WANDERING_IDENTIFIERS:
             cfg = door_config or {}
             doors = cfg.get("doors") or []

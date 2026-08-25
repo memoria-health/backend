@@ -93,3 +93,26 @@ async def test_reviewed_wrong_events_do_not_reach_the_day(owned) -> None:
     out = await journal.get_journal(owned, SimpleNamespace(id=uuid4()),
                                     session, date="2026-08-15")
     assert out["coverage_hours"] == 5
+
+
+async def test_day_boundary_follows_the_patient_not_the_reader(monkeypatch) -> None:
+    """A caregiver in New York reading about a patient in California gets
+    the PATIENT's day. Before this the journal read the caregiver's zone,
+    so his day rolled over at 9pm his time."""
+    pid = uuid4()
+
+    async def find(session, patient_id, caregiver_id=None):
+        return SimpleNamespace(id=pid, timezone="America/Los_Angeles")
+
+    async def dets(session, patient_id, caregiver_id=None):
+        return []
+    monkeypatch.setattr(journal.patient_repo, "find_by_id", find)
+    monkeypatch.setattr(journal.detector_repo, "list_for_patient", dets)
+
+    session = _Session([
+        ("from caregivers", [("America/New_York",)]),
+        ("date_trunc('hour'", [{"n": 14}]),
+    ])
+    out = await journal.get_journal(
+        pid, SimpleNamespace(id=uuid4()), session, date="2026-08-15")
+    assert out["timezone"] == "America/Los_Angeles"

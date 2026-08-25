@@ -117,7 +117,7 @@ dev = [
 # `torch.cuda.is_available()` is False in the container.
 #
 # This does NOT affect the GPU box: `requirements-gpu.txt` +
-# `scripts/gpu_setup.sh` install CUDA torch from the cu124 index on
+# `scripts/pod/gpu_setup.sh` install CUDA torch from the cu124 index on
 # their own, deliberately outside this lock.
 [[tool.uv.index]]
 name = "pytorch-cpu"

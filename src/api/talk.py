@@ -126,11 +126,17 @@ async def start_talk(
         )
         raise _CAMERA_PRIVATE
 
-    room = f"patient_{patient_id}"
+    # Each sensor's OWN room. Constructing `patient_<id>` assumed one
+    # room per patient, which stopped being true when the room became the
+    # account's — a caregiver's sensors can now sit in an account room
+    # while a wall phone paired earlier is still in a patient room, and a
+    # packet addressed to the wrong one is simply never delivered. Talk
+    # is a button the caregiver pressed, so silent non-delivery is the
+    # worst available failure.
     for cam in cameras:
         await _send_talk_packet(
             settings=settings,
-            room=room,
+            room=cam.livekit_room,
             camera=cam,
             is_active=(cam.id == body.camera_id),
         )
@@ -156,10 +162,9 @@ async def end_talk(
     )
     _ensure_livekit_configured(settings)
 
-    room = f"patient_{patient_id}"
     for cam in cameras:
         await _send_talk_packet(
-            settings=settings, room=room, camera=cam, is_active=False,
+            settings=settings, room=cam.livekit_room, camera=cam, is_active=False,
         )
     log.info("talk.end closed patient_id=%s cameras=%d", patient_id, len(cameras))
 

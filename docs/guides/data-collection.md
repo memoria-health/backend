@@ -105,7 +105,7 @@ see the "Database migrations" section of [setup-hosted-stack.md](./setup-hosted-
 1. **Apply the DB delta** to prod Supabase (adds two patient columns; idempotent, additive,
    safe to re-run):
    ```bash
-   psql "<prod NEMARA_DB_URL without +asyncpg>" -f scripts/apply_data_collection_delta.sql
+   psql "<prod NEMARA_DB_URL without +asyncpg>" -f scripts/deltas/apply_data_collection_delta.sql
    ```
 2. **Set the `NEMARA_B2_*` env vars** on Railway.
 3. **Merge + deploy** the backend (`railway up`) and the two apps.
@@ -116,7 +116,7 @@ see the "Database migrations" section of [setup-hosted-stack.md](./setup-hosted-
 - Backend recorder: `src/services/data_collection/` (self-contained) + two read-only hooks
   in `src/services/detection/room_worker.py` and `src/services/detection/camera_ingest.py`.
 - The patient flag: `src/db/patient.py`, `src/schemas/patient.py`, `src/api/patients.py`,
-  `scripts/apply_data_collection_delta.sql`.
+  `scripts/deltas/apply_data_collection_delta.sql`.
 - Web consent UI: `nemara-web-app` (`DataCollectionConsentModal`, `DataCollectionSettings`).
 - iOS consent UI: `nemara-caregiver-app` (`DataCollectionConsentSheet`, `DataCollectionCard`).
 

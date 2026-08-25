@@ -32,7 +32,7 @@ import typer
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from scripts import seed
+from scripts.seed import seed
 from src.db.camera import Camera
 from src.db.caregiver import Caregiver
 from src.db.detector import Detector
@@ -107,7 +107,7 @@ async def _find_detector(
 @app.command()
 def reset() -> None:
     """Wipe the demo caregiver's patients and re-seed Jane + Maggie."""
-    typer.echo("[e2e] reseeding via scripts.seed.main()...")
+    typer.echo("[e2e] reseeding via scripts.seed.seed.main()...")
     _run(seed.main())
     typer.secho("[e2e] reset complete.", fg=typer.colors.GREEN)
 
@@ -146,6 +146,7 @@ def fire_event(
             event = Event(
                 id=uuid4(),
                 patient_id=p.id,
+                caregiver_id=p.caregiver_id,
                 detector_id=None,
                 camera_id=None,
                 category=category,
@@ -340,8 +341,8 @@ def add_patient(
             )
             session.add(patient)
             await session.flush()
-            # Auto-seed preset detectors so the new patient has the same
-            # starter set the iOS app expects.
+            # Seeds only the hidden setup self-test — visible detectors are
+            # picked from the library, so this patient starts with none.
             from src.services import onboarding
             await onboarding.seed_detectors_for_patient(session, patient.id)
             await session.commit()

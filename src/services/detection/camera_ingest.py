@@ -32,19 +32,22 @@ import time
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from src.db.camera import Camera
 from src.db.caregiver import Caregiver
 from src.db.patient import Patient
-from src.services import clip_archival, email, event_gate, push
+from src.services import (
+    camera_coverage, clip_archival, email, event_gate, patient_tz, push,
+)
 from src.services.detection.analyses_store import add_analysis
 from src.services.detection.audio_buffer import AudioBuffer
 from src.services.detection.event_promotion import maybe_promote_analysis
 from src.services.detection.frame_buffer import FrameBuffer
 from src.services.detection.id_evidence import dump_id_evidence
+from src.services.detection import sleep_clips
 from src.services.detection.ingress_meter import IngressMeter
 from src.services.detection.motion import (
     BlockMotion,
@@ -68,7 +71,9 @@ from src.services.detection.scheduling import (
     resolve_dims,
     resolve_due,
 )
-from src.services.detection.scheduling.executor import run_scheduled_calls
+from src.services.detection.scheduling.executor import (
+    ConfirmBudget, run_scheduled_calls,
+)
 from src.services.detection.signals.tick_signals import TickSignals, compute_tick_signals
 from src.services.detection.speech_filter import sanitize_speech_fields
 from src.services.detection.vlm_routing import resolve_vlm_provider, run_vlm
@@ -188,6 +193,74 @@ def compute_reid_mode(
     return "full"
 
 
+# How many ticks in a row a resident must be the only person identity
+# can see before their presence is allowed to silence somebody else's
+# safety alert. Ticks are ~10s, so this is about half a minute of
+# uninterrupted solo occupancy.
+#
+# The number is the whole defence against the way this gate can kill a
+# real fall. Two residents share a room; both are tracked, so the count
+# is 2 and nothing is suppressed. One of them falls — and a fall is
+# exactly what breaks a body tracker, because the person goes from
+# upright to prone in a few frames and furniture takes them out of view
+# on the way down. Their track dies, the count drops to 1, and the
+# resident still standing looks like a clean solo confirmation. Judged
+# on that instant alone, the faller's own alert is cancelled by the
+# person who did not fall.
+#
+# A streak cannot be fooled that way: the survivor's solo run starts at
+# one tick, because every tick before the fall had two people in it.
+SOLO_TICKS_BEFORE_SUPPRESSING = 3
+
+
+def note_solo_confirmations(
+    streaks: dict[UUID, int],
+    identity_by_patient: dict[UUID, IdentityResult],
+) -> dict[UUID, int]:
+    """Count the ticks in a row identity has seen each resident alone.
+
+    A resident who is located, attributed, and the only person in frame
+    extends their run by one. Anything else — a second person, a
+    timeout, no lock — resets them to zero. Residents the sensor no
+    longer covers fall out entirely, because they are not in
+    `identity_by_patient`.
+    """
+    updated: dict[UUID, int] = {}
+    for pid, res in identity_by_patient.items():
+        alone = bool(
+            res is not None
+            and res.reid_ran
+            and res.attribution_ran
+            and res.patient_in_clip
+            # Exactly one, not "at most one". A count of 0 beside a lock
+            # contradicts itself, and this is not the place to guess
+            # which half is right — `identity_client` sets the count
+            # from the track list, so a real lock brings a real 1.
+            and res.people_count_reid == 1
+        )
+        updated[pid] = (streaks.get(pid, 0) + 1) if alone else 0
+    return updated
+
+
+def other_patient_confirmed(
+    solo_streaks: dict[UUID, int],
+    patient_id: UUID,
+    min_ticks: int = SOLO_TICKS_BEFORE_SUPPRESSING,
+) -> bool:
+    """Has a DIFFERENT resident of this sensor been alone here, and for
+    long enough to be believed?
+
+    Every failure mode answers False: identity down, attribution off,
+    nobody located, a crowd, or a solo run that has not lasted. The
+    caller uses this to STOP an alert, so not knowing has to mean
+    "carry on and alert".
+    """
+    return any(
+        other_id != patient_id and ticks >= min_ticks
+        for other_id, ticks in solo_streaks.items()
+    )
+
+
 class CameraIngest:
     """One per camera. Owns the frame buffer, the tick scheduler, and
     the per-camera lock. Lifecycle is controlled by the parent
@@ -207,6 +280,7 @@ class CameraIngest:
         reid: IdentityProvider,
         livekit_identity: str | None = None,
         recorder: "RecorderManager | None" = None,
+        on_idle_change: "Callable[[bool], None] | None" = None,
     ) -> None:
         self.camera_id = camera_id
         self.patient_id = patient_id
@@ -246,6 +320,13 @@ class CameraIngest:
         # Retained for log identification; the actual reaper for a
         # vanished camera lives in `LiveKitRoomReconciler`.
         self._livekit_identity = livekit_identity
+        # Told on every tick whether this camera is idle, so the room
+        # worker can step the SUBSCRIBED simulcast layer down while
+        # nothing is being analyzed. Skipping the VLM call saved the
+        # model cost but not the bandwidth — LiveKit bills the
+        # subscription, and an empty room kept delivering its top layer
+        # all night. None in unit harnesses = inert.
+        self._on_idle_change = on_idle_change
         # Caregiver-local timezone for when_scope windows (2026-07-14).
         # Resolved once on first use and cached for the worker's life —
         # a caregiver timezone change picks up on the next worker
@@ -290,6 +371,22 @@ class CameraIngest:
         # Monotonic per-camera tick counter — drives the scheduler's
         # sampled duty cycle (v2 P3). Single-writer within the loop.
         self._tick_counter = 0
+        # Ticks in a row each covered resident has been the only person
+        # identity could see here. Read only by the safety gate, which
+        # will not let a resident's presence silence another resident's
+        # emergency until that run is long enough to trust. Reset to
+        # zero the moment anyone else appears; see
+        # `note_solo_confirmations`.
+        self._solo_streaks: dict[UUID, int] = {}
+        # Last tick's `<ident>_detected` values, so the confirmer can
+        # tell a new claim from a continuing one. None until the first
+        # tick completes, which reads as "everything true right now just
+        # became true" — the safe direction, since it can only cause an
+        # extra check, never a skipped one.
+        self._prev_detected: dict | None = None
+        # Hard ceiling on confirm votes for THIS camera, per hour.
+        self._confirm_budget = ConfirmBudget(
+            getattr(settings, "confirm_votes_per_hour", 60))
         # Monotonic timestamp of the most recent frame pushed into
         # `frame_buffer` (set by RoomWorker._consume_video →
         # record_frame_arrival). Read by `LiveKitRoomReconciler` to
@@ -328,6 +425,18 @@ class CameraIngest:
         REST-presence signal to decide the column.
         """
         self._last_frame_at = monotonic_ts
+
+    def _note_idle(self, idle: bool) -> None:
+        """Tell the room worker whether this camera is worth full-rate
+        video right now. Best-effort: a bandwidth economy must never be
+        able to end a tick.
+        """
+        if self._on_idle_change is None:
+            return
+        try:
+            self._on_idle_change(idle)
+        except Exception:  # noqa: BLE001 — cost lever, not a dependency
+            log.warning("%s idle-layer hint failed", self._log_tag, exc_info=True)
 
     def _stamp_ingress(self, fields: dict) -> None:
         """Stash the video-ingress snapshot on whatever row this tick
@@ -722,26 +831,22 @@ class CameraIngest:
             )
 
     async def _resolve_caregiver_tz(self, session, patient: "Patient") -> ZoneInfo:
-        """Caregiver's IANA timezone for when_scope windows, cached for
-        the worker's life. Any failure falls back to the scheduled
-        runner's convention (America/New_York) — window gating degrades,
+        """The HOME's IANA timezone for when_scope windows, cached for
+        the worker's life. Falls back to the caregiver's zone, then to
+        the scheduled runner's convention — window gating degrades,
         never crashes a tick."""
         if self._caregiver_tz is not None:
             return self._caregiver_tz
-        name = None
+        cg_name = None
         try:
             cg = await session.get(Caregiver, patient.caregiver_id)
-            name = cg.timezone if cg else None
+            cg_name = cg.timezone if cg else None
         except Exception:  # noqa: BLE001
             log.warning(
                 "%s caregiver tz lookup failed — using fallback",
                 self._log_tag,
             )
-        try:
-            tz = ZoneInfo(name) if name else ZoneInfo("America/New_York")
-        except ZoneInfoNotFoundError:
-            log.warning("%s bad caregiver tz %r — using fallback", self._log_tag, name)
-            tz = ZoneInfo("America/New_York")
+        tz = patient_tz.zone_for(getattr(patient, "timezone", None), cg_name)
         self._caregiver_tz = tz
         return tz
 
@@ -1014,6 +1119,22 @@ class CameraIngest:
                     captured_at=captured_at,
                 )
                 await session.commit()
+                # A camera nobody is analyzing is the STRONGEST case for
+                # the low layer, and this path was missing it. The
+                # step-down lived only in the closed-state branch below,
+                # which this `return` never reaches — so pausing AI, the
+                # one action a user takes explicitly to stop spending,
+                # left the video arriving at full rate and quietly
+                # DISABLED the bandwidth saving. Measured 2026-08-24:
+                # 2.06 GB/hr with both cameras paused, against 2.22 with
+                # one merely idle.
+                #
+                # Unlike the closed-state case there is no first-look
+                # regret to trade against: nothing will judge these
+                # frames at any resolution until the user unpauses, and
+                # unpausing runs a full tick which asks for the top layer
+                # back before it builds anything.
+                self._note_idle(True)
                 log.info(
                     "%s SKIP user-off (%s) — state preserved at %s/%s",
                     self._log_tag,
@@ -1136,6 +1257,7 @@ class CameraIngest:
                         captured_at=captured_at,
                     )
                     await session.commit()
+                    self._note_idle(True)
                     log.info(
                         "%s SKIP closed-state, no motion (sad=%s block_max=%s) "
                         "— counter=%s/%s",
@@ -1144,6 +1266,15 @@ class CameraIngest:
                         state_after.no_people_count, state_after.close_threshold,
                     )
                     return
+
+            # Every path that reaches here is about to spend a real look,
+            # so ask for the full layer back. Placed before the window is
+            # built rather than in the wake branch alone: a camera that
+            # was never closed also passes through here, and the request
+            # is a no-op unless the layer actually changed. The window
+            # below is whatever was buffered DURING the idle period —
+            # this restores the next one, not this one.
+            self._note_idle(False)
 
             # Build the MP4 from the buffered window (video + audio).
             # at_fps: the buffer may retain a higher native rate for the
@@ -1289,6 +1420,51 @@ class CameraIngest:
             except Exception:
                 log.exception("%s reid.label_clip crashed", self._log_tag)
                 identity = IdentityResult.empty()
+
+            # Coverage, resolved here rather than at promotion time,
+            # because identity has to be asked about each patient while
+            # the tick's state is still cached.
+            async with self._sessionmaker() as _cov_session:
+                covered_now = await camera_coverage.coverage(
+                    _cov_session, self.camera_id)
+
+            # And once more for every OTHER patient this sensor covers.
+            # `_state()` is cached for the tick, so N patients cost one
+            # HTTP call, not N. Identity keys `seats` by patient and
+            # refuses to resolve an absent one to anybody else, so this
+            # is the only way to learn who is actually in frame when a
+            # sensor watches two people. The primary's answer is reused
+            # rather than re-fetched.
+            identity_by_patient = {self.patient_id: identity}
+            for _pid in covered_now:
+                if _pid in identity_by_patient:
+                    continue
+                try:
+                    identity_by_patient[_pid] = await self._reid.label_clip(
+                        mp4_bytes=mp4_bytes,
+                        patient_id=_pid,
+                        camera_id=self.camera_id,
+                        face_evidence=False,
+                        mode=reid_mode,
+                        tick_seq=self._tick_counter,
+                        capture_ts=_capture_ts,
+                    )
+                except Exception:
+                    log.exception(
+                        "%s reid.label_clip crashed for covered patient %s",
+                        self._log_tag, _pid,
+                    )
+                    identity_by_patient[_pid] = IdentityResult.empty()
+            # Extend or reset each resident's run of being alone here,
+            # before the sticky lock is folded in below. The RAW answer
+            # is the honest one for this: the lock exists to hold a
+            # patient present through blur and track death, which is
+            # exactly the evidence a gate that CANCELS an alert must not
+            # accept. Reading it pre-lock can only shorten a run, never
+            # invent one, so it errs toward alerting.
+            self._solo_streaks = note_solo_confirmations(
+                self._solo_streaks, identity_by_patient,
+            )
             # W3 identity lock: fold this tick into the sticky lock —
             # fresh PATIENT evidence (re)enters it; a held lock rides
             # through blur/track-death and upgrades the result so every
@@ -1743,6 +1919,11 @@ class CameraIngest:
                             run_main_vlm=run_vlm,
                             flash_provider=gemini_provider,
                             log_tag=self._log_tag,
+                            # Last tick's verdicts, so the confirmer can
+                            # re-check a CHANGE instead of re-checking a
+                            # state that has not moved for eight hours.
+                            prev_detected=self._prev_detected,
+                            confirm_budget=self._confirm_budget,
                         )
                     except Exception:  # noqa: BLE001
                         log.error(
@@ -2014,16 +2195,89 @@ class CameraIngest:
                 state_after=state_after_state,
                 captured_at=captured_at,
             )
-            promotion = await maybe_promote_analysis(
-                session,
-                patient_id=self.patient_id,
+            # Promote once PER PATIENT this camera watches. A shared room
+            # (an RCFE lounge, a couple's living room) is one camera and
+            # one set of model calls, but each resident has their own
+            # detectors, thresholds and record — so each gets their own
+            # pass over the same verdicts. A fall therefore reaches
+            # everyone the camera covers, while a routine detector stays
+            # quiet for each of them unless identity says it was them.
+            # No coverage means nobody is watched by this camera, so
+            # there is nobody to promote to. There used to be a fallback
+            # to this ingest's own patient here; it is gone (2026-08-20)
+            # because it was the one place a missing relationship
+            # silently resolved to a default person, and a camera with
+            # no coverage is filtered out of the roster and cannot tick
+            # in the first place.
+            covered = await camera_coverage.coverage(session, self.camera_id)
+            # One promotion per covered patient, and every one of them is
+            # dispatched. This kept only the first result and discarded
+            # the rest, so on a shared sensor a second resident's fall was
+            # written to `events` and then went nowhere — no push, no
+            # email, no page, no clip.
+            #
+            # Each patient is judged on THEIR OWN identity answer, not on
+            # one patient's answer applied to everybody:
+            #   identity locates P  -> P's detectors fire for P
+            #   identity locates no-one -> SAFETY fires for every covered
+            #     patient (a fall nobody can attribute is still a fall),
+            #     and non-safety fires for none of them, because filing
+            #     one resident's routine onto another is not recoverable.
+            # The second rule lives in `event_promotion`; what changed
+            # here is that it now receives the right patient's flag.
+            # Sleep fires no event (record_only), so nothing downstream
+            # would ever keep footage of a disturbance. Save it here,
+            # beside the fields that judged it. Never raises.
+            await sleep_clips.save_if_disturbance(
                 camera_id=self.camera_id,
-                occurred_at=captured_at,
-                description=result.description,
                 detector_fields=result.detector_fields,
+                mp4_bytes=vlm_mp4,
                 settings=self._settings,
             )
+
+            promotions: list = []
+            promotion = None
+            for pid in covered:
+                fields_for_patient = dict(result.detector_fields)
+                per_patient = identity_by_patient.get(pid)
+                if per_patient is not None:
+                    fields_for_patient["identity_patient_in_clip"] = (
+                        per_patient.reid_ran and per_patient.patient_in_clip
+                    )
+                # Whether SOMEONE ELSE on this sensor has been alone here
+                # long enough to be believed. Safety detectors read it to
+                # stay quiet for the people who were not the one in the
+                # room; every other detector ignores it. Answered from
+                # the per-patient identity results this tick already
+                # gathered — the ones that, until now, were computed and
+                # then dropped.
+                fields_for_patient["identity_other_patient_confirmed"] = (
+                    other_patient_confirmed(self._solo_streaks, pid)
+                )
+                result_for_patient = await maybe_promote_analysis(
+                    session,
+                    patient_id=pid,
+                    camera_id=self.camera_id,
+                    occurred_at=captured_at,
+                    description=result.description,
+                    detector_fields=fields_for_patient,
+                    settings=self._settings,
+                )
+                promotions.append(result_for_patient)
+                # The primary's outcome is the one the tick log reports.
+                if promotion is None or pid == self.patient_id:
+                    promotion = result_for_patient
             await session.commit()
+
+            # Remember this tick's verdicts for the next one's confirm
+            # edge. Taken AFTER promotion so it records what the tick
+            # actually concluded, and stored even when nothing fired —
+            # a false is exactly as load-bearing as a true here, since
+            # the edge is the transition between them.
+            self._prev_detected = {
+                k: bool(v) for k, v in result.detector_fields.items()
+                if k.endswith("_detected")
+            }
 
             # High-signal confirmation that a real analysis landed — grep
             # "analysis SAVED" to watch live ticks; its absence (with no
@@ -2046,8 +2300,11 @@ class CameraIngest:
             # rolled-back tick must not leave a phantom push trail.
             # Fire-and-forget: tick latency stays bound by Gemini, not
             # by Apple's push endpoint.
-            if promotion.fired:
-                fired_ids = [ev.id for ev in promotion.fired]
+            # Every covered patient's fired events, not just the
+            # primary's — the whole point of the loop above.
+            all_fired = [ev for pr in promotions for ev in (pr.fired or [])]
+            if all_fired:
+                fired_ids = [ev.id for ev in all_fired]
                 # Event gate: when patients.event_gate_enabled is OFF
                 # (the default, and true for every patient today) this
                 # dispatches push+email exactly as before. ON holds the
@@ -2122,28 +2379,35 @@ class CameraIngest:
                     if pre_frames
                     else window[-1].captured_at
                 )
-                for fired_event in promotion.fired:
-                    asyncio.create_task(
-                        clip_archival.archive_event(
-                            event_id=fired_event.id,
-                            patient_id=self.patient_id,
-                            camera_id=self.camera_id,
-                            pre_frames=pre_frames,
-                            pre_pcm=clip_pre_pcm,
-                            pre_pcm_start=clip_pre_pcm_start,
-                            pre_end_captured_at=pre_end_captured_at,
-                            frame_buffer=self.frame_buffer,
-                            audio_buffer=self.audio_buffer,
-                            sessionmaker=self._sessionmaker,
-                            settings=self._settings,
-                        ),
-                        name=f"clip-archive-{fired_event.id}",
-                    )
+                # Every covered patient's events, each clipped under the
+                # patient it fired for. This looped only the primary's,
+                # so a second resident's safety event had no clip.
+                for pr in promotions:
+                    for fired_event in (pr.fired or []):
+                        _pid_for_clip = getattr(
+                            fired_event, "patient_id", None) or self.patient_id
+                        asyncio.create_task(
+                            clip_archival.archive_event(
+                                event_id=fired_event.id,
+                                patient_id=_pid_for_clip,
+                                camera_id=self.camera_id,
+                                pre_frames=pre_frames,
+                                pre_pcm=clip_pre_pcm,
+                                pre_pcm_start=clip_pre_pcm_start,
+                                pre_end_captured_at=pre_end_captured_at,
+                                frame_buffer=self.frame_buffer,
+                                audio_buffer=self.audio_buffer,
+                                sessionmaker=self._sessionmaker,
+                                settings=self._settings,
+                            ),
+                            name=f"clip-archive-{fired_event.id}",
+                        )
 
             log.info(
                 "%s DONE provider=%s people=%s(%s) src=%s motion=%s "
                 "state=%s/%s events_fired=%d dedup=%d",
                 self._log_tag, used_provider, gate_people_present, gate_people_count,
                 present_src, motion_in_clip, state_after_state, no_people_count_log,
-                len(promotion.fired), len(promotion.skipped_for_dedup),
+                len(all_fired),
+                sum(len(pr.skipped_for_dedup) for pr in promotions),
             )

@@ -34,7 +34,7 @@ docs/
 │   └── detector-config-knobs.md         per-detector config knobs
 │
 ├── runbooks/        step-by-step operational procedures
-│   ├── pod.md                           GPU pod spin up/down/deploy (scripts/pod.sh)
+│   ├── pod.md                           GPU pod spin up/down/deploy (scripts/pod/pod.sh)
 │   ├── soak-protocol.md                 reusable soak methodology + open detector-axis validation
 │   ├── tracker-eval.md                  SAM3 vs EdgeTAM A/B rig (superseded live by identity service)
 │   ├── ghost-deadlock-known-fix.md      legacy track-ledger bug + unapplied fix (dies with P3 cleanup)

@@ -2,7 +2,7 @@
 --
 -- This file only seeds rows that Supabase doesn't itself manage. The
 -- richer demo data (caregiver, patients, detectors, events) lives in
--- `scripts/seed.py` which calls the same service-layer code the API
+-- `scripts/seed/seed.py` which calls the same service-layer code the API
 -- routes use — so seeding exercises the real provisioning path.
 --
 -- For now this is intentionally empty; the Python seed script handles

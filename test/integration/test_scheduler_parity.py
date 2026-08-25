@@ -34,6 +34,7 @@ from src.services.detection.motion_cache import MotionCache
 from src.services.identity.observations import TrackObservation
 from src.services.identity.result import IdentityResult
 from src.settings import get_settings
+from test.conftest import seed_catalog_detectors
 from test.fakes.fake_vlm import FakeVLM
 from test.integration.test_identity_suppression_gate import _FixedReID
 from test.integration.identity_helpers import _setup_patient_with_camera
@@ -69,13 +70,24 @@ async def _assign_detectors(session: AsyncSession, patient_id, camera_id) -> dic
     """Assign three seeded presets (scene + person + env buckets) to
     the camera; return ident → Detector."""
     from datetime import datetime, timezone
+    # Created here rather than inherited from onboarding: patient create
+    # stopped auto-seeding presets (1cd354e). This suite pins bucket
+    # SPLITTING, so it only needs the three rows to exist.
     rows = (await session.execute(
         select(Detector).where(
             Detector.patient_id == patient_id,
             Detector.identifier.in_(_IDENTS),
         )
     )).scalars().all()
-    assert len(rows) == 3, "onboarding must have seeded these presets"
+    if len(rows) != 3:
+        await seed_catalog_detectors(session, patient_id, _IDENTS)
+        rows = (await session.execute(
+            select(Detector).where(
+                Detector.patient_id == patient_id,
+                Detector.identifier.in_(_IDENTS),
+            )
+        )).scalars().all()
+    assert len(rows) == 3
     now = datetime.now(timezone.utc)
     for r in rows:
         # Neutralize seeded time windows (medication ships "8 AM, 8 PM

@@ -52,8 +52,24 @@ def i420_to_bgr(width: int, height: int, data: bytes) -> "np.ndarray":
     """Decode a raw I420 byte plane into a BGR array (cv2 layout)."""
     import cv2
 
-    yuv = np.frombuffer(data, dtype=np.uint8).reshape(height * 3 // 2, width)
-    return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
+    buf = np.frombuffer(data, dtype=np.uint8)
+    if width % 2 == 0 and height % 2 == 0:
+        return cv2.cvtColor(
+            buf.reshape(height * 3 // 2, width), cv2.COLOR_YUV2BGR_I420)
+    # Odd width or height: I420 rounds each colour plane UP to
+    # ceil(w/2) x ceil(h/2), so the buffer is larger than the packed
+    # (h*3/2, w) block cv2 wants and the reshape raises. Padding the Y
+    # plane out to even makes the colour planes already the right size,
+    # so we can hand cv2 the same packed layout and trim the pad after.
+    pad_w, pad_h = width + width % 2, height + height % 2
+    y_size = width * height
+    y = buf[:y_size].reshape(height, width)
+    y = np.pad(y, ((0, pad_h - height), (0, pad_w - width)), mode="edge")
+    uv_size = (pad_w // 2) * (pad_h // 2)
+    packed = np.concatenate([y.ravel(), buf[y_size:y_size + 2 * uv_size]])
+    bgr = cv2.cvtColor(
+        packed.reshape(pad_h * 3 // 2, pad_w), cv2.COLOR_YUV2BGR_I420)
+    return bgr[:height, :width]
 
 
 def bgr_to_i420(bgr: "np.ndarray") -> tuple[int, int, bytes]:

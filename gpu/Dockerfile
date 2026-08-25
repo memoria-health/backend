@@ -69,7 +69,14 @@ WORKDIR /workspace
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git curl ca-certificates socat \
+      openssh-server \
  && rm -rf /var/lib/apt/lists/*
+# openssh-server: the entrypoint starts sshd when RunPod injects
+# PUBLIC_KEY, but it can only do that if the binary exists — and it did
+# not, so every image-based node had port 22 mapped with nothing
+# listening and no way in exactly when debugging mattered (2026-08-20).
+# The entrypoint generates host keys itself; installing the package is
+# the half that was missing.
 # socat: the local-rig tailnet DB bridge (entrypoint §3.5) — asyncpg
 # cannot ride a proxy, so a tailnet DB URL gets a TCP bridge through
 # tailscaled's HTTP CONNECT proxy. Unused in prod (public DB).

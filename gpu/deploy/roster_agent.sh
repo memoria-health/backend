@@ -25,7 +25,14 @@
 #   NEMARA_NODE_BASE_URL         where the backend reaches THIS node's
 #                                identity processes (tailnet name in prod)
 # OPTIONAL
-#   NEMARA_NODE_CAPACITY         homes this node accepts (default 4)
+#   NEMARA_NODE_CAPACITY         SENSORS this node accepts (default 4).
+#                                Counted homes until 2026-08-22, when the
+#                                roster slot moved from patient to sensor.
+#                                A 3-sensor home used to be 1; it is now 3,
+#                                so a node left at the old number serves
+#                                roughly a third of the homes it did and
+#                                the rest page as blind. Raise it to the
+#                                sensor count you actually want.
 #   NEMARA_ROSTER_POLL_S         seconds between polls (default 30)
 set -uo pipefail
 
@@ -34,6 +41,9 @@ set -uo pipefail
 : "${NEMARA_NODE_ID:?set NEMARA_NODE_ID}"
 : "${NEMARA_NODE_BASE_URL:?set NEMARA_NODE_BASE_URL}"
 
+# Sensors, not homes — see the note above. Left at 4 so an unset
+# deployment keeps its current GPU footprint rather than silently
+# tripling it; set it deliberately per node.
 CAPACITY="${NEMARA_NODE_CAPACITY:-4}"
 POLL_S="${NEMARA_ROSTER_POLL_S:-30}"
 STATE_DIR="${NEMARA_STATE_DIR:-/persist/state}"
@@ -59,26 +69,42 @@ log() { echo "$(date -u +%FT%TZ) roster: $*" | tee -a "$LOGDIR/roster.log"; }
 # The backend allocates the lowest free port per node and tells us, the same
 # way it allocates gateways.tunnel_port.
 _start_room() {
-  local room="$1" port="$2" patient
-  patient="${room#patient_}"
-  mkdir -p "$STATE_DIR/$room"
+  # $3 is the CAMERA id and is what every piece of state is keyed on:
+  # N sensors on one account share a room, so keying on room made each
+  # start stop the previous one and the node ended up serving one of
+  # them, restarting on every poll. $4 is the camera's LiveKit identity,
+  # which is what the service filters its subscription by.
+  local room="$1" port="$2" key="$3" ident="$4"
+  mkdir -p "$STATE_DIR/$key"
   # Singleton per room, enforced, not assumed (node F melt, 2026-08-13):
   # a stop/kill race once orphaned a live identity process, and the
   # duplicate pair kicked each other off LiveKit (same participant
   # identity) in an endless churn. Before starting, kill any straggler
   # serving this room — match on the exact --room argument.
-  pkill -f -- "identity.service --room $room " 2>/dev/null && sleep 1
+  pkill -f -- "identity.service --room $room --only-cam $ident " 2>/dev/null && sleep 1
   (
     backoff=3
     while true; do
-      cd "$STATE_DIR/$room" || exit 1
+      cd "$STATE_DIR/$key" || exit 1
+      # Same overlay entrypoint.sh applies before perception and before
+      # a static-mode identity process. Without it here, the documented
+      # iteration loop — rsync to /persist, POST /admin/exit — respawned
+      # the OLD code from /workspace and read as a successful deploy.
+      # Only `identity`: this script is itself under /workspace and bash
+      # reads it lazily, so replacing it underneath a running agent
+      # corrupts the agent. deploy/ lands on the next container boot.
+      if [ "${NEMARA_DEV_CODE:-}" = "1" ] && [ -d /persist/dev-code/nemara/identity ]; then
+        cp -a /persist/dev-code/nemara/identity/. /workspace/nemara/identity/ 2>/dev/null \
+          && log "dev-code overlay applied (identity) for camera=$key"
+      fi
       t0=$(date +%s)
-      # --patient explicitly: its argparse default is a hardcoded pilot UUID,
-      # which on any other home silently binds the wrong patient.
+      # No --patient (2026-08-20): the room's cameras name the residents,
+      # because a shared camera watches more than one and a single flag
+      # could only ever describe one of them.
       python3 -m identity.service \
-        --room "$room" --patient "$patient" --port "$port" \
+        --room "$room" --only-cam "$ident" --port "$port" \
         --pod-url "http://127.0.0.1:${PERCEPTION_PORT}" \
-        >>"$LOGDIR/identity-$room.log" 2>&1
+        >>"$LOGDIR/identity-$key.log" 2>&1
       rc=$?
       dt=$(( $(date +%s) - t0 ))
       # 4 = pod wedged, 5 = camera walk exhausted; both are deliberate
@@ -86,19 +112,19 @@ _start_room() {
       # rapid deaths and resets after a 300s healthy run — a service
       # dying at import must never become a fork storm again.
       [ "$dt" -gt 300 ] && backoff=3
-      echo "$(date -u +%FT%TZ) identity room=$room exited rc=$rc after ${dt}s — restart in ${backoff}s" \
-        >>"$LOGDIR/identity-$room.log"
+      echo "$(date -u +%FT%TZ) identity camera=$key exited rc=$rc after ${dt}s — restart in ${backoff}s" \
+        >>"$LOGDIR/identity-$key.log"
       sleep "$backoff"
       backoff=$(( backoff * 2 ))
       [ "$backoff" -gt 60 ] && backoff=60
     done
   ) &
   local sup=$!
-  echo "$sup" > "$RUN/$room.pid"
+  echo "$sup" > "$RUN/$key.pid"
   # The port is recorded too, so the next poll can tell "already running here"
   # from "running on a port the backend has since moved".
-  echo "$port" > "$RUN/$room.port"
-  log "started room=$room port=$port pid=$sup"
+  echo "$port" > "$RUN/$key.port"
+  log "started camera=$key room=$room port=$port pid=$sup"
 
   # Userspace tailscaled cannot reach a local listener on its own; `serve` is
   # what publishes it onto the tailnet.
@@ -111,8 +137,9 @@ _start_room() {
 }
 
 _stop_room() {
-  local room="$1" pid
-  pid="$(cat "$RUN/$room.pid" 2>/dev/null)"
+  # Keyed on the CAMERA id, same as _start_room.
+  local key="$1" pid
+  pid="$(cat "$RUN/$key.pid" 2>/dev/null)"
   [ -n "$pid" ] || return 0
   # ORDER MATTERS (node F melt, 2026-08-13). The old sequence killed the
   # child first, then the supervisor — if the supervisor was between
@@ -123,19 +150,24 @@ _stop_room() {
   # argument), then verify the pid is actually gone before declaring
   # the room stopped.
   kill "$pid" 2>/dev/null
-  pkill -f -- "identity.service --room $room " 2>/dev/null
+  pkill -f -- "--only-cam .* --port $(cat "$RUN/$key.port" 2>/dev/null)" 2>/dev/null
   for _ in 1 2 3 4 5; do
     kill -0 "$pid" 2>/dev/null || break
     sleep 1
   done
   if kill -0 "$pid" 2>/dev/null; then
     kill -9 "$pid" 2>/dev/null
-    pkill -9 -f -- "identity.service --room $room " 2>/dev/null
-    log "stopped room=$room (FORCED — did not exit on TERM)"
+    pkill -9 -f -- "--only-cam .* --port $(cat "$RUN/$key.port" 2>/dev/null)" 2>/dev/null
+    log "stopped camera=$key (FORCED — did not exit on TERM)"
   else
-    log "stopped room=$room (reassigned or released)"
+    log "stopped camera=$key (reassigned or released)"
   fi
-  rm -f "$RUN/$room.pid" "$RUN/$room.port"
+  # $key, not $room — $room is not a parameter here, so this removed
+  # nothing and the run-state file survived its process. A dead pid file
+  # is re-stopped every poll forever, and once the kernel recycles that
+  # pid, `_alive` vouches for an unrelated process and the camera is
+  # never started (or `kill` takes the unrelated process down).
+  rm -f "$RUN/$key.pid" "$RUN/$key.port"
 }
 
 _alive() {
@@ -196,7 +228,9 @@ except Exception:
 if not isinstance(d, dict) or "rooms" not in d:
     sys.exit(1)                 # error body (403/422/500), NOT an empty roster
 for r in d["rooms"]:
-    print(r["room"], r["port"])
+    # camera_id keys everything below. Several sensors on one account
+    # share a room now, so room alone names N processes at once.
+    print(r["room"], r["port"], r.get("camera_id", ""), r.get("camera_identity", ""))
 ' 2>/dev/null)" || WANT="__UNREACHABLE__"
 
   if [ "$WANT" = "__UNREACHABLE__" ]; then
@@ -209,27 +243,35 @@ for r in d["rooms"]:
   fi
 
   # start what is newly assigned (or has died and lost its pid)
-  while IFS=' ' read -r room port; do
+  while IFS=' ' read -r room port cam ident; do
     [ -z "$room" ] && continue
-    if _alive "$room"; then
+    # No camera_id means an older backend: fall back to the room so a
+    # version skew degrades to the previous behaviour instead of running
+    # nothing at all.
+    key="${cam:-$room}"
+    if _alive "$key"; then
       # Already running — but if the backend moved it to a different port,
       # restart it there. Otherwise the process keeps serving a port nobody
       # is calling and the home looks alive while getting no traffic.
-      if [ "$(cat "$RUN/$room.port" 2>/dev/null)" != "$port" ]; then
-        log "room=$room port changed -> $port, restarting"
-        _stop_room "$room"
-        _start_room "$room" "$port"
+      if [ "$(cat "$RUN/$key.port" 2>/dev/null)" != "$port" ]; then
+        log "camera=$key port changed -> $port, restarting"
+        _stop_room "$key"
+        _start_room "$room" "$port" "$key" "$ident"
       fi
     else
-      _start_room "$room" "$port"
+      _start_room "$room" "$port" "$key" "$ident"
     fi
   done <<< "$WANT"
 
   # stop what is no longer ours
   for pidf in "$RUN"/*.pid; do
     [ -e "$pidf" ] || continue
-    room="$(basename "$pidf" .pid)"
-    awk '{print $1}' <<< "$WANT" | grep -qxF "$room" || _stop_room "$room"
+    # The pid file is named by CAMERA id (or by room, on the older
+    # fallback path), which is exactly what the roster's third column
+    # carries — so compare like for like.
+    held="$(basename "$pidf" .pid)"
+    awk '{print ($3 == "" ? $1 : $3)}' <<< "$WANT" | grep -qxF "$held" \
+      || _stop_room "$held"
   done
 
   sleep "$POLL_S"

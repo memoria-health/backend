@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from src.settings import Settings
 from src.services.detection import catalog
 from src.services import pager
+from src.services.camera_coverage import covered_cameras
 
 _log = logging.getLogger(__name__)
 
@@ -309,7 +310,7 @@ async def _episode_boundary(
         )
         .where(
             and_(
-                Analysis.patient_id == patient_id,
+                Analysis.camera_id.in_(covered_cameras(patient_id)),
                 Analysis.captured_at > lookback_start,
                 Analysis.captured_at <= now,
                 Analysis.detector_fields[detected_field].astext == "true",
@@ -481,33 +482,35 @@ async def _maybe_page_record_only(
     task.add_done_callback(_page_tasks.discard)
 
 
-# Identity gating is only meaningful for homes that CAN identify. A
-# household that never enrolled a face has no confirmation source, so
-# gating routine detectors on a confirmation that can never arrive
-# leaves them permanently silent (Aryaman 2026-08-19, prod day one:
-# every non-safety detector dead for an unenrolled test home). Cached
-# 60s — one row lookup per home per minute, not per detector per tick.
-_ENROLLMENT_TTL_S = 60.0
-_enrollment_cache: dict[str, tuple[bool, float]] = {}
+# Identity gating only means something when the camera could be showing
+# SOMEBODY ELSE. On a camera watching one patient, whoever is in frame is
+# them, so demanding confirmation would silence the home forever (found
+# on prod day one: every non-safety detector dead for a household that
+# never enrolled a face). On a camera shared by several residents the
+# opposite is true — an unattributed routine event would land on the
+# wrong person's record. So the gate arms on coverage, not enrollment.
+# Cached 60s: one lookup per camera per minute, not per detector per tick.
+_COVERAGE_TTL_S = 60.0
+_coverage_cache: dict[str, tuple[int, float]] = {}
 
 
-async def _patient_has_enrollment(session: AsyncSession, patient_id) -> bool:
-    key = str(patient_id)
+async def _covered_patient_count(session: AsyncSession, camera_id) -> int:
+    key = str(camera_id)
     now = time.monotonic()
-    hit = _enrollment_cache.get(key)
+    hit = _coverage_cache.get(key)
     if hit is not None and now < hit[1]:
         return hit[0]
     try:
-        val = bool((await session.execute(text(
-            "select 1 from public.patient_face_embeddings "
-            "where patient_id = :p and status = 'ready' limit 1"),
-            {"p": key})).scalar())
+        val = int((await session.execute(text(
+            "select count(*) from public.camera_patients where camera_id = :c"),
+            {"c": key})).scalar() or 0)
     except Exception:  # noqa: BLE001 — a probe, not a tick
-        # Fail toward TODAY'S behavior (gate armed) and say so — a DB
-        # hiccup here must not crash promotion or silently widen firing.
-        log.exception("[enrollment-probe] failed for %s — arming gate", key)
-        return True
-    _enrollment_cache[key] = (val, now + _ENROLLMENT_TTL_S)
+        # Fail toward the STRICTER reading (treat as shared, so routine
+        # events wait for identity) and say so. A DB hiccup must not
+        # silently widen what gets written to someone's record.
+        log.exception("[coverage-probe] failed for %s — treating as shared", key)
+        return 2
+    _coverage_cache[key] = (val, now + _COVERAGE_TTL_S)
     return val
 
 
@@ -613,14 +616,13 @@ async def maybe_promote_analysis(
         # track — narrated a seated person into an empty room. A new
         # category added tomorrow must default to fail-quiet, not to
         # bypassing identity.
-        # …and the gate only ARMS once the home has a usable enrollment:
-        # with no enrolled face, identity can never confirm anyone, and
-        # fail-quiet would mean fail-forever (Aryaman 2026-08-19).
+        # …and it only ARMS on a camera shared by more than one patient,
+        # where "which of them was it?" is a real question (2026-08-19).
         if (det.subject_scope == "patient"
                 and det.category != "safety"
                 and not _is_truthy_bool(
                     detector_fields.get("identity_patient_in_clip"))
-                and await _patient_has_enrollment(session, patient_id)):
+                and await _covered_patient_count(session, camera_id) > 1):
             skipped.append(f"{ident}(patient_unconfirmed)")
             continue
 
@@ -641,6 +643,41 @@ async def maybe_promote_analysis(
 
         threshold = _effective_threshold(base, det.sensitivity)
         if float(conf) < threshold:
+            continue
+
+        # The fail-loud rule above is for when identity CANNOT say who
+        # it was. It is not a licence to be loud when identity CAN. A
+        # fall that identity seated on another resident of this same
+        # sensor is that resident's fall; filing it here puts one
+        # person's emergency on another person's record and phone, and
+        # the caregiver has no way to tell the difference.
+        #
+        # Found 2026-08-25: the second resident of the TV Room acted out
+        # a fall while the identity service held a continuous lock on
+        # him, and it arrived as the first resident's fall. Identity had
+        # the answer the whole time; nothing asked for it.
+        #
+        # Deliberately NARROW. `identity_other_patient_confirmed` is set
+        # only when identity ran, attributed, and saw exactly one
+        # person. A crowd, a timeout, or no lock all leave it false and
+        # the alert goes to everyone as before. Being wrong here costs a
+        # fall nobody hears about, so every uncertain case stays loud.
+        #
+        # Sits AFTER the detection and confidence checks so it can say
+        # so out loud: reaching it means the detector really did fire
+        # and this is the only thing stopping the alert. Before them it
+        # would run on every quiet tick and could not be logged.
+        if (det.subject_scope == "patient"
+                and det.category == "safety"
+                and _is_truthy_bool(
+                    detector_fields.get("identity_other_patient_confirmed"))):
+            _log.info(
+                "[event_promotion] %s fired on camera %s but identity placed "
+                "another resident of this sensor in the room, alone — not "
+                "alerting patient %s",
+                ident, camera_id, patient_id,
+            )
+            skipped.append(f"{ident}(other_patient_confirmed)")
             continue
 
         # Continuous ("state") detectors fire ONCE PER EPISODE. An episode
@@ -783,17 +820,18 @@ async def maybe_promote_analysis(
                 description=description,
             )
         )
-        # Fire-once: the moment a self-test promotes, disable its (single,
-        # per-patient) row so it can never fire again — on this camera or
-        # any other. The caller commits this session, persisting
-        # is_on=false; the next tick's registry query (is_on=true filter)
-        # drops it everywhere.
+        # Fire-once is PER CAMERA (2026-08-22): stamp the camera that just
+        # passed instead of disabling the shared per-patient row, so every
+        # other camera in the home keeps its own chance to prove the alert
+        # path. The caller commits this session; the next tick's registry
+        # check drops the test on this camera only. A camera restart clears
+        # the stamp and re-arms it.
         if winner.identifier in _FIRE_ONCE_KEYS:
-            det.is_on = False
+            cam.setup_test_passed_at = occurred_at
             _log.info(
-                "[event_promotion] fire-once detector %s (%s) disabled after "
-                "first fire for patient %s", det.id, winner.identifier,
-                patient_id,
+                "[event_promotion] fire-once detector %s (%s) passed on "
+                "camera %s for patient %s", det.id, winner.identifier,
+                cam.id, patient_id,
             )
 
     if suppressed:

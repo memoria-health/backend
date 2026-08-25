@@ -56,7 +56,7 @@ yolo11n.pt
 # clutter git status or get committed by accident.
 * [2-9].*
 
-# Pod lifecycle secrets (scripts/pod.sh) — never commit.
+# Pod lifecycle secrets (scripts/pod/pod.sh) — never commit.
 #
 # GLOB, not the bare name: `pod.sh up` writes .pod.env.bak-<timestamp>
 # before rewriting the endpoint, and those backups hold the RunPod API key,

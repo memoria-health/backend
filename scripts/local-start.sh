@@ -173,7 +173,7 @@ fi
 # ── 4. Optional seed ────────────────────────────────────────────
 if $SEED; then
   step "Seeding demo data"
-  PYTHONPATH=. uv run python scripts/seed.py
+  PYTHONPATH=. uv run python scripts/seed/seed.py
   ok "demo data inserted"
 else
   dim "skipping seed (--seed to include demo data)"

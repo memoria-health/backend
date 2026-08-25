@@ -4,7 +4,7 @@ The single Python source of truth mapping every catalog identifier to its
 v2 dimension values — evidence branch, subject, instrument bucket, and the
 decision/delivery attributes that now live on the `detectors` row (spec:
 docs/architecture/detection-architecture-v2.md §1–§3). The prod backfill
-block in scripts/apply_detector_v2_delta.sql is generated from this table;
+block in scripts/deltas/apply_detector_v2_delta.sql is generated from this table;
 keep the two in sync.
 
 Validated at import time against `catalog.CATALOG` and `catalog._SEVERITY`

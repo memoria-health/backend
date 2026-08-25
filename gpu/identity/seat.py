@@ -1,4 +1,5 @@
-"""The single home-wide patient seat — Aryaman's rule (2026-07-24).
+"""One seat per resident — Aryaman's rule (2026-07-24, widened
+2026-08-20).
 
 Seat = highest combined score. A challenger takes it only by beating
 the seated reference score by δ. The reference lives and dies with its
@@ -8,15 +9,30 @@ their reference dies with it (deliberately deferred: add decay only if
 the pilot shows a stuck wrong seat; plan §6).
 
 Empty-seat rule: lock the best candidate only if it clears the floor
-AND beats the runner-up by δ — two plausible patients lock neither
+AND beats the runner-up by δ — two plausible tracks lock neither
 (UNKNOWN is recoverable; a wrong patient is not).
+
+MULTI-PATIENT. A camera can watch more than one resident, so a home
+holds one seat PER PATIENT rather than one seat outright. Everything
+above is unchanged and simply runs once per resident over that
+resident's own candidates — the same binary question, asked N times.
+Two arbitrations then exist and they are deliberately separate:
+
+  which track is Alice   — `update_seat`, exactly as before
+  which resident is T    — `resolve_track_conflicts`, below
+
+Keeping them apart is what makes the one-resident case identical to
+the pre-2026-08-20 code: with a single patient there is nothing for
+the second arbitration to arbitrate, and it returns its input.
 """
 
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from dataclasses import dataclass, replace
 from typing import Optional
+from uuid import UUID
 
 log = logging.getLogger(__name__)
 
@@ -27,6 +43,10 @@ TrackKey = tuple[str, int]  # (camera_id, track_id)
 class Candidate:
     camera_id: str
     track_id: int
+    # WHICH resident this score is about. A track produces one candidate
+    # per patient the camera covers, so a candidate is a claim ("track 4
+    # looks like Alice, 0.61"), never an identity by itself.
+    patient_id: UUID
     score: float
     anchor: str                    # "face" | "body"
     # Marginal face evidence not yet backed by a fused track template
@@ -68,6 +88,76 @@ class Seat:
         return (self.camera_id, self.track_id)
 
 
+def carry_seat(
+    seat: Optional[Seat],
+    live: set[TrackKey],
+    boxes: dict[TrackKey, tuple[float, float, float, float]],
+    *,
+    taken: frozenset[TrackKey] = frozenset(),
+    overlap_floor: float = 0.5,
+) -> Optional[Seat]:
+    """Move a seat onto a re-numbered track instead of letting it die.
+
+    The tracker does not promise stable ids. It drops a box and issues a
+    new number for the same person, in the same place, often within the
+    same second — measured 2026-08-25: `track_death tid=22` and
+    `track_birth tid=23` one second apart with overlapping boxes, while
+    the resident sat still. Because the seat is keyed on the track id,
+    a face match that took 20-60 seconds to earn was destroyed by a
+    renumbering that changed nothing about the world.
+
+    So when a seated track is gone and exactly ONE live track occupies
+    the space it just vacated, the seat moves there. Everything else
+    about the seat — score, anchor, face_confirmed, since — travels
+    unchanged, because it is the same person.
+
+    Deliberately conservative in three ways:
+
+      * ONE candidate only. Two overlapping tracks means we cannot say
+        which is the person, and a wrong carry is a misattribution —
+        the failure this system must not have.
+      * The candidate must not already hold ANOTHER resident's seat
+        (`taken`), or one person's identity would be handed to another's
+        track.
+      * A real overlap, not proximity. `overlap_floor` is IoU, so a
+        different person walking through the same doorway does not
+        inherit anybody.
+
+    Returns the moved seat, or None to let the caller kill it as before.
+    """
+    if seat is None or seat.key in live:
+        return seat
+    old_box = boxes.get(seat.key)
+    if old_box is None:
+        return None
+    hits = [
+        k for k in live
+        if k[0] == seat.camera_id
+        and k != seat.key
+        and k not in taken
+        and _iou(old_box, boxes.get(k)) >= overlap_floor
+    ]
+    if len(hits) != 1:
+        return None
+    return replace(seat, track_id=hits[0][1])
+
+
+def _iou(a, b) -> float:
+    """Intersection over union. 0.0 when either box is missing."""
+    if not a or not b:
+        return 0.0
+    x0, y0 = max(a[0], b[0]), max(a[1], b[1])
+    x1, y1 = min(a[2], b[2]), min(a[3], b[3])
+    iw, ih = max(0.0, x1 - x0), max(0.0, y1 - y0)
+    inter = iw * ih
+    if inter <= 0.0:
+        return 0.0
+    area_a = max(0.0, (a[2] - a[0]) * (a[3] - a[1]))
+    area_b = max(0.0, (b[2] - b[0]) * (b[3] - b[1]))
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
 def update_seat(
     seat: Optional[Seat],
     candidates: list[Candidate],
@@ -78,7 +168,9 @@ def update_seat(
     now: float,
 ) -> Optional[Seat]:
     """Fold one round of identity scores into the seat. Pure."""
-    # 1. The seat dies with its track — no ghost references.
+    # 1. The seat dies with its track — no ghost references. The caller
+    #    may first offer it a re-numbered track via `carry_seat`; by the
+    #    time we get here that chance has been taken or declined.
     if seat is not None and seat.key not in live:
         log.info("identity.seat_died key=%s", seat.key)
         seat = None
@@ -149,6 +241,49 @@ def update_seat(
         return updated
 
     return _challenge(seat, best, delta=delta, now=now)
+
+
+def resolve_track_conflicts(
+    seats: dict[UUID, Seat],
+) -> dict[UUID, Seat]:
+    """One body is one person: no track may hold two residents' seats.
+
+    `update_seat` runs per resident and knows nothing about the others,
+    so on a shared camera the same track can win Alice's seat AND Bob's
+    — two people's routines would then be recorded off one body. The
+    highest score keeps the track; the loser is UNSEATED rather than
+    moved to its runner-up track, because the runner-up already lost
+    that resident's own δ contest and re-seating it here would smuggle
+    in a lock that arbitration rejected.
+
+    Greedy by score (Aryaman, 2026-08-20): the face and body bars are
+    unforgiving enough that two enrolled residents rarely both clear
+    them on one body, and when they do the stronger evidence is the
+    honest answer. Ties break on patient id so a coverage query with no
+    ORDER BY can't make attribution flap between ticks.
+
+    Pure. With one resident it returns its input untouched — this is
+    the function that has to be a no-op for the 90% case.
+    """
+    by_track: dict[TrackKey, list[UUID]] = defaultdict(list)
+    for pid, s in seats.items():
+        by_track[s.key].append(pid)
+
+    resolved = dict(seats)
+    for key, pids in by_track.items():
+        if len(pids) < 2:
+            continue
+        winner = max(pids, key=lambda p: (seats[p].score, str(p)))
+        for pid in pids:
+            if pid == winner:
+                continue
+            log.info(
+                "identity.seat_contested key=%s kept=%s (%.2f) unseated=%s "
+                "(%.2f)",
+                key, winner, seats[winner].score, pid, seats[pid].score,
+            )
+            resolved.pop(pid, None)
+    return resolved
 
 
 def notary_contradiction(

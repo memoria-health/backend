@@ -17,8 +17,8 @@ from src.db.detector import Detector
 from src.services.detection.analyses_store import add_analysis
 from src.services.detection.event_promotion import maybe_promote_analysis
 from test.integration.identity_helpers import (
-    _enroll_face,
     _setup_patient_with_camera,
+    _share_camera_with_another_patient,
 )
 
 _V2 = SimpleNamespace(detection_v2_decision_enabled=True)
@@ -271,7 +271,7 @@ async def test_routine_patient_custom_fails_quiet_without_confirmed_patient(
         client, auth_user, session,
     )
     ident = "custom_tvhabit"
-    await _enroll_face(session, patient_id)
+    await _share_camera_with_another_patient(session, camera_id, patient_id)
     await _add_detector(
         session, patient_id, ident, is_sustained=False,
         category="routine", subject_scope="patient",
@@ -339,8 +339,8 @@ async def test_behaviour_and_care_patient_customs_fail_quiet_too(
     patient_id, camera_id = await _setup_patient_with_camera(
         client, auth_user, session,
     )
-    # The gate only arms for a home that CAN identify someone.
-    await _enroll_face(session, patient_id)
+    # The gate only arms where 'which of them?' is a real question.
+    await _share_camera_with_another_patient(session, camera_id, patient_id)
     now = datetime.now(timezone.utc)
     for i, category in enumerate(("behaviour", "care")):
         ident = f"custom_quiet_{category}"
@@ -371,16 +371,14 @@ async def test_behaviour_and_care_patient_customs_fail_quiet_too(
 
 
 @pytest.mark.asyncio
-async def test_unenrolled_home_is_not_silenced_by_the_identity_gate(
+async def test_single_patient_camera_is_not_silenced_by_the_identity_gate(
     client: AsyncClient, auth_user, session: AsyncSession,
 ) -> None:
-    """Enrollment is OPTIONAL (Aryaman, 2026-08-19).
+    """A camera watching ONE patient never needs identity (2026-08-19).
 
-    Fail-quiet gating asks identity to confirm the patient. A household
-    that never enrolled a face has no confirmation source, so the gate
-    could never open and every routine detector stayed silent forever —
-    found on prod day one, on a home with detectors on and nothing ever
-    firing. The gate must arm only where it can actually be satisfied.
+    Whoever is in frame on a single-patient camera is that patient, so
+    demanding confirmation just silences the home — which is what
+    happened on prod day one, with detectors on and nothing ever firing.
     """
     patient_id, camera_id = await _setup_patient_with_camera(
         client, auth_user, session,
@@ -401,5 +399,53 @@ async def test_unenrolled_home_is_not_silenced_by_the_identity_gate(
     await session.commit()
 
     assert len(res.fired) == 1, (
-        "an unenrolled home must still get its routine detectors"
+        "a single-patient camera must still get its routine detectors"
+    )
+
+
+@pytest.mark.asyncio
+async def test_shared_camera_fires_safety_for_every_resident(
+    client: AsyncClient, auth_user, session: AsyncSession,
+) -> None:
+    """One camera, two residents, nobody identified (Aryaman, 2026-08-19).
+
+    A fall in a shared lounge must reach BOTH records — a duplicate alert
+    is recoverable, a missed fall is not. The routine detector in the same
+    clip must reach NEITHER, because "who ate lunch?" has no honest answer
+    when nobody was recognised.
+    """
+    patient_id, camera_id = await _setup_patient_with_camera(
+        client, auth_user, session,
+    )
+    housemate = await _share_camera_with_another_patient(
+        session, camera_id, patient_id,
+    )
+
+    safety, routine = "custom_collapse", "custom_snack"
+    fields: dict = {}
+    for pid in (patient_id, housemate):
+        await _add_detector(session, pid, safety, is_sustained=False,
+                            category="safety", subject_scope="patient")
+        await _add_detector(session, pid, routine, is_sustained=False,
+                            category="routine", subject_scope="patient")
+    await session.commit()
+    fields.update(_fields(safety))
+    fields.update(_fields(routine))
+
+    now = datetime.now(timezone.utc)
+    fired_for: list[UUID] = []
+    for pid in (patient_id, housemate):
+        res = await maybe_promote_analysis(
+            session, patient_id=pid, camera_id=camera_id,
+            occurred_at=now, description="someone went down",
+            detector_fields=fields, settings=_V2,
+        )
+        await session.commit()
+        fired_for.extend(e.patient_id for e in res.fired)
+        assert all(e.category == "safety" for e in res.fired), (
+            "an unattributed routine event would land on the wrong record"
+        )
+
+    assert set(fired_for) == {patient_id, housemate}, (
+        "a fall on a shared camera must reach every resident it covers"
     )

@@ -45,7 +45,7 @@ Backend (each its own commit, review after):
   test_widget_compile_hook.py.
 - T3: db/detector.py + schemas/detector.py — drop dashboard_widget (KEEP
   severity: journal orders sections by it); supabase/schema.sql line;
-  delete scripts/apply_dashboard_widget_delta.sql +
+  delete scripts/deltas/apply_dashboard_widget_delta.sql +
   test_dashboard_widget_schema.py; local db:
   `alter table detectors drop column if exists dashboard_widget;`
 - KEEP: insights_widgets.py wholesale (web app's engine; detector filter,

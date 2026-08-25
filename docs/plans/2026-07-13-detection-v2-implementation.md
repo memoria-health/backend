@@ -79,7 +79,7 @@ The single worst live accuracy problem, fixed with the validated recipe, minimal
 
 Branch: `feat/detection-v2-p1-schema`. Adds the six-dimension columns; nothing reads them yet except severity (pure-parity change), so risk is near-zero.
 
-1. Delta SQL `scripts/apply_detector_v2_delta.sql` (idempotent, per convention): `subject_scope`, `evidence_branch` (environment|person_motion|person_still), `bucket`, `needs_audio`, `evidence_unit`, `eventing` JSONB, `duty_cycle`, `severity`, `cooldown_seconds`, `degradation_warning`; `shape` gains `point` value (backfill `point_in_time`→`point` deferred to P4 when `scheduled` dissolves).
+1. Delta SQL `scripts/deltas/apply_detector_v2_delta.sql` (idempotent, per convention): `subject_scope`, `evidence_branch` (environment|person_motion|person_still), `bucket`, `needs_audio`, `evidence_unit`, `eventing` JSONB, `duty_cycle`, `severity`, `cooldown_seconds`, `degradation_warning`; `shape` gains `point` value (backfill `point_in_time`→`point` deferred to P4 when `scheduled` dissolves).
 2. ORM + Pydantic mirrors; `CatalogEntry` gains the same fields; backfill all 24 built-ins per the §3 mapping table in the v2 doc; catalog validation extended (every entry must declare bucket/subject/eventing).
 3. Severity moves from `catalog._SEVERITY` onto rows; `event_promotion._select_primary` reads the row. Test: promotion parity fixture — identical inputs produce identical primary selection before/after.
 4. Onboarding seeding writes the new fields; `from-library` path too.

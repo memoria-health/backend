@@ -30,6 +30,7 @@ from uuid import UUID
 
 from livekit import api as lkapi
 
+from src.services import livekit_rooms
 from src.services.detection import camera_presence
 from src.services.detection.motion_cache import MotionCache
 from src.services.detection.room_worker import RoomWorker
@@ -381,7 +382,12 @@ class DetectorWorker:
             candidates: list[str] = []
             skipped_foreign = 0
             for r in rooms_resp.rooms:
-                if not r.name.startswith(_PATIENT_ROOM_PREFIX):
+                # Both room shapes, same as the webhook. Gating on
+                # `patient_` here meant that on every restart no
+                # RoomWorker spawned for an account room — no detection
+                # at all — and the stale sweep below then flipped every
+                # live bridge sensor to online=false.
+                if not livekit_rooms.is_room_name(r.name):
                     continue
                 if r.num_participants == 0:
                     continue
@@ -542,10 +548,37 @@ class DetectorWorker:
             async with self._lock:
                 self._rooms.pop(room_name, None)
 
-    async def ensure_room_left_if_empty(self, room_name: str) -> None:
+    async def ensure_room_left_if_empty(
+        self, room_name: str, *, departed: str | None = None,
+    ) -> None:
         """Called from `participant_left` webhooks for cam_* identities.
-        Tears the room worker down. The next camera join re-fires the
-        webhook and we rejoin from scratch.
+        Tears the room worker down ONLY when no camera is left
+        publishing. The next camera join re-fires the webhook and we
+        rejoin from scratch.
+
+        The emptiness check is new (2026-08-23) and the name predates
+        it: this used to tear down on ANY camera leaving. Correct when a
+        room held one camera; sensors are account-scoped now, so
+        `account_<caregiver>` routinely holds several and the rule
+        became "unplug one sensor, lose detection on every other sensor
+        in that home". Observed live: a bridge camera disconnecting
+        stopped the shared worker while a gateway camera was still
+        publishing, and that camera's analyses simply stopped. It stayed
+        `online` in the app throughout, so nothing surfaced it, and
+        because `stop()` then hung to its timeout the reference was
+        dropped and nothing rebuilt the worker.
+
+        It is also the LiveKit FFI panic. Cancelling the supervisor
+        while `room.connect()` sits between its websocket handshake and
+        `ReadyForRoomEventRequest` leaves the Rust side waiting on a
+        request that never comes, and it aborts the whole process 15s
+        later. Not tearing down needlessly is what closes that window.
+
+        `departed` is the identity whose webhook brought us here. It is
+        excluded from the survivor count because the webhook can beat
+        the SDK's own participant pruning, and counting the leaver would
+        keep every room open forever — the opposite failure, quieter,
+        and it leaks a LiveKit participant per home.
 
         `worker.stop()` runs **inside** `self._lock` so a concurrent
         `ensure_room_joined` for the same room can't spawn a new
@@ -565,9 +598,20 @@ class DetectorWorker:
         if not self._started:
             return
         async with self._lock:
-            worker = self._rooms.pop(room_name, None)
+            worker = self._rooms.get(room_name)
             if worker is None:
                 return
+            # Checked INSIDE the lock, against the worker we are about to
+            # stop, so a camera joining concurrently cannot be missed.
+            survivors = worker.live_camera_identities() - {departed or ""}
+            if survivors:
+                log.info(
+                    "detector_worker.ensure_left room=%s keeping worker — "
+                    "%d camera(s) still publishing: %s",
+                    room_name, len(survivors), ", ".join(sorted(survivors)),
+                )
+                return
+            self._rooms.pop(room_name, None)
             try:
                 await asyncio.wait_for(worker.stop(), timeout=_STOP_TIMEOUT)
             except asyncio.TimeoutError:

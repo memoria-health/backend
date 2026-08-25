@@ -27,10 +27,14 @@ var, was deleted 2026-08-11.)
 
 **Locally**, run one directly:
 
-    uv run python gpu/identity/service.py --room patient_<uuid> --patient <uuid>
+    uv run python gpu/identity/service.py --room patient_<uuid>
 
-Pass `--patient` explicitly. Its argparse default is a hardcoded pilot
-UUID, so on any other home it silently binds the wrong patient.
+There is no `--patient` (removed 2026-08-20). The process loads a face
+gallery for every resident its room's cameras cover, resolved from
+`cameras.livekit_room` -> `camera_patients`, because a shared camera
+watches more than one person and a single flag could only name one of
+them. The 60s gallery refresh re-reads coverage too, so sharing a
+camera with another resident takes effect without a restart.
 
 Pure modules are unit-tested (`test/unit/test_identity_*.py`).
 

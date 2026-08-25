@@ -26,7 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.camera import Camera
 from src.services.detection.state_machine import apply_tick_update
-from test.conftest import mint_test_jwt
+from test.conftest import mint_test_jwt, seed_camera
 
 from datetime import datetime, timezone
 
@@ -57,33 +57,12 @@ async def _insert_camera(
 ) -> UUID:
     """Insert a camera with a CALLER-CONTROLLED `online` so the test can
     verify the state machine doesn't rewrite it."""
-    cid = uuid4()
     now = datetime.now(timezone.utc)
-    await session.execute(
-        text(
-            """
-            INSERT INTO cameras (
-                id, patient_id, display_id, room, icon_name, online,
-                created_at, state, no_people_count, state_changed_at,
-                close_threshold
-            ) VALUES (
-                :id, :pid, 1, 'Living room', 'tv', :online,
-                :now, :state, :nc, :now, :ct
-            )
-            """
-        ),
-        {
-            "id": str(cid),
-            "pid": patient_id,
-            "now": now,
-            "state": state,
-            "nc": no_people_count,
-            "ct": close_threshold,
-            "online": online,
-        },
+    return await seed_camera(
+        session, patient_id=patient_id, room="Living room", online=online,
+        state=state, no_people_count=no_people_count,
+        close_threshold=close_threshold, state_changed_at=now,
     )
-    await session.commit()
-    return cid
 
 
 @pytest.mark.asyncio

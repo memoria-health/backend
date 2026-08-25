@@ -31,12 +31,6 @@ class Patient(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
-    # Facilities audio kill (2026-07-28): False = publishers never publish
-    # the audio track (source-level sever, roster-driven like
-    # privacy_enabled). Facilities where audio recording is illegal set
-    # this False; family homes default True. needs_audio detectors
-    # degrade via sched_degraded_audio.
-    audio_capture_enabled: Mapped[bool] = mapped_column(default=True)
     date_of_birth: Mapped[date | None] = mapped_column(Date, default=None)
     gender: Mapped[str | None] = mapped_column(String(40), default=None)
     home_address: Mapped[str | None] = mapped_column(String(500), default=None)
@@ -83,6 +77,17 @@ class Patient(Base):
     # NULL = never asked, which drives the first-open consent banner on
     # web + iOS. Both "Share" and "Not now" stamp it, so once a decision
     # exists the banner never re-nags.
+    # IANA timezone THIS HOME is in. Every day boundary the caregiver
+    # sees — the journal, scheduled windows, sleep nights — resolves
+    # here first. It used to resolve to the caregiver's own timezone,
+    # which is wrong the moment they do not live with the patient: a
+    # daughter in New York watching a father in California saw his day
+    # roll over at 9pm his time. NULL = never set, fall back to the
+    # caregiver's zone (see services/patient_tz.py) so existing homes
+    # keep exactly the behaviour they had.
+    timezone: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, default=None,
+    )
     data_collection_enabled: Mapped[bool] = mapped_column(
         Boolean, server_default=text("false"), default=False,
     )

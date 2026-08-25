@@ -133,24 +133,28 @@ async def _create_patient_and_event(
 
 
 @pytest.mark.asyncio
-async def test_clip_url_returns_signed_url_when_ready(
+async def test_clip_url_points_at_our_own_proxy_when_ready(
     client: httpx.AsyncClient, auth_user, session, fake_httpx,
 ):
+    """Was: asserts a storage-signed absolute URL.
+
+    That URL was built from `settings.supabase_url`, the address the
+    BACKEND uses to reach Supabase — unroutable from a phone, so the app
+    got a player that silently never started (2026-08-23). The clip is
+    served from our own origin now, and this asserts the new contract
+    rather than the shape that could not work.
+
+    No `fake_httpx` response is queued any more: minting this URL no
+    longer talks to storage at all. The bytes are fetched, under the
+    caregiver's own token, only when the player actually opens.
+    """
     headers = await _provision(client, auth_user)
     event_id = await _create_patient_and_event(client, headers, session, has_clip=True)
-
-    fake_httpx["responses"].append(
-        httpx.Response(
-            200,
-            json={"signedURL": f"/object/sign/incident-clips/events/{event_id}.mp4?token=t"},
-        )
-    )
 
     r = await client.get(f"/v1/events/{event_id}/clip-url", headers=headers)
     assert r.status_code == 200
     body = r.json()
-    assert body["url"].startswith("http")
-    assert body["url"].endswith("?token=t")
+    assert body["url"] == f"/v1/events/{event_id}/clip"
     assert body["expires_in_seconds"] == 600
 
 

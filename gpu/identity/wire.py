@@ -79,6 +79,19 @@ class RemoteObservations:
     # on ticks where the backend requested one): (x0, y0, x1, y1, prob)
     # in extracted-frame pixels. Feeds the per-camera ScreenMap.
     screen_regions: tuple[tuple[float, float, float, float, float], ...] = ()
+    # Which concept found those regions. A screen can show a moving
+    # person; a painting cannot. The veto needs to tell them apart.
+    screen_concept: str = ""
+    # (width, height) of the frame `screen_regions` were measured in.
+    # None from an older pod, and the consumer MUST treat that as
+    # "cannot normalise" rather than guessing a size — guessing is what
+    # put every region in the empty corner of the frame on 2026-08-25.
+    screen_frame_wh: "tuple[int, int] | None" = None
+    # YOLO's person boxes for this tick, as FRACTIONS of the frame — a
+    # second opinion from a model with different failure modes. Used only
+    # to PROTECT a track from the display veto, never to kill one, so an
+    # empty tuple (no people, or the detector is dead) costs nothing.
+    person_boxes: tuple[tuple[float, float, float, float], ...] = ()
     # Stateless-worker mode (2026-08-16): the camera's updated cross-
     # tick session snapshot, returned only when the request carried one.
     # The CameraLoop stores it and sends it with the next tick — that

@@ -14,10 +14,10 @@ import logging
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
+from sqlalchemy import text
 from fastapi import APIRouter, File, HTTPException, UploadFile, status
 from pydantic import BaseModel
 
-from src.api import cameras_ingest as pi_ingest_module
 from src.api.deps import CaregiverAuth, SessionDep, SettingsDep
 from src.db.patient import Patient
 from src.errors import StorageError
@@ -83,13 +83,14 @@ async def create_patient(
 ) -> PatientResponse:
     """Create a patient under the current caregiver.
 
-    Auto-seeds preset detectors via `services.onboarding.seed_detectors_for_patient`
-    in the same transaction. The set is age-based: 18+ or unknown birthday get
-    the older-adult set (Falls / Agitation / Wandering / Medication adherence);
-    under-18 patients get only the both-cohort safety net (Falls) — the child
-    preset set was deleted 2026-08-16 (adult-only product).
+    Creates NO visible detectors: the caregiver picks those from the library
+    on add (2026-08-19). `services.onboarding.seed_detectors_for_patient` still
+    runs in the same transaction, but it now only creates the hidden internal
+    setup self-test, which is not in the library and so cannot be picked.
     """
     now = datetime.now(timezone.utc)
+    # The JWT principal carries no timezone, so read the caregiver row.
+    creator = await caregiver_repo.find_by_id(session, auth.id)
     p = Patient(
         id=uuid4(),
         caregiver_id=auth.id,
@@ -104,6 +105,10 @@ async def create_patient(
         date_of_birth=body.date_of_birth,
         gender=body.gender,
         home_address=body.home_address,
+        # Default the home's zone to the creating caregiver's. Right when
+        # they live together, and a sane start when they do not — the
+        # caregiver can move the patient's zone afterwards.
+        timezone=body.timezone or (creator.timezone if creator else None),
         # Record the picked country verbatim; the residency region collapses to
         # what we physically support (region_for_country) — client never sets it.
         country=body.country,
@@ -197,8 +202,6 @@ async def patch_patient(
                 caregiver_id=auth.id,
                 desired_state=cascade_to,
             )
-            if cascade_to == "disconnected" and cam.source_type == "pi":
-                await pi_ingest_module.cancel_active_relay(cam.id)
 
     await session.commit()
 
@@ -254,8 +257,11 @@ async def delete_patient(
     auth: CaregiverAuth,
     session: SessionDep,
 ) -> None:
-    """Remove a caregiver-owned patient. Cascades to cameras /
-    detectors / events via DB-level `ON DELETE CASCADE`.
+    """Remove a caregiver-owned patient. Cascades to detectors / events.
+
+    SENSORS SURVIVE. `cameras.patient_id` is `ON DELETE SET NULL` since
+    2026-08-22 — a sensor can watch more than one person, and deleting
+    one of them must not take the hardware away from the others.
     """
     deleted = await patient_repo.delete_by_id(session, patient_id, caregiver_id=auth.id)
     if not deleted:
@@ -263,6 +269,20 @@ async def delete_patient(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="patient_not_found",
         )
+    # Re-point the compatibility shim at whoever is still covered. The FK
+    # nulled it for every sensor this patient was filed under; leaving it
+    # NULL would make a sensor that still watches somebody read as
+    # unassigned to the ~70 readers that have not migrated off the column.
+    await session.execute(
+        text(
+            "UPDATE public.cameras c SET patient_id = ("
+            "  SELECT cp.patient_id FROM public.camera_patients cp "
+            "   WHERE cp.camera_id = c.id "
+            "   ORDER BY cp.added_at, cp.patient_id LIMIT 1) "
+            " WHERE c.caregiver_id = :cg AND c.patient_id IS NULL"
+        ),
+        {"cg": auth.id},
+    )
     await session.commit()
 
 

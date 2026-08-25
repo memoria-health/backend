@@ -203,6 +203,19 @@ create table public.patients (
   -- alerts when enabled). JSON array of strings.
   email_alerts_enabled    boolean not null default false,
   email_alert_recipients  jsonb   not null default '[]'::jsonb,
+  -- Hold this patient's alerts for an OPERATOR yes/no before any caregiver
+  -- is told (src/services/event_gate.py). Defaults ON: review is the point
+  -- of production. Only category='safety' auto-releases (60s) — everything
+  -- else waits for a human verdict, so an unattended queue holds those
+  -- events indefinitely. Unrelated to events.reviewed, which is the
+  -- caregiver's own retrospective review.
+  event_gate_enabled      boolean not null default true,
+  -- IANA timezone of THIS HOME. Every day boundary the caregiver sees —
+  -- the journal, scheduled windows, sleep nights — resolves here first,
+  -- because the day being described is the patient's. NULL = never set,
+  -- which falls back to the caregiver's own zone (the behaviour before
+  -- this column existed). See src/services/patient_tz.py.
+  timezone                text,
   -- Data-collection consent (research opt-in). `data_collection_enabled`
   -- is the master switch to store short video+audio clips of this
   -- patient for research, only when someone is present; default OFF
@@ -316,9 +329,41 @@ create table public.gateways (
   last_seen_at timestamptz
 );
 
+-- ── identity_nodes ──────────────────────────────────────────────
+-- GPU nodes that run identity processes. A node polls
+-- POST /v1/identity/roster to be told which SENSORS to serve; the same
+-- call is its heartbeat. Was delta-only until 2026-08-22, so a database
+-- built from this file alone could not serve the roster at all.
+create table public.identity_nodes (
+  -- The RunPod pod id: stable for the life of the node, and the thing
+  -- you can paste into the RunPod console when something looks wrong.
+  node_id      text primary key,
+  -- Host only, NO PORT. A tailnet MagicDNS name in production, so it
+  -- survives RunPod reassigning the pod's direct-TCP endpoint. The port
+  -- lives on the SENSOR (cameras.identity_port) because the node runs
+  -- one process per sensor.
+  base_url     text not null,
+  -- Sensors this node accepts. Per-node: it depends on the GPU and on
+  -- NEMARA_PERCEPTION_CONCURRENCY.
+  capacity     int  not null default 4 check (capacity > 0),
+  last_seen_at timestamptz not null default now()
+);
+
 create table public.cameras (
   id                  uuid primary key default gen_random_uuid(),
-  patient_id          uuid not null references public.patients(id) on delete cascade,
+  -- The owning ACCOUNT. Always known at provision time, including for a
+  -- camera the installer set up before anyone decided who it watches.
+  -- NOT NULL since 2026-08-22. It is also load-bearing for the
+  -- cameras_member RLS policy, whose first arm is caregiver_id =
+  -- auth.uid() — nullable, that arm degrades to NULL and an unassigned
+  -- sensor becomes unreachable by its own owner.
+  caregiver_id        uuid references public.caregivers(id) on delete cascade
+                        not null,
+  -- DEPRECATED compatibility shim: the FIRST covered patient. Coverage
+  -- lives in camera_patients. SET NULL, not CASCADE — a sensor can watch
+  -- more than one person and deleting one must not take the hardware
+  -- from the others. Dropped once nothing reads it.
+  patient_id          uuid references public.patients(id) on delete set null,
   display_id          int  not null,                  -- per-patient sequence: "Cam 01"
   room                text not null,
   icon_name           text not null default 'tv',
@@ -399,11 +444,9 @@ create table public.cameras (
   -- served their stream. Push refactor (Pi POSTs frames outbound)
   -- made it unused but column is kept nullable so historical /
   -- diagnostic queries still work. NOT referenced by the relay path.
-  pi_stream_url       text,
   -- Vestigial: was the URL the backend pulled PCM audio from in the
   -- pull-mode design. Same status as pi_stream_url after the push
   -- refactor; nullable, unused by the relay path.
-  pi_audio_url        text,
   -- Bearer token (hashed) that the Pi presents on POST /v1/cameras/me/frames
   -- when pushing its MJPEG stream up. Generated at provision time,
   -- returned ONCE in plaintext to the Pi via the announce response,
@@ -454,13 +497,23 @@ create table public.cameras (
   -- severed per-camera at the SFU and data collection never records this
   -- camera; detection + text insights keep flowing.
   privacy_enabled         boolean not null default false,
-  constraint cameras_pi_stream_url_length
-    check (pi_stream_url is null or length(pi_stream_url) <= 2048),
-  constraint cameras_pi_audio_url_length
-    check (pi_audio_url is null or length(pi_audio_url) <= 2048),
+  -- Facilities audio kill, per SENSOR since 2026-08-22: it is a statement
+  -- about a room, and a sensor covering nobody had no patient to read it
+  -- from.
+  audio_capture_enabled   boolean not null default true,
+  -- Identity GPU slot, per SENSOR since 2026-08-22. Every sensor on an
+  -- account shares one LiveKit room, so a per-patient slot meant two
+  -- processes decoding the same video.
+  identity_node_id        text references public.identity_nodes(node_id) on delete set null,
+  identity_port           integer
+    check (identity_port is null or identity_port between 8012 and 8111),
+  -- When this camera last passed the three-finger setup self-test. Cleared
+  -- on the camera's next participant_joined (a restart re-arms the test).
+  -- NULL = armed. Gates the setup-test detector and nothing else.
+  setup_test_passed_at    timestamptz,
   constraint cameras_ingest_token_required
     check (
-      (source_type in ('pi', 'gateway') and ingest_token_hash is not null)
+      (source_type = 'gateway' and ingest_token_hash is not null)
       or (source_type = 'iphone' and ingest_token_hash is null)
     ),
   constraint cameras_ingest_token_hash_length
@@ -476,73 +529,6 @@ create index idx_cameras_gateway_id on public.cameras(gateway_id);
 create unique index cameras_pairing_code_uniq
   on public.cameras(pairing_code)
   where pairing_code is not null;
-
-
--- ── pi_discoveries ───────────────────────────────────────────────
--- Holds "I am a Nemara camera at <url>" announcements from Pi
--- devices that have joined home WiFi but have not yet been paired
--- to a patient. Pairing happens when a caregiver picks a discovery
--- from the "Add a camera" screen, which triggers
--- POST /v1/cameras/pi-provision {discovery_id} and inserts a row
--- in `cameras` referencing this discovery.
---
--- One row per device, keyed by hardware_id (stable MAC address).
--- A device that re-announces just updates `current_url` and
--- `last_seen_at`. The caregiver-facing list endpoint filters to
--- recently-seen unclaimed rows so stale devices fall off
--- automatically.
---
--- Security note: there is intentionally NO authentication on the
--- announce path. The Pi has no credentials before pairing. This is
--- acceptable for v1 because BLE-based provisioning (Phase 4.5b)
--- requires physical proximity to set up the device, and our
--- customer scale is low enough that cross-customer announcement
--- collisions are extremely unlikely. v2 will add a per-device
--- secret negotiated over BLE that the announcement carries.
-create table public.pi_discoveries (
-  id                uuid primary key default gen_random_uuid(),
-  -- Stable hardware identifier (the WiFi NIC's MAC address). Used
-  -- both as the de-dupe key (one record per device) and as the
-  -- public-facing "ID" the caregiver picks from in the UI.
-  hardware_id       text not null,
-  -- Human-readable label the Pi sends (e.g. "Nemara Camera A4B7C2"
-  -- with the last 6 of MAC). Surfaces in the caregiver's pick list
-  -- so they can match a discovered record to the physical device.
-  device_label      text not null,
-  -- Current MJPEG endpoint. Updated on every re-announce; a Pi that
-  -- gets a new DHCP lease pushes a new URL within ~60 s.
-  current_url       text not null,
-  -- Optional audio endpoint, same shape contract as cameras.pi_audio_url.
-  current_audio_url text,
-  first_seen_at     timestamptz not null default now(),
-  last_seen_at      timestamptz not null default now(),
-  -- When a caregiver pairs this discovery to a camera row, both
-  -- fields are populated. `claimed_camera_id` is the FK; nulled on
-  -- camera delete so the discovery can be re-paired without manual
-  -- DB intervention.
-  claimed_at        timestamptz,
-  claimed_camera_id uuid references public.cameras(id) on delete set null,
-  -- One-shot plaintext ingest bearer token for the Pi to pick up on
-  -- its next announce response. See src/db/pi_discovery.py for the
-  -- lifecycle rule (set on provision, nulled on first read).
-  pending_ingest_token text,
-  -- Length caps mirror cameras.pi_stream_url for consistency.
-  constraint pi_discoveries_url_length
-    check (length(current_url) <= 2048),
-  constraint pi_discoveries_audio_url_length
-    check (current_audio_url is null or length(current_audio_url) <= 2048),
-  constraint pi_discoveries_pending_token_length
-    check (pending_ingest_token is null or length(pending_ingest_token) <= 128),
-  unique (hardware_id)
-);
-
-create index pi_discoveries_last_seen_idx
-  on public.pi_discoveries(last_seen_at);
--- Index the "unclaimed list" query path: GET /v1/cameras/discovered
--- filters `WHERE claimed_at IS NULL AND last_seen_at > now() - 5 min`.
-create index pi_discoveries_unclaimed_idx
-  on public.pi_discoveries(last_seen_at)
-  where claimed_at is null;
 
 
 -- ── detectors ────────────────────────────────────────────────────
@@ -620,7 +606,7 @@ create table public.detectors (
   -- ── Detection v2 dimensions ────────────────────────────────────────
   -- Spec: docs/architecture/detection-architecture-v2.md. Python source of
   -- truth for built-in values: src/services/detection/catalog_v2.py (keep
-  -- the backfill block in scripts/apply_detector_v2_delta.sql in sync).
+  -- the backfill block in scripts/deltas/apply_detector_v2_delta.sql in sync).
   -- NULL = not yet classified (pre-backfill rows / legacy customs).
   -- Nothing before P3 reads these except severity (promotion prefers the
   -- row value, falls back to the in-code catalog map when NULL).
@@ -669,6 +655,22 @@ create trigger detectors_set_updated_at
 --                                   so doesn't appear here)
 --   - row in this table        → detector runs on that specific camera
 --   - no row                   → detector does NOT run on that camera
+-- Which patients a camera watches. A shared room (an RCFE lounge, a
+-- couple's living room) is ONE camera covering several residents: one
+-- stream, one set of model calls, results attributed per resident.
+-- No rows = provisioned but not yet assigned to anyone.
+create table public.camera_patients (
+  camera_id  uuid not null references public.cameras(id)  on delete cascade,
+  patient_id uuid not null references public.patients(id) on delete cascade,
+  -- The patient whose LiveKit room this camera publishes into. A camera
+  -- streams to exactly one room; everyone else covered gets the results.
+  added_at   timestamptz not null default now(),
+  primary key (camera_id, patient_id)
+);
+create index camera_patients_patient_idx
+  on public.camera_patients (patient_id);
+
+
 create table public.cameras_detectors (
   camera_id   uuid not null references public.cameras(id)   on delete cascade,
   detector_id uuid not null references public.detectors(id) on delete cascade,
@@ -981,9 +983,38 @@ create policy patients_member on public.patients
   for all using (public.has_patient_access(id)) with check (caregiver_id = auth.uid());
 
 alter table public.cameras enable row level security;
+-- Two ways in: you own the account (the ONLY way to see a camera nobody
+-- has assigned yet), or you can reach a patient it covers.
 create policy cameras_member on public.cameras
-  for all using (public.has_patient_access(patient_id))
-  with check (public.has_patient_access(patient_id));
+  for all using (
+    caregiver_id = auth.uid()
+    or exists (
+      select 1 from public.camera_patients cp
+       where cp.camera_id = cameras.id
+         and public.has_patient_access(cp.patient_id)
+    )
+  )
+  with check (
+    caregiver_id = auth.uid()
+    or exists (
+      select 1 from public.camera_patients cp
+       where cp.camera_id = cameras.id
+         and public.has_patient_access(cp.patient_id)
+    )
+  );
+
+alter table public.camera_patients enable row level security;
+create policy camera_patients_member on public.camera_patients
+  for all using (
+    public.has_patient_access(patient_id)
+    and exists (select 1 from public.cameras c
+                 where c.id = camera_id and c.caregiver_id = auth.uid())
+  )
+  with check (
+    public.has_patient_access(patient_id)
+    and exists (select 1 from public.cameras c
+                 where c.id = camera_id and c.caregiver_id = auth.uid())
+  );
 
 -- gateways is backend-internal: ONLY the postgres/service role (which
 -- bypasses RLS) touches it, via the gateway roster/provision endpoints. No
@@ -995,12 +1026,16 @@ create policy cameras_member on public.cameras
 alter table public.gateways enable row level security;
 revoke all on public.gateways from anon, authenticated;
 
--- pi_discoveries is likewise backend-internal (the Pi announce/provision
+-- identity_nodes is fleet infrastructure, reached only by the backend
+-- through the service role. No policy: RLS with none denies every
+-- non-owner, and the revoke stops PostgREST exposing it to the anon key
+-- that ships in the app binary.
+alter table public.identity_nodes enable row level security;
+revoke all on public.identity_nodes from anon, authenticated;
+
 -- flow). The app reads discoveries via the backend API, never the table
 -- directly, and there's no caregiver_id to scope by. It holds a plaintext
 -- one-shot ingest token (`pending_ingest_token`), so deny-all is essential.
-alter table public.pi_discoveries enable row level security;
-revoke all on public.pi_discoveries from anon, authenticated;
 
 alter table public.detectors enable row level security;
 create policy detectors_member on public.detectors
@@ -1078,3 +1113,22 @@ alter table public.detectors         replica identity full;
 alter table public.cameras_detectors replica identity full;
 alter table public.events            replica identity full;
 alter table public.analyses          replica identity full;
+
+-- Sensor names are unique per ACCOUNT (2026-08-22).
+create unique index cameras_account_room_unique
+  on public.cameras (caregiver_id, lower(room))
+  where room is not null and room <> '';
+
+-- One gateways row per service token: enrolment is a
+-- SELECT-then-INSERT and raced into duplicates.
+create unique index gateways_token_hash_uidx
+  on public.gateways (token_hash);
+
+-- One identity process per port per node. Across nodes the same
+-- port is fine; they are different machines.
+create unique index cameras_identity_node_port_uidx
+  on public.cameras (identity_node_id, identity_port)
+  where identity_node_id is not null and identity_port is not null;
+-- The claim's hot query: unassigned sensors, oldest first.
+create index cameras_identity_unassigned_idx
+  on public.cameras (created_at) where identity_node_id is null;

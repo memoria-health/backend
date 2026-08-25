@@ -156,10 +156,21 @@ YOLO-trigger→forced-reground self-heal closing in one tick.
   proxies (:1055 HTTP CONNECT; asyncpg gets a socat TCP bridge for the
   local-rig DB). Production backend/DB/LiveKit are public — no proxy.
 
-## 2. Identity service — one process per home
+## 2. Identity service — one process per ROOM
 
-Entry: `python3 -m identity.service --room patient_<id> --patient <id>
---port <port> --pod-url http://127.0.0.1:8000`. Joins the LiveKit room
+Entry: `python3 -m identity.service --room patient_<id>
+--port <port> --pod-url http://127.0.0.1:8000`.
+
+A room, not a patient (2026-08-20). A camera publishes into exactly one
+LiveKit room, so a camera watching two residents is decoded, tracked and
+probed ONCE, in the one process that holds that room — and that process
+answers for BOTH of them. It loads one face gallery per covered
+resident and asks the same binary question of each, keeping the highest
+score above the floor; below it for everyone the answer is nobody, with
+no fall back to any default person. `/state` returns `seats` keyed by
+patient uuid (state-v2), and the backend router resolves which process
+to ask from the CAMERA's `livekit_room`, never from the patient the
+tick is about. Joins the LiveKit room
 with `auto_subscribe`; every `cam_*` video track gets a `CameraLoop`.
 A 10s "missed subscription" walk re-toggles any unsubscribed or quiet
 camera (gateway restarts can re-publish without a callback); 6 failed

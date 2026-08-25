@@ -29,7 +29,7 @@ from starlette.requests import ClientDisconnect
 
 from src.api.deps import SettingsDep
 from src.db.session import get_sessionmaker
-from src.services import livekit_privacy
+from src.services import livekit_privacy, livekit_rooms
 from src.services.detection import camera_presence
 
 log = logging.getLogger(__name__)
@@ -95,9 +95,14 @@ async def receive_livekit_webhook(
     room_name = event.room.name if event.room else ""
     participant_identity = event.participant.identity if event.participant else ""
 
-    # Only patient rooms are interesting to the detector. Other rooms
-    # (e.g. future surface area) are accepted-but-ignored.
-    if not room_name.startswith("patient_"):
+    # Only OUR rooms are interesting to the detector; anything else is
+    # accepted-but-ignored. Both shapes count: `account_<caregiver_id>`
+    # for sensors, and `patient_<patient_id>` for wall phones paired
+    # before the account-room change. Checking only the old prefix meant
+    # every bridge sensor's join and leave was dropped on the floor —
+    # no RoomWorker spawned, and `online` never written, so a streaming
+    # camera read offline forever.
+    if not livekit_rooms.is_room_name(room_name):
         return
 
     if event.event == "participant_joined" and participant_identity.startswith("cam_"):
@@ -110,6 +115,11 @@ async def receive_livekit_webhook(
         if worker is not None:
             await worker.ensure_room_joined(room_name)
             await worker.signal_reconcile(room_name)
+        # A rejoining publisher is what a camera restart looks like here, so
+        # re-arm its setup self-test. Best-effort: never blocks the ack.
+        await camera_presence.rearm_setup_test_by_identity(
+            get_sessionmaker(), participant_identity,
+        )
         log.info(
             "livekit_webhook participant_joined room=%s identity=%s -> joined",
             room_name, participant_identity,
@@ -149,7 +159,13 @@ async def receive_livekit_webhook(
             get_sessionmaker(), participant_identity,
         )
         if worker is not None:
-            await worker.ensure_room_left_if_empty(room_name)
+            # Naming the leaver is what lets the worker tell "this room is
+            # now empty" from "one of several sensors on this account went
+            # away". Without it, a shared account room lost detection on
+            # every surviving camera.
+            await worker.ensure_room_left_if_empty(
+                room_name, departed=participant_identity,
+            )
         log.info(
             "livekit_webhook participant_left room=%s identity=%s -> offline",
             room_name, participant_identity,
@@ -161,7 +177,13 @@ async def receive_livekit_webhook(
             get_sessionmaker(), room_name,
         )
         if worker is not None:
-            await worker.ensure_room_left_if_empty(room_name)
+            # UNCONDITIONAL, unlike participant_left. The room itself is
+            # gone, so there is nothing left to publish into it and no
+            # survivor to protect — and the worker's ingest map may still
+            # be populated simply because the SDK has not caught up, which
+            # the emptiness check would read as "someone is still here"
+            # and leave the worker running against a dead room forever.
+            await worker._evict_room(room_name)
         log.info(
             "livekit_webhook room_finished room=%s -> %d offline",
             room_name, flipped,

@@ -97,7 +97,11 @@ async def record_clip(
     task = asyncio.create_task(
         clip_recorder.record_clip(
             settings=settings,
-            room_name=f"patient_{patient_id}",
+            # The sensor's own room, not one built from the
+            # patient: an account-room sensor would otherwise be
+            # recorded from a room it does not publish into, and
+            # the clip would be empty.
+            room_name=target.livekit_room,
             camera_identity=target.livekit_identity,
             duration=duration,
         )

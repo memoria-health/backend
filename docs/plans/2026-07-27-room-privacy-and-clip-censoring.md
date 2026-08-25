@@ -44,7 +44,7 @@
 
 ### State (backend)
 
-New delta `scripts/apply_camera_privacy_delta.sql`:
+New delta `scripts/deltas/apply_camera_privacy_delta.sql`:
 
 ```sql
 alter table cameras add column room_class text

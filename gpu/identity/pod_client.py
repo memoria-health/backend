@@ -25,6 +25,7 @@ import asyncio
 import base64
 import logging
 import os
+import pathlib
 
 import httpx
 import numpy as np
@@ -40,6 +41,47 @@ from perception.rawwire import pack_frames
 log = logging.getLogger(__name__)
 
 _EMB_DIM = 512
+
+# Default matches perception/server.py's `_load_auth_token`.
+_TOKEN_FILE = "/persist/secrets/perception_token"
+
+
+def _wh(v) -> "tuple[int, int] | None":
+    """(width, height) of the frame the screen regions were measured in.
+
+    None from an older pod build, which is why the consumer must treat
+    None as "cannot normalise" rather than substituting a guess — the
+    guess is what put every region in the wrong place.
+    """
+    try:
+        w, h = int(v[0]), int(v[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    return (w, h) if w > 0 and h > 0 else None
+
+
+def load_perception_token() -> str:
+    """The shared bearer for perception, from the environment or a file.
+
+    MUST mirror the server's resolution. Perception reads env-then-file
+    precisely so auth can be switched on by writing one file on the
+    shared volume — no pod recycle. This side read the env ALONE, so
+    writing that file turned auth on for the server and left the only
+    legitimate client sending no bearer at all: every /observe_raw came
+    back 401, every tracking step failed, and the service went on
+    answering /state as `ready` with an empty camera map (2026-08-23).
+
+    Not imported from `perception.server`: importing the server module
+    would start it. Eight duplicated lines beat that.
+    """
+    env = os.environ.get("NEMARA_PERCEPTION_TOKEN", "").strip()
+    if env:
+        return env
+    path = os.environ.get("NEMARA_PERCEPTION_TOKEN_FILE", _TOKEN_FILE)
+    try:
+        return pathlib.Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
 
 
 # Payload sanity caps (security review S5): the brain consumes rows
@@ -86,7 +128,7 @@ class SamServiceClient:
         # an unset token leaves dev exactly as it was. Sent on every request
         # via the client's default headers rather than per-call, so a new
         # endpoint cannot forget it.
-        _tok = os.environ.get("NEMARA_PERCEPTION_TOKEN", "").strip()
+        _tok = load_perception_token()
         if _tok:
             self._client.headers["Authorization"] = f"Bearer {_tok}"
         self._expected_face_model = expected_face_model
@@ -173,6 +215,7 @@ class SamServiceClient:
         face_cap: int,
         detect_screens: bool = False,
         session_state: "dict | None" = None,
+        not_people: "set[int] | None" = None,
     ) -> RemoteObservations:
         """POST ordered (orig_idx, frame) frames; parse the raw
         observations. Raises on transport/HTTP errors (fail-open is
@@ -198,6 +241,12 @@ class SamServiceClient:
             }
             if session_state is not None:
                 header["session_state"] = session_state
+            if not_people:
+                # Ids judged to be a display or a painting. The pod still
+                # TRACKS them — it must, or a wrong judgement here would
+                # blind it permanently — but stops counting them as
+                # people when comparing its view of the room to YOLO's.
+                header["not_people"] = sorted(int(t) for t in not_people)
             # to_thread: packing a batch is a ~tens-of-MB memcpy — off
             # the event loop, same as the JPEG encode it replaced.
             body = await asyncio.to_thread(
@@ -312,6 +361,14 @@ def _parse_observe(j: dict) -> RemoteObservations:
             continue
         if len(vals) == 5 and all(np.isfinite(v) for v in vals):
             screen_regions.append(vals)
+    person_boxes: list[tuple[float, float, float, float]] = []
+    for box in j.get("person_boxes", [])[:32]:
+        try:
+            vals = tuple(float(v) for v in box[:4])
+        except (TypeError, ValueError):
+            continue
+        if len(vals) == 4 and all(np.isfinite(v) for v in vals):
+            person_boxes.append(vals)
     stats = j.get("stats", {})
     return RemoteObservations(
         epoch=str(j.get("epoch", "")),
@@ -329,6 +386,9 @@ def _parse_observe(j: dict) -> RemoteObservations:
             k: float(v) for k, v in j.get("timings_ms", {}).items()
         },
         screen_regions=tuple(screen_regions),
+        screen_concept=str(j.get("screen_concept", "")),
+        screen_frame_wh=_wh(j.get("screen_frame_wh")),
+        person_boxes=tuple(person_boxes),
         session_state=(
             j["session_state"]
             if isinstance(j.get("session_state"), dict) else None

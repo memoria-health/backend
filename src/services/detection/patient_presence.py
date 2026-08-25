@@ -180,3 +180,36 @@ class PatientPresence:
             return False
         seen, at = self._holder_seen
         return seen and (time.monotonic() - at) <= fresh_s
+
+
+class PresenceRegistry:
+    """One `PatientPresence` per patient, created on demand.
+
+    `PatientPresence` holds a single claim meaning "the patient is on
+    camera X", and RoomWorker kept one instance per ROOM. That was sound
+    while a room was a patient: `room_worker` says so in its own comment,
+    "one per room (= per patient)".
+
+    Account rooms broke it. Every sensor on an account now shares one
+    room, so one registry spanned every resident: Dad face-confirmed in
+    the kitchen made `confirmed_elsewhere()` true for MOM's bedroom
+    sensor, which skips her patient-scoped detectors, degrades her re-id
+    fidelity and can skip her tick outright. The registry has to be keyed
+    by the thing the claim is actually about.
+    """
+
+    def __init__(self, *, ttl_s: float = CONFIRM_TTL_S) -> None:
+        self._ttl_s = ttl_s
+        self._by_patient: dict[UUID, PatientPresence] = {}
+
+    def for_patient(self, patient_id: UUID | None) -> PatientPresence | None:
+        """The registry for one patient. None for an unassigned sensor —
+        there is no patient to be present or elsewhere, and every caller
+        already treats a missing registry as "no opinion"."""
+        if patient_id is None:
+            return None
+        got = self._by_patient.get(patient_id)
+        if got is None:
+            got = self._by_patient[patient_id] = PatientPresence(
+                ttl_s=self._ttl_s)
+        return got

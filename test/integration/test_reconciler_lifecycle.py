@@ -191,7 +191,8 @@ async def _seed_caregiver_patient_camera(
     camera_id = uuid4()
     session.add(
         Camera(
-            id=camera_id, patient_id=patient_id, display_id=1,
+            id=camera_id, patient_id=patient_id, caregiver_id=uid,
+            display_id=1,
             room="Bedroom", icon_name="bed.double", online=online,
             api_key_hash=None, livekit_identity=livekit_identity,
             state=state,

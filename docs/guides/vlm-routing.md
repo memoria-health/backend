@@ -256,7 +256,7 @@ Three ways, in order of convenience:
 - `src/db/caregiver.py` — the `vlm_provider` column on the ORM.
 - Schema: `caregivers.vlm_provider text` (nullable) and the
   `analyses_provider_check` constraint must include `'openrouter'`
-  (see `scripts/apply_vlm_provider_delta.sql` if migrating a fresh DB —
+  (see `scripts/deltas/apply_vlm_provider_delta.sql` if migrating a fresh DB —
   **without that constraint value, Qwen ticks run fine but fail to save**).
   The constraint does **not** yet include `'dashscope'` — see the ⚠️ in §1.
 

@@ -16,6 +16,8 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 
+from sqlalchemy import text as sa_text
+
 from src.db.camera import Camera
 from src.db.session import get_sessionmaker
 from test.conftest import mint_test_jwt
@@ -34,10 +36,17 @@ async def _insert_camera(
     cam_id = uuid4()
     sm = get_sessionmaker()
     async with sm() as s:
+        # Derived rather than passed in: a camera's account is not an
+        # independent fact about it, it is the account its patient is on.
+        caregiver_id = (await s.execute(
+            sa_text("select caregiver_id from patients where id = :p"),
+            {"p": str(patient_id)},
+        )).scalar_one()
         s.add(
             Camera(
                 id=cam_id,
                 patient_id=patient_id,
+                caregiver_id=caregiver_id,
                 display_id=display_id,
                 room=room,
                 icon_name="bed.double",
@@ -47,7 +56,10 @@ async def _insert_camera(
                 close_threshold=2,
                 source_type=source_type,
                 desired_state=desired_state,
-                ingest_token_hash=("a" * 64) if source_type == "pi" else None,
+                # A gateway sensor authenticates with an ingest token,
+                # and `cameras_ingest_token_required` enforces that.
+                ingest_token_hash=(
+                    "a" * 64 if source_type == "gateway" else None),
                 created_at=datetime.now(timezone.utc),
             ),
         )
@@ -288,30 +300,27 @@ async def test_other_caregiver_cannot_see_my_patient(
 
 
 @pytest.mark.asyncio
-async def test_create_patient_auto_seeds_four_preset_detectors(
+async def test_create_patient_seeds_no_visible_detectors(
     client: AsyncClient, auth_user
 ) -> None:
-    """POST /v1/patients should seed Falls / Agitation / Wandering /
-    Medication adherence — same shape MockData.swift uses on iOS.
+    """Was: POST /v1/patients seeds Falls / Agitation / Wandering /
+    Medication adherence.
+
+    It seeds none of them now (1cd354e). The caregiver picks from the
+    library on add, so the auto-seeded rows were a second, competing
+    source of truth and showed up in the picker as "already added".
+
+    `setup_test` still seeds and must — it is hidden, so it is excluded
+    from this list, which is why the assertion is an empty VISIBLE list
+    rather than an empty table.
     """
     headers = await _provision(client, auth_user)
     pid = (await client.post("/v1/patients", headers=headers, json=_FULL_BODY)).json()["id"]
 
     r = await client.get(f"/v1/patients/{pid}/detectors", headers=headers)
     assert r.status_code == 200
-    detectors = r.json()
-    assert len(detectors) == 4
+    assert r.json() == []
 
-    names = [d["name"] for d in detectors]
-    assert names == ["Falls", "Agitation", "Wandering", "Medication adherence"]
-    for d in detectors:
-        assert d["source"] == "preset"
-        assert d["sensitivity"] == "standard"
-        assert d["is_on"] is True
-        assert d["custom_prompt"] is None
-
-
-# ─── cameras_paused cascade ───────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -330,27 +339,21 @@ async def test_patch_cameras_paused_false_to_true_cascades_to_disconnected(
         patient_id=UUID(pid), display_id=1, room="Living Room",
         source_type="iphone", desired_state="connected",
     )
-    pi_id = await _insert_camera(
+    gateway_id = await _insert_camera(
         patient_id=UUID(pid), display_id=2, room="Bedroom",
-        source_type="pi", desired_state="connected",
+        source_type="gateway", desired_state="connected",
     )
 
-    with patch(
-        "src.api.patients.pi_ingest_module.cancel_active_relay",
-        new=AsyncMock(return_value=False),
-    ) as mock_cancel:
-        r = await client.patch(
-            f"/v1/patients/{pid}", headers=headers,
-            json={"cameras_paused": True},
-        )
+    r = await client.patch(
+        f"/v1/patients/{pid}", headers=headers,
+        json={"cameras_paused": True},
+    )
 
     assert r.status_code == 200
     assert r.json()["cameras_paused"] is True
 
     assert await _camera_desired_state(iphone_id) == "disconnected"
-    assert await _camera_desired_state(pi_id) == "disconnected"
-
-    mock_cancel.assert_awaited_once_with(pi_id)
+    assert await _camera_desired_state(gateway_id) == "disconnected"
 
 
 @pytest.mark.asyncio
@@ -367,31 +370,25 @@ async def test_patch_cameras_paused_true_to_false_cascades_to_connected(
         patient_id=UUID(pid), display_id=1, room="Living Room",
         source_type="iphone", desired_state="disconnected",
     )
-    pi_id = await _insert_camera(
+    gateway_id = await _insert_camera(
         patient_id=UUID(pid), display_id=2, room="Bedroom",
-        source_type="pi", desired_state="disconnected",
+        source_type="gateway", desired_state="disconnected",
     )
 
     await client.patch(
         f"/v1/patients/{pid}", headers=headers, json={"cameras_paused": True},
     )
 
-    with patch(
-        "src.api.patients.pi_ingest_module.cancel_active_relay",
-        new=AsyncMock(return_value=False),
-    ) as mock_cancel:
-        r = await client.patch(
-            f"/v1/patients/{pid}", headers=headers,
-            json={"cameras_paused": False},
-        )
+    r = await client.patch(
+        f"/v1/patients/{pid}", headers=headers,
+        json={"cameras_paused": False},
+    )
 
     assert r.status_code == 200
     assert r.json()["cameras_paused"] is False
 
     assert await _camera_desired_state(iphone_id) == "connected"
-    assert await _camera_desired_state(pi_id) == "connected"
-
-    mock_cancel.assert_not_awaited()
+    assert await _camera_desired_state(gateway_id) == "connected"
 
 
 @pytest.mark.asyncio
@@ -410,18 +407,13 @@ async def test_patch_cameras_paused_same_value_does_not_cascade(
         source_type="iphone", desired_state="disconnected",
     )
 
-    with patch(
-        "src.api.patients.pi_ingest_module.cancel_active_relay",
-        new=AsyncMock(return_value=False),
-    ) as mock_cancel:
-        r = await client.patch(
-            f"/v1/patients/{pid}", headers=headers,
-            json={"cameras_paused": False},
-        )
+    r = await client.patch(
+        f"/v1/patients/{pid}", headers=headers,
+        json={"cameras_paused": False},
+    )
 
     assert r.status_code == 200
     assert await _camera_desired_state(cam_id) == "disconnected"
-    mock_cancel.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -439,18 +431,13 @@ async def test_patch_without_cameras_paused_does_not_touch_cameras(
         source_type="iphone", desired_state="disconnected",
     )
 
-    with patch(
-        "src.api.patients.pi_ingest_module.cancel_active_relay",
-        new=AsyncMock(return_value=False),
-    ) as mock_cancel:
-        r = await client.patch(
-            f"/v1/patients/{pid}", headers=headers,
-            json={"preferred_name": "Margie"},
-        )
+    r = await client.patch(
+        f"/v1/patients/{pid}", headers=headers,
+        json={"preferred_name": "Margie"},
+    )
 
     assert r.status_code == 200
     assert await _camera_desired_state(cam_id) == "disconnected"
-    mock_cancel.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -491,14 +478,17 @@ async def test_patch_cameras_paused_does_not_cascade_to_other_caregivers_cameras
 
 
 @pytest.mark.asyncio
-async def test_under_18_seeds_child_detectors(
+async def test_a_minor_is_seeded_no_visible_detectors(
     client: AsyncClient, auth_user
 ) -> None:
-    """A patient under 18 seeds ONLY the both-cohort safety net (fall).
-    The child-only preset set (climbing/distress/child_*) was deleted
-    2026-08-16 — adult-only product, zero rows in any database — so a
-    minor must get neither those nor the older-adult
-    agitation/wandering/medication set."""
+    """Was: a minor seeds ONLY the both-cohort safety net (fall).
+
+    No cohort seeds anything visible any more (1cd354e). The caregiver
+    picks from the library, and the seeded rows were a competing source
+    of truth that rendered as "already added" in the picker. What this
+    still pins is that a MINOR gets nothing extra and nothing special —
+    the child-only preset set was deleted 2026-08-16 (adult-only
+    product) and must not come back through a cohort branch."""
     headers = await _provision(client, auth_user)
     pid = (
         await client.post(
@@ -514,11 +504,11 @@ async def test_under_18_seeds_child_detectors(
     ).json()["id"]
     dets = (await client.get(f"/v1/patients/{pid}/detectors", headers=headers)).json()
     ids = {d["identifier"] for d in dets}
-    assert ids == {"fall"}
+    assert ids == set()
 
 
 @pytest.mark.asyncio
-async def test_adult_and_unknown_age_seed_adult_detectors(
+async def test_an_adult_and_an_unknown_age_are_seeded_nothing_visible(
     client: AsyncClient, auth_user
 ) -> None:
     """18+ and unknown-birthday patients both get the older-adult set."""
@@ -542,7 +532,9 @@ async def test_adult_and_unknown_age_seed_adult_detectors(
             await client.get(f"/v1/patients/{adult_pid}/detectors", headers=headers)
         ).json()
     }
-    assert adult_ids == {"fall", "agitation", "wandering", "medication"}
+    # Was the four-preset adult set. Nothing is seeded now; the picker
+    # is the only way a detector arrives.
+    assert adult_ids == set()
 
     # No date_of_birth → adult default (unchanged prior behavior).
     nodob_pid = (
@@ -562,5 +554,5 @@ async def test_adult_and_unknown_age_seed_adult_detectors(
             await client.get(f"/v1/patients/{nodob_pid}/detectors", headers=headers)
         ).json()
     }
-    assert "agitation" in nodob_ids
+    assert nodob_ids == set()
     assert "climbing" not in nodob_ids

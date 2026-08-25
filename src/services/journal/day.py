@@ -183,8 +183,17 @@ def _sleep_spans(bed, wake, out_of_bed, tz: tzinfo) -> list[list[float]]:
     gaps: list[tuple[float, float]] = []
     for item in (out_of_bed or []):
         try:
-            gs = datetime.fromisoformat(str(item["start"]))
-            ge = datetime.fromisoformat(str(item.get("end") or item["start"]))
+            # "from"/"to" is what the summarizer writes; "start"/"end"
+            # is the older spelling still present in rows computed
+            # before 2026-08-03. Reading only the old one meant every
+            # gap raised KeyError into the except below and the band
+            # came out unbroken — a night with three wake-ups drawn as
+            # uninterrupted sleep, silently, because the fallback is
+            # the honest-looking answer (2026-08-25).
+            start_raw = item.get("from") or item.get("start")
+            end_raw = item.get("to") or item.get("end") or start_raw
+            gs = datetime.fromisoformat(str(start_raw))
+            ge = datetime.fromisoformat(str(end_raw))
             g0, g1 = hour_x(gs, tz, "noon"), hour_x(ge, tz, "noon")
             if b < g0 < w:
                 gaps.append((g0, max(g0 + 0.15, min(g1, w))))
@@ -325,7 +334,7 @@ def build_entries(*, detectors: list, events_by_detector: dict, tz: tzinfo,
 
     Honesty rules (phase review, Aug 16):
       - A detector that is OFF still contributes its line on days it
-        HAS events — history never vanishes on a toggle. Off detectors
+        produced DATA — history never vanishes on a toggle. Off detectors
         with nothing that day are skipped (no quiet claims for them).
       - When the day had zero watched hours, quiet lines say
         "Not watched" instead of asserting a clean bill that was never
@@ -334,11 +343,18 @@ def build_entries(*, detectors: list, events_by_detector: dict, tz: tzinfo,
     entries: list[dict] = []
     for det in detectors:
         events = events_by_detector.get(str(det.id), [])
-        if not getattr(det, "is_on", True):
-            had_ticks = bool(detected_times_by_identifier.get(
-                det.identifier or ""))
-            if not events and not had_ticks:
-                continue
+        # "Had data" must cover EVERY source a line can be built from
+        # below, not just events. Sleep and activity arrive as their own
+        # arguments, so checking events + detected_times alone reported
+        # them as empty and silently dropped a day of real history the
+        # moment the detector was switched off (fixed 2026-08-19).
+        if not getattr(det, "is_on", True) and not (
+            events
+            or detected_times_by_identifier.get(det.identifier or "")
+            or (det.identifier == "sleep" and sleep_row)
+            or (det.identifier == "activity" and activity_ticks)
+        ):
+            continue
         if det.alert_trigger == "record_only":
             if det.identifier == "sleep":
                 e = sleep_line(sleep_row, tz)

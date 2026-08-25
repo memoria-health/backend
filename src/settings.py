@@ -261,7 +261,7 @@ class Settings(BaseSettings):
     # (Replaces the per-clip masked-audio switch: audio is now kept
     # unconditionally per the 2026-07-28 product call — redaction
     # pixelates video spans and never touches the track. Capture is
-    # still severed at the publisher by patients.audio_capture_enabled.)
+    # still severed at the publisher by cameras.audio_capture_enabled.)
     # Recording is raw-to-local-disk; between mux and upload the clip is
     # re-screened in chunks and the sensitive spans pixelated via the
     # event-clip censor (research mode, span-gated). ANY redaction
@@ -394,6 +394,30 @@ class Settings(BaseSettings):
     scheduler_person_requires_track: bool = Field(default=False)
     # duty_cycle='sampled' detectors run every k-th tick. 1 = parity.
     scheduler_sample_every_k: int = Field(ge=1, le=60, default=1)
+    # Hard ceiling on k-of-N confirm votes per camera per rolling hour.
+    # The confirmer spends a model call per vote on a clip already paid
+    # for, so it is invisible next to the tick it rides on and unbounded
+    # in the same breath: armed on sleep for one night it made 905
+    # rounds of 3 and burned 33M input tokens confirming that a sleeping
+    # man was still asleep. Edge-triggering is the fix; this is the
+    # backstop for when the fix is wrong. 60/hour is one round of three
+    # every three minutes, far above any real detector and far below an
+    # accident.
+    confirm_votes_per_hour: int = Field(ge=0, le=10_000, default=60)
+    # Fold nights into `sleep_nights` on a schedule.
+    #
+    # OFF since 2026-08-25. The fold is correct; its INPUT is not. On the
+    # night of 08-24 the detector said "asleep" on 4-9% of ticks during
+    # genuine deep sleep and 3% of ticks while the resident sat awake on
+    # his phone. Those two rates overlap, so no rule downstream can tell
+    # a real night from three stray verdicts — the record claimed he fell
+    # asleep at 23:16 when he fell asleep at about 03:15.
+    #
+    # A wrong night is worse than no night: a caregiver cannot tell it is
+    # wrong, and it is exactly the number they would act on. This stays
+    # off until the detector's own separation is fixed (see
+    # docs/plans/2026-08-24-sleep-detector-rework.md).
+    nightly_summaries_enabled: bool = Field(default=False)
     # Page record-only positives (rising edge) for verification. Off in prod.
     record_only_paging: bool = Field(default=False)
     # Dump every VLM artifact (exact Gemini input bytes) here. "" = off.
@@ -409,6 +433,13 @@ class Settings(BaseSettings):
     # Ring-pruned per camera; written under out/ (host-mounted).
     soak_id_frames_enabled: bool = Field(default=False)
     soak_id_frames_dir: str = Field(default="out/id_frames")
+
+    # Sleep is `record_only`: it fires no event, so clip_archival — which
+    # hangs off a fired event — never runs for it, and a night of sleep
+    # data leaves nothing to look at. Set this to a directory and the tick
+    # a disturbance is marked on, plus the one after, is written there.
+    # Empty (default) = off. DEV ONLY: raw frames, no sensitivity screen.
+    sleep_clips_dir: str = Field(default="")
 
     # ── Detection v2 decision layer (P4) ─────────────────────────
     # OFF = legacy decision logic byte-for-byte (30s global dedup,
@@ -822,6 +853,16 @@ class Settings(BaseSettings):
     # the top layer (the camera's full resolution). "medium" was the
     # soak-1 crash-night triage — kept selectable for rollback.
     livekit_subscribe_quality: str = Field(default="high")
+
+    # Which layer a CLOSED camera drops to. The subscription is what
+    # LiveKit bills and it does not care that we skip the analysis, so
+    # an empty room delivered its top layer all night for nothing.
+    # "medium" (640x360) rather than "low" (320x180): the tick that
+    # WAKES us judges the window already buffered, so this is the
+    # resolution a fall is first seen at. Set "low" for another ~3x if
+    # that trade is acceptable, "high" to disable the step-down.
+    # No effect where the publisher does not simulcast.
+    livekit_idle_subscribe_quality: str = Field(default="medium")
 
     # ── APNs (Phase 4) ──────────────────────────────────────────
     # Apple Developer credentials for HTTP/2 push. team_id +

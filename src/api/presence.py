@@ -26,8 +26,9 @@ async def last_presence(
              max(captured_at) filter (where people_present) as seen,
              max(captured_at) as looked
            from analyses a
-           join patients p on p.id = a.patient_id
-           where a.patient_id = :pid and p.caregiver_id = :cg"""),
+           join public.camera_patients cp on cp.camera_id = a.camera_id
+           join patients p on p.id = cp.patient_id
+           where cp.patient_id = :pid and p.caregiver_id = :cg"""),
         {"pid": str(patient_id), "cg": str(auth.id)})).first()
     return PresenceResponse(
         last_person_seen_at=row[0].isoformat() if row and row[0] else None,

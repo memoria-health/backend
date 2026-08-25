@@ -26,7 +26,7 @@ without enabling RLS fails the unit suite. It is deliberately static (parses
 SQL text, no database connection) so it runs in the suite that actually
 executes here — the integration suite currently cannot reach its fixtures.
 
-Defense in depth, not a replacement: `scripts/apply_auto_enable_rls_delta.sql`
+Defense in depth, not a replacement: `scripts/deltas/apply_auto_enable_rls_delta.sql`
 installs an event trigger that enables RLS automatically at CREATE TABLE time.
 This test catches the mistake in review; the trigger catches it in the database.
 """

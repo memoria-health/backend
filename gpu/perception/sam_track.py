@@ -192,6 +192,11 @@ def _write_clip(frames_bgr: list[np.ndarray]) -> str:
     return path
 
 
+# Fewest frames the tracker will actually propagate over. One is
+# not enough — see the note inside track_stream.
+_MIN_CLIP_FRAMES = 3
+
+
 def track_stream(
     pred, frames_bgr: list[np.ndarray], *, concept: str, thr: float,
 ) -> Iterator[tuple[int, list]]:
@@ -203,6 +208,30 @@ def track_stream(
 
     if not frames_bgr:
         return
+    # A ONE-FRAME CLIP GROUNDS NOTHING. Measured 2026-08-24 on a bedroom
+    # frame containing a large television:
+    #
+    #   frames=1 -> 0 regions    frames=3 -> 3 regions
+    #   frames=2 -> 2 regions    frames=5 -> 5 regions
+    #
+    # Same frame, same concept, same threshold. The clip is encoded to
+    # mp4 below and a single-frame mp4 gives the tracker nothing to
+    # propagate over, so it returns an empty result rather than an
+    # error — indistinguishable from "there is no television here".
+    #
+    # The display veto is the casualty: it calls this with exactly one
+    # frame, so it has NEVER found a region on any build, and every TV
+    # and framed face in the fleet has been minting phantom people
+    # while the veto reported itself healthy. Padded here rather than
+    # at that call site so the next single-frame caller cannot rediscover
+    # it the same way.
+    #
+    # Positions beyond the caller's real frame count are never yielded,
+    # so orig-index mapping is untouched.
+    real_frames = len(frames_bgr)
+    if real_frames < _MIN_CLIP_FRAMES:
+        frames_bgr = list(frames_bgr) + [frames_bgr[-1]] * (
+            _MIN_CLIP_FRAMES - real_frames)
     h, w = frames_bgr[0].shape[:2]
     tmp_dir = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
     fd, path = tempfile.mkstemp(suffix=".mp4", dir=tmp_dir)
@@ -267,12 +296,15 @@ def track_stream(
                     emitted.add(0)
                     yield 0, parse_frame(seeded["outputs"], thr)
                 emitted.add(pos0)
-                yield pos0, parse_frame(first.get("outputs", first), thr)
+                if pos0 < real_frames:
+                    yield pos0, parse_frame(first.get("outputs", first), thr)
                 for res in stream:
                     pos = int(res.get("frame_index", res.get("frame_idx")))
                     emitted.add(pos)
-                    yield pos, parse_frame(res.get("outputs", res), thr)
-            if 0 not in emitted and seeded.get("outputs") is not None:
+                    if pos < real_frames:
+                        yield pos, parse_frame(res.get("outputs", res), thr)
+            if (0 not in emitted and real_frames > 0
+                    and seeded.get("outputs") is not None):
                 yield 0, parse_frame(seeded["outputs"], thr)
     finally:
         if writer is not None:

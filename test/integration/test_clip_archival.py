@@ -186,7 +186,8 @@ async def _seed_event(
     camera_id = uuid4()
     session.add(
         Camera(
-            id=camera_id, patient_id=patient_id, display_id=1,
+            id=camera_id, patient_id=patient_id, caregiver_id=uid,
+            display_id=1,
             room="Bedroom", icon_name="tv", online=True, created_at=now,
         )
     )

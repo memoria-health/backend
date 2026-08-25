@@ -20,6 +20,31 @@ from src.main import create_app
 from src.settings import get_settings
 
 
+@pytest.fixture(autouse=True)
+def _restore_settings_cache():
+    """Hand `get_settings` back the way it was found.
+
+    Every test here builds an app under a pretend NEMARA_ENV, and the
+    last one parametrised is `prod`. `monkeypatch` puts the env var
+    back at teardown but it knows nothing about the lru_cache, so the
+    prod-built Settings stayed cached for the whole session — with
+    NEMARA_INTERNAL_SERVICE_KEY deliberately blank (conftest) and env
+    no longer "test", every /internal-style route in every LATER test
+    started failing closed. 20 failures across identity_roster and
+    patient_privacy_mode_api, none of them reproducible on their own,
+    and the suite could not be trusted as a merge gate (2026-08-25).
+
+    Clearing on the way out is the fix; clearing on the way in keeps
+    that true even if something else leaves a dirty cache behind.
+    """
+    _clear = getattr(get_settings, "cache_clear", None)
+    if _clear is not None:
+        _clear()
+    yield
+    if _clear is not None:
+        _clear()
+
+
 def _app_for_env(monkeypatch: pytest.MonkeyPatch, env: str):
     """Build an app as if it were running under NEMARA_ENV=<env>.
 
@@ -27,6 +52,7 @@ def _app_for_env(monkeypatch: pytest.MonkeyPatch, env: str):
     `get_settings()` builds a fresh Settings per call (see conftest),
     so setting the var is enough — but `get_settings` is lru_cached in
     some call paths, so clear it to be certain the app sees `env`.
+    The autouse fixture above clears it again afterwards.
     """
     monkeypatch.setenv("NEMARA_ENV", env)
     cache_clear = getattr(get_settings, "cache_clear", None)
@@ -49,10 +75,11 @@ def test_pi_announce_route_does_not_exist(monkeypatch, env):
     It accepted anonymous writes keyed on a caller-supplied
     hardware_id and handed back a plaintext ingest bearer token, so an
     attacker who won the race against a real Pi could push frames as
-    that camera. The Pi path is dead code (see src/db/camera.py:126 —
-    the push refactor made pi_stream_url vestigial), so the fix is
-    deletion. Parametrised across envs because an env-gated version of
-    this route would still be one config mistake from being live.
+    that camera. The whole Pi path is now deleted — endpoints, tables,
+    columns and the `source_type` value — so this guards against it
+    being reintroduced rather than against it still being live.
+    Parametrised across envs because an env-gated version of this route
+    would still be one config mistake away from serving.
     """
     app = _app_for_env(monkeypatch, env)
     paths = _paths(app)

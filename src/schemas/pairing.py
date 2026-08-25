@@ -43,6 +43,25 @@ class CreatePairingCodeRequest(BaseModel):
     icon_name: IconName = "tv"
 
 
+class CreateAccountPairingCodeRequest(BaseModel):
+    """Body of POST /v1/cameras/pairing-code.
+
+    Same as above minus the patient in the URL. Coverage is an ordinary
+    optional field here, which is the whole point: a phone paired from
+    the sensor roster names nobody and arrives unassigned, exactly like
+    an installed sensor, while one paired from a resident's Live view
+    passes that resident and arrives watching them. One endpoint, and
+    attribution lives in the same concept for every device class.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    room: RoomName
+    icon_name: IconName = "tv"
+    # Empty is the roster case and is entirely legal.
+    patient_ids: list[UUID] = []
+
+
 class CreatePairingCodeResponse(BaseModel):
     """Returned to the caregiver app after a code is minted. The code
     is short-lived; the caregiver app should countdown to the expiry

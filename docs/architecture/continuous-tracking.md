@@ -152,7 +152,7 @@ exist only in the unmerged `nemara-v2-soak` staging — not on this branch.
 
 ## 4. Verifying it
 
-- **Tick cadence & mode:** `scripts/pod.sh health` (or grep
+- **Tick cadence & mode:** `scripts/pod/pod.sh health` (or grep
   `continuous.tick` in `/workspace/sam_server.log`). Each line reports
   `mode=ground|carry seeded=N live=N drift=N`.
 - **See the mask:** set `NEMARA_EDGE_DEBUG_DIR=/workspace/edge_debug`,

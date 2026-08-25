@@ -61,6 +61,10 @@ if [ -n "${PUBLIC_KEY:-}" ] && [ -x "$SSHD_BIN" ]; then
   chmod 700 /root/.ssh
   echo "$PUBLIC_KEY" >> /root/.ssh/authorized_keys
   chmod 600 /root/.ssh/authorized_keys
+  # Host keys are NOT in the image (they must not be — a shared host key
+  # across every node is a fleet-wide impersonation risk). sshd refuses
+  # to start without them, so generate per-container on first boot.
+  ssh-keygen -A >/dev/null 2>&1 || true
   if "$SSHD_BIN"; then
     log "sshd up (PUBLIC_KEY present)"
   else
@@ -142,10 +146,31 @@ WORKERS="${NEMARA_PERCEPTION_WORKERS:-1}"
 # not an image build (30 min). EXPERIMENT NODES ONLY: production runs
 # immutable tagged images, which is why pod.sh-style rsync deploys
 # were deleted in the first place.
+#
+# COVERS src/ TOO (2026-08-23). It did not, and gpu/identity/gallery.py
+# imports src.services.identity.trace — so an overlay could put today's
+# identity code next to the image's three-day-old src/ and the pair
+# would not agree. It cost a day: `body_score() got an unexpected
+# keyword argument 'scores'` on every probe, while the service went on
+# answering /state as ready. A partial overlay is worse than none,
+# because "deployed" stops meaning "running what I wrote".
 dev_code_overlay() {
-  if [ "${NEMARA_DEV_CODE:-}" = "1" ] && [ -d /persist/dev-code/nemara ]; then
+  [ "${NEMARA_DEV_CODE:-}" = "1" ] || return 0
+  if [ -d /persist/dev-code/nemara ]; then
     cp -a /persist/dev-code/nemara/. /workspace/nemara/ 2>/dev/null \
       && log "dev-code overlay applied from /persist/dev-code/nemara"
+  fi
+  # MIRROR, not merge. src/ is wholly image-owned, so replacing the tree
+  # is what makes a DELETED module actually disappear — `cp` alone left
+  # ten dead Pi files behind on the first run. Staged into a sibling and
+  # swapped so a half-copied src/ is never importable.
+  if [ -d /persist/dev-code/src ]; then
+    rm -rf /workspace/.src.staging \
+      && cp -a /persist/dev-code/src /workspace/.src.staging \
+      && rm -rf /workspace/src.prev \
+      && mv /workspace/src /workspace/src.prev \
+      && mv /workspace/.src.staging /workspace/src \
+      && log "dev-code overlay applied from /persist/dev-code/src (mirrored)"
   fi
 }
 
@@ -373,17 +398,17 @@ for room in "${ROOMS[@]}"; do
   room="$(echo "$room" | tr -d '[:space:]')"
   [ -z "$room" ] && continue
   port=$((8012 + i))
-  patient="${room#patient_}"
-  log "starting identity room=$room patient=$patient port=$port"
+  log "starting identity room=$room port=$port"
   mkdir -p "$STATE_DIR/$room"
   (
     while true; do
       cd "$STATE_DIR/$room" || exit 1
       dev_code_overlay
-      # --patient explicitly: its argparse default is a hardcoded pilot UUID,
-      # which on any other home would silently bind the wrong patient.
+      # No --patient (2026-08-20): the room's cameras name the residents,
+      # because a shared camera watches more than one and a single flag
+      # could only ever describe one of them.
       python3 -m identity.service \
-        --room "$room" --patient "$patient" --port "$port" \
+        --room "$room" --port "$port" \
         --pod-url "http://127.0.0.1:${PERCEPTION_PORT:-8000}" \
         >>"$LOGDIR/identity-$room.log" 2>&1
       rc=$?

@@ -35,7 +35,11 @@ def _loop_with(sam) -> CameraLoop:
         sam=sam, pods=[], sam_for=lambda _cam_id: sam,
         pod_lock=asyncio.Lock(),
         lock_for=lambda _client: asyncio.Lock(),  # per-worker admission
-        seat=None, cameras={},
+        # One seat per resident, and nobody located here (2026-08-20).
+        seats={}, seat_on=lambda _cam_id: None,
+        seats_on=lambda _cam_id: [],
+        covered=lambda _cam_id: [], face_galleries={},
+        cameras={},
         journal=None, name_of=lambda cam_id: cam_id,
     )
     lp = CameraLoop(camera_id="a", home=home)

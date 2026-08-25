@@ -37,9 +37,8 @@ from sqlalchemy import select
 
 from src.api.deps import SessionDep, SettingsDep, camera_auth, caregiver_auth
 from src.db.camera import Camera
-from src.db.patient import Patient
-from src.repos.access import accessible_patient_ids
 from src.schemas.livekit_io import MintTokenRequest, MintTokenResponse
+from src.services import livekit_rooms
 
 log = logging.getLogger(__name__)
 
@@ -221,7 +220,7 @@ async def _resolve_gateway_camera_or_401(
     """
     from sqlalchemy import text
 
-    from src.services.ingest.pi.auth import hash_ingest_token
+    from src.services.fleet_auth import hash_ingest_token
 
     if credentials.credentials is None or not credentials.credentials.strip():
         raise _INVALID
@@ -270,26 +269,26 @@ async def _ensure_caregiver_can_join(
     caregiver_id,
     room: str,
 ) -> None:
-    """Caregivers may only join rooms named `patient_<id>` for patients
-    they own. The room name is the load-bearing identifier.
-    """
-    if not room.startswith("patient_"):
-        raise _FORBIDDEN
-    try:
-        patient_id = UUID(room.removeprefix("patient_"))
-    except ValueError:
-        raise _FORBIDDEN from None
+    """Caregivers may only join a room that resolves to something of theirs.
 
-    # Membership, not ownership — a shared caregiver may join the room too.
-    stmt = select(Patient.id).where(
-        Patient.id == patient_id,
-        Patient.id.in_(accessible_patient_ids(caregiver_id)),
-    )
-    found = (await session.execute(stmt)).scalar_one_or_none()
-    if found is None:
+    RESOLVED, not parsed. This used to take the uuid out of
+    `patient_<uuid>` and check access to that patient, which was correct
+    only while every room was a patient's. An account room
+    (`account_<caregiver_id>`, 2026-08-22) parses just as cleanly and
+    resolves to no patient at all, so the caregiver was refused their own
+    streaming sensor — the room name had quietly become the thing
+    granting access, rather than the thing being checked.
+
+    `livekit_rooms.caregiver_may_join` answers both shapes by lookup, and
+    returns the same False for unknown, malformed and unauthorized, so a
+    caller probing room names learns nothing from the difference.
+    """
+    if not await livekit_rooms.caregiver_may_join(
+        session, caregiver_id=caregiver_id, room=room,
+    ):
         log.info(
-            "livekit.mint_token reject reason=patient_not_owned "
-            "caregiver=%s patient=%s",
-            caregiver_id, patient_id,
+            "livekit.mint_token reject reason=room_not_accessible "
+            "caregiver=%s room=%s",
+            caregiver_id, room,
         )
         raise _FORBIDDEN

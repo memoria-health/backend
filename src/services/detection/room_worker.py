@@ -43,7 +43,7 @@ from src.services.data_collection.manager import RecorderManager
 from src.services.data_collection.manager import temp_root as recorder_temp_root
 from src.services.detection import frame_codec
 from src.services.detection.camera_ingest import CameraIngest
-from src.services.detection.patient_presence import PatientPresence
+from src.services.detection.patient_presence import PresenceRegistry
 from src.services.detection.room_reconciler import LiveKitRoomReconciler
 
 if TYPE_CHECKING:
@@ -206,9 +206,12 @@ class RoomWorker:
         self._sessionmaker = sessionmaker
         self._motion_cache = motion_cache
         self._reid = reid
-        # One per room (= per patient): "patient confirmed on camera A
-        # ⇒ patient-scoped detectors skip on B/C" (2026-07-18).
-        self._patient_presence = PatientPresence()
+        # Keyed by PATIENT, not by room. "Patient confirmed on camera A
+        # ⇒ their patient-scoped detectors skip on B/C" (2026-07-18) was
+        # one instance per room while a room was a patient; an account
+        # room holds every resident, so one registry would have let one
+        # person's presence suppress another's detectors.
+        self._presence = PresenceRegistry()
         # Optional callback used by the idle monitor to ask the
         # parent DetectorWorker to remove this room. See
         # _IDLE_TEARDOWN_WINDOW_S for the trigger condition.
@@ -247,6 +250,14 @@ class RoomWorker:
         # arrive as separate `track_subscribed` events; either can
         # arrive first and the other is wired up when it shows.
         self._audio_tasks_by_identity: dict[str, asyncio.Task[None]] = {}
+        # The video publication per publisher, kept so the subscribed
+        # simulcast layer can be re-requested AFTER subscribe — a closed
+        # camera steps down to save egress and back up on wake, and
+        # `set_video_quality` needs the publication to say it on.
+        self._video_pubs_by_identity: dict[str, rtc.RemoteTrackPublication] = {}
+        # Last layer asked for, per publisher, so the 10s tick only
+        # signals on a transition.
+        self._layer_by_identity: dict[str, str] = {}
         self._stopped = False
         # Supervisor task that owns the connect → wait-for-disconnect →
         # cleanup → reconnect lifecycle. Spawned by start(), cancelled
@@ -348,6 +359,22 @@ class RoomWorker:
         # SDK-dict-walking reconciler we used to run inline here; see
         # `room_reconciler.py` for the design rationale.
         await self._reconciler.start()
+
+    def live_camera_identities(self) -> set[str]:
+        """The `cam_*` identities this worker is currently consuming.
+
+        Read by `ensure_room_left_if_empty` to answer the question its
+        name has always implied: is anyone still publishing here? An
+        account room routinely holds several sensors, so one leaving
+        says nothing about the others.
+
+        `_ingests_by_identity` rather than the SDK's participant list:
+        an ingest exists only once a track is actually subscribed and
+        being consumed, which is the thing worth keeping the worker
+        alive for. A participant that has joined but published nothing
+        would otherwise hold the room open indefinitely.
+        """
+        return set(self._ingests_by_identity)
 
     async def stop(self) -> None:
         if self._stopped:
@@ -795,15 +822,76 @@ class RoomWorker:
                 continue
             await self._handle_track_subscribed(track, publication, participant)
 
+    def request_idle_layer(self, identity: str, idle: bool) -> None:
+        """Step this camera's subscribed layer down while it is closed.
+
+        WHY (2026-08-24, measured): the subscription is what LiveKit
+        bills, and it does not care whether we analyze the frames. A
+        camera in closed-state with nobody in the room still delivered
+        its top layer to every subscriber all night — the Warner at
+        2304x1296 is 5 Mbps, and with the backend and its identity
+        service both subscribed that is ~4.5 GB/hr to watch an empty
+        room. The backend container measured 3.96 GB/hr inbound with one
+        occupied camera and one empty one.
+
+        MEDIUM (640x360, 450 kbps) and not LOW (320x180, 160 kbps). LOW
+        saves 31x against MEDIUM's 11x, but the tick that WAKES us
+        analyzes the window already in the buffer, so whatever layer was
+        arriving during the closed period is what a fall is judged on.
+        640x360 is the documented rollback quality for all analysis;
+        320x180 is not something to show a VLM a fall in. Block motion —
+        the wake authority — runs on a 32x18 grid and cannot tell the
+        difference either way, so the wake itself is never at risk.
+        `livekit_idle_subscribe_quality` is the knob if that trade wants
+        moving.
+
+        Only fires on a TRANSITION: a layer request is a signalling
+        round-trip and this is consulted every 10s tick.
+
+        No-op where the publisher does not simulcast. The gateway sets
+        `.simulcast-off` (the Tapo publishes one 1920x1080 layer and
+        nothing else), so today this saves on bridge cameras only —
+        turning that back on is the other half of the lever.
+        """
+        quality = (
+            self._settings.livekit_idle_subscribe_quality if idle
+            else self._settings.livekit_subscribe_quality
+        )
+        if self._layer_by_identity.get(identity) == quality:
+            return
+        publication = self._video_pubs_by_identity.get(identity)
+        if publication is None:
+            return
+        ingest = self._ingests_by_identity.get(identity)
+        self._layer_by_identity[identity] = quality
+        self._request_layer(
+            publication,
+            ingest.camera_id if ingest else identity,
+            quality_name=quality,
+        )
+
     def _request_layer(
-        self, publication: rtc.RemoteTrackPublication, camera_id
+        self, publication: rtc.RemoteTrackPublication, camera_id,
+        quality_name: str | None = None,
     ) -> None:
         """Pin the analytics ('think lane') simulcast layer for this
-        subscriber. MEDIUM = the 640x360 rung: every consumer is
-        satisfied (VLM tokens are resolution-independent, reid runs at
-        640w, block motion is a 32x18 grid), delivery holds full rate
-        because 360p never stresses the SFU's bandwidth estimator, and
-        buffers stay ~55MB/cam — the 2026-07-18 OOM class can't recur.
+        subscriber. HIGH (native) is the steady state. MEDIUM (640x360)
+        is a rollback lever for CPU starvation and buffer pressure only
+        — it is NOT quality-neutral, so do not reach for it to save
+        money:
+
+          - Identity needs native pixels. gpu/identity/loop.py measured
+            640px shipping (2026-07-26) and rejected it: ~9x off
+            wire/encode but only ~10% off GPU, "not worth the
+            small-distant-person detection risk". A face 20ft out has
+            too few pixels to embed at 360p.
+          - Gemini's token count IS resolution-independent (~12.4k input
+            tokens/call whether the SFU delivers 512x288 or 2304x1296),
+            but that is a COST fact, not an accuracy one — the same
+            price buys a worse picture.
+          - Block motion genuinely does not care (32x18 grid).
+
+        The cost lever is frame COUNT (TARGET_FPS), not resolution.
 
         History: with NO request, a width-0 UpdateTrackSettings default
         lands on VIDEO_QUALITY_LOW → the 320x180 rung at 2-9fps with
@@ -818,7 +906,9 @@ class RoomWorker:
         # triage is no longer the ceiling. "medium" stays selectable
         # for instant rollback if 2K decode starves this rig's CPU
         # (watch ingress_recv_fps after any flip).
-        quality_name = (self._settings.livekit_subscribe_quality or "high").lower()
+        quality_name = (
+            quality_name or self._settings.livekit_subscribe_quality or "high"
+        ).lower()
         quality = {
             "low": rtc.VideoQuality.VIDEO_QUALITY_LOW,
             "medium": rtc.VideoQuality.VIDEO_QUALITY_MEDIUM,
@@ -878,6 +968,14 @@ class RoomWorker:
             prev = self._video_tasks_by_identity.get(identity)
             if prev is not None and not prev.done():
                 prev.cancel()
+            self._video_pubs_by_identity[identity] = publication
+            # A (re)subscribe starts at the full layer whatever the
+            # camera's state was: the step-down is re-asserted by the
+            # next closed tick, and starting low would silently outlive
+            # the reason for it if the ingest never came back.
+            self._layer_by_identity[identity] = (
+                self._settings.livekit_subscribe_quality
+            )
             self._request_layer(publication, ingest.camera_id)
             consumer = asyncio.create_task(
                 self._consume_video(track, ingest),
@@ -907,6 +1005,8 @@ class RoomWorker:
         ingest = self._ingests_by_identity.pop(identity, None)
         if ingest is None:
             return
+        self._video_pubs_by_identity.pop(identity, None)
+        self._layer_by_identity.pop(identity, None)
         for task_map in (self._video_tasks_by_identity, self._audio_tasks_by_identity):
             task = task_map.pop(identity, None)
             if task is not None and not task.done():
@@ -1214,11 +1314,14 @@ class RoomWorker:
             patient_id=row.patient_id,
             sessionmaker=self._sessionmaker,
             motion_cache=self._motion_cache,
-            patient_presence=self._patient_presence,
+            patient_presence=self._presence.for_patient(row.patient_id),
             settings=self._settings,
             reid=self._reid,
             livekit_identity=identity,
             recorder=self._recorder,
+            on_idle_change=lambda idle, ident=identity: (
+                self.request_idle_layer(ident, idle)
+            ),
         )
         await ingest.start()
         self._ingests_by_identity[identity] = ingest
@@ -1259,6 +1362,8 @@ class RoomWorker:
         # into this ingest's buffers. Without cancelling them we'd leak
         # the asyncio tasks and they'd keep trying to write to the now-
         # stopped ingest's buffers (harmless but noisy).
+        self._video_pubs_by_identity.pop(identity, None)
+        self._layer_by_identity.pop(identity, None)
         for task_map in (self._video_tasks_by_identity, self._audio_tasks_by_identity):
             task = task_map.pop(identity, None)
             if task is not None and not task.done():

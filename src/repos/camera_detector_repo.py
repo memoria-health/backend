@@ -16,7 +16,28 @@ from src.db.camera import Camera
 from src.db.camera_detector import CameraDetector
 from src.db.detector import Detector
 from src.db.patient import Patient
+from src.db.camera_patient import CameraPatient
 from src.repos.access import accessible_patient_ids
+
+
+def _covering(patient_id: UUID):
+    """Sensor ids that watch this patient.
+
+    Every "the cameras of this patient" query in this module used
+    `cameras.patient_id`, which held the primary — so a sensor shared
+    between two people belonged, for detector purposes, only to whichever
+    one happened to be first. The second patient's presets never linked
+    to it, and their detectors ran nowhere on the sensor actually
+    watching them, while the app showed them armed.
+
+    Coverage is the real relation and it is symmetric: both patients'
+    detectors link to the shared sensor, and each attributes to its own
+    person. That is what makes assignment superficial — it changes which
+    detectors point at a sensor, and nothing about the video.
+    """
+    return select(CameraPatient.camera_id).where(
+        CameraPatient.patient_id == patient_id,
+    )
 
 
 async def list_detector_ids_for_camera(
@@ -129,7 +150,7 @@ async def patient_has_cameras(
     worth blocking a toggle over."""
     return (
         await session.execute(
-            select(Camera.id).where(Camera.patient_id == patient_id).limit(1)
+            select(Camera.id).where(Camera.id.in_(_covering(patient_id))).limit(1)
         )
     ).first() is not None
 
@@ -175,7 +196,7 @@ async def cameras_in_scope(
         ).scalars().all()
         return set(rows)
 
-    stmt = select(Camera.id).where(Camera.patient_id == patient_id)
+    stmt = select(Camera.id).where(Camera.id.in_(_covering(patient_id)))
     if not rooms_mean_all(where_rooms):
         stmt = stmt.where(Camera.room.in_(list(where_rooms or ())))
     return set((await session.execute(stmt)).scalars().all())
@@ -200,7 +221,7 @@ async def set_detector_rooms(
     `door_config` (that's the preset wandering picker, never room-scoped
     through here).
     """
-    stmt = select(Camera.id).where(Camera.patient_id == patient_id)
+    stmt = select(Camera.id).where(Camera.id.in_(_covering(patient_id)))
     if not rooms_mean_all(rooms):
         stmt = stmt.where(Camera.room.in_(list(rooms)))
     cam_ids = (await session.execute(stmt)).scalars().all()
@@ -251,7 +272,7 @@ async def rewrite_where_rooms_from_links(
     ).scalars().all()
     cameras = (
         await session.execute(
-            select(Camera.id, Camera.room).where(Camera.patient_id == patient_id)
+            select(Camera.id, Camera.room).where(Camera.id.in_(_covering(patient_id)))
         )
     ).all()
     room_by_cam = {c.id: c.room for c in cameras}
@@ -332,7 +353,7 @@ async def sync_links_for_patient(
     ).all()
     cameras = (
         await session.execute(
-            select(Camera.id, Camera.room).where(Camera.patient_id == patient_id)
+            select(Camera.id, Camera.room).where(Camera.id.in_(_covering(patient_id)))
         )
     ).all()
 

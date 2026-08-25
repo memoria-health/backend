@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import text
 
+from src.api.identity_roster import _LIVE_SENSOR
 from src.services import pager
 
 if TYPE_CHECKING:
@@ -61,12 +62,17 @@ UNASSIGNED_GRACE_S = 300
 # Only a home with a camera actually streaming can be "blind" — a home
 # with nothing online has no identity to miss. Counting every patient row
 # made this page fire critical forever on dormant test accounts (10 of 10
-# on prod, 2026-08-19), which is how a real alarm gets ignored. Mirrors
-# the roster's liveness predicate (src/api/identity_roster.py).
-_LIVE_CAM = (
-    "EXISTS (SELECT 1 FROM public.cameras c "
-    "         WHERE c.patient_id = p.id AND c.online AND NOT c.disabled)"
-)
+# on prod, 2026-08-19), which is how a real alarm gets ignored.
+#
+# IMPORTED, not mirrored (2026-08-20). This used to be a copy of the
+# roster's predicate with a comment saying so, and the copy drifted the
+# moment the roster started keying on `livekit_room`: the roster
+# deliberately gives no process to the second resident of a shared
+# camera (their video arrives in the other resident's room), while this
+# copy still counted them as a home that ought to have one — so every
+# shared camera would have paged "homes blind", forever, correctly
+# according to a rule that was no longer true. A pager that disagrees
+# with the thing it watches is worse than no pager.
 
 # Prefixes keep this subsystem's dedup keys out of the event gate's, which
 # uses bare event uuids. A collision would collapse two incidents into one
@@ -152,12 +158,12 @@ class FleetWatch:
             # because the roster has not yet got round to releasing it and
             # the home is just as blind in the meantime.
             blind = (await session.execute(text(
-                "SELECT count(*) FROM public.patients p "
-                " WHERE " + _LIVE_CAM + " AND ("
-                "       p.identity_node_id IS NULL "
+                "SELECT count(*) FROM public.cameras c "
+                " WHERE " + _LIVE_SENSOR + " AND ("
+                "       c.identity_node_id IS NULL "
                 "    OR NOT EXISTS ("
                 "         SELECT 1 FROM public.identity_nodes n "
-                "          WHERE n.node_id = p.identity_node_id "
+                "          WHERE n.node_id = c.identity_node_id "
                 "            AND n.last_seen_at > now() - make_interval("
                 "                  secs => :stale)))"
             ), {"stale": stale_s})).scalar() or 0
@@ -170,23 +176,35 @@ class FleetWatch:
             # node, and is otherwise invisible because it has no node row
             # to have aged.
             overdue = (await session.execute(text(
-                "SELECT count(*) FROM public.patients p "
+                "SELECT count(*) FROM public.cameras c "
                 " LEFT JOIN public.identity_nodes n "
-                "        ON n.node_id = p.identity_node_id "
-                " WHERE " + _LIVE_CAM +
-                "   AND (p.identity_node_id IS NULL "
+                "        ON n.node_id = c.identity_node_id "
+                " WHERE " + _LIVE_SENSOR +
+                "   AND (c.identity_node_id IS NULL "
                 "        OR n.last_seen_at <= now() - make_interval("
                 "             secs => :stale)) "
-                "   AND COALESCE(n.last_seen_at, p.created_at) "
+                "   AND COALESCE(n.last_seen_at, c.created_at) "
                 "       < now() - make_interval(secs => :grace)"
             ), {"stale": stale_s, "grace": UNASSIGNED_GRACE_S})).scalar() or 0
 
             # Nodes that were serving homes and have stopped polling.
+            # Counts only homes with a live camera, same as `blind` and
+            # `overdue` above. Without the filter this counted every
+            # patient row ever pinned to the node — dormant test accounts
+            # included — so the page reported "142 home(s) held" on a dev
+            # box with one real camera, and would have said 8 instead of 2
+            # on prod. A blast radius nobody believes is one nobody reads.
             down = (await session.execute(text(
-                "SELECT n.node_id, count(p.id), "
+                # Only LIVE sensors (fix/general-fixes): a node holding
+                # nothing but dormant homes is not an outage worth paging
+                # for. Kept on `c` rather than the old `p` — identity is
+                # sharded per SENSOR now, so the thing a node holds is a
+                # camera, and _LIVE_SENSOR is the same predicate the blind
+                # and overdue queries above already use.
+                "SELECT n.node_id, count(c.id) FILTER (WHERE " + _LIVE_SENSOR + "), "
                 "       EXTRACT(EPOCH FROM now() - n.last_seen_at)::int "
                 "  FROM public.identity_nodes n "
-                "  LEFT JOIN public.patients p ON p.identity_node_id = n.node_id "
+                "  LEFT JOIN public.cameras c ON c.identity_node_id = n.node_id "
                 " WHERE n.last_seen_at <= now() - make_interval(secs => :stale) "
                 " GROUP BY n.node_id, n.last_seen_at"
             ), {"stale": stale_s})).all()
@@ -236,11 +254,11 @@ class FleetWatch:
         tick_s = float(self._settings.livekit_worker_tick_seconds)
         async with self._sessionmaker() as session:
             served = (await session.execute(text(
-                "SELECT p.id::text, n.node_id, n.base_url, p.identity_port "
-                "  FROM public.patients p "
+                "SELECT c.id::text, n.node_id, n.base_url, c.identity_port "
+                "  FROM public.cameras c "
                 "  JOIN public.identity_nodes n "
-                "    ON n.node_id = p.identity_node_id "
-                " WHERE p.identity_port IS NOT NULL "
+                "    ON n.node_id = c.identity_node_id "
+                " WHERE c.identity_port IS NOT NULL "
                 "   AND n.last_seen_at > now() - make_interval(secs => :stale)"
             ), {"stale": stale_s})).all()
 
@@ -333,7 +351,7 @@ class FleetWatch:
             self._occupancy_ok = False
             log.warning(
                 "identity.occupancy_sampling_disabled — table missing? "
-                "apply scripts/apply_identity_fleet_ops_delta.sql",
+                "apply scripts/deltas/apply_identity_fleet_ops_delta.sql",
                 exc_info=True,
             )
 
@@ -360,7 +378,7 @@ class FleetWatch:
                     "grace_s": UNASSIGNED_GRACE_S,
                     "remedy": (
                         "no node has spare capacity — release another with "
-                        "scripts/pod.sh release <tag>, or raise "
+                        "scripts/pod/pod.sh release <tag>, or raise "
                         "NEMARA_NODE_CAPACITY on an existing one"
                     ),
                 },

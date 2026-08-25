@@ -9,6 +9,8 @@ on silence, never on a single frame (the caller demands consecutive
 rounds).
 """
 
+from uuid import UUID
+
 from identity.seat import (
     Candidate,
     Seat,
@@ -26,9 +28,12 @@ def _seat(tid=2, score=0.87):
     )
 
 
+_P = UUID("11111111-1111-1111-1111-111111111111")
+
+
 def _cand(tid, score, anchor="face", provisional=False):
     return Candidate(
-        camera_id="a", track_id=tid, score=score, anchor=anchor,
+        camera_id="a", track_id=tid, patient_id=_P, score=score, anchor=anchor,
         provisional=provisional,
     )
 

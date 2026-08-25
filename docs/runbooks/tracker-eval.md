@@ -28,7 +28,7 @@ Built + deployed overnight 2026-07-23. The lean rig is **live now on the SAM3 ar
 Two spots (pod + backend; the backend env is the arm *label* the trace records):
 
 > **Rewritten 2026-08-11.** Everything this section used to describe is gone:
-> `scripts/pod.sh deploy`, `scripts/deploy_continuous_remote.sh` and the
+> `scripts/pod/pod.sh deploy`, `scripts/deploy_continuous_remote.sh` and the
 > supervisor heredoc it wrote were all deleted when the node became an image.
 > The tracker arm is still selected by `NEMARA_TRACKER`
 > (`gpu/perception/continuous.py`, default `edgetam`) — only the way it is
@@ -42,7 +42,7 @@ Two spots (pod + backend; the backend env is the arm *label* the trace records):
 
 ```bash
 # 1) Node (functional — the actual tracker):
-#    NEMARA_TRACKER=sam3 in .pod.env, then scripts/pod.sh release <tag>
+#    NEMARA_TRACKER=sam3 in .pod.env, then scripts/pod/pod.sh release <tag>
 #    (omit it to revert to edgetam)
 # 2) Backend (label only):
 sed -i '' 's/NEMARA_TRACKER=sam3/NEMARA_TRACKER=edgetam/' .env
@@ -115,7 +115,7 @@ uv run python gpu/identity/service.py --room patient_75a30940-b5e2-4608-afa3-b31
 # state JSON: http://localhost:8012/state
 ```
 
-Prereqs: pod up in EdgeTAM mode (`scripts/pod.sh health`, or check
+Prereqs: pod up in EdgeTAM mode (`scripts/pod/pod.sh health`, or check
 http://localhost:8000/health through the tunnel), DB up (face enrollment
 gallery). Historical note (2026-07-24 rig): the backend container stayed
 stopped so the spine owned the A40 — since then the backend consumes this

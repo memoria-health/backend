@@ -55,14 +55,24 @@ class _RecordingWorker:
     Captures every call so we can assert routing + filtering.
     """
     joined: list[str] = field(default_factory=list)
-    left_checked: list[str] = field(default_factory=list)
+    left_checked: list[tuple[str, str | None]] = field(default_factory=list)
+    evicted: list[str] = field(default_factory=list)
     signalled: list[str] = field(default_factory=list)
 
     async def ensure_room_joined(self, room_name: str) -> None:
         self.joined.append(room_name)
 
-    async def ensure_room_left_if_empty(self, room_name: str) -> None:
-        self.left_checked.append(room_name)
+    async def ensure_room_left_if_empty(
+        self, room_name: str, *, departed: str | None = None,
+    ) -> None:
+        # `departed` is recorded, not ignored: naming the leaver is what
+        # lets the worker keep serving the OTHER cameras in an account
+        # room, so a caller that stops passing it is a regression.
+        self.left_checked.append((room_name, departed))
+
+    async def _evict_room(self, room_name: str) -> None:
+        # room_finished tears down unconditionally — the room is gone.
+        self.evicted.append(room_name)
 
     async def signal_reconcile(self, room_name: str) -> None:
         self.signalled.append(room_name)
@@ -190,9 +200,11 @@ async def test_participant_left_for_camera_marks_offline_then_leaves(
     assert r.status_code == 204
     # online=false written for the leaving camera.
     assert recorded_presence["offline_identity"] == ["cam_ce110001"]
-    # ...then the worker is torn down.
+    # ...then the worker is ASKED whether the room is now empty, and is
+    # told which camera left. It used to be torn down outright, which on
+    # an account room stopped detection for every other sensor there.
     assert installed_worker.left_checked == [
-        "patient_5b1c0312-44a0-4f9d-9a3a-2d4f44a1f0bb",
+        ("patient_5b1c0312-44a0-4f9d-9a3a-2d4f44a1f0bb", "cam_ce110001"),
     ]
     assert installed_worker.joined == []
 
@@ -218,9 +230,13 @@ async def test_room_finished_marks_room_offline_then_leaves(
     assert recorded_presence["room_offline"] == [
         "patient_5b1c0312-44a0-4f9d-9a3a-2d4f44a1f0bb",
     ]
-    assert installed_worker.left_checked == [
+    # Evicted, not emptiness-checked: the room itself is gone, so there is
+    # no survivor to protect, and the worker's ingest map may still look
+    # populated purely because the SDK has not caught up yet.
+    assert installed_worker.evicted == [
         "patient_5b1c0312-44a0-4f9d-9a3a-2d4f44a1f0bb",
     ]
+    assert installed_worker.left_checked == []
 
 
 # ─── filtering ────────────────────────────────────────────────────

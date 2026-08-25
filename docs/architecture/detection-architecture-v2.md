@@ -109,5 +109,5 @@ src/services/scheduling/scheduler.py   absence + trailing runner (outside the ti
 
 ## Cleanup ledger (was "Known cleanup (TODO)")
 
-- ~~**Collapse `evidence_branch` → `requires_motion`.**~~ **DONE 2026-07-26** (Phase H1, commit `fb7ad88`): the enum column is gone; `requires_motion` boolean is the stored contract (`scripts/apply_requires_motion_delta.sql`).
+- ~~**Collapse `evidence_branch` → `requires_motion`.**~~ **DONE 2026-07-26** (Phase H1, commit `fb7ad88`): the enum column is gone; `requires_motion` boolean is the stored contract (`scripts/deltas/apply_requires_motion_delta.sql`).
 - Also landed since this doc was written (Phases C–H2, 2026-07-26/27): `shape` column + enum dropped in favor of `alert_trigger` + `is_sustained` (`1043491`, `d7a44f1`, `76fa214`); catalog remapped (`8e90d4f`); `duration` trigger + `trailing` firing + `schedule`→`absence` rename (`53b7a9e`); stored `where_scope` dropped for `where_rooms` (`146d693`); M-of-N made an internal difficulty-derived gate (`22c5d3e`); crowd fallback made a global home-wide rule (`06de5b9`).

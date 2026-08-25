@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 from httpx import AsyncClient
 
-from test.conftest import mint_test_jwt
+from test.conftest import add_library_detectors, mint_test_jwt
 
 
 _PATIENT_BODY = {
@@ -31,7 +31,11 @@ _CUSTOM_DETECTOR_BODY = {
 
 
 async def _setup_patient(client: AsyncClient, auth_user) -> tuple[dict[str, str], str]:
-    """Provision caregiver + patient. Returns (headers, patient_id)."""
+    """Provision caregiver + patient. Returns (headers, patient_id).
+
+    The patient starts with NO visible detectors (1cd354e) — use
+    `_setup_patient_with_presets` when a test needs one to exist.
+    """
     uid, email = auth_user
     headers = {"Authorization": f"Bearer {mint_test_jwt(uid, email)}"}
     await client.post("/v1/me", headers=headers, json={"display_name": "Test"})
@@ -39,22 +43,51 @@ async def _setup_patient(client: AsyncClient, auth_user) -> tuple[dict[str, str]
     return headers, p["id"]
 
 
+async def _setup_patient_with_presets(
+    client: AsyncClient, auth_user,
+) -> tuple[dict[str, str], str]:
+    """Caregiver + patient + the four presets, added from the library.
+
+    Detectors used to be auto-seeded on patient create. They are not any
+    more: the caregiver picks them, and the seeded rows were a second
+    source of truth that showed up in the picker as "already added". The
+    tests below are about PATCH, DELETE and cascade behaviour, so they
+    need a detector to exist; they do not care how it got there.
+    """
+    headers, pid = await _setup_patient(client, auth_user)
+    await add_library_detectors(client, headers, pid)
+    return headers, pid
+
+
 # ─── List + auto-seed ────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_list_detectors_returns_four_presets_after_patient_create(
+async def test_a_new_patient_starts_with_no_detectors(
     client: AsyncClient, auth_user
 ) -> None:
+    """Was: asserts four presets are auto-seeded on create.
+
+    That seeding was removed (1cd354e) because the caregiver already
+    picks detectors from the library on add, so the seeded rows competed
+    with that choice and rendered as "already added" in the picker. A new
+    patient now starts empty and the caregiver decides.
+
+    `setup_test` is excluded from this list because it is hidden; it
+    still seeds, and has to.
+    """
     headers, pid = await _setup_patient(client, auth_user)
     r = await client.get(f"/v1/patients/{pid}/detectors", headers=headers)
     assert r.status_code == 200
-    dets = r.json()
-    assert [d["name"] for d in dets] == [
+    assert r.json() == []
+
+    # ...and asking for them from the library is what fills the list.
+    dets = await add_library_detectors(client, headers, pid)
+    assert set(dets) == {
         "Falls", "Agitation", "Wandering", "Medication adherence",
-    ]
-    # Field-by-field check on the first preset.
-    falls = dets[0]
+    }
+    # Field-by-field check on one preset.
+    falls = dets["Falls"]
     assert falls["icon_name"] == "figure.fall"
     assert falls["description"] == "Sudden fall events across all rooms."
     assert falls["category"] == "safety"
@@ -168,7 +201,7 @@ async def test_create_custom_detector_on_other_caregivers_patient_404(
 @pytest.mark.asyncio
 async def test_patch_sensitivity_tune(client: AsyncClient, auth_user) -> None:
     """The iOS UI's "Tune" affordance hits this — toggles Low/Standard/High."""
-    headers, pid = await _setup_patient(client, auth_user)
+    headers, pid = await _setup_patient_with_presets(client, auth_user)
     dets = (await client.get(f"/v1/patients/{pid}/detectors", headers=headers)).json()
     falls_id = dets[0]["id"]
 
@@ -184,7 +217,7 @@ async def test_patch_sensitivity_tune(client: AsyncClient, auth_user) -> None:
 
 @pytest.mark.asyncio
 async def test_patch_toggle_is_on(client: AsyncClient, auth_user) -> None:
-    headers, pid = await _setup_patient(client, auth_user)
+    headers, pid = await _setup_patient_with_presets(client, auth_user)
     dets = (await client.get(f"/v1/patients/{pid}/detectors", headers=headers)).json()
     falls_id = dets[0]["id"]
 
@@ -205,7 +238,7 @@ async def test_patch_toggle_is_on(client: AsyncClient, auth_user) -> None:
 async def test_patch_partial_leaves_unspecified_fields_unchanged(
     client: AsyncClient, auth_user
 ) -> None:
-    headers, pid = await _setup_patient(client, auth_user)
+    headers, pid = await _setup_patient_with_presets(client, auth_user)
     dets = (await client.get(f"/v1/patients/{pid}/detectors", headers=headers)).json()
     falls = dets[0]
 
@@ -249,6 +282,7 @@ async def test_patch_other_caregivers_detector_404(
     await client.post("/v1/me", headers=h_a, json={"display_name": "A"})
     await client.post("/v1/me", headers=h_b, json={"display_name": "B"})
     pid = (await client.post("/v1/patients", headers=h_a, json=_PATIENT_BODY)).json()["id"]
+    await add_library_detectors(client, h_a, pid, keys=("fall",))
     det_id = (await client.get(f"/v1/patients/{pid}/detectors", headers=h_a)).json()[0]["id"]
 
     r = await client.patch(
@@ -262,7 +296,7 @@ async def test_patch_other_caregivers_detector_404(
 
 @pytest.mark.asyncio
 async def test_delete_custom_detector(client: AsyncClient, auth_user) -> None:
-    headers, pid = await _setup_patient(client, auth_user)
+    headers, pid = await _setup_patient_with_presets(client, auth_user)
     created = await client.post(
         f"/v1/patients/{pid}/detectors", headers=headers, json=_CUSTOM_DETECTOR_BODY,
     )
@@ -295,7 +329,7 @@ async def test_delete_404_when_detector_missing(
 async def test_delete_patient_cascades_to_detectors(
     client: AsyncClient, auth_user
 ) -> None:
-    headers, pid = await _setup_patient(client, auth_user)
+    headers, pid = await _setup_patient_with_presets(client, auth_user)
     # 4 preset detectors exist; pre-confirm.
     pre = await client.get(f"/v1/patients/{pid}/detectors", headers=headers)
     assert len(pre.json()) == 4
@@ -325,7 +359,7 @@ _MINOR_PATIENT_BODY = {
 async def test_library_lists_adult_cohort_with_already_added(
     client: AsyncClient, auth_user
 ) -> None:
-    headers, pid = await _setup_patient(client, auth_user)  # adult (no DOB)
+    headers, pid = await _setup_patient_with_presets(client, auth_user)  # adult (no DOB)
     r = await client.get(f"/v1/patients/{pid}/detectors/library", headers=headers)
     assert r.status_code == 200
     entries = {e["key"]: e for e in r.json()}
@@ -349,8 +383,13 @@ async def test_library_lists_adult_cohort_with_already_added(
 @pytest.mark.asyncio
 async def test_library_lists_child_cohort(client: AsyncClient, auth_user) -> None:
     """A minor's library after the 2026-08-16 child-cohort deletion
-    (adult-only product): fall present and seeded; the deleted child
-    entries gone entirely; adult-only entries still not offered."""
+    (adult-only product): fall is OFFERED; the deleted child entries gone
+    entirely; adult-only entries still not offered.
+
+    Was "fall present and seeded". Nothing is seeded any more (1cd354e),
+    so the test adds it and then asserts the library reflects that — the
+    library's job is to say what is available and what is already on, and
+    both halves still matter."""
     uid, email = auth_user
     headers = {"Authorization": f"Bearer {mint_test_jwt(uid, email)}"}
     await client.post("/v1/me", headers=headers, json={"display_name": "Test"})
@@ -360,6 +399,11 @@ async def test_library_lists_child_cohort(client: AsyncClient, auth_user) -> Non
     r = await client.get(f"/v1/patients/{pid}/detectors/library", headers=headers)
     assert r.status_code == 200
     entries = {e["key"]: e for e in r.json()}
+    # Not added yet: offered, and not marked as already on.
+    assert entries["fall"]["already_added"] is False
+    await add_library_detectors(client, headers, pid, keys=("fall",))
+    entries = {e["key"]: e for e in (await client.get(
+        f"/v1/patients/{pid}/detectors/library", headers=headers)).json()}
     assert entries["fall"]["already_added"] is True
     assert entries["fall"]["recommended"] is True
     # Deleted child cohort: absent, not merely unrecommended.
@@ -374,7 +418,7 @@ async def test_library_lists_child_cohort(client: AsyncClient, auth_user) -> Non
 async def test_add_from_library_creates_detector(
     client: AsyncClient, auth_user
 ) -> None:
-    headers, pid = await _setup_patient(client, auth_user)
+    headers, pid = await _setup_patient_with_presets(client, auth_user)
     r = await client.post(
         f"/v1/patients/{pid}/detectors/from-library",
         headers=headers, json={"keys": ["emergency"]},
@@ -396,7 +440,7 @@ async def test_add_from_library_creates_detector(
 async def test_add_from_library_skips_already_present(
     client: AsyncClient, auth_user
 ) -> None:
-    headers, pid = await _setup_patient(client, auth_user)
+    headers, pid = await _setup_patient_with_presets(client, auth_user)
     # 'fall' is already auto-seeded -> skipped, nothing created.
     r = await client.post(
         f"/v1/patients/{pid}/detectors/from-library",
@@ -412,7 +456,7 @@ async def test_add_from_library_skips_already_present(
 async def test_add_from_library_partial_skip(
     client: AsyncClient, auth_user
 ) -> None:
-    headers, pid = await _setup_patient(client, auth_user)
+    headers, pid = await _setup_patient_with_presets(client, auth_user)
     # 'fall' present (skip); 'choking' + 'meal_eaten' new (created).
     r = await client.post(
         f"/v1/patients/{pid}/detectors/from-library",

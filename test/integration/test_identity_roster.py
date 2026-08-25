@@ -7,7 +7,7 @@ identity forever, with no error anywhere — so the behaviours below are
 tested against a real database rather than reasoned about.
 
 Assumes a local Supabase is running and
-scripts/apply_identity_nodes_delta.sql has been applied.
+scripts/deltas/apply_identity_nodes_delta.sql has been applied.
 
 Coverage:
 - a node is upserted and heartbeated by the act of polling
@@ -29,6 +29,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 import pytest_asyncio
 
+from test.conftest import seed_camera
+
 @pytest_asyncio.fixture(autouse=True)
 async def _restore_real_fleet(session: AsyncSession):
     """Snapshot REAL home->node assignments and put them back after
@@ -40,14 +42,17 @@ async def _restore_real_fleet(session: AsyncSession):
     pytest run was reshuffling production. Real rows = anything not
     named by this suite."""
     rows = [tuple(r) for r in (await session.execute(text(
-        "SELECT id, identity_node_id, identity_port FROM public.patients "
+        "SELECT id, identity_node_id, identity_port FROM public.cameras "
         " WHERE identity_node_id IS NOT NULL "
         "   AND identity_node_id NOT LIKE 'node-%' "
-        "   AND identity_node_id <> 'fleet-sentinel'"))).all()]
+        # 'sentinel' is THIS suite's own parking node (see the claim-order
+        # case below), so it is not a real assignment to restore. Restoring
+        # onto it after _clear has deleted the node row fails the FK.
+        "   AND identity_node_id NOT IN ('fleet-sentinel', 'sentinel')"))).all()]
     yield
     for pid, node, port in rows:
         await session.execute(text(
-            "UPDATE public.patients "
+            "UPDATE public.cameras "
             "   SET identity_node_id = :n, identity_port = :p "
             " WHERE id = :i"), {"n": node, "p": port, "i": pid})
     await session.commit()
@@ -73,9 +78,8 @@ async def _mk_caregiver(session: AsyncSession, caregiver_id: UUID, email: str) -
 
 
 async def _mk_patient(session: AsyncSession, caregiver_id: UUID) -> UUID:
-    """A bare patient row — the roster only cares about id/created_at."""
-    # full_name / preferred_name / relation are the only NOT NULLs without a
-    # default; everything else the roster ignores.
+    """A bare patient row. Not a unit of scheduling any more — kept
+    because coverage still needs somebody to attribute to."""
     pid = uuid4()
     await session.execute(
         text(
@@ -95,6 +99,22 @@ async def _mk_patient(session: AsyncSession, caregiver_id: UUID) -> UUID:
     return pid
 
 
+async def _mk_home(
+    session: AsyncSession, caregiver_id: UUID, *, online: bool = True,
+) -> str:
+    """A patient with one SENSOR, and the sensor id — which is the unit
+    the roster schedules on since 2026-08-22.
+
+    Every case in this file used to make a bare patient and expect it to
+    be claimable, because a slot was allocated per patient. A patient
+    does not stream, so nothing about that was ever load-bearing except
+    the row's existence; the sensor is what a process is started for.
+    `online` is the liveness the claim and evict order read.
+    """
+    pid = await _mk_patient(session, caregiver_id)
+    return await _mk_camera(session, pid, online=online)
+
+
 async def _clear(session: AsyncSession) -> None:
     """Detach every home and drop THIS SUITE'S nodes, so a case starts from a
     known pool regardless of what other tests left behind.
@@ -109,7 +129,7 @@ async def _clear(session: AsyncSession) -> None:
     Detaching the homes is a plain UPDATE and stays: it loses nothing, and
     the roster reassigns on the next poll, which is the behaviour under test.
     """
-    await session.execute(text("UPDATE public.patients SET identity_node_id = NULL"))
+    await session.execute(text("UPDATE public.cameras SET identity_node_id = NULL"))
     await session.execute(
         text(
             "DELETE FROM public.identity_nodes "
@@ -120,9 +140,13 @@ async def _clear(session: AsyncSession) -> None:
 
 
 def _names(body) -> list[str]:
-    """Room names only. The roster now returns {room, port} per entry —
-    the port is asserted separately, in the tests that care about it."""
-    return [r["room"] for r in body["rooms"]]
+    """The SENSOR ids the roster handed out.
+
+    Was room names, which identified a home while one room meant one
+    patient. Several sensors now share an account room, so a room name no
+    longer says which sensor a process is for — that is exactly why the
+    roster entry carries `camera_id`."""
+    return [r["camera_id"] for r in body["rooms"]]
 
 
 async def _poll(client: AsyncClient, node: str, cap: int, url: str | None = None):
@@ -147,7 +171,7 @@ async def test_poll_registers_node_and_claims_up_to_capacity(
     await _clear(session)
     await _mk_caregiver(session, caregiver_id, email)
     for _ in range(5):
-        await _mk_patient(session, caregiver_id)
+        await _mk_home(session, caregiver_id)
 
     r = await _poll(client, "node-cap", cap=3)
     assert r.status_code == 200, r.text
@@ -156,7 +180,8 @@ async def test_poll_registers_node_and_claims_up_to_capacity(
     # Capacity is a ceiling, not a target to overshoot.
     assert len(body["rooms"]) == 3
     assert body["node_id"] == "node-cap"
-    assert all(r.startswith("patient_") for r in _names(body))
+    # Sensor ids now, not room names — several sensors share a room.
+    assert all(isinstance(r, str) and len(r) == 36 for r in _names(body))
 
     # Polling IS the heartbeat — the row exists without a separate register.
     seen = (
@@ -179,7 +204,7 @@ async def test_second_poll_is_stable_not_cumulative(
     await _clear(session)
     await _mk_caregiver(session, caregiver_id, email)
     for _ in range(5):
-        await _mk_patient(session, caregiver_id)
+        await _mk_home(session, caregiver_id)
 
     first = _names((await _poll(client, "node-stable", cap=2)).json())
     second = _names((await _poll(client, "node-stable", cap=2)).json())
@@ -196,7 +221,7 @@ async def test_two_nodes_do_not_claim_the_same_home(
     await _clear(session)
     await _mk_caregiver(session, caregiver_id, email)
     for _ in range(4):
-        await _mk_patient(session, caregiver_id)
+        await _mk_home(session, caregiver_id)
 
     a = set(_names((await _poll(client, "node-a", cap=2)).json()))
     b = set(_names((await _poll(client, "node-b", cap=2)).json()))
@@ -216,7 +241,7 @@ async def test_stale_node_homes_are_reclaimed(
     await _clear(session)
     await _mk_caregiver(session, caregiver_id, email)
     for _ in range(2):
-        await _mk_patient(session, caregiver_id)
+        await _mk_home(session, caregiver_id)
 
     dead = _names((await _poll(client, "node-dead", cap=2)).json())
     assert len(dead) == 2
@@ -248,7 +273,7 @@ async def test_returning_node_keeps_identity_and_reclaims(
     caregiver_id, email = auth_user
     await _clear(session)
     await _mk_caregiver(session, caregiver_id, email)
-    await _mk_patient(session, caregiver_id)
+    await _mk_home(session, caregiver_id)
 
     (await _poll(client, "node-flap", cap=1)).json()
     await session.execute(
@@ -283,7 +308,7 @@ async def test_base_url_and_capacity_refresh_on_every_poll(
     await _clear(session)
     await _mk_caregiver(session, caregiver_id, email)
     for _ in range(3):
-        await _mk_patient(session, caregiver_id)
+        await _mk_home(session, caregiver_id)
 
     await _poll(client, "node-move", cap=1, url="http://old-name")
     await _poll(client, "node-move", cap=3, url="http://new-name")
@@ -314,7 +339,7 @@ async def test_each_room_on_a_node_gets_its_own_port(
     await _clear(session)
     await _mk_caregiver(session, caregiver_id, email)
     for _ in range(3):
-        await _mk_patient(session, caregiver_id)
+        await _mk_home(session, caregiver_id)
 
     body = (await _poll(client, "node-ports", cap=3)).json()
     ports = [r["port"] for r in body["rooms"]]
@@ -333,7 +358,7 @@ async def test_ports_are_stable_across_polls(
     await _clear(session)
     await _mk_caregiver(session, caregiver_id, email)
     for _ in range(2):
-        await _mk_patient(session, caregiver_id)
+        await _mk_home(session, caregiver_id)
 
     first = {r["room"]: r["port"] for r in (await _poll(client, "node-fix", cap=2)).json()["rooms"]}
     second = {r["room"]: r["port"] for r in (await _poll(client, "node-fix", cap=2)).json()["rooms"]}
@@ -348,7 +373,7 @@ async def test_released_port_is_reused(
     caregiver_id, email = auth_user
     await _clear(session)
     await _mk_caregiver(session, caregiver_id, email)
-    await _mk_patient(session, caregiver_id)
+    await _mk_home(session, caregiver_id)
 
     before = (await _poll(client, "node-reuse", cap=1)).json()["rooms"][0]["port"]
 
@@ -364,7 +389,7 @@ async def test_released_port_is_reused(
 
     # Sweeper hands it back, then the original reclaims from a clean pool.
     await session.execute(
-        text("UPDATE public.patients SET identity_node_id=NULL, identity_port=NULL")
+        text("UPDATE public.cameras SET identity_node_id=NULL, identity_port=NULL")
     )
     await session.commit()
     after = (await _poll(client, "node-reuse", cap=1)).json()["rooms"][0]["port"]
@@ -382,7 +407,7 @@ async def test_lowering_capacity_sheds_load(
     await _clear(session)
     await _mk_caregiver(session, caregiver_id, email)
     for _ in range(4):
-        await _mk_patient(session, caregiver_id)
+        await _mk_home(session, caregiver_id)
 
     assert len(_names((await _poll(client, "node-shrink", cap=4)).json())) == 4
     assert len(_names((await _poll(client, "node-shrink", cap=2)).json())) == 2
@@ -410,18 +435,18 @@ async def test_unassigned_claimed_oldest_first(
     )
     await session.execute(
         text(
-            "UPDATE public.patients SET identity_node_id = 'sentinel' "
+            "UPDATE public.cameras SET identity_node_id = 'sentinel' "
             " WHERE identity_node_id IS NULL"
         )
     )
     await session.commit()
 
-    ids = [await _mk_patient(session, caregiver_id) for _ in range(3)]
+    ids = [await _mk_home(session, caregiver_id) for _ in range(3)]
     # Force a known ordering rather than relying on insert timing.
     for offset, pid in enumerate(ids):
         await session.execute(
             text(
-                "UPDATE public.patients "
+                "UPDATE public.cameras "
                 "   SET created_at = now() - make_interval(mins => :m) "
                 " WHERE id = :id"
             ),
@@ -430,7 +455,7 @@ async def test_unassigned_claimed_oldest_first(
     await session.commit()
 
     rooms = _names((await _poll(client, "node-order", cap=1)).json())
-    assert rooms == [f"patient_{ids[0]}"], "did not take the longest-waiting home"
+    assert rooms == [ids[0]], "did not take the longest-waiting home"
 
 
 @pytest.mark.parametrize(
@@ -458,7 +483,7 @@ async def test_unaddressable_base_url_is_refused(
     caregiver_id, email = auth_user
     await _clear(session)
     await _mk_caregiver(session, caregiver_id, email)
-    await _mk_patient(session, caregiver_id)
+    await _mk_home(session, caregiver_id)
 
     r = await client.post(
         ROSTER, json={"node_id": "node-bad", "base_url": bad, "capacity": 1},
@@ -489,7 +514,7 @@ async def test_corpse_rows_are_reaped_after_seven_days(
     caregiver_id, email = auth_user
     await _clear(session)
     await _mk_caregiver(session, caregiver_id, email)
-    pid = await _mk_patient(session, caregiver_id)
+    pid = await _mk_home(session, caregiver_id)
 
     # Direct SQL, not API polls: registering via /roster would also CLAIM
     # unassigned patients (the local DB has real ones), stealing the port
@@ -508,7 +533,7 @@ async def test_corpse_rows_are_reaped_after_seven_days(
     # node-holding keeps a home pinned to it; corpse + nap hold nothing.
     await session.execute(
         text(
-            "UPDATE public.patients SET identity_node_id = 'node-holding', "
+            "UPDATE public.cameras SET identity_node_id = 'node-holding', "
             "identity_port = 8012 WHERE id = :p"
         ),
         {"p": pid},
@@ -538,7 +563,7 @@ async def test_corpse_rows_are_reaped_after_seven_days(
     holder = (
         await session.execute(
             text(
-                "SELECT identity_node_id FROM public.patients WHERE id = :p"
+                "SELECT identity_node_id FROM public.cameras WHERE id = :p"
             ),
             {"p": pid},
         )
@@ -546,17 +571,25 @@ async def test_corpse_rows_are_reaped_after_seven_days(
     assert holder != "node-holding"
 
 
-async def _mk_camera(session: AsyncSession, patient_id: UUID, *, online: bool) -> None:
+async def _mk_camera(
+    session: AsyncSession, patient_id: UUID, *, online: bool,
+    publishes_into: UUID | None = None,
+) -> str:
     """A camera row for liveness. Only patient_id/display_id/room are
-    NOT NULL without a default; `online` is the field under test."""
-    await session.execute(
-        text(
-            "INSERT INTO public.cameras (id, patient_id, display_id, room, online) "
-            "VALUES (:id, :p, :d, :r, :o)"
-        ),
-        {"id": uuid4(), "p": patient_id, "d": 1, "r": "Roster Test Room", "o": online},
-    )
-    await session.commit()
+    NOT NULL without a default; `online` is the field under test.
+
+    `livekit_room` is set because every real creation path sets it and
+    liveness reads it (2026-08-20): a room is live when a camera
+    STREAMS INTO it, not when a camera is assigned to its patient.
+    `publishes_into` makes them differ, which is exactly what a shared
+    camera does — it covers this patient while publishing into someone
+    else's room.
+    """
+    room_owner = publishes_into or patient_id
+    return str(await seed_camera(
+        session, patient_id=patient_id, online=online,
+        livekit_room=f"patient_{room_owner}",
+    ))
 
 
 async def _park_others(session: AsyncSession) -> None:
@@ -568,7 +601,7 @@ async def _park_others(session: AsyncSession) -> None:
     Parking is a plain UPDATE onto a `node-` id that `_clear` both detaches
     and deletes, so nothing is destroyed and the next case starts clean.
     """
-    # patients.identity_node_id is FK'd to identity_nodes, so the parking
+    # cameras.identity_node_id is FK'd to identity_nodes, so the parking
     # node has to exist. Fresh heartbeat = never stale, so the release step
     # cannot hand these back mid-test.
     await session.execute(
@@ -578,9 +611,13 @@ async def _park_others(session: AsyncSession) -> None:
             "ON CONFLICT (node_id) DO UPDATE SET last_seen_at = now()"
         )
     )
+    # Clear the port too: a parked home is served by nobody, and leaving a
+    # stale port behind collides on cameras_identity_node_port_uidx the
+    # moment two of them carry the same one.
     await session.execute(
         text(
-            "UPDATE public.patients SET identity_node_id = 'node-park' "
+            "UPDATE public.cameras "
+            "   SET identity_node_id = 'node-park', identity_port = NULL "
             " WHERE identity_node_id IS NULL"
         )
     )
@@ -596,16 +633,15 @@ async def test_live_home_is_claimed_before_an_older_dormant_one(
     await _clear(session)
     await _mk_caregiver(session, caregiver_id, email)
     await _park_others(session)
-    dormant = await _mk_patient(session, caregiver_id)   # older
-    live = await _mk_patient(session, caregiver_id)      # newer, but streaming
-    await _mk_camera(session, live, online=True)
+    dormant = await _mk_home(session, caregiver_id, online=False)  # older
+    live = await _mk_home(session, caregiver_id, online=True)      # newer
 
     body = (await _poll(client, "node-live-first", cap=1)).json()
 
-    assert _names(body) == [f"patient_{live}"], (
+    assert _names(body) == [live], (
         "a streaming home must outrank an older dormant one"
     )
-    assert f"patient_{dormant}" not in _names(body)
+    assert dormant not in _names(body)
 
 
 async def test_dormant_home_yields_its_slot_to_a_live_one(
@@ -615,23 +651,22 @@ async def test_dormant_home_yields_its_slot_to_a_live_one(
     await _clear(session)
     await _mk_caregiver(session, caregiver_id, email)
     await _park_others(session)
-    dormant = await _mk_patient(session, caregiver_id)
+    dormant = await _mk_home(session, caregiver_id, online=False)
 
     # Seats the dormant home — nothing else wants the slot yet.
     first = (await _poll(client, "node-evict", cap=1)).json()
-    assert _names(first) == [f"patient_{dormant}"]
+    assert _names(first) == [dormant]
 
     # A streaming home appears with the node already full.
-    live = await _mk_patient(session, caregiver_id)
-    await _mk_camera(session, live, online=True)
+    live = await _mk_home(session, caregiver_id, online=True)
 
     second = (await _poll(client, "node-evict", cap=1)).json()
-    assert _names(second) == [f"patient_{live}"], (
+    assert _names(second) == [live], (
         "a dormant home must give way once a live home needs the slot"
     )
     freed = (
         await session.execute(
-            text("SELECT identity_port FROM public.patients WHERE id = :p"),
+            text("SELECT identity_port FROM public.cameras WHERE id = :p"),
             {"p": dormant},
         )
     ).scalar()
@@ -645,16 +680,14 @@ async def test_a_live_home_is_never_evicted(
     await _clear(session)
     await _mk_caregiver(session, caregiver_id, email)
     await _park_others(session)
-    seated = await _mk_patient(session, caregiver_id)
-    await _mk_camera(session, seated, online=True)
+    seated = await _mk_home(session, caregiver_id)
     (await _poll(client, "node-nokick", cap=1)).json()
 
     # A second live home wants in, but there is nothing dormant to evict.
-    waiting = await _mk_patient(session, caregiver_id)
-    await _mk_camera(session, waiting, online=True)
+    waiting = await _mk_home(session, caregiver_id, online=True)
 
     body = (await _poll(client, "node-nokick", cap=1)).json()
-    assert _names(body) == [f"patient_{seated}"], (
+    assert _names(body) == [seated], (
         "evicting a streaming home to seat another just moves the blindness"
     )
 
@@ -668,9 +701,45 @@ async def test_dormant_home_keeps_its_slot_when_capacity_is_spare(
     await _clear(session)
     await _mk_caregiver(session, caregiver_id, email)
     await _park_others(session)
-    dormant = await _mk_patient(session, caregiver_id)
-    live = await _mk_patient(session, caregiver_id)
-    await _mk_camera(session, live, online=True)
+    dormant = await _mk_home(session, caregiver_id)
+    live = await _mk_home(session, caregiver_id)
 
     body = (await _poll(client, "node-standby", cap=4)).json()
-    assert set(_names(body)) == {f"patient_{dormant}", f"patient_{live}"}
+    assert set(_names(body)) == {dormant, live}
+
+
+async def test_a_shared_sensor_takes_exactly_one_slot(
+    client: AsyncClient, session: AsyncSession, auth_user
+) -> None:
+    """One sensor, one process, however many people it watches.
+
+    This case used to ask whether a shared camera made a SECOND resident
+    "live", because a slot was allocated per patient and the answer
+    decided whether one got a process with no video in it. Sharding on
+    the sensor deletes the question: residents do not hold slots, so
+    covering another person cannot conjure one. What is worth pinning is
+    the consequence — adding a patient to a sensor must not cost a second
+    process on identical video, which is exactly the N-times-the-model-
+    spend the one-row-per-camera change was made to stop.
+    """
+    caregiver_id, email = auth_user
+    await _clear(session)
+    await _mk_caregiver(session, caregiver_id, email)
+    await _park_others(session)
+
+    shared = await _mk_home(session, caregiver_id, online=True)
+    # A second resident in the same room, watched by the same sensor.
+    housemate = await _mk_patient(session, caregiver_id)
+    await session.execute(
+        text("INSERT INTO public.camera_patients (camera_id, patient_id) "
+             "VALUES (CAST(:c AS uuid), :p) ON CONFLICT DO NOTHING"),
+        {"c": shared, "p": housemate},
+    )
+    await session.commit()
+
+    body = (await _poll(client, "node-shared", cap=4)).json()
+
+    assert _names(body) == [shared], (
+        "a sensor watching two people is still one sensor, and must not "
+        "be handed two processes decoding the same video"
+    )

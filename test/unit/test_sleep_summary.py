@@ -71,9 +71,14 @@ def test_a_real_awakening_is_reported_as_a_window() -> None:
     # first tick seen asleep again. We cannot know the exact instant the
     # eyes opened, so the window is deliberately the outer bound rather
     # than the span of awake ticks.
-    assert w["from"] == (_N + timedelta(minutes=119.5)).isoformat()
-    assert w["to"] == (_N + timedelta(minutes=135)).isoformat()
+    assert w["from"] == (_N + timedelta(minutes=119.5)).isoformat() + "+00:00"
+    assert w["to"] == (_N + timedelta(minutes=135)).isoformat() + "+00:00"
     assert w["duration_minutes"] == 16          # 15.5 min, rounded
+    # The OFFSET is part of the contract, not decoration. These strings
+    # leave the process as jsonb and are parsed by an iOS decoder that
+    # requires one; without it the phone reads a UTC instant in its own
+    # zone and draws the night hours out of place (2026-08-25).
+    assert w["from"].endswith("+00:00") and w["to"].endswith("+00:00")
 
 
 # ── bug 1: silence is not wakefulness (the 06:26 case) ───────────────
@@ -308,3 +313,4 @@ def test_activity_state_timeline_time_weighted() -> None:
     # Posture-derived measures: legacy `sitting` counts as sedentary.
     assert out["sedentary_minutes"] == 120.0
     assert out["upright_minutes"] == 30.0
+

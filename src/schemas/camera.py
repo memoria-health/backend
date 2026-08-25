@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 Room = Annotated[str, Field(min_length=1, max_length=80)]
 IconName = Annotated[str, Field(min_length=1, max_length=80)]
@@ -23,23 +23,14 @@ RoomClass = Literal["bathroom", "bedroom", "other"]
 DesiredState = Literal["connected", "disconnected"]
 
 # Mirrors the DB CHECK constraint on cameras.source_type. 'iphone' is
-# the existing NemaraCam wall-phone path. 'pi' is the Raspberry Pi
-# MJPEG-relay ingest path. 'gateway' is the mini-PC RTSP gateway — its
-# OWN third path: it carries an ingest token like 'pi' but publishes
-# DIRECTLY to LiveKit (no relay), so it shares none of the relay logic.
-SourceType = Literal["iphone", "pi", "gateway"]
-
-# A Pi stream URL must be an HTTP(S) URL. We do not parse / validate
-# routing here; the worker process will discover unreachable URLs
-# at connect time. Length cap protects against accidentally storing
-# a multi-MB blob.
-PiStreamUrl = Annotated[str, Field(min_length=8, max_length=2048)]
-
-# A Pi audio URL has the same shape and constraints. We split the
-# type alias for clarity at field declarations even though it is
-# identical to PiStreamUrl.
-PiAudioUrl = Annotated[str, Field(min_length=8, max_length=2048)]
-
+# the NemaraCam wall-phone path. 'gateway' covers anything that
+# publishes DIRECTLY to LiveKit with an ingest token — the mini-PC RTSP
+# gateway and the hosted camera bridge.
+#
+# 'pi' was the Raspberry Pi MJPEG-relay path, removed 2026-08-22. It had
+# no ingest endpoint left after 2026-08-21, so a 'pi' row could be
+# created and could never deliver a frame; no Pi ever ran in production.
+SourceType = Literal["iphone", "gateway"]
 
 class CameraResponse(BaseModel):
     """Full camera row."""
@@ -47,7 +38,10 @@ class CameraResponse(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     id: UUID
-    patient_id: UUID
+    # Compatibility only — the FIRST covered patient, NULL when the sensor
+    # covers nobody. Coverage lives in `camera_patients`; nothing should
+    # decide anything from this.
+    patient_id: UUID | None = None
     display_id: int
     room: Room
     icon_name: IconName
@@ -66,27 +60,28 @@ class CameraResponse(BaseModel):
     # flipping back to 'connected'. See cameras.desired_state in
     # supabase/schema.sql for the underlying CHECK constraint.
     desired_state: DesiredState
-    # 'iphone' (NemaraCam wall phone) or 'pi' (Raspberry Pi ingest).
-    # The caregiver app uses this to hide source-incompatible UI
-    # affordances; e.g. Talk mode is iPhone-only until Pi gets a
-    # speaker (Phase 6).
+    # 'iphone' (NemaraCam wall phone) or 'gateway' (anything publishing
+    # straight to LiveKit). The caregiver app uses this to hide
+    # source-incompatible affordances — Talk needs a speaker, which only
+    # the wall phone has.
     source_type: SourceType
-    # The MJPEG-over-HTTP endpoint for Pi cameras. Present only when
-    # source_type='pi'. Forbidden when source_type='iphone' (enforced
-    # at the DB layer too via CHECK constraint).
-    pi_stream_url: PiStreamUrl | None = None
-    # Optional PCM-over-HTTP audio endpoint for Pi cameras with a USB
-    # microphone. NULL when the camera is video-only (no LiveKit
-    # audio track is published, the agitation/speech detectors
-    # downstream degrade gracefully). Forbidden on iPhone cameras
-    # (their audio rides on the same LiveKit publisher as video).
-    pi_audio_url: PiAudioUrl | None = None
     # `cam_<8 hex>` once the pairing handshake completes; None on rows
     # that hold an open pairing code but haven't been claimed by a
     # wall phone yet. Exposed to the caregiver app so the Live tab
     # can map a Camera row to a subscribed LiveKit track without
     # reconstructing the identity from the UUID prefix client-side.
     livekit_identity: str | None
+    # The LiveKit room this sensor PUBLISHES INTO — the address a viewer
+    # must join to see it. Exposed to clients because it is not
+    # derivable from the patient being viewed: it is the ACCOUNT's room
+    # for a sensor, and a `patient_<uuid>` room for a wall phone paired
+    # before 2026-08-22. A client that builds the string itself joins a
+    # room the sensor never appears in and shows a black tile.
+    #
+    # Declared TWICE until 2026-08-22 — once here and once above. The
+    # second declaration silently won, so the first comment described
+    # behaviour no longer in force and any change to it did nothing.
+    livekit_room: str | None = None
     created_at: datetime
     # True once the wall phone has called /v1/cameras/pair and we've
     # set the api_key_hash. False = "row exists with an open pairing
@@ -99,8 +94,8 @@ class CameraResponse(BaseModel):
     # iPhone (it polls desired-state every 1s when open). false = app
     # closed / phone off → clients show "App closed, open Memoria
     # Sensor" instead of a reconnectable "Disconnected". Only
-    # meaningful for source_type='iphone'; Pi cameras stay true (no app
-    # to close). Defaulted True so older backends / un-migrated rows /
+    # meaningful for source_type='iphone'; gateway sensors stay true (no
+    # app to close). Defaulted True so older backends / un-migrated rows /
     # any not-yet-updated construction site degrade gracefully to
     # "present" and never falsely show "app closed".
     app_present: bool = True
@@ -116,16 +111,8 @@ class CameraResponse(BaseModel):
     # classifier's fail-closed fallback). Locked — no user toggle;
     # written only by the classifier / internal reclassify endpoint.
     privacy_enabled: bool = False
-
-    @model_validator(mode="after")
-    def _validate_source_pi_url_consistency(self) -> "CameraResponse":
-        """Vestigial URL columns: pi_stream_url and pi_audio_url no
-        longer carry source-type-XOR semantics after the push refactor
-        (Pi POSTs frames outbound; backend never pulls). The columns
-        remain nullable for backwards compat but the API does not
-        enforce a presence rule on them.
-        """
-        return self
+    # The facilities audio kill, so a client can read back what it set.
+    audio_capture_enabled: bool = True
 
 
 class UpdateCameraRequest(BaseModel):
@@ -141,6 +128,13 @@ class UpdateCameraRequest(BaseModel):
     disabled: bool | None = None
     # LLM-only pause. Video keeps streaming; AI tick is skipped.
     ai_paused: bool | None = None
+    # Facilities audio kill: False = no audio track is ever published by
+    # this sensor, severed at the publisher. Moved off `patients` on
+    # 2026-08-22 — it is a statement about a physical room ("no recording
+    # in here"), not about a person, and a sensor covering nobody had no
+    # patient to read it from. Reaches the bridge within ~0.4s via the
+    # roster long-poll fingerprint.
+    audio_capture_enabled: bool | None = None
     # Flip this from the dashboard's 3-dot menu. Phone polls
     # /v1/cameras/me/desired-state every 1s and reconciles by leaving
     # or rejoining the LiveKit room.
@@ -225,73 +219,29 @@ class SetCameraDetectorsRequest(BaseModel):
     detector_ids: list[UUID]
 
 
-class PiProvisionRequest(BaseModel):
-    """Body of POST /v1/patients/{patient_id}/cameras/pi-provision.
+class AccountCameraResponse(BaseModel):
+    """A camera as the ACCOUNT sees it — including ones no patient owns yet."""
 
-    Creates a Pi camera row in one shot. Unlike the iPhone pairing
-    flow, there is no two-step exchange: the Pi has no UI to enter a
-    code, and the backend worker authenticates to LiveKit using its
-    own credentials, so no api_key needs to be handed to the Pi
-    device itself.
+    id: UUID
+    room: str
+    icon_name: str
+    online: bool
+    source_type: str
+    # Coverage, oldest assignment first. Empty until someone assigns it.
+    # Equals, with no primary: a primary only ever answered "whose LiveKit
+    # room does this publish into", and the room is the account's now.
+    patient_ids: list[UUID]
+    unassigned: bool
 
-    Two mutually-exclusive modes to specify the camera's MJPEG URL:
 
-      - `discovery_id`: pick a discovered Pi from the announce table
-        (the normal customer flow; the caregiver app gets the id
-        from GET /v1/cameras/discovered). The URL fields on the row
-        come from the discovery record and the discovery is marked
-        claimed.
-      - `pi_stream_url` (+ optional `pi_audio_url`): for ops /
-        scripted provisioning when the caregiver already knows the
-        URL and no announce record exists. Kept so the existing
-        admin and test workflows still work.
+class CoverageRequest(BaseModel):
+    """Assign a sensor: name it, pick its icon, and say who it watches.
 
-    Exactly one of the two modes must be set; both or neither raises
-    a 422.
+    An EMPTY `patient_ids` is legal and means "watched by nobody yet".
+    The sensor keeps streaming either way -- coverage is attribution, and
+    it never starts or stops the video.
     """
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    room: Room
-    icon_name: IconName = "tv"
-    # Mode A (recommended): pair from a discovery. The Pi's hardware ID
-    # and human label come from the discovery record.
-    discovery_id: UUID | None = None
-    # Mode B (manual): direct URLs (vestigial, accepted but unused after
-    # the push refactor since the backend no longer pulls from the Pi).
-    # Kept for ops/scripted workflows and to avoid breaking old test
-    # fixtures.
-    pi_stream_url: PiStreamUrl | None = None
-    pi_audio_url: PiAudioUrl | None = None
-
-    @model_validator(mode="after")
-    def _validate_mode(self) -> "PiProvisionRequest":
-        has_discovery = self.discovery_id is not None
-        has_direct_url = self.pi_stream_url is not None
-        if has_discovery and has_direct_url:
-            raise ValueError(
-                "Specify either discovery_id or pi_stream_url, not both"
-            )
-        if not has_discovery and not has_direct_url:
-            raise ValueError(
-                "Must specify either discovery_id or pi_stream_url"
-            )
-        return self
-
-
-class PiProvisionResponse(BaseModel):
-    """Handed back to the caregiver app after provisioning. Carries the
-    LiveKit identity + room so the app can confirm the camera is wired
-    before the Pi starts pushing frames.
-
-    NOTE: the camera's ingest bearer token is NOT delivered here. The
-    Pi receives it via the next /v1/cameras/pi-announce response (which
-    is the only direct Pi-to-backend channel before pairing completes).
-    """
-
-    model_config = ConfigDict(frozen=True)
-
-    camera_id: UUID
-    patient_id: UUID
-    livekit_identity: str
-    livekit_room: str
+    room: str | None = Field(default=None, max_length=80)
+    icon_name: str | None = Field(default=None, max_length=80)
+    patient_ids: list[UUID] = Field(default_factory=list)

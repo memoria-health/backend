@@ -44,9 +44,14 @@ class _FakeSession:
         if "INSERT INTO public.identity_occupancy_samples" in sql:
             self._inserts.append(params)
             return _FakeResult([])
-        if "FROM public.patients p" in sql and "JOIN" in sql:
+        if "FROM public.cameras c" in sql and "JOIN" in sql:
             return _FakeResult(self._served)
-        return _FakeResult([])
+        # Loudly, not silently. This matched "FROM public.patients p"
+        # until the identity shard moved to the sensor, and a fake that
+        # answers an unrecognised query with an empty result turns a
+        # renamed table into "the fleet is serving nothing" — which reads
+        # as a real finding rather than a broken test.
+        raise AssertionError(f"unexpected query in fake session: {sql[:120]}")
 
     async def commit(self):
         pass

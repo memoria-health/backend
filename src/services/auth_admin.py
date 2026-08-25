@@ -5,7 +5,7 @@ Currently one operation: hard-delete an auth user. Deleting the
 CASCADE`, see supabase/schema.sql) and from there to the entire
 account graph — so this is the load-bearing step of account deletion.
 
-Mirrors the header/auth shape `scripts/seed.py` uses for the admin
+Mirrors the header/auth shape `scripts/seed/seed.py` uses for the admin
 `users` endpoint (apikey + service-role bearer). Pure async; the caller
 injects the frozen Settings instance.
 """
