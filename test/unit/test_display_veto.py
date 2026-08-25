@@ -6,13 +6,14 @@ import numpy as np
 
 from identity.display_veto import ScreenMap
 
-_REGION = (100.0, 100.0, 400.0, 400.0)
+# Fractions of the frame — everything in the map is normalised.
+_REGION = (0.10, 0.10, 0.40, 0.40)
 
 
 def _track(dx: float, tid: int = 7):
     """A small box moving `dx` per frame, always INSIDE _REGION."""
     return {
-        i: np.array([[150.0 + i * dx, 150.0, 200.0 + i * dx, 250.0, tid]])
+        i: np.array([[0.15 + i * dx, 0.15, 0.20 + i * dx, 0.25, tid]])
         for i in range(3)
     }
 
@@ -25,7 +26,7 @@ def _veto(dx: float) -> bool:
 
 def test_a_thing_inside_a_region_is_dropped():
     """The phantom case: painted faces on a wall."""
-    assert _veto(dx=0) is True
+    assert _veto(dx=0.0) is True
 
 
 def test_movement_no_longer_spares_anything():
@@ -44,7 +45,7 @@ def test_movement_no_longer_spares_anything():
     is 3.6x larger once normalised, crossed the movement bar often
     enough to keep the phantoms alive indefinitely.
     """
-    assert _veto(dx=30) is True
+    assert _veto(dx=0.03) is True
 
 
 def test_a_person_sized_box_is_never_vetoed():

@@ -41,6 +41,15 @@ class TrackView:
     bbox: Bbox
     born_at: float
     last_seen: float
+    # Where this track FIRST appeared. Never updated.
+    #
+    # A real person walks in: wherever they end up standing, their box
+    # is a long way from where it was born. A face painted on a wall is
+    # born where it will die. That difference is physical rather than
+    # room-specific, which per-batch drift was not — mask jitter is
+    # zero-mean and crossed any per-batch threshold often enough to
+    # spare the paintings (2026-08-25).
+    birth_bbox: Bbox = (0.0, 0.0, 0.0, 0.0)
     batches_seen: int = 1
     # Consecutive batches this track has been absent from. Reset to 0
     # every time it is seen; at MISSES_BEFORE_DEATH the track dies.
@@ -96,7 +105,7 @@ class CameraState:
             if t is None:
                 t = TrackView(
                     track_id=tid, bbox=bbox, born_at=now, last_seen=now,
-                    series=fresh[-120:],
+                    series=fresh[-120:], birth_bbox=bbox,
                 )
                 births.append(tid)
             else:

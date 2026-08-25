@@ -662,6 +662,33 @@ def _assign_face(
 class CameraLoop:
     """One camera's continuous loop."""
 
+    # How far a track must have travelled from where it was born to
+    # count as something that walked in rather than something painted
+    # on the wall. A fraction of the frame diagonal, so it means the
+    # same thing at every resolution and in every room.
+    _MOVED_FRAC = 0.05
+
+    def _moved_since_birth(self) -> set:
+        """Track ids that have travelled since they first appeared.
+
+        These are never vetoed, however contained they are. It is the
+        one guard that generalises: the containment floor is safe only
+        while a room's art hangs higher than a person's box reaches,
+        which is a fact about one room and not about the world.
+        """
+        out = set()
+        for tid, tv in self.state.tracks.items():
+            b0, b1 = getattr(tv, "birth_bbox", None), tv.bbox
+            if not b0 or len(b0) < 4:
+                continue
+            dx = ((b1[0] + b1[2]) - (b0[0] + b0[2])) / 2.0
+            dy = ((b1[1] + b1[3]) - (b0[1] + b0[3])) / 2.0
+            wh = self._frame_wh() or (1.0, 1.0)
+            diag = (wh[0] ** 2 + wh[1] ** 2) ** 0.5 or 1.0
+            if ((dx * dx + dy * dy) ** 0.5) / diag > self._MOVED_FRAC:
+                out.add(tid)
+        return out
+
     def _report_deaths(self, events, prev_meta, vetoed, rows_before,
                        rows_after, now: float) -> None:
         """Say WHY each track died, once per death.
@@ -1115,7 +1142,9 @@ class CameraLoop:
 
         obs, vetoed = apply_veto(
             obs, self.screen_map,
-            frame_wh=self._frame_wh(), now=time.monotonic(),
+            frame_wh=self._frame_wh(),
+            moved=self._moved_since_birth(),
+            now=time.monotonic(),
         )
         rows_after = sum(len(r) for r in obs.rows_by_frame.values())
 

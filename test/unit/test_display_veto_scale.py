@@ -213,3 +213,40 @@ def test_a_person_cannot_be_vetoed_by_the_clustered_canvas() -> None:
     ):
         rows = {i: np.array([[*person, 11]]) for i in range(3)}
         assert m.veto_track_ids(rows, now=1.0) == set(), f"vetoed a person {who}"
+
+
+def test_a_person_in_front_of_a_low_hung_screen_is_not_vetoed() -> None:
+    """The case that does NOT depend on how this living room is arranged.
+
+    A containment floor is safe only while a room's art hangs higher
+    than a person's box reaches. That is true of the TV Room and is not
+    a property of the system — a large television at eye level would
+    contain someone standing in front of it, and vetoing them is silent:
+    nothing downstream ever learns they were there.
+
+    What generalises is that a person WALKED IN. Wherever they settle is
+    far from where their track was born; a face painted on the screen is
+    born where it dies.
+    """
+    m = ScreenMap()
+    # A big screen occupying the middle of the wall, person height.
+    m.add([(0.30, 0.25, 0.75, 0.85)])
+    person = (0.40, 0.30, 0.60, 0.80)          # squarely inside it
+    rows = {i: np.array([[*person, 4]]) for i in range(3)}
+
+    # Without the history it is contained, and would be vetoed.
+    assert m.veto_track_ids(rows, now=1.0) == {4}
+    # Knowing the track walked here, it never is.
+    assert m.veto_track_ids(rows, now=1.0, moved={4}) == set()
+
+
+def test_a_painted_face_that_never_moved_is_still_vetoed() -> None:
+    """The exemption must not become a hole.
+
+    Only tracks that actually travelled are spared. A phantom is born
+    where it dies, so it is never in `moved` and the veto still applies.
+    """
+    m = ScreenMap()
+    m.add([(0.30, 0.25, 0.75, 0.85)])
+    rows = {i: np.array([[0.40, 0.30, 0.60, 0.80, 9]]) for i in range(3)}
+    assert m.veto_track_ids(rows, now=1.0, moved=set()) == {9}

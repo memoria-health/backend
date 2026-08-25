@@ -213,6 +213,7 @@ class ScreenMap:
         self, rows_by_frame: dict[int, np.ndarray],
         frame_wh: tuple[int, int] | None = None,
         now: float | None = None,
+        moved: "set[int] | None" = None,
     ) -> set[int]:
         """Track ids whose EVERY observed bbox is contained in a live
         screen region."""
@@ -229,8 +230,26 @@ class ScreenMap:
                 per_tid.setdefault(tid, []).append(
                     max(containment(box, r) for r in live))
         vetoed = set()
+        moved = moved or set()
         for tid, scores in per_tid.items():
             if len(scores) < _MIN_FRAMES:
+                continue
+            # IT WALKED HERE, SO IT IS NOT PAINTED ON THE WALL.
+            #
+            # The containment floor alone is not a general guard. It is
+            # safe in a room where the art hangs high, because a
+            # person's box then extends below it — but that is a fact
+            # about one living room, not about the system. A large
+            # television at eye level would contain a person standing in
+            # front of it.
+            #
+            # Displacement from BIRTH is the property that travels: a
+            # person walks in, so wherever they settle is far from where
+            # their track began; a painted face is born where it dies.
+            # Per-batch drift was not this property and could not do
+            # this job — mask jitter is zero-mean, so it crossed any
+            # per-batch bar often enough to keep the phantoms alive.
+            if tid in moved:
                 continue
             # ONE RULE: every observed box of this track sat almost
             # entirely inside a region we know is a display or a
@@ -312,11 +331,13 @@ def save_regions(path: str, regions) -> None:
 
 def apply_veto(obs, screen_map: ScreenMap, *,
                frame_wh: tuple[int, int] | None = None,
+               moved: "set[int] | None" = None,
                now: float | None = None):
     """Drop screen-contained tracks from a RemoteObservations bundle
     (rows + face obs). Returns (obs, dropped_tids) — obs is mutated in
     place (it is per-tick and not shared)."""
-    dropped = screen_map.veto_track_ids(obs.rows_by_frame, frame_wh, now)
+    dropped = screen_map.veto_track_ids(
+        obs.rows_by_frame, frame_wh, now, moved=moved)
     if not dropped:
         return obs, dropped
     for fi in list(obs.rows_by_frame):
