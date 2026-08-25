@@ -922,7 +922,23 @@ async def identity_timeline():
             ts, row = sample[0], sample[1]
             if not isinstance(row, dict):
                 continue
-            key = int(round(float(ts) / _TIMELINE_PERIOD_S))
+            # FLOOR, not round. The services sample on their own
+            # clocks: the bedroom lands on ...399, ...409, ...419 and
+            # the TV Room on ...395, ...405, ...415 — four seconds
+            # apart, which is nothing, except that dividing by 10 puts
+            # the TV Room exactly on .5 every time. Python rounds a tie
+            # to even, so ...395 and ...405 both became bucket 540 and
+            # bucket 541 got no TV Room sample at all. The strip draws
+            # `row[cam] || 'empty'`, so the TV Room went empty on every
+            # odd bucket — alternating for as long as you watched it,
+            # while the camera was ticking cleanly every 10s. The
+            # collision also threw one of the two samples away, because
+            # the second `update` overwrote the first.
+            #
+            # Flooring puts any two samples inside the same 10s window
+            # in the same bucket regardless of phase, which is what
+            # "bucket to the sample period" was always supposed to mean.
+            key = int(float(ts) // _TIMELINE_PERIOD_S)
             buckets.setdefault(key, {}).update(row)
     merged = [[k * _TIMELINE_PERIOD_S, row]
               for k, row in sorted(buckets.items())]
