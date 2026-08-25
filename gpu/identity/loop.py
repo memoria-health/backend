@@ -795,6 +795,13 @@ class CameraLoop:
         self.camera_id = camera_id
         self.home = home
         self.state = CameraState(camera_id=camera_id)
+        # Tick health, surfaced on /state. "No tracks" is ambiguous —
+        # an empty room and a perception service failing every call look
+        # identical — so the loop counts which one it is.
+        self.step_ok = 0
+        self.step_fail = 0
+        self.last_step_ok_at = 0.0
+        self.last_step_error = ""
         # Furniture survives a restart, so the regions do too. Without
         # this, every restart begins blind and re-tracks every painted
         # face until the next search two minutes later — and the tracks
@@ -978,7 +985,19 @@ class CameraLoop:
                 await asyncio.sleep(interval)
             try:
                 await self._step()
-            except Exception:                # noqa: BLE001 — keep looping
+                self.step_ok += 1
+                self.last_step_ok_at = time.time()
+            except Exception as exc:         # noqa: BLE001 — keep looping
+                # COUNTED, not just logged. Swallowing here is right —
+                # one bad tick must not stop the loop — but until now it
+                # was also INVISIBLE: /state reported `ready` with an
+                # empty camera map whether the room was empty or every
+                # single pod call was throwing. On 2026-08-25 perception
+                # failed every ground for 37s and the soak dashboard
+                # stayed green throughout, because "no tracks" is what
+                # both look like from outside.
+                self.step_fail += 1
+                self.last_step_error = f"{type(exc).__name__}: {exc}"[:200]
                 log.exception("identity.step_failed cam=%s", self.camera_id)
 
     async def _step(self) -> None:

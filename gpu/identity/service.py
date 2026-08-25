@@ -162,6 +162,21 @@ def state(request: Request) -> JSONResponse:
                 "pod_ms": round(sp.pod_ms, 0),
                 "stage_ms": sp.stage_ms,     # measured per-batch stages
                 "probe_ms": sp.probe_ms,     # measured per-probe stages
+                # Is this loop actually WORKING, as distinct from being
+                # alive? A camera watching an empty room and a camera
+                # whose every pod call throws both report zero tracks;
+                # only these tell them apart. `since_ok_s` is the one to
+                # alarm on — counters climb forever and say nothing
+                # about now.
+                "tick_health": {
+                    "ok": sp.step_ok,
+                    "failed": sp.step_fail,
+                    "since_ok_s": (
+                        round(time.time() - sp.last_step_ok_at, 1)
+                        if sp.last_step_ok_at else None
+                    ),
+                    "last_error": sp.last_step_error or None,
+                },
             }
             for cam_id, sp in _HOME.cameras.items()
         },

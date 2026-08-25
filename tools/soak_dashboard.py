@@ -1364,7 +1364,21 @@ async function pollIdentity(){
     }
     for(const [c,v] of Object.entries(s.cameras||{})){
       const t=Object.keys(v.tracks||{});
-      h+=`<div class="mono" style="font-size:12px;margin-top:3px">${nm(c)} · tracks [${t.join(',')||'—'}]${v.solo?' · solo':''} · lag ${v.lag_s}s · pod ${v.pod_ms}ms</div>`;
+      // TICK HEALTH, stated where tracks are stated. "tracks [—]" is
+      // what an empty room looks like AND what a perception service
+      // failing every call looks like. On 2026-08-25 grounding threw
+      // for 37s straight and this page stayed green the whole time,
+      // because nothing on it could tell those two apart.
+      const th=v.tick_health||{}; let hb='';
+      if(th.since_ok_s!==null&&th.since_ok_s!==undefined){
+        // Alarm on TIME SINCE A GOOD TICK, not on the failure counter:
+        // counters only ever climb, so a service that broke an hour ago
+        // and one breaking right now read identically.
+        const cls=th.since_ok_s>30?'crit':(th.since_ok_s>10?'warn':'ok');
+        if(cls!=='ok') hb=` · <span class="${cls}" style="font-weight:700">NO GOOD TICK ${th.since_ok_s}s</span>`;
+        if(cls==='crit'&&th.last_error) hb+=` <span class="crit">${th.last_error.slice(0,60)}</span>`;
+      }
+      h+=`<div class="mono" style="font-size:12px;margin-top:3px">${nm(c)} · tracks [${t.join(',')||'—'}]${v.solo?' · solo':''} · lag ${v.lag_s}s · pod ${v.pod_ms}ms${hb}</div>`;
     }
     $("idsvc").innerHTML=h; window._idLastOk=Date.now();
     const cams=Object.keys(s.cameras||{});
