@@ -1061,7 +1061,17 @@ class CameraLoop:
                 )
                 self.state.apply({}, now=now)
             return
-        empty_poll = not self.state.tracks and self._last_shipped is not None
+        # EMPTY OF PEOPLE, not empty of tracks. A room whose only tracks
+        # are the painted faces on its wall is an empty room, and the
+        # whole point of going idle is to stop paying to download it.
+        #
+        # Judging on `state.tracks` alone is why the TV Room never once
+        # stepped down: the canvas kept a track alive almost continuously,
+        # so the camera was billed at full resolution all night with
+        # nobody in it. The bedroom, which has no art, idled correctly —
+        # which is exactly why this went unnoticed.
+        _people = set(self.state.tracks) - self._not_people
+        empty_poll = not _people and self._last_shipped is not None
         # Nothing tracked and nothing moved is exactly why the pod is
         # skipped below — and the same reason the SFU should not be
         # sending us full-resolution video for it. Transitions only.

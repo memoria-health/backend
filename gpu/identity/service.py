@@ -269,8 +269,12 @@ async def _log_link_stats(room) -> None:
                     r.received.jitter * 1000.0,
                 )
         except Exception:  # noqa: BLE001 — a probe must never kill the service
-            log.exception("identity.link_stats_failed")
-            return
+            # KEEP GOING. Returning here meant one transient error — a
+            # reconnect, a stats call racing a disconnect — silently
+            # ended monitoring for the life of the process, and the
+            # symptom would be an absence of lines, which is exactly the
+            # thing this probe exists to stop being ambiguous.
+            log.exception("identity.link_stats_failed — continuing")
 
 
 async def _mjpeg(cam_id: str):
