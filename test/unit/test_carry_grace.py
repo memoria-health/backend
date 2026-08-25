@@ -89,3 +89,32 @@ def test_the_list_is_bounded():
     """A hostile or corrupt response must not allocate without limit."""
     from perception.server import _int_set
     assert len(_int_set(list(range(500)))) == 64
+
+
+# ── The day <-> night switch ───────────────────────────────────────────
+#
+# The camera changes its entire appearance in one frame: colour to
+# grayscale, new exposure, IR illuminator on. Every mask EdgeTAM carries
+# was built on pixels that no longer exist, so they all fail at once and
+# a person lying perfectly still gets re-numbered.
+#
+# A wider grace across the switch holds the ids while the carry
+# re-acquires on the new appearance.
+
+
+def test_the_switch_grace_holds_a_track_the_normal_grace_would_drop():
+    """Normal grace is 2, so a second consecutive miss is fatal. Across
+    an IR switch that same miss must not be."""
+    out, _m, _h = carry_grace({1: A}, {}, {1: 1})              # grace=2
+    assert 1 not in out
+    out, misses, held = carry_grace({1: A}, {}, {1: 1}, 5)     # switch grace
+    assert out[1] == A
+    assert misses == {1: 2}
+    assert held == [(1, 2)]
+
+
+def test_the_switch_grace_is_still_bounded():
+    """It is wider, not infinite — a person who genuinely left during
+    the switch must still be let go."""
+    out, _m, _h = carry_grace({1: A}, {}, {1: 4}, 5)
+    assert 1 not in out
