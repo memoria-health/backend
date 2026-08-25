@@ -242,17 +242,10 @@ class SamServiceClient:
             if session_state is not None:
                 header["session_state"] = session_state
             if not_people:
-                # Track ids THIS SERVICE has judged to be a display or a
-                # painting. The pod tracks them regardless — it must, or
-                # a wrong judgement here would blind it permanently — but
-                # it stops COUNTING them when deciding whether its view
-                # of the room disagrees with YOLO's.
-                #
-                # Without this the TV Room's painted faces made the pod
-                # believe it was holding 8 people while YOLO reported 1.
-                # A permanent disagreement forced a full re-look on 33%
-                # of ticks (vs 12% in the bedroom), each ~1.3s instead of
-                # the ~130ms of carrying what it already had.
+                # Ids judged to be a display or a painting. The pod still
+                # TRACKS them — it must, or a wrong judgement here would
+                # blind it permanently — but stops counting them as
+                # people when comparing its view of the room to YOLO's.
                 header["not_people"] = sorted(int(t) for t in not_people)
             # to_thread: packing a batch is a ~tens-of-MB memcpy — off
             # the event loop, same as the JPEG encode it replaced.

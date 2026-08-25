@@ -235,12 +235,9 @@ async def _log_link_stats(room) -> None:
                 elif which == "inbound_rtp":
                     if s.inbound_rtp.stream.kind == "video":
                         video.append(s.inbound_rtp)
-            # ALWAYS say something. The first version logged only when it
-            # found a candidate pair and a video stream, so an empty
-            # stats list produced no line and no error — indistinguishable
-            # from the task not running, which cost two deploys to work
-            # out. Same failure this codebase already learned from
-            # `screen_pass ok` meaning only "the call did not throw".
+            # Always say something: logging only on success made an
+            # empty stats list indistinguishable from the task not
+            # running at all.
             if pair is None:
                 kinds: dict = {}
                 for s in _src:
@@ -1014,11 +1011,8 @@ async def _run_livekit(
         "identity.connected participants=%s",
         [p.identity for p in room.remote_participants.values()],
     )
-    # Held in a module global on purpose. asyncio keeps only a WEAK
-    # reference to a running task, so a bare create_task() whose result
-    # nobody stores can be garbage-collected before it ever runs — which
-    # is exactly what happened here: the code shipped, the process
-    # restarted, and not one stats line was ever emitted.
+    # Module global on purpose: asyncio holds only a weak reference to a
+    # task, so a bare create_task() can be collected before it runs.
     global _LINK_STATS_TASK
     _LINK_STATS_TASK = asyncio.create_task(_log_link_stats(room))
     # Missed-subscription recovery walk (2026-07-29): auto_subscribe

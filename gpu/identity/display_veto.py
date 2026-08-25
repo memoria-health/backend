@@ -68,14 +68,9 @@ _DILATE = 0.02
 
 _MIN_FRAMES = 2
 
-# How much a track's box must overlap one of YOLO's person boxes before
-# we call them the same thing. 0.30 is the mask-IoU floor this codebase
-# already matches detections at (perception.continuous's remap), so it is
-# the house currency rather than a new number to tune.
-#
-# A generous floor is the SAFE direction here, because the match only ever
-# PROTECTS a track. A real person's SAM3 mask-bbox and YOLO box agree far
-# above this; the painted faces get no YOLO box at all to match against.
+# Overlap at which a track and a YOLO box are the same thing. 0.30 is
+# the mask-IoU floor used elsewhere (continuous._remap_masks). Generous
+# is the safe direction: this only ever spares a track.
 _YOLO_MATCH_IOU = 0.30
 
 
@@ -242,11 +237,9 @@ class ScreenMap:
         """Track ids whose EVERY observed bbox is contained in a live
         screen region.
 
-        `person_boxes` (YOLO, normalised) and `protected` (tracks identity
-        has bound to a resident) are SHIELDS: they can only spare a track,
-        never condemn one. That asymmetry is the whole point — YOLO misses
-        real people, especially small, dark or partly hidden ones, so its
-        SILENCE must mean nothing while its AGREEMENT means a lot.
+        `person_boxes` (YOLO, normalised) and `protected` (identity's
+        seats) only ever SPARE a track, never condemn one — YOLO misses
+        real people, so its silence must mean nothing.
         """
         live = cluster_regions(self.live(now))
         if not live:
@@ -269,54 +262,23 @@ class ScreenMap:
         for tid, scores in per_tid.items():
             if len(scores) < _MIN_FRAMES:
                 continue
-            # Decide CANDIDACY first, then hear the defence. Ordering the
-            # shields ahead of the containment test made them fire on
-            # tracks that were never at risk — a "shield" logged at
-            # containment 0.000 says nothing, and it cost a YOLO overlap
-            # scan per track for the same nothing.
+            # Candidacy first, then the defences — shields ordered ahead
+            # of this fired on tracks that were never at risk.
             if min(scores) < self.containment_floor:
                 continue
-            # IT WALKED HERE, SO IT IS NOT PAINTED ON THE WALL.
-            #
-            # The containment floor alone is not a general guard. It is
-            # safe in a room where the art hangs high, because a
-            # person's box then extends below it — but that is a fact
-            # about one living room, not about the system. A large
-            # television at eye level would contain a person standing in
-            # front of it.
-            #
-            # Displacement from BIRTH is the property that travels: a
-            # person walks in, so wherever they settle is far from where
-            # their track began; a painted face is born where it dies.
-            # Per-batch drift was not this property and could not do
-            # this job — mask jitter is zero-mean, so it crossed any
-            # per-batch bar often enough to keep the phantoms alive.
+            # It walked here, so it is not painted on the wall.
             if tid in moved:
                 continue
-            # IDENTITY SAID THIS IS A PERSON, SO IT IS NOT THE FURNITURE.
-            #
-            # A painted face is never face-matched to a resident. This
-            # shield is not geometric, so it survives everything geometry
-            # gets wrong — a bad region, a renumbered track, a person who
-            # happens to be standing dead still. It is the guard to trust
-            # when the others fail.
+            # Identity matched it to a resident. Not geometric, so it
+            # holds when the region is wrong or the tracker renumbers.
             if tid in protected:
                 log.info(
                     "reid.display_veto_shield tid=%s by=seat containment=%.3f",
                     tid, min(scores))
                 continue
-            # A SECOND MODEL AGREES THERE IS A PERSON HERE.
-            #
-            # Everything above is one model's opinion filtered by
-            # geometry, so a wrong region and a wrong veto are the same
-            # mistake. YOLO26x is trained on photographs of bodies and
-            # fails differently: on the TV Room frame it put ZERO boxes on
-            # twelve painted faces even at conf 0.05, while SAM3 grounded
-            # seven of them as people at 0.4.
-            #
-            # It already ran — the reground trigger calls it every tick
-            # and kept only the count. This costs no inference, just the
-            # boxes we were discarding.
+            # A second detector, with different failure modes, also sees
+            # a person. Its boxes already exist — the reground trigger
+            # computed them and kept only the count.
             best_yolo = max(
                 (_iou(b, p)
                  for b in boxes_by_tid.get(tid, ())
@@ -327,28 +289,6 @@ class ScreenMap:
                     "reid.display_veto_shield tid=%s by=yolo iou=%.2f "
                     "containment=%.3f", tid, best_yolo, min(scores))
                 continue
-            # ONE RULE: every observed box of this track sat almost
-            # entirely inside a region we know is a display or a
-            # painting.
-            #
-            # There used to be a second rule — a movement exemption, so
-            # a person standing in front of a painting was spared even
-            # when contained. It protected nothing. Measured on the real
-            # geometry (2026-08-25): a painting panel is 0.05 x 0.11 of
-            # frame and a standing adult is 0.19 x 0.20, six times
-            # larger, so the most of a person that can ever fall inside
-            # one is 0.16 — against a floor of 0.93. The containment
-            # floor alone already makes vetoing a person impossible.
-            #
-            # What the exemption DID do was spare the paintings: a mask
-            # wobble of a couple of pixels, amplified by a downshifted
-            # frame, crossed the movement bar often enough to keep the
-            # phantoms alive indefinitely.
-            #
-            # Removing it also removes the reason the two region KINDS
-            # existed — screens versus static art differed only in who
-            # got the exemption — along with the drift maths and the
-            # per-track kind arbitration.
             log.info(
                 "reid.display_veto_drop tid=%s containment=%.3f",
                 tid, min(scores),

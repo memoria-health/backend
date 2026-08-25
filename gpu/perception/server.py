@@ -403,27 +403,13 @@ def _startup() -> None:
         _torch.backends.cuda.enable_flash_sdp = lambda *a, **k: None
         _torch.backends.cuda.enable_math_sdp = lambda *a, **k: None
         _torch.backends.cuda.enable_mem_efficient_sdp = lambda *a, **k: None
-        # The setters are NOT the only door, and pinning them was
-        # therefore never the pin it claimed to be.
-        #
-        # EdgeTAM wraps every attention op in
-        # `torch.backends.cuda.sdp_kernel(enable_flash=..., enable_math=...)`
-        # (sam2/modeling/sam/transformer.py:32). On torch 2.4.1 that is
-        # deprecated and forwards to `torch.nn.attention.sdpa_kernel`,
-        # which installs a backend LIST through a different path and
-        # never touches the functions patched above. So EdgeTAM could
-        # still turn math SDP off process-wide, and a SAM3 attention
-        # running in another camera's thread at that moment found no
-        # enabled backend it could use: "No available kernel."
-        #
-        # Measured 2026-08-25: three perception restarts gave 126, 27
-        # and 0 of those in the first minute — the signature of a race,
-        # not of a config. `continuous._get_edge` already neutralises
-        # EdgeTAM's context, but only from the first EdgeTAM load, which
-        # is exactly the window the burst lives in.
-        #
-        # Both spellings, because the deprecated one imports the new one
-        # at call time and would otherwise walk straight past this.
+        # The setters are not the only door. On torch 2.4.1
+        # `backends.cuda.sdp_kernel` forwards to
+        # `nn.attention.sdpa_kernel`, which sets the backend list without
+        # touching the functions patched above — so EdgeTAM could still
+        # disable math SDP process-wide and a concurrent SAM3 attention
+        # found no usable kernel. Both spellings, because the deprecated
+        # one imports the new one at call time.
         def _nullctx(*_a, **_k):
             return contextlib.nullcontext()
         _torch.backends.cuda.sdp_kernel = _nullctx

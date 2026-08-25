@@ -833,17 +833,9 @@ class CameraLoop:
         self.step_fail = 0
         self.last_step_ok_at = 0.0
         self.last_step_error = ""
-        # WHERE A TRACK WAS WHEN IT DIED, kept for a few seconds.
-        #
-        # `carry_seat` moves a seat onto a renumbered track by comparing
-        # the dead track's last box against the live ones. It read those
-        # boxes from `state.tracks`, which holds only LIVE tracks — and
-        # it is only ever called once the seated track is already gone.
-        # So its `old_box` lookup returned None on every call and it
-        # returned None on its third line, every time, since it was
-        # written. Measured 2026-08-25: zero carries on either camera,
-        # against 40 deaths that had exactly the single overlapping
-        # successor it exists to find.
+        # Where a track was when it died. `carry_seat` matches a
+        # renumbered track against it; sourcing those boxes from
+        # `state.tracks` (live only) meant it could never succeed.
         self._dead_boxes: dict[int, tuple[tuple, float]] = {}
         # Track ids this service last judged to be a display or a
         # painting, sent back to the pod so it stops counting them as
@@ -1036,14 +1028,10 @@ class CameraLoop:
                 self.step_ok += 1
                 self.last_step_ok_at = time.time()
             except Exception as exc:         # noqa: BLE001 — keep looping
-                # COUNTED, not just logged. Swallowing here is right —
-                # one bad tick must not stop the loop — but until now it
-                # was also INVISIBLE: /state reported `ready` with an
-                # empty camera map whether the room was empty or every
-                # single pod call was throwing. On 2026-08-25 perception
-                # failed every ground for 37s and the soak dashboard
-                # stayed green throughout, because "no tracks" is what
-                # both look like from outside.
+                # Counted, not just logged. Swallowing is right — one bad
+                # tick must not stop the loop — but an empty room and a
+                # pod throwing on every call looked identical from
+                # outside, and the dashboard stayed green through both.
                 self.step_fail += 1
                 self.last_step_error = f"{type(exc).__name__}: {exc}"[:200]
                 log.exception("identity.step_failed cam=%s", self.camera_id)
@@ -1061,15 +1049,9 @@ class CameraLoop:
                 )
                 self.state.apply({}, now=now)
             return
-        # EMPTY OF PEOPLE, not empty of tracks. A room whose only tracks
-        # are the painted faces on its wall is an empty room, and the
-        # whole point of going idle is to stop paying to download it.
-        #
-        # Judging on `state.tracks` alone is why the TV Room never once
-        # stepped down: the canvas kept a track alive almost continuously,
-        # so the camera was billed at full resolution all night with
-        # nobody in it. The bedroom, which has no art, idled correctly —
-        # which is exactly why this went unnoticed.
+        # Empty of PEOPLE, not of tracks. Judging on `state.tracks`
+        # alone is why a room whose wall art is tracked never stepped
+        # down, and was billed at full resolution with nobody in it.
         _people = set(self.state.tracks) - self._not_people
         empty_poll = not _people and self._last_shipped is not None
         # Nothing tracked and nothing moved is exactly why the pod is
@@ -1235,11 +1217,9 @@ class CameraLoop:
         # threw it away" — the distinction every theory about track
         # churn so far has had to guess at.
         rows_before = sum(len(r) for r in obs.rows_by_frame.values())
-        # Which ids the POD is reporting, read BEFORE the veto strips
-        # them out. Needed to retire `_not_people` entries: after
-        # apply_veto the surviving rows can never contain a vetoed id,
-        # so asking the mutated bundle would retire every entry every
-        # tick and the list would never accumulate.
+        # Ids the pod is reporting, read BEFORE the veto strips them —
+        # afterwards the surviving rows can never contain a vetoed id,
+        # so retirement below would empty the set every tick.
         pod_ids = {
             int(r[4]) for rows in obs.rows_by_frame.values() for r in rows
         }
@@ -1252,12 +1232,9 @@ class CameraLoop:
             now=time.monotonic(),
         )
         rows_after = sum(len(r) for r in obs.rows_by_frame.values())
-        # Accumulate rather than replace. A painted face is vetoed on
-        # ~99% of ticks and spared on the odd one (a mask wobble), so a
-        # tick-by-tick replacement would drop it from the list at exactly
-        # the moment it flickers — and the disagreement, and the
-        # expensive re-look, would come straight back. Bounded, and
-        # every id is retired the moment the pod stops reporting it.
+        # Accumulate, don't replace: a painted face is spared on the odd
+        # tick (mask wobble), and replacing would drop it exactly then.
+        # Retired as soon as the pod stops reporting the id.
         self._not_people = (self._not_people | set(vetoed or ())) & pod_ids
 
         prev_boxes = {t: tv.bbox for t, tv in self.state.tracks.items()}

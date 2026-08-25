@@ -812,21 +812,11 @@ class CameraSession:
             new_masks = {
                 tid: mm for tid, (_bb, mm) in out[last_pos].items() if mm.any()
             }
-        # PARTIAL carry loss: some seeds survived propagation and some
-        # did not. The grace below this only ever covered the all-empty
-        # case, so a tick that kept 2 of 3 masks dropped the third with
-        # no grace at all — and a track missing from `last_masks` cannot
-        # be remapped at the next ground, so it comes back as a NEW ID.
-        # That is the renumbering that costs the seat.
-        #
-        # Measured 2026-08-25: EdgeTAM lost a seeded track on 2% of ticks
-        # on BOTH cameras (46 and 77 tracks), which is the only churn
-        # source common to both — the paintings and the resolution flips
-        # are TV-Room-only and cannot explain the Bedroom.
-        #
-        # CARRY ONLY. A ground is the existence authority: if the
-        # grounder looked and found nobody there, the track is gone and
-        # must die. This grace is strictly for a propagation blink.
+        # Partial carry loss: the grace below only covers the all-empty
+        # tick, so one that kept 2 of 3 masks dropped the third outright
+        # — and a track missing from `last_masks` gets a NEW ID at the
+        # next ground, which is what costs the seat. CARRY ONLY: a ground
+        # is the existence authority.
         if mode == "carry" and seed:
             new_masks, self._mask_misses, held = carry_grace(
                 seed, new_masks, self._mask_misses)
@@ -903,17 +893,10 @@ class CameraSession:
                     for x1, y1, x2, y2, _conf in boxes
                 )
         if mode == "carry":
-            # COUNT ONLY. `not_people` are ids the identity service has
-            # judged to be a display or a painting. They stay tracked —
-            # nothing here removes them — but they must not be counted as
-            # people when asking "does my view of the room match YOLO's".
-            #
-            # The TV Room's painted faces made this comparison read
-            # dets=1 live=8 forever. A disagreement that can never be
-            # resolved forced a full re-look on 33% of ticks (vs 12% in
-            # the bedroom), each ~1.3s against ~130ms to carry what we
-            # already had. It bought nothing: the re-look re-found the
-            # same paintings every time.
+            # COUNT ONLY — `not_people` stay tracked, nothing here
+            # removes them. Counting paintings as people made this read
+            # dets=1 live=8 forever, and an unresolvable disagreement
+            # forced a full re-look that re-found the same paintings.
             people = len(self.last_masks) - sum(
                 1 for t in self.last_masks if t in (not_people or ()))
             force, self._under_streak = person_trigger.should_force_reground(
