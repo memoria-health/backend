@@ -179,3 +179,45 @@ def test_both_seat_carry_call_sites_use_a_method_their_owner_has() -> None:
                     f"{node.name} calls self.{call.func.attr}() but does not "
                     f"define it — this is the bug that stopped every seat "
                     f"from locking")
+
+
+def test_a_rejected_track_dies_at_once() -> None:
+    """The display filter's verdict is not a blink.
+
+    The grace period exists so one noisy batch cannot destroy a face
+    match. A track the filter has positively judged to be a painting is
+    not missing — we looked and decided it is not a person.
+
+    Measured 2026-08-25 in the TV Room: the canvas faces were dropped on
+    99% of batches and spared on the odd one, when a mask wobble crossed
+    the movement bar (inflated by a downshifted frame, where one pixel
+    is 3.6x larger once normalised). Every spare reset the miss counter,
+    so the phantoms never died and `solo` never became true — which in
+    turn blocked face harvesting for the person who WAS in the room.
+    """
+    st = _state()
+    st.apply({1: (0.0, 0.0, 10.0, 10.0)}, now=0.0)
+    ev = st.apply({}, now=0.2, rejected={1})
+    assert ev.deaths == [1], "a rejected track was given the grace period"
+    assert 1 not in st.live_ids
+
+
+def test_an_occasional_spare_cannot_keep_a_rejected_track_alive() -> None:
+    """Reject, reject, spare, reject — the pattern that was surviving."""
+    st = _state()
+    st.apply({7: (0.0, 0.0, 10.0, 10.0)}, now=0.0)
+    st.apply({}, now=0.2, rejected={7})          # rejected -> dead
+    assert 7 not in st.live_ids
+    # It comes back as a fresh track, and is rejected again just as fast.
+    st.apply({7: (0.0, 0.0, 10.0, 10.0)}, now=0.4)
+    ev = st.apply({}, now=0.6, rejected={7})
+    assert ev.deaths == [7]
+
+
+def test_a_merely_missing_track_still_gets_its_grace() -> None:
+    """The fix must not undo the reason the counter exists."""
+    st = _state()
+    st.apply({3: (0.0, 0.0, 10.0, 10.0)}, now=0.0)
+    ev = st.apply({}, now=0.2, rejected=set())
+    assert ev.deaths == [], "a blink was treated as a rejection"
+    assert 3 in st.live_ids

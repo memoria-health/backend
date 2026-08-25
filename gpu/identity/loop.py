@@ -1143,7 +1143,8 @@ class CameraLoop:
         }
         events = self.state.apply(
             newest_bboxes(obs), now=now,
-            batch_series=series_bboxes(obs, batch))
+            batch_series=series_bboxes(obs, batch),
+            rejected=set(vetoed or ()))
         if events.deaths:
             self._report_deaths(
                 events, prev_meta, vetoed, rows_before, rows_after, now)

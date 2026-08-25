@@ -77,6 +77,7 @@ class CameraState:
 
     def apply(self, batch_tracks: dict[int, Bbox], *, now: float,
               batch_series: dict[int, list[tuple[float, Bbox]]] | None = None,
+              rejected: "set[int] | None" = None,
               ) -> TrackEvents:
         """Fold one batch's pod output (tid -> newest bbox) into state.
 
@@ -110,8 +111,25 @@ class CameraState:
                     e for e in (*t.series, *fresh) if now - e[0] <= 15.0
                 )[-120:]
             new_tracks[tid] = t
+        rejected = rejected or set()
         for tid, t in self.tracks.items():
             if tid in batch_tracks:
+                continue
+            # REJECTED is not MISSING, and the difference is the whole
+            # point of the counter.
+            #
+            # A missing track might be a detector blink, and the grace
+            # period exists so one noisy batch cannot destroy a face
+            # match. A track the display filter has positively judged to
+            # be a painting is not missing — we looked at it and decided
+            # it is not a person. Giving it the same benefit of the
+            # doubt kept the phantoms alive: measured 2026-08-25, the
+            # canvas faces were dropped on 99% of batches and spared on
+            # the odd one (a mask wobble crossing the movement bar,
+            # inflated by a downshifted frame), and every spare reset
+            # the counter. Rejected once, gone.
+            if tid in rejected:
+                deaths.append(tid)
                 continue
             t.misses += 1
             if t.misses >= MISSES_BEFORE_DEATH:
