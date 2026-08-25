@@ -149,3 +149,67 @@ def test_regions_are_scaled_by_the_frame_they_were_measured_in() -> None:
     assert wrong.veto_track_ids(_rows(painting_full), (W_INTAKE, H_INTAKE)) == set(), (
         "scaling by the intake size happened to work — the test cannot "
         "distinguish the bug from the fix")
+
+
+# ── the tiled artwork ────────────────────────────────────────────────
+
+_CANVAS_PANELS = [
+    (0.819, 0.208, 0.864, 0.314), (0.820, 0.312, 0.866, 0.416),
+    (0.861, 0.203, 0.906, 0.310), (0.864, 0.308, 0.910, 0.421),
+    (0.900, 0.201, 0.954, 0.309), (0.907, 0.309, 0.960, 0.429),
+    (0.948, 0.200, 1.000, 0.310),
+]
+_FRAMED_PICTURE = (0.500, 0.231, 0.528, 0.348)   # separate object, far away
+_MISSED_PANEL = (0.96, 0.33, 1.00, 0.44)         # grounding never found it
+
+
+def test_the_panel_grounding_missed_is_still_covered() -> None:
+    """The real failure, with the real boxes.
+
+    Concept grounding returned the TV Room's canvas as seven panels
+    across two rows and missed the eighth — the bottom-right face. It
+    fell in the gap between the last panel and the frame edge and was
+    tracked as a person for hours. Joining panels that touch turns them
+    into one canvas, which covers the miss.
+    """
+    from identity.display_veto import cluster_regions
+
+    clustered = cluster_regions(_CANVAS_PANELS)
+    assert len(clustered) == 1, f"the canvas did not become one object: {clustered}"
+    c = clustered[0]
+    assert c[0] <= _MISSED_PANEL[0] and c[2] >= _MISSED_PANEL[2]
+    assert c[1] <= _MISSED_PANEL[1] and c[3] >= _MISSED_PANEL[3]
+
+
+def test_a_separate_object_is_not_swallowed() -> None:
+    """Clustering must not blanket the room.
+
+    The small framed picture by the door is a real, separate region. If
+    everything merged, the resulting box would span half the frame and
+    could contain a person.
+    """
+    from identity.display_veto import cluster_regions
+
+    clustered = cluster_regions(_CANVAS_PANELS + [_FRAMED_PICTURE])
+    assert len(clustered) == 2, f"expected canvas + picture, got {clustered}"
+    assert min(b[2] - b[0] for b in clustered) < 0.1
+
+
+def test_a_person_cannot_be_vetoed_by_the_clustered_canvas() -> None:
+    """The clustered region is person-sized, so this has to be checked.
+
+    It is safe for a reason worth stating: the art hangs high on the
+    wall, and a standing or seated person's box always extends well
+    below it. Measured against the floor of 0.93, the worst case here is
+    0.25.
+    """
+    m = ScreenMap()
+    for panel in _CANVAS_PANELS:
+        m.add([panel])
+    for who, person in (
+        ("standing in front of the wall", (0.86, 0.30, 0.95, 0.90)),
+        ("seated under the art", (0.86, 0.40, 0.95, 0.70)),
+        ("across the room", (724 / 2304, 518 / 1296, 1156 / 2304, 778 / 1296)),
+    ):
+        rows = {i: np.array([[*person, 11]]) for i in range(3)}
+        assert m.veto_track_ids(rows, now=1.0) == set(), f"vetoed a person {who}"

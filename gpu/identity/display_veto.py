@@ -46,6 +46,26 @@ log = logging.getLogger(__name__)
 # displays in it.
 _REGION_FORMAT = 3
 
+# How close two regions must be to count as one object, and how much to
+# grow the result, both as a fraction of the frame.
+#
+# Concept grounding returns an artwork PANEL BY PANEL, not as one thing.
+# The TV Room's canvas came back as seven boxes tiling two rows, and the
+# eighth — the bottom-right face — was simply missed, so it fell in the
+# gap between the last panel and the frame edge and was tracked as a
+# person indefinitely. Asking for a better prompt is a vocabulary
+# problem with no end; joining the panels that touch is arithmetic.
+#
+# The dilation exists because grounding boxes are tight. Clustered but
+# undilated, the missed face was 0.900 contained against a 0.93 floor —
+# short by a hundredth. At 0.02 it is fully covered.
+#
+# Clustering deliberately does NOT merge everything: the small framed
+# picture by the door sits alone at x 0.50 and stays its own region, so
+# this cannot blanket half a room.
+_ADJACENT_GAP = 0.01
+_DILATE = 0.02
+
 _MIN_FRAMES = 2
 
 
@@ -76,6 +96,40 @@ def _to_frac(box, frame_wh: tuple[int, int] | None):
     if not w or not h:
         return box
     return (box[0] / w, box[1] / h, box[2] / w, box[3] / h)
+
+
+def _union(a, b):
+    return (min(a[0], b[0]), min(a[1], b[1]),
+            max(a[2], b[2]), max(a[3], b[3]))
+
+
+def _touching(a, b, gap: float) -> bool:
+    return (a[0] <= b[2] + gap and b[0] <= a[2] + gap
+            and a[1] <= b[3] + gap and b[1] <= a[3] + gap)
+
+
+def cluster_regions(boxes, gap: float = _ADJACENT_GAP, grow: float = _DILATE):
+    """Join regions that touch into one, then grow each a little.
+
+    An artwork is one object and grounding returns it as many. Joining
+    the pieces that touch turns seven panel boxes into one canvas, which
+    then also covers the panel grounding missed.
+    """
+    out = [tuple(b) for b in boxes]
+    merged = True
+    while merged:
+        merged = False
+        for i in range(len(out)):
+            for j in range(i + 1, len(out)):
+                if _touching(out[i], out[j], gap):
+                    out[i] = _union(out[i], out[j])
+                    del out[j]
+                    merged = True
+                    break
+            if merged:
+                break
+    return [(max(0.0, b[0] - grow), max(0.0, b[1] - grow),
+             min(1.0, b[2] + grow), min(1.0, b[3] + grow)) for b in out]
 
 
 def containment(inner, outer) -> float:
@@ -162,7 +216,7 @@ class ScreenMap:
     ) -> set[int]:
         """Track ids whose EVERY observed bbox is contained in a live
         screen region."""
-        live = self.live(now)
+        live = cluster_regions(self.live(now))
         if not live:
             return set()
         per_tid: dict[int, list[float]] = {}
