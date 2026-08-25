@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -562,6 +563,15 @@ _LAYER_ACTIVE = "high"
 # way". A person walking in still moves enough pixels at 320x180 to
 # latch it.
 _LAYER_IDLE = os.environ.get("NEMARA_IDENTITY_IDLE_QUALITY", "low").strip().lower()
+# Which cameras this process has stopped pulling video for because the
+# room is empty. Read by the subscription walk so its repair does not
+# undo the economy.
+_idle_video: dict[str, bool] = {}
+# Fall back to the old step-down-a-rung behaviour. The escape hatch if
+# severing on empty turns out to miss a wake — set to 1 and the room
+# merely gets cheaper instead of silent.
+_PAUSED_SEVER_ONLY = os.environ.get(
+    "NEMARA_IDENTITY_IDLE_STEP_ONLY", "").strip() in ("1", "true", "yes")
 _QUALITY = {
     "low": rtc.VideoQuality.VIDEO_QUALITY_LOW,
     "medium": rtc.VideoQuality.VIDEO_QUALITY_MEDIUM,
@@ -604,6 +614,47 @@ def request_layer(cam_id: str, quality: str) -> None:
         log.info("identity.layer_request cam=%s quality=%s", cam_id, quality.upper())
     except Exception:  # noqa: BLE001 — an economy must not break intake
         log.warning("identity.layer_request_failed cam=%s", cam_id, exc_info=True)
+
+
+def set_idle_video(cam_id: str, idle: bool) -> None:
+    """Stop pulling video for an empty room; resume on the first motion.
+
+    NOT a step down to a cheaper rung. LiveKit bills each subscriber for
+    what it pulls, and the bottom rung is still a stream — an empty room
+    is most of the day (measured 2026-08-24: the TV Room had a person in
+    40% of ticks, the bedroom 74%), so the correct amount to download
+    for it is none.
+
+    Unsubscribing normally means going blind, because identity's own
+    wake signal is a thumbnail diff over the frames it is no longer
+    receiving. It does not here: the camera publishes a `motion_state`
+    DATA PACKET, and LiveKit delivers data to every participant in the
+    room whether or not they subscribe to any track. So identity keeps
+    the cheap channel and drops the expensive one, and needs nothing
+    from the backend to come back.
+
+    `paused_cameras()` already severs on ai_paused and is a different
+    question — that one is the caregiver switching the AI off, this one
+    is the room being empty. Both end in `set_subscribed(False)`; the
+    subscription walk re-asserts whichever is currently wanted.
+    """
+    if _PAUSED_SEVER_ONLY:
+        request_layer(cam_id, _LAYER_IDLE if idle else _LAYER_ACTIVE)
+        return
+    _idle_video[cam_id] = idle
+    pub = _pubs.get(cam_id)
+    if pub is None:
+        return
+    try:
+        pub.set_subscribed(not idle)
+        if not idle:
+            # A re-subscribe resets the SFU's idea of what we asked for,
+            # so the pin has to go out again with it.
+            _layer.pop(cam_id, None)
+            request_layer(cam_id, _LAYER_ACTIVE)
+        log.info("identity.idle_video cam=%s subscribed=%s", cam_id, not idle)
+    except Exception:  # noqa: BLE001 — an economy must never break intake
+        log.warning("identity.idle_video_failed cam=%s", cam_id, exc_info=True)
 
 
 _paused_cache: dict = {"t": 0.0, "v": set()}
@@ -698,6 +749,40 @@ async def _run_livekit(
         cam_loop.ring.clear()
         log.info("identity.camera_removed cam=%s (%s)", cam_id, why)
 
+    @room.on("data_received")
+    def _on_data(data) -> None:
+        """Wake on the camera's own motion packet.
+
+        This is what makes unsubscribing safe. LiveKit delivers data to
+        every participant in the room regardless of track subscriptions,
+        so a camera we are pulling ZERO video from can still tell us
+        somebody moved. Same topic and payload the backend already
+        consumes (`room_worker._handle_data_packet`).
+
+        Never raises into the SDK's event loop: a malformed packet must
+        cost one missed wake, not the reader.
+        """
+        try:
+            if getattr(data, "topic", "") != "motion_state":
+                return
+            participant = getattr(data, "participant", None)
+            ident = getattr(participant, "identity", "") or ""
+            if not ident.startswith("cam_"):
+                return
+            cam_id = ident.removeprefix("cam_")
+            payload = json.loads(bytes(data.data).decode("utf-8"))
+            if not bool(payload.get("in_motion")):
+                return
+            if not _idle_video.get(cam_id):
+                return                      # already awake
+            log.info("identity.motion_wake cam=%s", cam_id)
+            cam_loop = home.cameras.get(cam_id)
+            if cam_loop is not None:
+                cam_loop.motion_pending = True
+            set_idle_video(cam_id, False)
+        except Exception:  # noqa: BLE001 — a bad packet is not a fault
+            log.warning("identity.motion_packet_failed", exc_info=True)
+
     @room.on("participant_disconnected")
     def _on_participant_gone(participant):  # noqa: ANN001
         ident = participant.identity
@@ -756,8 +841,7 @@ async def _run_livekit(
             cams[cam_id] = cam_loop
             home.cameras = cams
             cam_loop.on_idle = (
-                lambda idle, c=cam_id: request_layer(
-                    c, _LAYER_IDLE if idle else _LAYER_ACTIVE)
+                lambda idle, c=cam_id: set_idle_video(c, idle)
             )
             loop_tasks[cam_id] = asyncio.ensure_future(cam_loop.run())
             log.info("identity.camera_started cam=%s", cam_id)
@@ -829,7 +913,12 @@ async def _run_livekit(
                 # polled here rather than passed in. The walk already
                 # runs every 10s over exactly these publications, so the
                 # check costs one cached query and resume is ~10s.
-                want = cam_id[:8] not in paused
+                # Two independent reasons not to pull: the caregiver
+                # paused the AI, and the room is empty. The walk repairs
+                # toward whichever is currently true, or its own repair
+                # would re-subscribe an empty room every 10 seconds and
+                # quietly undo the economy.
+                want = (cam_id[:8] not in paused) and not _idle_video.get(cam_id)
                 resubscribed = False
                 if _subscribed.get(cam_id) is not want:
                     _subscribed[cam_id] = want
