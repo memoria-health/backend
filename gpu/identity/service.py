@@ -567,6 +567,18 @@ _LAYER_IDLE = os.environ.get("NEMARA_IDENTITY_IDLE_QUALITY", "low").strip().lowe
 # room is empty. Read by the subscription walk so its repair does not
 # undo the economy.
 _idle_video: dict[str, bool] = {}
+# Cameras we have EVER received a motion_state packet from.
+#
+# The sever is only safe for a camera that can wake us, and not every
+# camera can. The gateway publishes motion_state; the Warner bridge
+# publishes NONE — verified 2026-08-25 by grepping the whole bridge for
+# the topic. Severing a camera that cannot wake us means it goes dark
+# and stays dark, which is the worst failure this service has: silent,
+# and indistinguishable from a quiet room.
+#
+# So a camera earns the sever by proving it can wake us. Until then it
+# gets the old step-down, which is cheaper but never blind.
+_motion_capable: set[str] = set()
 # Fall back to the old step-down-a-rung behaviour. The escape hatch if
 # severing on empty turns out to miss a wake — set to 1 and the room
 # merely gets cheaper instead of silent.
@@ -638,7 +650,17 @@ def set_idle_video(cam_id: str, idle: bool) -> None:
     is the room being empty. Both end in `set_subscribed(False)`; the
     subscription walk re-asserts whichever is currently wanted.
     """
-    if _PAUSED_SEVER_ONLY:
+    if _PAUSED_SEVER_ONLY or cam_id not in _motion_capable:
+        # No proof this camera can wake us — step the rung down instead
+        # of going blind. Logged once per transition so the reason a
+        # camera is merely cheap rather than free is visible.
+        if idle and cam_id not in _motion_capable:
+            log.info(
+                "identity.idle_step_only cam=%s — no motion_state packet "
+                "seen from this camera, stepping the layer down instead of "
+                "unsubscribing (a camera that cannot wake us must not sleep)",
+                cam_id,
+            )
         request_layer(cam_id, _LAYER_IDLE if idle else _LAYER_ACTIVE)
         return
     _idle_video[cam_id] = idle
@@ -770,6 +792,11 @@ async def _run_livekit(
             if not ident.startswith("cam_"):
                 return
             cam_id = ident.removeprefix("cam_")
+            # Any motion packet at all proves this camera can wake us,
+            # which is what makes the sever safe for it.
+            if cam_id not in _motion_capable:
+                _motion_capable.add(cam_id)
+                log.info("identity.motion_capable cam=%s", cam_id)
             payload = json.loads(bytes(data.data).decode("utf-8"))
             if not bool(payload.get("in_motion")):
                 return

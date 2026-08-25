@@ -406,6 +406,24 @@ class IdentityHome:
         held = self.seats_on(cam_id)
         return held[0] if held else None
 
+    def home_seat_boxes(self) -> dict:
+        """(camera_id, track_id) -> bbox across EVERY camera in the home.
+
+        `CameraLoop._seat_boxes` is the per-camera version; this one
+        exists because seats live on the home, not on a loop, and the
+        home has no single camera to ask. Wrong owner was a real bug:
+        calling the loop's method from here raised AttributeError inside
+        `fold_candidates`, every probe failed, and NOTHING could lock a
+        seat — the symptom was staring at a camera and never being
+        recognised (2026-08-25).
+        """
+        out: dict = {}
+        for cam_id, loop in (self.cameras or {}).items():
+            state = getattr(loop, "state", None)
+            for tid, tv in getattr(state, "tracks", {}).items():
+                out[(cam_id, tid)] = tv.bbox
+        return out
+
     def live_keys(self) -> set[tuple[str, int]]:
         # Reads the frozenset snapshots (GIL-atomic ref reads) — safe
         # from worker threads while event-loop apply() mutates tracks.
@@ -440,7 +458,7 @@ class IdentityHome:
                 # constantly; without this, every renumber throws away
                 # a face match and costs 20-60s to earn back.
                 carried = carry_seat(
-                    self.seats.get(pid), live, self._seat_boxes(),
+                    self.seats.get(pid), live, self.home_seat_boxes(),
                     # Track numbers other residents are sitting on. A
                     # carry must never take one, or this resident's
                     # identity lands on their housemate.
@@ -579,7 +597,7 @@ class IdentityHome:
                 for pid, s in (
                     (pid, update_seat(
                         carry_seat(
-                            seat, live, self._seat_boxes(),
+                            seat, live, self.home_seat_boxes(),
                             taken=frozenset(
                                 t.key for q, t in self.seats.items()
                                 if q != pid

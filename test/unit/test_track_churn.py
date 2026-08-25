@@ -136,3 +136,46 @@ def test_a_seat_never_carries_across_cameras() -> None:
         boxes={(CAM, 22): (100.0, 100.0, 200.0, 300.0),
                ("cam2", 23): (100.0, 100.0, 200.0, 300.0)},
     ) is None
+
+
+def test_both_seat_carry_call_sites_use_a_method_their_owner_has() -> None:
+    """The carry runs from TWO classes, and they are not the same class.
+
+    `CameraLoop` has `_seat_boxes`; `IdentityHome` does not — seats live
+    on the home, which owns several cameras and has no single one to
+    ask. Calling the loop's method from the home raised AttributeError
+    inside `fold_candidates`, so EVERY probe failed and no seat could
+    ever lock. The symptom was standing in front of a camera and never
+    being recognised, with nothing in the logs but `probe_failed`
+    (2026-08-25).
+
+    Checked structurally rather than by running a probe, because the
+    failure was an attribute that does not exist on the receiver — the
+    kind of thing only the real object graph reveals.
+    """
+    import ast
+    import pathlib
+
+    tree = ast.parse(
+        pathlib.Path("gpu/identity/loop.py").read_text(encoding="utf-8"))
+    owns: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            owns[node.name] = {
+                m.name for m in node.body if isinstance(m, ast.FunctionDef)
+            }
+
+    # Every `self.<name>()` called inside a class must exist on it.
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for call in ast.walk(node):
+            if (isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)
+                    and isinstance(call.func.value, ast.Name)
+                    and call.func.value.id == "self"
+                    and call.func.attr in ("_seat_boxes", "home_seat_boxes")):
+                assert call.func.attr in owns[node.name], (
+                    f"{node.name} calls self.{call.func.attr}() but does not "
+                    f"define it — this is the bug that stopped every seat "
+                    f"from locking")

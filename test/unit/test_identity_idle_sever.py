@@ -31,6 +31,7 @@ def svc(monkeypatch):
     monkeypatch.setattr(mod, "_layer", {}, raising=False)
     monkeypatch.setattr(mod, "_pubs", {}, raising=False)
     monkeypatch.setattr(mod, "_PAUSED_SEVER_ONLY", False, raising=False)
+    monkeypatch.setattr(mod, "_motion_capable", set(), raising=False)
     return mod
 
 
@@ -47,6 +48,7 @@ class _Pub:
 
 
 def test_an_empty_room_stops_the_download(svc) -> None:
+    svc._motion_capable.add("cam1")     # proven wakeable; see the guard below
     pub = _Pub()
     svc._pubs["cam1"] = pub
     svc.set_idle_video("cam1", True)
@@ -57,6 +59,7 @@ def test_an_empty_room_stops_the_download(svc) -> None:
 def test_motion_resumes_it_and_re_pins_the_rung(svc) -> None:
     """A re-subscribe resets the SFU's idea of what we asked for, so the
     pin must go out with it or we come back on the smallest rung."""
+    svc._motion_capable.add("cam1")
     pub = _Pub()
     svc._pubs["cam1"] = pub
     svc.set_idle_video("cam1", True)
@@ -98,5 +101,32 @@ def test_the_step_only_escape_hatch_never_unsubscribes(svc, monkeypatch) -> None
 
 def test_a_missing_publication_is_not_a_crash(svc) -> None:
     """Called before the track exists; an economy must never break intake."""
+    svc._motion_capable.add("nosuchcam")
     svc.set_idle_video("nosuchcam", True)
     assert svc._idle_video["nosuchcam"] is True
+
+
+def test_a_camera_that_cannot_wake_us_is_never_severed(svc, monkeypatch) -> None:
+    """The failure this guard exists to prevent: a dark camera.
+
+    Severing is only safe for a camera that can wake us, and not every
+    camera can. The gateway publishes motion_state packets; the Warner
+    bridge publishes NONE — verified 2026-08-25 by grepping the entire
+    bridge for the topic. Unsubscribing one of those means it goes dark
+    and stays dark, which is the worst failure mode this service has:
+    silent, and indistinguishable from a quiet room.
+    """
+    monkeypatch.setattr(svc, "_motion_capable", set(), raising=False)
+    pub = _Pub()
+    svc._pubs["warner"] = pub
+    svc.set_idle_video("warner", True)
+    assert pub.subscribed[-1] is True, "a camera with no wake path was severed"
+    assert pub.quality, "it should still get the cheaper rung"
+
+
+def test_a_camera_earns_the_sever_by_proving_it_can_wake_us(svc, monkeypatch) -> None:
+    monkeypatch.setattr(svc, "_motion_capable", {"tapo"}, raising=False)
+    pub = _Pub()
+    svc._pubs["tapo"] = pub
+    svc.set_idle_video("tapo", True)
+    assert pub.subscribed[-1] is False, "a wakeable camera should sever fully"
