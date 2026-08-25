@@ -174,6 +174,16 @@ FACES_ENABLED = True           # False = pure tracking (the "yesterday"
 STALE_INTAKE_S = 10.0          # no fresh frames this long → clear tracks
                                # (a dead LiveKit reader must not leave a
                                # frozen track holding the seat forever)
+# How long a dead track's last box stays available for `carry_seat` to
+# match a renumbered track against. Not a grace period for the SEAT —
+# the seat still dies this tick if nothing overlaps — only the window in
+# which "the person who was standing here" is still a meaningful claim.
+#
+# 6s: the measured gap between a seated track dying and its replacement
+# appearing is a median 1.9s and a max 2.8s, so this clears the observed
+# range twice over while staying far short of the time it takes anyone
+# to leave a room and someone else to occupy the same box.
+DEAD_BOX_TTL_S = 6.0
 # Env-overridable so the native-vs-downscaled question can be A/B'd
 # without a code change: NEMARA_TRACK_SEND_W=960 to test, unset to
 # restore native. The measured claim being tested (2026-07-29) is that
@@ -418,7 +428,14 @@ class IdentityHome:
         recognised (2026-08-25).
         """
         out: dict = {}
+        now = time.time()
         for cam_id, loop in (self.cameras or {}).items():
+            # Just-dead tracks FIRST, so a live track of the same number
+            # always wins. A recycled id must describe where it is now.
+            for tid, (bbox, died_at) in getattr(
+                    loop, "_dead_boxes", {}).items():
+                if now - died_at <= DEAD_BOX_TTL_S:
+                    out[(cam_id, tid)] = bbox
             state = getattr(loop, "state", None)
             for tid, tv in getattr(state, "tracks", {}).items():
                 out[(cam_id, tid)] = tv.bbox
@@ -592,24 +609,38 @@ class IdentityHome:
         with self.seat_lock:
             old = dict(self.seats)
             live = self.live_keys()
-            self.seats = {
-                pid: s
-                for pid, s in (
-                    (pid, update_seat(
-                        carry_seat(
-                            seat, live, self.home_seat_boxes(),
-                            taken=frozenset(
-                                t.key for q, t in self.seats.items()
-                                if q != pid
-                            ),
-                        ),
-                        [], live=live,
-                        floor=SEAT_FLOOR, delta=SEAT_DELTA, now=now,
-                    ))
-                    for pid, seat in self.seats.items()
+            boxes = self.home_seat_boxes()
+            kept: dict[UUID, Seat] = {}
+            for pid, seat in self.seats.items():
+                carried = carry_seat(
+                    seat, live, boxes,
+                    taken=frozenset(
+                        t.key for q, t in self.seats.items() if q != pid
+                    ),
                 )
-                if s is not None
-            }
+                # SAY SO. This path had no logging at all, which is why a
+                # carry that could never succeed looked exactly like a
+                # carry that was never needed — for as long as the
+                # function has existed.
+                if carried is not None and carried.track_id != seat.track_id:
+                    log.info(
+                        "identity.seat_carried pid=%s %s -> %s (reap; same "
+                        "person, new track number)",
+                        str(pid)[:8], seat.track_id, carried.track_id,
+                    )
+                elif carried is None and seat.key not in live:
+                    log.info(
+                        "identity.seat_lost pid=%s track=%s cam=%s — died "
+                        "with no single overlapping successor",
+                        str(pid)[:8], seat.track_id, seat.camera_id,
+                    )
+                s = update_seat(
+                    carried, [], live=live,
+                    floor=SEAT_FLOOR, delta=SEAT_DELTA, now=now,
+                )
+                if s is not None:
+                    kept[pid] = s
+            self.seats = kept
             new = dict(self.seats)
         self._journal_transitions(old, new, now)
 
@@ -802,6 +833,18 @@ class CameraLoop:
         self.step_fail = 0
         self.last_step_ok_at = 0.0
         self.last_step_error = ""
+        # WHERE A TRACK WAS WHEN IT DIED, kept for a few seconds.
+        #
+        # `carry_seat` moves a seat onto a renumbered track by comparing
+        # the dead track's last box against the live ones. It read those
+        # boxes from `state.tracks`, which holds only LIVE tracks — and
+        # it is only ever called once the seated track is already gone.
+        # So its `old_box` lookup returned None on every call and it
+        # returned None on its third line, every time, since it was
+        # written. Measured 2026-08-25: zero carries on either camera,
+        # against 40 deaths that had exactly the single overlapping
+        # successor it exists to find.
+        self._dead_boxes: dict[int, tuple[tuple, float]] = {}
         # Furniture survives a restart, so the regions do too. Without
         # this, every restart begins blind and re-tracks every painted
         # face until the next search two minutes later — and the tracks
@@ -1195,8 +1238,28 @@ class CameraLoop:
             batch_series=series_bboxes(obs, batch),
             rejected=set(vetoed or ()))
         if events.deaths:
+            # Record where each one was BEFORE anything else runs. The
+            # seat carry happens later this tick (reap_seat) and needs
+            # these; `state.apply` has already forgotten them.
+            #
+            # A VETOED track is deliberately excluded: we looked at it
+            # and decided it was a painting, so letting a seat carry onto
+            # its corpse would hand somebody's identity to the wall.
+            for _tid in events.deaths:
+                if _tid in (vetoed or ()):
+                    continue
+                _m = prev_meta.get(_tid)
+                if _m:
+                    self._dead_boxes[_tid] = (_m[0], now)
             self._report_deaths(
                 events, prev_meta, vetoed, rows_before, rows_after, now)
+        if self._dead_boxes:
+            # Bounded by time, not count: a box older than the carry
+            # window is not evidence about where anyone is now.
+            self._dead_boxes = {
+                t: v for t, v in self._dead_boxes.items()
+                if now - v[1] <= DEAD_BOX_TTL_S
+            }
         if events.births or events.deaths:
             log.info(
                 "identity.tracks cam=%s births=%s deaths=%s live=%s",
