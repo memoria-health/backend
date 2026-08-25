@@ -717,7 +717,28 @@ def _read_line(path: str, whole: bool = False) -> str:
         return ""
 
 
-_screen_turn = 0
+# One turn counter PER CAMERA, not one for the whole process.
+#
+# A single global counter looks equivalent and is not. Each camera makes
+# one screen pass per rotation, so a shared counter hands out concepts
+# by arrival order — and when the number of cameras shares a factor with
+# the number of concepts, every camera lands on the same index forever.
+#
+# Measured 2026-08-25, and caused by this file: the rotation was
+# ("television or computer screen", "painting", "statue") with two
+# cameras. 3 and 2 are coprime, so both cameras saw all three concepts
+# over time and it worked. Dropping "statue" that morning — because it
+# never grounded anything — left 2 concepts and 2 cameras, and the
+# parity locked instantly:
+#
+#     bedroom  kind=static  every pass    (painting, forever)
+#     TV Room  kind=screen  every pass    (never painting, forever)
+#
+# The TV Room's painted faces could no longer be grounded, its regions
+# aged out (live 12 -> 11 -> 0), and the phantom people came back. The
+# concept list is now free to be any length without the camera count
+# silently deciding what each camera is allowed to look for.
+_screen_turn: dict[str, int] = {}
 
 
 def _screen_config() -> tuple[tuple[str, ...], float]:
@@ -743,13 +764,16 @@ def _screen_config() -> tuple[tuple[str, ...], float]:
     return concepts, thr
 
 
-def _screen_params() -> tuple[str, float]:
-    """(concept for THIS pass, threshold). Advances the rotation."""
-    global _screen_turn
+def _screen_params(camera_id: str = "default") -> tuple[str, float]:
+    """(concept for THIS camera's next pass, threshold).
+
+    Advances only THIS camera's turn, so every camera walks the whole
+    rotation regardless of how many cameras or concepts there are.
+    """
     concepts, thr = _screen_config()
-    concept = concepts[_screen_turn % len(concepts)]
-    _screen_turn += 1
-    return concept, thr
+    turn = _screen_turn.get(camera_id, 0)
+    _screen_turn[camera_id] = turn + 1
+    return concepts[turn % len(concepts)], thr
 
 
 def _observe_sync(
@@ -988,7 +1012,7 @@ def _observe_sync(
         screen_regions: list[list[float]] = []
         screens_ms = 0.0
         if screen_src is not None:
-            _concept, _thr = _screen_params()
+            _concept, _thr = _screen_params(camera_id)
             t_sc = time.time()
             try:
                 for _pos, dets in sam_track.track_stream(
