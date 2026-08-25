@@ -154,8 +154,26 @@ def _track_dims(w: int, h: int) -> tuple[int, int, float]:
 # it is the continuous per-frame cost; SAM3 runs only on re-grounds and
 # its multiplex graph is a riskier compile target. dynamic=True because
 # batch shape varies per tick. One env kills it: NEMARA_TORCH_COMPILE=0.
+#
+# DEFAULT OFF since 2026-08-25. On this node the compile has never once
+# succeeded: 768 `BackendCompilerFailed` ("'SymInt' object has no
+# attribute 'size'") between 08-24 11:32 and 08-25, and zero successes.
+# `suppress_errors = True` below stops a failure becoming a 500, but it
+# does not stop dynamo RETRYING — so the node paid an expensive failed
+# compile over and over, went unresponsive during each one, and the
+# watchdog SIGKILLed the worker 42 times in 26 hours.
+#
+# Every kill is a model reload, and during it perception returns
+# nothing. Identity reads that as `rows=0->0` and every track dies at
+# once, taking every seat with it — which is the "I keep losing my
+# identity lock while sitting still" that cost most of 2026-08-25.
+#
+# So the fusion win is theoretical here and the cost is measured. The
+# comment below already said an optimisation must never become a
+# dependency; leaving it on by default is what made it one.
+# NEMARA_TORCH_COMPILE=1 turns it back on for a node where it works.
 _COMPILE = os.environ.get(
-    "NEMARA_TORCH_COMPILE", "1",
+    "NEMARA_TORCH_COMPILE", "0",
 ).strip() not in ("0", "false")
 
 
