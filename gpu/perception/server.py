@@ -1086,6 +1086,22 @@ def _observe_sync(
             # able to tell the two kinds of region apart — see
             # display_veto.veto_track_ids.
             "screen_concept": (_concept if screen_src is not None else ""),
+            # The frame these boxes were MEASURED IN, so the consumer
+            # can normalise them without guessing.
+            #
+            # It used to guess, and got it wrong whenever the SFU
+            # changed rung: identity divided by the last size its INTAKE
+            # reader had seen, while the regions came from `imgs[-1]` of
+            # a batch that could be a different size entirely. A
+            # painting at 0.82 of a 640-wide grounding frame is pixel
+            # 525; divided by 2304 that is 0.23, so every region landed
+            # in the empty top-left of the frame and the veto covered
+            # nothing (2026-08-25, TV Room: 16 regions grounded, painted
+            # faces still tracked).
+            "screen_frame_wh": (
+                [int(screen_src.shape[1]), int(screen_src.shape[0])]
+                if screen_src is not None else None
+            ),
         }
         if stateless:
             # The caller owns this camera's continuity — hand back the

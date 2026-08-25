@@ -1089,11 +1089,24 @@ class CameraLoop:
                          or "monitor" in _c or "laptop" in _c
                          or "phone" in _c)
                      else KIND_STATIC)
-            self.screen_map.add(
-                [r[:4] for r in obs.screen_regions],
-                frame_wh=self._frame_wh(),
-                now=time.monotonic(), kind=_kind,
-            )
+            # The size the POD measured them in, which is the only
+            # size that can be right. `_frame_wh()` is the intake
+            # reader's last-seen size and is a DIFFERENT frame whenever
+            # the SFU has changed rung between the two.
+            _gwh = getattr(obs, "screen_frame_wh", None)
+            if _gwh is None:
+                log.warning(
+                    "identity.screen_regions_unscaled cam=%s — pod did not "
+                    "report the grounding frame size; dropping this pass "
+                    "rather than placing regions by guesswork",
+                    self.camera_id,
+                )
+            else:
+                self.screen_map.add(
+                    [r[:4] for r in obs.screen_regions],
+                    frame_wh=_gwh,
+                    now=time.monotonic(), kind=_kind,
+                )
             # HOW MANY did the pod actually find. `screen_pass ok` on the
             # pod only says the call did not throw — an empty result
             # counts as a success there, so "the check is running" and

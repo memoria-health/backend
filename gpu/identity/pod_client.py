@@ -46,6 +46,20 @@ _EMB_DIM = 512
 _TOKEN_FILE = "/persist/secrets/perception_token"
 
 
+def _wh(v) -> "tuple[int, int] | None":
+    """(width, height) of the frame the screen regions were measured in.
+
+    None from an older pod build, which is why the consumer must treat
+    None as "cannot normalise" rather than substituting a guess — the
+    guess is what put every region in the wrong place.
+    """
+    try:
+        w, h = int(v[0]), int(v[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    return (w, h) if w > 0 and h > 0 else None
+
+
 def load_perception_token() -> str:
     """The shared bearer for perception, from the environment or a file.
 
@@ -358,6 +372,7 @@ def _parse_observe(j: dict) -> RemoteObservations:
         },
         screen_regions=tuple(screen_regions),
         screen_concept=str(j.get("screen_concept", "")),
+        screen_frame_wh=_wh(j.get("screen_frame_wh")),
         session_state=(
             j["session_state"]
             if isinstance(j.get("session_state"), dict) else None

@@ -82,6 +82,11 @@ class RemoteObservations:
     # Which concept found those regions. A screen can show a moving
     # person; a painting cannot. The veto needs to tell them apart.
     screen_concept: str = ""
+    # (width, height) of the frame `screen_regions` were measured in.
+    # None from an older pod, and the consumer MUST treat that as
+    # "cannot normalise" rather than guessing a size — guessing is what
+    # put every region in the empty corner of the frame on 2026-08-25.
+    screen_frame_wh: "tuple[int, int] | None" = None
     # Stateless-worker mode (2026-08-16): the camera's updated cross-
     # tick session snapshot, returned only when the request carried one.
     # The CameraLoop stores it and sends it with the next tick — that

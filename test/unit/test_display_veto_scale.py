@@ -123,3 +123,40 @@ def test_a_saved_region_round_trips(tmp_path) -> None:
     assert len(got) == 1
     assert got[0][1] == KIND_STATIC
     assert got[0][0] == pytest.approx((0.25, 0.25, 0.45, 0.55))
+
+
+def test_regions_are_scaled_by_the_frame_they_were_measured_in() -> None:
+    """The denominator must come from the pod, not from intake.
+
+    The regions are measured in `imgs[-1]` of whatever batch the pod
+    grounded on. Identity used to normalise them with the size its
+    INTAKE reader last saw — a different frame whenever the SFU had
+    changed rung in between.
+
+    Observed 2026-08-25 in the TV Room: a painting occupying the right
+    edge of frame, grounded on a 640-wide frame, divided by 2304. Every
+    one of the 16 regions landed at x 0.17-0.33 — the empty ceiling —
+    so the veto had regions and covered nothing, and the painted faces
+    kept being tracked as people.
+    """
+    m = ScreenMap()
+    W_GROUND, H_GROUND = 640, 360          # what the pod actually saw
+    W_INTAKE, H_INTAKE = 2304, 1296        # what intake last reported
+
+    # A painting on the right edge, in the GROUNDING frame's pixels.
+    painting_ground = (0.82 * W_GROUND, 0.20 * H_GROUND,
+                       1.00 * W_GROUND, 0.44 * H_GROUND)
+    m.add([painting_ground], frame_wh=(W_GROUND, H_GROUND), kind=KIND_STATIC)
+
+    # The same painting, as the tracker reports it in a full-size frame.
+    painting_full = (0.82 * W_INTAKE, 0.20 * H_INTAKE,
+                     1.00 * W_INTAKE, 0.44 * H_INTAKE)
+    assert m.veto_track_ids(_rows(painting_full), (W_INTAKE, H_INTAKE)) == {7}
+
+    # And the wrong denominator must NOT accidentally work.
+    wrong = ScreenMap()
+    wrong.add([painting_ground], frame_wh=(W_INTAKE, H_INTAKE),
+              kind=KIND_STATIC)
+    assert wrong.veto_track_ids(_rows(painting_full), (W_INTAKE, H_INTAKE)) == set(), (
+        "scaling by the intake size happened to work — the test cannot "
+        "distinguish the bug from the fix")
