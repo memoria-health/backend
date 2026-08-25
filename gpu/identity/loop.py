@@ -689,6 +689,21 @@ class CameraLoop:
                 out.add(tid)
         return out
 
+    def _seat_protected(self) -> set:
+        """Track ids identity has bound to a resident on this camera.
+
+        These are never vetoed. A painted face is not face-matched to
+        somebody's father, so this shield costs nothing on the confounds
+        it exists beside — and unlike the containment floor and the
+        movement test it is not geometric, so it still holds when the
+        region is wrong or the tracker has renumbered.
+        """
+        try:
+            return {s.track_id for _pid, s in self.home.seats_on(self.camera_id)}
+        except Exception:  # noqa: BLE001 — a shield must never kill a tick
+            log.exception("identity.seat_protected_failed cam=%s", self.camera_id)
+            return set()
+
     def _report_deaths(self, events, prev_meta, vetoed, rows_before,
                        rows_after, now: float) -> None:
         """Say WHY each track died, once per death.
@@ -1144,6 +1159,7 @@ class CameraLoop:
             obs, self.screen_map,
             frame_wh=self._frame_wh(),
             moved=self._moved_since_birth(),
+            protected=self._seat_protected(),
             now=time.monotonic(),
         )
         rows_after = sum(len(r) for r in obs.rows_by_frame.values())

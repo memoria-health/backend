@@ -68,6 +68,28 @@ _DILATE = 0.02
 
 _MIN_FRAMES = 2
 
+# How much a track's box must overlap one of YOLO's person boxes before
+# we call them the same thing. 0.30 is the mask-IoU floor this codebase
+# already matches detections at (perception.continuous's remap), so it is
+# the house currency rather than a new number to tune.
+#
+# A generous floor is the SAFE direction here, because the match only ever
+# PROTECTS a track. A real person's SAM3 mask-bbox and YOLO box agree far
+# above this; the painted faces get no YOLO box at all to match against.
+_YOLO_MATCH_IOU = 0.30
+
+
+def _iou(a, b) -> float:
+    ix0, iy0 = max(a[0], b[0]), max(a[1], b[1])
+    ix1, iy1 = min(a[2], b[2]), min(a[3], b[3])
+    iw, ih = max(0.0, ix1 - ix0), max(0.0, iy1 - iy0)
+    inter = iw * ih
+    if inter <= 0.0:
+        return 0.0
+    union = ((a[2] - a[0]) * (a[3] - a[1])
+             + (b[2] - b[0]) * (b[3] - b[1]) - inter)
+    return inter / union if union > 0.0 else 0.0
+
 
 
 
@@ -214,13 +236,23 @@ class ScreenMap:
         frame_wh: tuple[int, int] | None = None,
         now: float | None = None,
         moved: "set[int] | None" = None,
+        person_boxes: "tuple | None" = None,
+        protected: "set[int] | None" = None,
     ) -> set[int]:
         """Track ids whose EVERY observed bbox is contained in a live
-        screen region."""
+        screen region.
+
+        `person_boxes` (YOLO, normalised) and `protected` (tracks identity
+        has bound to a resident) are SHIELDS: they can only spare a track,
+        never condemn one. That asymmetry is the whole point — YOLO misses
+        real people, especially small, dark or partly hidden ones, so its
+        SILENCE must mean nothing while its AGREEMENT means a lot.
+        """
         live = cluster_regions(self.live(now))
         if not live:
             return set()
         per_tid: dict[int, list[float]] = {}
+        boxes_by_tid: dict[int, list[tuple]] = {}
         for rows in rows_by_frame.values():
             for row in rows:
                 tid = int(row[4])
@@ -229,10 +261,20 @@ class ScreenMap:
                      float(row[2]), float(row[3])), frame_wh)
                 per_tid.setdefault(tid, []).append(
                     max(containment(box, r) for r in live))
+                boxes_by_tid.setdefault(tid, []).append(box)
         vetoed = set()
         moved = moved or set()
+        protected = protected or set()
+        person_boxes = tuple(person_boxes or ())
         for tid, scores in per_tid.items():
             if len(scores) < _MIN_FRAMES:
+                continue
+            # Decide CANDIDACY first, then hear the defence. Ordering the
+            # shields ahead of the containment test made them fire on
+            # tracks that were never at risk — a "shield" logged at
+            # containment 0.000 says nothing, and it cost a YOLO overlap
+            # scan per track for the same nothing.
+            if min(scores) < self.containment_floor:
                 continue
             # IT WALKED HERE, SO IT IS NOT PAINTED ON THE WALL.
             #
@@ -250,6 +292,40 @@ class ScreenMap:
             # this job — mask jitter is zero-mean, so it crossed any
             # per-batch bar often enough to keep the phantoms alive.
             if tid in moved:
+                continue
+            # IDENTITY SAID THIS IS A PERSON, SO IT IS NOT THE FURNITURE.
+            #
+            # A painted face is never face-matched to a resident. This
+            # shield is not geometric, so it survives everything geometry
+            # gets wrong — a bad region, a renumbered track, a person who
+            # happens to be standing dead still. It is the guard to trust
+            # when the others fail.
+            if tid in protected:
+                log.info(
+                    "reid.display_veto_shield tid=%s by=seat containment=%.3f",
+                    tid, min(scores))
+                continue
+            # A SECOND MODEL AGREES THERE IS A PERSON HERE.
+            #
+            # Everything above is one model's opinion filtered by
+            # geometry, so a wrong region and a wrong veto are the same
+            # mistake. YOLO26x is trained on photographs of bodies and
+            # fails differently: on the TV Room frame it put ZERO boxes on
+            # twelve painted faces even at conf 0.05, while SAM3 grounded
+            # seven of them as people at 0.4.
+            #
+            # It already ran — the reground trigger calls it every tick
+            # and kept only the count. This costs no inference, just the
+            # boxes we were discarding.
+            best_yolo = max(
+                (_iou(b, p)
+                 for b in boxes_by_tid.get(tid, ())
+                 for p in person_boxes),
+                default=0.0)
+            if best_yolo >= _YOLO_MATCH_IOU:
+                log.info(
+                    "reid.display_veto_shield tid=%s by=yolo iou=%.2f "
+                    "containment=%.3f", tid, best_yolo, min(scores))
                 continue
             # ONE RULE: every observed box of this track sat almost
             # entirely inside a region we know is a display or a
@@ -273,12 +349,11 @@ class ScreenMap:
             # existed — screens versus static art differed only in who
             # got the exemption — along with the drift maths and the
             # per-track kind arbitration.
-            if min(scores) >= self.containment_floor:
-                log.info(
-                    "reid.display_veto_drop tid=%s containment=%.3f",
-                    tid, min(scores),
-                )
-                vetoed.add(tid)
+            log.info(
+                "reid.display_veto_drop tid=%s containment=%.3f",
+                tid, min(scores),
+            )
+            vetoed.add(tid)
         return vetoed
 
 
@@ -332,12 +407,15 @@ def save_regions(path: str, regions) -> None:
 def apply_veto(obs, screen_map: ScreenMap, *,
                frame_wh: tuple[int, int] | None = None,
                moved: "set[int] | None" = None,
+               protected: "set[int] | None" = None,
                now: float | None = None):
     """Drop screen-contained tracks from a RemoteObservations bundle
     (rows + face obs). Returns (obs, dropped_tids) — obs is mutated in
     place (it is per-tick and not shared)."""
     dropped = screen_map.veto_track_ids(
-        obs.rows_by_frame, frame_wh, now, moved=moved)
+        obs.rows_by_frame, frame_wh, now, moved=moved,
+        person_boxes=getattr(obs, "person_boxes", ()),
+        protected=protected)
     if not dropped:
         return obs, dropped
     for fi in list(obs.rows_by_frame):
@@ -353,7 +431,12 @@ def apply_veto(obs, screen_map: ScreenMap, *,
         if key[0] in dropped:
             del obs.face_obs[key]
     log.info(
-        "reid.display_veto_dropped tids=%s regions=%d",
+        # `yolo` distinguishes the two ways the shield can be silent:
+        # a detector seeing nobody, and a wire that never delivered the
+        # boxes at all. Without it a broken field looks exactly like a
+        # working one on an empty room.
+        "reid.display_veto_dropped tids=%s regions=%d yolo=%d",
         sorted(dropped), len(screen_map.live(now)),
+        len(getattr(obs, "person_boxes", ()) or ()),
     )
     return obs, dropped

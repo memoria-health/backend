@@ -87,6 +87,11 @@ class RemoteObservations:
     # "cannot normalise" rather than guessing a size — guessing is what
     # put every region in the empty corner of the frame on 2026-08-25.
     screen_frame_wh: "tuple[int, int] | None" = None
+    # YOLO's person boxes for this tick, as FRACTIONS of the frame — a
+    # second opinion from a model with different failure modes. Used only
+    # to PROTECT a track from the display veto, never to kill one, so an
+    # empty tuple (no people, or the detector is dead) costs nothing.
+    person_boxes: tuple[tuple[float, float, float, float], ...] = ()
     # Stateless-worker mode (2026-08-16): the camera's updated cross-
     # tick session snapshot, returned only when the request carried one.
     # The CameraLoop stores it and sends it with the next tick — that

@@ -354,6 +354,14 @@ def _parse_observe(j: dict) -> RemoteObservations:
             continue
         if len(vals) == 5 and all(np.isfinite(v) for v in vals):
             screen_regions.append(vals)
+    person_boxes: list[tuple[float, float, float, float]] = []
+    for box in j.get("person_boxes", [])[:32]:
+        try:
+            vals = tuple(float(v) for v in box[:4])
+        except (TypeError, ValueError):
+            continue
+        if len(vals) == 4 and all(np.isfinite(v) for v in vals):
+            person_boxes.append(vals)
     stats = j.get("stats", {})
     return RemoteObservations(
         epoch=str(j.get("epoch", "")),
@@ -373,6 +381,7 @@ def _parse_observe(j: dict) -> RemoteObservations:
         screen_regions=tuple(screen_regions),
         screen_concept=str(j.get("screen_concept", "")),
         screen_frame_wh=_wh(j.get("screen_frame_wh")),
+        person_boxes=tuple(person_boxes),
         session_state=(
             j["session_state"]
             if isinstance(j.get("session_state"), dict) else None

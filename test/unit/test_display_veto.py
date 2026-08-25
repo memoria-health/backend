@@ -141,3 +141,80 @@ def test_rows_that_make_no_sense_are_skipped_individually():
     ]))
     got = load_regions(path)
     assert got == [(0.1, 0.2, 0.3, 0.4), (0.9, 0.9, 0.95, 0.95)]
+
+
+# ── Shields: signals that can only SPARE a track, never condemn one ────
+#
+# The geometry above is one model's opinion filtered by containment, so a
+# wrong region and a wrong veto are the same mistake — and the mistake is
+# silent, which for a fall detector is the worst shape a bug can have.
+# These two shields fail differently from the geometry, so a real person
+# now has to lose three arguments instead of one.
+
+
+def _still_person_inside_a_big_region(tid: int = 3):
+    """The hole the geometry cannot close on its own.
+
+    A person standing still in front of a artwork large enough to contain
+    them, whose track was renumbered so `moved` is empty. Containment is
+    1.0 on every frame; nothing in the geometry can tell them from paint.
+    """
+    region = (0.05, 0.05, 0.95, 0.95)
+    person = (0.40, 0.40, 0.55, 0.75)
+    rows = {i: np.array([[*person, tid]]) for i in range(3)}
+    return region, person, rows
+
+
+def test_a_still_person_in_a_huge_artwork_is_vetoed_without_a_shield():
+    """Stated as a test so the hole cannot quietly reopen."""
+    region, _person, rows = _still_person_inside_a_big_region()
+    m = ScreenMap()
+    m.add([region], now=0.0)
+    assert m.veto_track_ids(rows, now=1.0) == {3}
+
+
+def test_yolo_agreement_spares_that_person():
+    """A second model with different failure modes breaks the tie.
+
+    Measured on the live TV Room frame 2026-08-25: YOLO26x put zero boxes
+    on twelve painted faces even at conf 0.05, while SAM3 grounded seven
+    of them as people at 0.4.
+    """
+    region, person, rows = _still_person_inside_a_big_region()
+    m = ScreenMap()
+    m.add([region], now=0.0)
+    assert m.veto_track_ids(rows, now=1.0, person_boxes=(person,)) == set()
+
+
+def test_an_identity_seat_spares_that_person():
+    """Not geometric, so it holds when the geometry is wrong."""
+    region, _person, rows = _still_person_inside_a_big_region()
+    m = ScreenMap()
+    m.add([region], now=0.0)
+    assert m.veto_track_ids(rows, now=1.0, protected={3}) == set()
+
+
+def test_yolo_silence_changes_nothing():
+    """The whole reason YOLO is a shield and not a judge.
+
+    It misses real people — small, dark, partly hidden, at night. If its
+    silence could condemn, every miss would become a suppressed person.
+    Here it sees nobody and the painting is vetoed exactly as before.
+    """
+    m = ScreenMap()
+    m.add([_REGION], now=0.0)
+    assert m.veto_track_ids(_track(dx=0.0), now=1.0, person_boxes=()) == {7}
+
+
+def test_a_yolo_box_elsewhere_does_not_spare_the_painting():
+    """The shield is per-track, not per-frame.
+
+    A real person in the room must not resurrect the painted faces on the
+    wall behind them — which is the ordinary state of that living room.
+    """
+    m = ScreenMap()
+    m.add([_REGION], now=0.0)
+    person_across_the_room = (0.60, 0.60, 0.75, 0.90)
+    assert m.veto_track_ids(
+        _track(dx=0.0), now=1.0,
+        person_boxes=(person_across_the_room,)) == {7}

@@ -1080,6 +1080,16 @@ def _observe_sync(
                 "screens": round(screens_ms, 1),
                 "total": round(total_ms, 1),
             },
+            # YOLO's person boxes for this tick, already NORMALISED to
+            # fractions of the frame they were measured in — a second,
+            # independent opinion on which tracks are really people.
+            # Empty means "YOLO saw nobody" AND "YOLO is unavailable";
+            # the consumer treats both as no-signal, so a dead detector
+            # degrades to the behaviour we had before this existed.
+            "person_boxes": [
+                [round(v, 5) for v in b]
+                for b in getattr(session, "person_boxes_frac", ())
+            ],
             "screen_regions": screen_regions,
             # WHICH concept found them. A screen can show a moving
             # person and a painting cannot, so the consumer must be

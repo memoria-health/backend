@@ -317,6 +317,11 @@ class CameraSession:
         # tighter, and the mask-decay exit still bounds a phantom.
         self._ir = False
         self._empty_ground_streak = 0
+        # This tick's YOLO person boxes, as FRACTIONS of the frame they
+        # were measured in. Transient — read by the server immediately
+        # after observe() and never serialised, because it describes one
+        # tick and nothing carries over.
+        self.person_boxes_frac: "tuple[tuple[float, float, float, float], ...]" = ()
         # Session epoch: track ids are only meaningful WITHIN one
         # session lifetime — a server restart resets next_id and
         # recycles numbers (live 2026-07-25: "how was I born again as
@@ -789,6 +794,7 @@ class CameraSession:
         # in ~1 tick instead of waiting out the reground interval (~50s
         # blind spot, measured live). The trigger never touches tracks.
         dets = None
+        self.person_boxes_frac = ()
         if frames:
             from perception import person_trigger
 
@@ -796,7 +802,31 @@ class CameraSession:
             # YOLO count with SAM3's authoritative verdict on the same
             # scene — the passive agreement dataset that decides whether
             # YOLO earns grounding duty (and the GPU-rental endgame).
-            dets = person_trigger.count_persons(frames[-1])
+            #
+            # Keep the BOXES, not just the count. They were always
+            # computed and then thrown away one line later; the display
+            # veto needs to know WHICH detection YOLO agrees with, not
+            # how many there were. Measured on the TV Room 2026-08-25:
+            # SAM3 grounds 7 of the wall's painted faces as people and
+            # YOLO26x boxes none of them, even at conf 0.05 — so a track
+            # YOLO also sees is a track no painting can explain.
+            boxes = person_trigger.person_boxes(frames[-1])
+            dets = None if boxes is None else len(boxes)
+            # Inside the guard, not above it. `person_boxes` swallows its
+            # own failures and returns None, so reading .shape outside
+            # would be the one line here able to kill a tick — on a frame
+            # that failed to decode, for a signal that is only ever an
+            # optional shield.
+            fh, fw = (frames[-1].shape[:2] if boxes else (0, 0))
+            if boxes and fw and fh:
+                # Normalised HERE, in the frame they were measured in.
+                # Shipping pixels and letting the consumer guess the size
+                # is the exact bug that made screen regions land in the
+                # empty top-left of the frame (see server.screen_frame_wh).
+                self.person_boxes_frac = tuple(
+                    (x1 / fw, y1 / fh, x2 / fw, y2 / fh)
+                    for x1, y1, x2, y2, _conf in boxes
+                )
         if mode == "carry":
             force, self._under_streak = person_trigger.should_force_reground(
                 dets, len(self.last_masks), self._under_streak,
