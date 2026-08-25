@@ -42,6 +42,14 @@ _MIN_FRAMES = 2
 
 # Region kinds. A screen shows moving content; a painting or statue
 # cannot move. That difference decides whether movement is evidence.
+# Bumped when the on-disk geometry changes meaning. v1 files held
+# PIXELS; v2 holds fractions of the frame. Reading a v1 file as v2 gives
+# coordinates in the hundreds where 0..1 is expected, which vetoes
+# nothing and looks exactly like a camera with no displays in it — so
+# an unversioned or older file is DISCARDED, costing one two-minute
+# blind window rather than a silently dead veto.
+_REGION_FORMAT = 2
+
 KIND_SCREEN = "screen"
 KIND_STATIC = "static"
 
@@ -63,12 +71,42 @@ def _drift(boxes: list[tuple]) -> float:
     ))
 
 
+def _to_frac(box, frame_wh: tuple[int, int] | None):
+    """Pixel box -> fraction of the frame. None means already a fraction.
+
+    EVERYTHING in this module is normalised, because the frame size is
+    not a constant. The SFU hands a subscriber whatever simulcast rung
+    it judges affordable, so the same wall arrives as 1920x1080 one
+    minute and 320x180 the next — measured 866 times in one window on
+    the TV Room.
+
+    Comparing a region grounded at one size against a track box measured
+    at another gives containment near zero, so the veto silently stops
+    vetoing and the painted faces come back as people. That is exactly
+    the "churning between identifying those faces and cancelling them
+    out" reported 2026-08-25, and it is why the persisted region file
+    made things worse rather than better: it carried whatever resolution
+    happened to be live when the regions were grounded.
+
+    In fractions the wall is in the same place at every rung.
+    """
+    if not frame_wh:
+        return box
+    w, h = frame_wh
+    if not w or not h:
+        return box
+    return (box[0] / w, box[1] / h, box[2] / w, box[3] / h)
+
+
 def containment(inner, outer) -> float:
     """area(inner ∩ outer) / area(inner)."""
     ix0, iy0 = max(inner[0], outer[0]), max(inner[1], outer[1])
     ix1, iy1 = min(inner[2], outer[2]), min(inner[3], outer[3])
     iw, ih = max(0.0, ix1 - ix0), max(0.0, iy1 - iy0)
-    a = max(1.0, (inner[2] - inner[0]) * (inner[3] - inner[1]))
+    # A tiny floor, not 1.0. In fractions a whole-frame box has area
+    # 1.0, so the old pixel-era floor made every containment come out as
+    # the intersection area and the veto never fired.
+    a = max(1e-9, (inner[2] - inner[0]) * (inner[3] - inner[1]))
     return (iw * ih) / a
 
 
@@ -87,7 +125,13 @@ class ScreenMap:
     # jitter, no motion. A 6px threshold was therefore sparing the very
     # things it exists to discard. 15px sits above that noise floor and
     # well under any real step.
-    move_px: float = float(os.environ.get("NEMARA_VETO_MOVE_PX", "15"))
+    # A FRACTION OF FRAME WIDTH, not pixels. Everything in this map is
+    # normalised (see `add`), so a pixel threshold would mean a
+    # different physical distance at every rung the SFU hands us.
+    # 15px measured at 2304 wide = 0.0065; the env var stays in pixels
+    # against that reference so the tuning history still reads.
+    move_frac: float = (
+        float(os.environ.get("NEMARA_VETO_MOVE_PX", "15")) / 2304.0)
     # 0.93, raised from 0.8 on 2026-08-24 and MEASURED rather than
     # picked. Every painted face actually being dropped in the TV Room
     # scored 0.957-1.000 containment — the lowest was 0.957 — so the
@@ -100,11 +144,19 @@ class ScreenMap:
         default_factory=list,
     )
 
-    def add(self, regions, now: float | None = None,
-            kind: str = KIND_STATIC) -> None:
+    def add(self, regions, frame_wh: tuple[int, int] | None = None,
+            now: float | None = None, kind: str = KIND_STATIC) -> None:
+        """Remember these regions, in FRACTIONS of the frame.
+
+        `frame_wh` is the size the regions were measured at. None means
+        they are already normalised (the restart path, which reloads
+        fractions straight off disk).
+        """
         now = time.monotonic() if now is None else now
         for r in regions:
-            box = (float(r[0]), float(r[1]), float(r[2]), float(r[3]))
+            box = _to_frac(
+                (float(r[0]), float(r[1]), float(r[2]), float(r[3])),
+                frame_wh)
             # Refresh an existing region if this is essentially the
             # same display seen again; else append.
             for i, (old, _ts, old_kind) in enumerate(self._regions):
@@ -135,6 +187,7 @@ class ScreenMap:
 
     def veto_track_ids(
         self, rows_by_frame: dict[int, np.ndarray],
+        frame_wh: tuple[int, int] | None = None,
         now: float | None = None,
     ) -> set[int]:
         """Track ids whose EVERY observed bbox is contained in a live
@@ -148,8 +201,9 @@ class ScreenMap:
         for rows in rows_by_frame.values():
             for row in rows:
                 tid = int(row[4])
-                box = (float(row[0]), float(row[1]),
-                       float(row[2]), float(row[3]))
+                box = _to_frac(
+                    (float(row[0]), float(row[1]),
+                     float(row[2]), float(row[3])), frame_wh)
                 best = max(containment(box, s) for s in live)
                 per_tid.setdefault(tid, []).append(best)
                 boxes.setdefault(tid, []).append(box)
@@ -176,7 +230,7 @@ class ScreenMap:
             if best_kind == KIND_SCREEN:
                 vetoed.add(tid)
                 continue
-            if drift > self.move_px:
+            if drift > self.move_frac:
                 # IT MOVED, SO IT IS NOT ART. The camera has no depth —
                 # one lens, no stereo, no sensor — so a person standing
                 # against a painted wall and a face painted ON it are
@@ -190,14 +244,14 @@ class ScreenMap:
                 # front of their own wall, and nothing downstream would
                 # ever know they were there.
                 log.info(
-                    "reid.display_veto_spared tid=%s drift=%.1fpx "
+                    "reid.display_veto_spared tid=%s drift=%.4f "
                     "containment=%.2f — moved, so not art",
                     tid, drift, min(scores),
                 )
                 continue
             log.info(
                 "reid.display_veto_drop tid=%s kind=%s containment=%.3f "
-                "drift=%.1fpx",
+                "drift=%.4f",
                 tid, best_kind, min(scores), drift,
             )
             vetoed.add(tid)
@@ -225,11 +279,17 @@ def load_regions(path: str) -> list[tuple[tuple[float, ...], str]]:
     out = []
     for row in raw[:16]:
         try:
+            if int(row.get("v", 1)) != _REGION_FORMAT:
+                continue                 # pixel-era file; see _REGION_FORMAT
             box = tuple(float(v) for v in row["box"][:4])
             if len(box) == 4:
                 out.append((box, str(row.get("kind", KIND_STATIC))))
         except (TypeError, KeyError, ValueError):
             continue
+    if raw and not out:
+        log.warning(
+            "display_veto.regions_discarded path=%s — wrong format version, "
+            "re-grounding from scratch", path)
     return out
 
 
@@ -238,18 +298,21 @@ def save_regions(path: str, regions) -> None:
     try:
         tmp = f"{path}.tmp"
         pathlib.Path(tmp).write_text(json.dumps([
-            {"box": list(box), "kind": kind} for box, kind in regions
+            {"box": list(box), "kind": kind, "v": _REGION_FORMAT}
+            for box, kind in regions
         ]), encoding="utf-8")
         os.replace(tmp, path)
     except OSError:
         log.warning("display_veto.save_failed path=%s", path, exc_info=True)
 
 
-def apply_veto(obs, screen_map: ScreenMap, *, now: float | None = None):
+def apply_veto(obs, screen_map: ScreenMap, *,
+               frame_wh: tuple[int, int] | None = None,
+               now: float | None = None):
     """Drop screen-contained tracks from a RemoteObservations bundle
     (rows + face obs). Returns (obs, dropped_tids) — obs is mutated in
     place (it is per-tick and not shared)."""
-    dropped = screen_map.veto_track_ids(obs.rows_by_frame, now)
+    dropped = screen_map.veto_track_ids(obs.rows_by_frame, frame_wh, now)
     if not dropped:
         return obs, dropped
     for fi in list(obs.rows_by_frame):

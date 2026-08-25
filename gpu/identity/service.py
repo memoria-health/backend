@@ -538,7 +538,30 @@ async def _read_video(track: rtc.Track, cam_loop: CameraLoop) -> None:
 # "the small-distant-person detection risk" — is about the layer we
 # work AT, not the layer we idle at.
 _LAYER_ACTIVE = "high"
-_LAYER_IDLE = os.environ.get("NEMARA_IDENTITY_IDLE_QUALITY", "medium").strip().lower()
+# LOW, not medium. LiveKit bills each subscriber for what IT pulls, and
+# an empty room is most of the day: measured 2026-08-24, the TV Room had
+# a person in 40% of ticks and the bedroom 74%. Stepping to the bottom
+# rung is roughly 150-300 kbps against ~4 Mbps, and the room stays
+# visible — so nothing has to wake us, unlike unsubscribing.
+#
+# LOW here even though the BACKEND deliberately uses MEDIUM, and the
+# difference is worth stating because it looks like an inconsistency.
+#
+# The backend steps to 640x360 because the tick that wakes it analyses
+# the window ALREADY IN ITS BUFFER — so whatever rung was arriving
+# during the quiet period is what a fall gets judged on, and 320x180 is
+# not something to show a VLM a fall in. Identity has no such
+# obligation: it keeps no window for later judgement, and the moment it
+# wakes it asks for `_LAYER_ACTIVE` and the next batch is full
+# resolution.
+#
+# And its wake authority does not depend on the rung at all.
+# `motion_pending` is set by a THUMBNAIL DIFF on the incoming frames
+# (see the latch above), not by person detection — the same reason the
+# backend notes that block motion "cannot tell the difference either
+# way". A person walking in still moves enough pixels at 320x180 to
+# latch it.
+_LAYER_IDLE = os.environ.get("NEMARA_IDENTITY_IDLE_QUALITY", "low").strip().lower()
 _QUALITY = {
     "low": rtc.VideoQuality.VIDEO_QUALITY_LOW,
     "medium": rtc.VideoQuality.VIDEO_QUALITY_MEDIUM,
@@ -807,8 +830,10 @@ async def _run_livekit(
                 # runs every 10s over exactly these publications, so the
                 # check costs one cached query and resume is ~10s.
                 want = cam_id[:8] not in paused
+                resubscribed = False
                 if _subscribed.get(cam_id) is not want:
                     _subscribed[cam_id] = want
+                    resubscribed = True
                     for pub in p.track_publications.values():
                         try:
                             pub.set_subscribed(want)
@@ -835,12 +860,26 @@ async def _run_livekit(
                     # lasted exactly one walk period, 10s, every time —
                     # which is what says it is a race and not congestion.
                     #
-                    # So this is a reconcile, not a one-shot. Forgetting
-                    # the remembered value is what makes the request
-                    # actually go out; one settings message per camera
-                    # per 10s is nothing, and the desired state is now
-                    # continuously true instead of true at subscribe.
-                    _layer.pop(cam_id, None)
+                    # So this is a reconcile — but ONLY on the pass that
+                    # actually re-subscribed. Forgetting the remembered
+                    # value every pass sent one UpdateTrackSettings per
+                    # camera per 10 seconds forever, on a camera nothing
+                    # had touched, and `request_layer`'s own docstring
+                    # names that call as the prime suspect for the
+                    # 2304 -> 320 -> 2304 oscillation. It was right:
+                    # measured 2026-08-25 on the TV Room, the SFU
+                    # downshifted between our requests and the intake
+                    # walked 2304x1296 -> 640x360 -> 320x180 -> 2304x1296
+                    # on the request period.
+                    #
+                    # There is no race to beat on a pass where we did not
+                    # call `set_subscribed`, because nothing reset the
+                    # track settings. Re-asserting there is not
+                    # enforcement, it is churn — the same lesson the
+                    # bridge's permission re-send taught on the publisher
+                    # side the day before.
+                    if resubscribed:
+                        _layer.pop(cam_id, None)
                     request_layer(cam_id, _LAYER_ACTIVE)
                 else:
                     # Nothing to police on a camera we are not pulling —

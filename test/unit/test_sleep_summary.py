@@ -313,3 +313,4 @@ def test_activity_state_timeline_time_weighted() -> None:
     # Posture-derived measures: legacy `sitting` counts as sedentary.
     assert out["sedentary_minutes"] == 120.0
     assert out["upright_minutes"] == 30.0
+

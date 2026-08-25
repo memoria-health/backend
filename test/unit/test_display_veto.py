@@ -169,7 +169,9 @@ def test_the_movement_floor_is_above_measured_jitter():
     """Static painted faces drifted 6.5-9.0px with the room EMPTY —
     mask jitter, not motion. A floor at or below that spares the very
     things the veto exists to drop."""
-    assert ScreenMap().move_px > 9.0
+    # The floor is now a FRACTION of frame width (see move_frac);
+    # 9px of measured jitter at 2304 wide is 0.0039.
+    assert ScreenMap().move_frac > 9.0 / 2304.0
 
 
 def test_the_containment_floor_is_above_the_measured_paintings():
@@ -227,14 +229,20 @@ def test_a_corrupt_file_is_not_an_error():
 
 
 def test_rows_that_make_no_sense_are_skipped_individually():
-    """One bad row must not discard the good ones alongside it."""
+    """One bad row must not discard the good ones alongside it.
+
+    Rows carry a format version now: v1 held PIXELS, v2 holds fractions
+    of the frame, and reading one as the other vetoes nothing while
+    looking exactly like a room with no displays in it.
+    """
+    from identity.display_veto import _REGION_FORMAT
     path = _tmp()
     Path(path).write_text(json.dumps([
-        {"box": [1.0, 2.0, 3.0, 4.0], "kind": KIND_SCREEN},
-        {"box": ["x", "y"], "kind": KIND_STATIC},
+        {"box": [0.1, 0.2, 0.3, 0.4], "kind": KIND_SCREEN, "v": _REGION_FORMAT},
+        {"box": ["x", "y"], "kind": KIND_STATIC, "v": _REGION_FORMAT},
         {"nope": True},
-        {"box": [9.0, 9.0, 9.0, 9.0]},
+        {"box": [0.9, 0.9, 0.95, 0.95], "v": _REGION_FORMAT},
     ]))
     got = load_regions(path)
-    assert got == [((1.0, 2.0, 3.0, 4.0), KIND_SCREEN),
-                   ((9.0, 9.0, 9.0, 9.0), KIND_STATIC)]
+    assert got == [((0.1, 0.2, 0.3, 0.4), KIND_SCREEN),
+                   ((0.9, 0.9, 0.95, 0.95), KIND_STATIC)]

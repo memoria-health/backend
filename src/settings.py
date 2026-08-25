@@ -404,6 +404,20 @@ class Settings(BaseSettings):
     # every three minutes, far above any real detector and far below an
     # accident.
     confirm_votes_per_hour: int = Field(ge=0, le=10_000, default=60)
+    # Fold nights into `sleep_nights` on a schedule.
+    #
+    # OFF since 2026-08-25. The fold is correct; its INPUT is not. On the
+    # night of 08-24 the detector said "asleep" on 4-9% of ticks during
+    # genuine deep sleep and 3% of ticks while the resident sat awake on
+    # his phone. Those two rates overlap, so no rule downstream can tell
+    # a real night from three stray verdicts — the record claimed he fell
+    # asleep at 23:16 when he fell asleep at about 03:15.
+    #
+    # A wrong night is worse than no night: a caregiver cannot tell it is
+    # wrong, and it is exactly the number they would act on. This stays
+    # off until the detector's own separation is fixed (see
+    # docs/plans/2026-08-24-sleep-detector-rework.md).
+    nightly_summaries_enabled: bool = Field(default=False)
     # Page record-only positives (rising edge) for verification. Off in prod.
     record_only_paging: bool = Field(default=False)
     # Dump every VLM artifact (exact Gemini input bytes) here. "" = off.

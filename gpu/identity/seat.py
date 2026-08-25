@@ -88,6 +88,76 @@ class Seat:
         return (self.camera_id, self.track_id)
 
 
+def carry_seat(
+    seat: Optional[Seat],
+    live: set[TrackKey],
+    boxes: dict[TrackKey, tuple[float, float, float, float]],
+    *,
+    taken: frozenset[TrackKey] = frozenset(),
+    overlap_floor: float = 0.5,
+) -> Optional[Seat]:
+    """Move a seat onto a re-numbered track instead of letting it die.
+
+    The tracker does not promise stable ids. It drops a box and issues a
+    new number for the same person, in the same place, often within the
+    same second — measured 2026-08-25: `track_death tid=22` and
+    `track_birth tid=23` one second apart with overlapping boxes, while
+    the resident sat still. Because the seat is keyed on the track id,
+    a face match that took 20-60 seconds to earn was destroyed by a
+    renumbering that changed nothing about the world.
+
+    So when a seated track is gone and exactly ONE live track occupies
+    the space it just vacated, the seat moves there. Everything else
+    about the seat — score, anchor, face_confirmed, since — travels
+    unchanged, because it is the same person.
+
+    Deliberately conservative in three ways:
+
+      * ONE candidate only. Two overlapping tracks means we cannot say
+        which is the person, and a wrong carry is a misattribution —
+        the failure this system must not have.
+      * The candidate must not already hold ANOTHER resident's seat
+        (`taken`), or one person's identity would be handed to another's
+        track.
+      * A real overlap, not proximity. `overlap_floor` is IoU, so a
+        different person walking through the same doorway does not
+        inherit anybody.
+
+    Returns the moved seat, or None to let the caller kill it as before.
+    """
+    if seat is None or seat.key in live:
+        return seat
+    old_box = boxes.get(seat.key)
+    if old_box is None:
+        return None
+    hits = [
+        k for k in live
+        if k[0] == seat.camera_id
+        and k != seat.key
+        and k not in taken
+        and _iou(old_box, boxes.get(k)) >= overlap_floor
+    ]
+    if len(hits) != 1:
+        return None
+    return replace(seat, track_id=hits[0][1])
+
+
+def _iou(a, b) -> float:
+    """Intersection over union. 0.0 when either box is missing."""
+    if not a or not b:
+        return 0.0
+    x0, y0 = max(a[0], b[0]), max(a[1], b[1])
+    x1, y1 = min(a[2], b[2]), min(a[3], b[3])
+    iw, ih = max(0.0, x1 - x0), max(0.0, y1 - y0)
+    inter = iw * ih
+    if inter <= 0.0:
+        return 0.0
+    area_a = max(0.0, (a[2] - a[0]) * (a[3] - a[1]))
+    area_b = max(0.0, (b[2] - b[0]) * (b[3] - b[1]))
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
 def update_seat(
     seat: Optional[Seat],
     candidates: list[Candidate],
@@ -98,7 +168,9 @@ def update_seat(
     now: float,
 ) -> Optional[Seat]:
     """Fold one round of identity scores into the seat. Pure."""
-    # 1. The seat dies with its track — no ghost references.
+    # 1. The seat dies with its track — no ghost references. The caller
+    #    may first offer it a re-numbered track via `carry_seat`; by the
+    #    time we get here that chance has been taken or declined.
     if seat is not None and seat.key not in live:
         log.info("identity.seat_died key=%s", seat.key)
         seat = None

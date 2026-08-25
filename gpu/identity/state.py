@@ -2,9 +2,20 @@
 
 The pod owns id continuity (EdgeTAM carry + SAM3 ground); this mirror
 just records what is currently live so the identity layer can reason
-about births, deaths, solo-ness, and track age. A track absent from a
-batch's output is dead — SAM3 is the authority on existence and the
-session clears departed masks (continuous.py "empty-scene clear").
+about births, deaths, solo-ness, and track age.
+
+A track absent from ONE batch is not dead. It used to be, and that
+single line was the loudest source of instability in the system:
+everything above it — the seat, the identity lock, every downstream
+consumer — is chained to a track id, so one noisy batch from the
+detector destroyed a face match that had cost 20-60 seconds to earn.
+Measured 2026-08-25 in the bedroom, with the resident sitting still:
+seat lifetimes of 81s, 6s and 97s, and re-acquisition taking 22, 57 and
+443 seconds.
+
+A track now has to be missing for `MISSES_BEFORE_DEATH` consecutive
+batches before it dies. SAM3 is still the authority on existence; this
+only declines to believe it on the strength of a single frame.
 """
 
 from __future__ import annotations
@@ -12,6 +23,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 Bbox = tuple[float, float, float, float]
+
+# Consecutive batches a track may be missing before it is declared dead.
+#
+# 2 rather than 1, and not more. Batches arrive a few hundred
+# milliseconds apart, so this buys roughly half a second of tolerance —
+# enough to ride out the single-batch dropouts that were killing seats,
+# and far too short to keep a ghost of someone who has actually left.
+# The cost of being wrong in this direction is one stale box for one
+# extra batch; the cost of the old behaviour was a destroyed identity.
+MISSES_BEFORE_DEATH = 2
 
 
 @dataclass
@@ -21,6 +42,9 @@ class TrackView:
     born_at: float
     last_seen: float
     batches_seen: int = 1
+    # Consecutive batches this track has been absent from. Reset to 0
+    # every time it is seen; at MISSES_BEFORE_DEATH the track dies.
+    misses: int = 0
     # Recent (wall_ts, bbox) samples, newest last — the follow-crop
     # series (2026-08-18). Capped in apply(); ~15s of history.
     series: tuple[tuple[float, Bbox], ...] = ()
@@ -78,13 +102,25 @@ class CameraState:
                 t.bbox = bbox
                 t.last_seen = now
                 t.batches_seen += 1
+                # Seen again, so whatever gap it had is over. A track
+                # that flickers every other batch must not accumulate
+                # its way to a death.
+                t.misses = 0
                 t.series = tuple(
                     e for e in (*t.series, *fresh) if now - e[0] <= 15.0
                 )[-120:]
             new_tracks[tid] = t
-        for tid in self.tracks:
-            if tid not in batch_tracks:
+        for tid, t in self.tracks.items():
+            if tid in batch_tracks:
+                continue
+            t.misses += 1
+            if t.misses >= MISSES_BEFORE_DEATH:
                 deaths.append(tid)
+            else:
+                # Still ours: carried forward with its last known box,
+                # so the seat above it survives the gap and every
+                # consumer keeps seeing the person who has not moved.
+                new_tracks[tid] = t
         self.tracks = new_tracks
         self.live_ids = frozenset(new_tracks)
         self.updated_at = now

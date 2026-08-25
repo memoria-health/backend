@@ -52,6 +52,8 @@ class _AccessLogQuietFilter(logging.Filter):
 
 logging.getLogger("uvicorn.access").addFilter(_AccessLogQuietFilter())
 
+log = logging.getLogger(__name__)
+
 # Register every ORM model in SQLAlchemy metadata at startup so foreign
 # keys resolve when the first INSERT/SELECT runs. Imported for side
 # effects only.
@@ -186,7 +188,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # never summarised without anything appearing to fail.
     summaries = NightlySummaryRunner(sessionmaker=get_sessionmaker())
     app.state.summaries = summaries
-    await summaries.start()
+    if get_settings().nightly_summaries_enabled:
+        await summaries.start()
+    else:
+        log.warning(
+            "[summaries] nightly fold DISABLED — the sleep detector cannot "
+            "yet separate real sleep from stray verdicts, and a wrong night "
+            "is worse than no night. Set NEMARA_NIGHTLY_SUMMARIES_ENABLED=1 "
+            "to re-enable.",
+        )
     # `cameras.online` is now owned by each `RoomWorker`'s
     # `LiveKitRoomReconciler` (see room_reconciler.py). The standalone
     # `StaleOnlineSweeper` was removed because REST polling produces

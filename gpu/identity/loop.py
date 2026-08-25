@@ -43,6 +43,7 @@ from identity.harvest import harvest_eligible
 from identity.scoring import body_conf, face_conf
 from identity.journal import EventJournal
 from identity.seat import (
+    carry_seat,
     Candidate,
     Seat,
     heal_seat,
@@ -433,8 +434,29 @@ class IdentityHome:
             seats: dict[UUID, Seat] = {}
             for pid in set(self.seats) | set(by_patient):
                 mine = by_patient.get(pid, [])
+                # Offer a re-numbered track before the seat is allowed
+                # to die. The tracker renumbers a stationary person
+                # constantly; without this, every renumber throws away
+                # a face match and costs 20-60s to earn back.
+                carried = carry_seat(
+                    self.seats.get(pid), live, self._seat_boxes(),
+                    # Track numbers other residents are sitting on. A
+                    # carry must never take one, or this resident's
+                    # identity lands on their housemate.
+                    taken=frozenset(
+                        s.key for q, s in self.seats.items() if q != pid
+                    ),
+                )
+                if carried is not None and self.seats.get(pid) is not None \
+                        and carried.track_id != self.seats[pid].track_id:
+                    log.info(
+                        "identity.seat_carried pid=%s %s -> %s (same person, "
+                        "new track number)",
+                        str(pid)[:8], self.seats[pid].track_id,
+                        carried.track_id,
+                    )
                 seat = update_seat(
-                    self.seats.get(pid), mine, live=live,
+                    carried, mine, live=live,
                     floor=SEAT_FLOOR, delta=SEAT_DELTA, now=now,
                 )
                 # Swap healing: the tracker can trade two people's track
@@ -555,7 +577,14 @@ class IdentityHome:
                 pid: s
                 for pid, s in (
                     (pid, update_seat(
-                        seat, [], live=live,
+                        carry_seat(
+                            seat, live, self._seat_boxes(),
+                            taken=frozenset(
+                                t.key for q, t in self.seats.items()
+                                if q != pid
+                            ),
+                        ),
+                        [], live=live,
                         floor=SEAT_FLOOR, delta=SEAT_DELTA, now=now,
                     ))
                     for pid, seat in self.seats.items()
@@ -614,6 +643,35 @@ def _assign_face(
 class CameraLoop:
     """One camera's continuous loop."""
 
+    def _seat_boxes(self) -> dict:
+        """(camera_id, track_id) -> current bbox, for the seat carry.
+
+        Includes tracks that have just gone missing but are still held
+        by the death hysteresis, which is exactly the window in which a
+        renumbering happens.
+        """
+        return {
+            (self.camera_id, tid): tv.bbox
+            for tid, tv in self.state.tracks.items()
+        }
+
+    def _frame_wh(self) -> tuple[int, int] | None:
+        """(width, height) of the frames currently arriving, or None.
+
+        `_last_shape` is (h, w) and is stamped by the intake reader in
+        service.py on every size CHANGE, which is the only place the
+        real size is known — the observation bundle does not carry it.
+        None before the first frame, which makes the veto treat boxes as
+        already normalised and therefore veto nothing. That is the safe
+        direction: no veto costs a phantom track, a wrong veto costs a
+        person.
+        """
+        shape = getattr(self, "_last_shape", None)
+        if not shape or len(shape) < 2:
+            return None
+        h, w = int(shape[0]), int(shape[1])
+        return (w, h) if w > 0 and h > 0 else None
+
     def __init__(self, *, camera_id: str, home: IdentityHome) -> None:
         self.camera_id = camera_id
         self.home = home
@@ -629,6 +687,7 @@ class CameraLoop:
         )
         self.screen_map = ScreenMap()
         for _box, _kind in load_regions(self._screen_path):
+            # No frame size: what is on disk is already normalised.
             self.screen_map.add([_box], kind=_kind)
         self.ring: list[tuple[int, float, np.ndarray]] = []  # fed by intake
         # Frame idx is OWNED HERE, not by the intake reader — a LiveKit
@@ -954,8 +1013,9 @@ class CameraLoop:
                          or "phone" in _c)
                      else KIND_STATIC)
             self.screen_map.add(
-                [r[:4] for r in obs.screen_regions], now=time.monotonic(),
-                kind=_kind,
+                [r[:4] for r in obs.screen_regions],
+                frame_wh=self._frame_wh(),
+                now=time.monotonic(), kind=_kind,
             )
             # HOW MANY did the pod actually find. `screen_pass ok` on the
             # pod only says the call did not throw — an empty result
@@ -971,7 +1031,10 @@ class CameraLoop:
                 self.camera_id, _kind, len(obs.screen_regions),
                 len(self.screen_map.live(time.monotonic())),
             )
-        obs, vetoed = apply_veto(obs, self.screen_map, now=time.monotonic())
+        obs, vetoed = apply_veto(
+            obs, self.screen_map,
+            frame_wh=self._frame_wh(), now=time.monotonic(),
+        )
 
         prev_boxes = {t: tv.bbox for t, tv in self.state.tracks.items()}
         events = self.state.apply(

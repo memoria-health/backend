@@ -1,4 +1,12 @@
-"""The identity service pays for its own copy of every camera.
+"""Identity steps to the BOTTOM rung when the room is empty.
+
+Low rather than the backend's medium, and the difference is deliberate:
+the backend's waking tick analyses its buffered window, so the rung
+arriving during the quiet period is what a fall gets judged on. Identity
+keeps no such window, and its wake authority is a thumbnail pixel diff
+rather than person detection, so it still notices someone walking in at
+320x180 and asks for full resolution before the next batch.
+The identity service pays for its own copy of every camera.
 
 Each camera in a room is subscribed TWICE — once by the backend's
 detector worker and once by this camera's identity service on the GPU
@@ -59,7 +67,7 @@ def test_an_empty_room_steps_down():
     service._pubs[CAM] = pub
     service.request_layer(CAM, service._LAYER_ACTIVE)
     service.request_layer(CAM, service._LAYER_IDLE)
-    assert pub.asked == ["high", "medium"]
+    assert pub.asked == ["high", "low"]
 
 
 def test_motion_steps_back_up():
@@ -67,7 +75,7 @@ def test_motion_steps_back_up():
     service._pubs[CAM] = pub
     service.request_layer(CAM, service._LAYER_IDLE)
     service.request_layer(CAM, service._LAYER_ACTIVE)
-    assert pub.asked == ["medium", "high"]
+    assert pub.asked == ["low", "high"]
 
 
 def test_only_transitions_signal():
@@ -78,7 +86,7 @@ def test_only_transitions_signal():
     service._pubs[CAM] = pub
     for _ in range(40):
         service.request_layer(CAM, service._LAYER_IDLE)
-    assert pub.asked == ["medium"]
+    assert pub.asked == ["low"]
 
 
 def test_a_failed_request_does_not_raise():
