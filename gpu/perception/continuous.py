@@ -86,6 +86,15 @@ _IR_REMAP_IOU = float(os.environ.get("NEMARA_IR_REMAP_IOU", "0.10"))
 # grace x reground_every ticks (~1 min) before the daytime rule
 # reasserts. 0 disables.
 _IR_GROUND_GRACE = int(os.environ.get("NEMARA_IR_GROUND_GRACE", "4"))
+# Consecutive CARRY ticks a track's mask may fail to propagate before we
+# accept it is gone. 2, matching identity's MISSES_BEFORE_DEATH — the
+# same "one blink is not an absence" rule, applied a layer earlier so the
+# TRACK ID survives rather than being rebuilt after the fact.
+#
+# Deliberately small. A departed person's mask lingering is bounded by
+# this AND killed outright at the next ground, which stays the sole
+# authority on existence.
+_CARRY_MISS_GRACE = int(os.environ.get("NEMARA_CARRY_MISS_GRACE", "2"))
 _IR_BOOST = os.environ.get("NEMARA_IR_BOOST", "1").strip().lower() not in (
     "0", "false", "off",
 )
@@ -137,6 +146,38 @@ _GROUNDER = os.environ.get("NEMARA_GROUNDER", "sam3").strip().lower()
 # Masks are resized to track-res downstream either way — only SAM3's view
 # changes. 0 = native (the misbehaving regime); env knob is for live A/B.
 _SAM3_GROUND_W = int(os.environ.get("NEMARA_SAM3_GROUND_W", "1280"))
+
+
+def carry_grace(seed: dict, survived: dict, misses: dict,
+                grace: int = _CARRY_MISS_GRACE):
+    """One blink is not an absence — decided for a CARRY tick.
+
+    Returns (masks_to_keep, new_miss_counts, [(tid, miss_n) held]).
+
+    A seeded track whose mask failed to propagate is held at its last
+    known mask for up to `grace` consecutive ticks instead of vanishing.
+    It matters because a track absent from `last_masks` cannot be
+    remapped at the next ground: it comes back with a NEW ID, and the
+    seat — with the face match that took 20-60s to earn — was keyed on
+    the old one.
+
+    Pure, so the rule can be tested. The engine around it cannot be:
+    it needs a GPU, EdgeTAM and a live camera.
+    """
+    out = dict(survived)
+    fresh: dict = {}
+    held: list = []
+    for tid, prev_mask in seed.items():
+        if tid in out:
+            continue                       # propagated fine, owes nothing
+        n = misses.get(tid, 0) + 1
+        if n < grace:
+            fresh[tid] = n
+            out[tid] = prev_mask
+            held.append((tid, n))
+        # else: out of grace. Left out of `out` and out of `fresh`, so
+        # it dies exactly as it did before this existed.
+    return out, fresh, held
 
 
 def _track_dims(w: int, h: int) -> tuple[int, int, float]:
@@ -317,6 +358,11 @@ class CameraSession:
         # tighter, and the mask-decay exit still bounds a phantom.
         self._ir = False
         self._empty_ground_streak = 0
+        # Consecutive carry ticks each track's mask has failed to
+        # propagate. Transient like `_empty_ground_streak` and for the
+        # same reason: a worker hop resets it, which only ever makes the
+        # grace more generous, never tighter.
+        self._mask_misses: "dict[int, int]" = {}
         # This tick's YOLO person boxes, as FRACTIONS of the frame they
         # were measured in. Transient — read by the server immediately
         # after observe() and never serialised, because it describes one
@@ -763,6 +809,32 @@ class CameraSession:
             new_masks = {
                 tid: mm for tid, (_bb, mm) in out[last_pos].items() if mm.any()
             }
+        # PARTIAL carry loss: some seeds survived propagation and some
+        # did not. The grace below this only ever covered the all-empty
+        # case, so a tick that kept 2 of 3 masks dropped the third with
+        # no grace at all — and a track missing from `last_masks` cannot
+        # be remapped at the next ground, so it comes back as a NEW ID.
+        # That is the renumbering that costs the seat.
+        #
+        # Measured 2026-08-25: EdgeTAM lost a seeded track on 2% of ticks
+        # on BOTH cameras (46 and 77 tracks), which is the only churn
+        # source common to both — the paintings and the resolution flips
+        # are TV-Room-only and cannot explain the Bedroom.
+        #
+        # CARRY ONLY. A ground is the existence authority: if the
+        # grounder looked and found nobody there, the track is gone and
+        # must die. This grace is strictly for a propagation blink.
+        if mode == "carry" and seed:
+            new_masks, self._mask_misses, held = carry_grace(
+                seed, new_masks, self._mask_misses)
+            for tid, n in held:
+                log.info(
+                    "continuous.carry_blink cam=%s tick=%d tid=%d "
+                    "miss=%d/%d — holding last mask so the id survives",
+                    self.camera_id, self.tick, tid, n, _CARRY_MISS_GRACE,
+                )
+        else:
+            self._mask_misses = {}
         if new_masks:
             self.last_masks = new_masks
             self._empty_ground_streak = 0
