@@ -43,6 +43,7 @@ from identity.harvest import harvest_eligible
 from identity.scoring import body_conf, face_conf
 from identity.journal import EventJournal
 from identity.seat import (
+    _iou,
     carry_seat,
     Candidate,
     Seat,
@@ -643,6 +644,64 @@ def _assign_face(
 class CameraLoop:
     """One camera's continuous loop."""
 
+    def _report_deaths(self, events, prev_meta, vetoed, rows_before,
+                       rows_after, now: float) -> None:
+        """Say WHY each track died, once per death.
+
+        Every explanation for the churn so far has been inference from
+        second-order symptoms — seat lifetimes, event counts, commit
+        timings — because nothing recorded the death itself. Three
+        separate theories were argued and two were wrong. This line is
+        meant to end that in one occupied hour.
+
+        Fields, and what each one rules in or out:
+
+          age_s        how long the track lived. Seconds means the
+                       detector is unstable; minutes means something
+                       ended a healthy track.
+          gap_s        how long since it was last seen. Sub-second is a
+                       detector blink; multi-second is a person who
+                       actually left or became invisible.
+          vetoed       was it removed by the display filter this batch.
+                       Distinguishes "we threw it away" from "the
+                       detector lost it" — the exact question the veto
+                       theory could not answer.
+          rows         detector rows before -> after the veto. `0 -> 0`
+                       means the detector returned nothing at all;
+                       `4 -> 0` means we discarded everything it found.
+          reborn_iou   best overlap with a track BORN in this same
+                       batch. High means a renumbering (the seat carry
+                       case); 0.00 means nothing took its place.
+          seat         did it hold an identity. A death with a seat is
+                       the one that costs a face match.
+
+        Never raises: instrumentation must not be able to end a tick.
+        """
+        try:
+            births = {
+                tid: self.state.tracks[tid].bbox
+                for tid in events.births if tid in self.state.tracks
+            }
+            for tid in events.deaths:
+                meta = prev_meta.get(tid)
+                if meta is None:
+                    continue
+                box, last_seen, born_at, seen = meta
+                best_iou = max(
+                    (_iou(box, b) for b in births.values()), default=0.0)
+                held = any(
+                    st.track_id == tid for st in self.home.seats.values()
+                ) if getattr(self.home, "seats", None) else False
+                log.info(
+                    "identity.track_death cam=%s tid=%s age_s=%.1f gap_s=%.2f "
+                    "batches=%d vetoed=%s rows=%d->%d reborn_iou=%.2f seat=%s",
+                    self.camera_id, tid, now - born_at, now - last_seen,
+                    seen, tid in (vetoed or ()), rows_before, rows_after,
+                    best_iou, held,
+                )
+        except Exception:  # noqa: BLE001 — a log line is never a dependency
+            log.warning("identity.track_death_report_failed", exc_info=True)
+
     def _seat_boxes(self) -> dict:
         """(camera_id, track_id) -> current bbox, for the seat carry.
 
@@ -1031,15 +1090,32 @@ class CameraLoop:
                 self.camera_id, _kind, len(obs.screen_regions),
                 len(self.screen_map.live(time.monotonic())),
             )
+        # How much the DETECTOR returned, before anything of ours
+        # removed rows. `rows_after` below is what survived the veto, so
+        # the two together separate "the detector saw nothing" from "we
+        # threw it away" — the distinction every theory about track
+        # churn so far has had to guess at.
+        rows_before = sum(len(r) for r in obs.rows_by_frame.values())
+
         obs, vetoed = apply_veto(
             obs, self.screen_map,
             frame_wh=self._frame_wh(), now=time.monotonic(),
         )
+        rows_after = sum(len(r) for r in obs.rows_by_frame.values())
 
         prev_boxes = {t: tv.bbox for t, tv in self.state.tracks.items()}
+        # Snapshot what we are about to lose. `state.apply` mutates in
+        # place, so anything read after it describes the survivor.
+        prev_meta = {
+            t: (tv.bbox, tv.last_seen, tv.born_at, tv.batches_seen)
+            for t, tv in self.state.tracks.items()
+        }
         events = self.state.apply(
             newest_bboxes(obs), now=now,
             batch_series=series_bboxes(obs, batch))
+        if events.deaths:
+            self._report_deaths(
+                events, prev_meta, vetoed, rows_before, rows_after, now)
         if events.births or events.deaths:
             log.info(
                 "identity.tracks cam=%s births=%s deaths=%s live=%s",
