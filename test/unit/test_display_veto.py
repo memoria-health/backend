@@ -4,116 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from identity.display_veto import ScreenMap, apply_veto, containment
-from identity.wire import RemoteObservations
-
-# The measured geometry from the 2026-07-21 8:44 incident: laptop
-# screen region ~[626,163,707,222]; phantom screen-person inside it
-# (containment 1.0); the real patient's body box overlapped ~0.13.
-SCREEN = (626.0, 163.0, 707.0, 222.0)
-PHANTOM = (655.0, 174.0, 683.0, 218.0)
-PATIENT = (639.0, 121.0, 784.0, 294.0)
-
-
-def rows(*entries):
-    """entries: (tid, box) -> one frame's (N, 8) row array."""
-    return np.array(
-        [[*box, float(tid), 0.9, 0.0, 0.0] for tid, box in entries],
-        dtype=np.float32,
-    )
-
-
-def obs(rows_by_frame, face_tids=()):
-    o = RemoteObservations()
-    o.rows_by_frame = rows_by_frame
-    o.face_obs = {(tid, 0): ["dummy"] for tid in face_tids}
-    return o
-
-
-def test_measured_incident_separation():
-    assert containment(PHANTOM, SCREEN) == 1.0
-    # Live probe measured ≤0.131 per-frame; this fixture pair rounds
-    # to ~0.16 — either way a chasm below the 0.8 veto floor.
-    assert containment(PATIENT, SCREEN) < 0.2
-
-
-def test_phantom_vetoed_patient_survives():
-    m = ScreenMap()
-    m.add([SCREEN], now=100.0)
-    o = obs(
-        {0: rows((0, PATIENT), (1, PHANTOM)),
-         2: rows((0, PATIENT), (1, PHANTOM)),
-         4: rows((0, PATIENT), (1, PHANTOM))},
-        face_tids=(0, 1),
-    )
-    o, dropped = apply_veto(o, m, now=101.0)
-    assert dropped == {1}
-    for fi in o.rows_by_frame:
-        assert all(int(r[4]) == 0 for r in o.rows_by_frame[fi])
-    assert (0, 0) in o.face_obs and (1, 0) not in o.face_obs
-
-
-def test_walker_crossing_screen_not_vetoed():
-    m = ScreenMap()
-    big_tv = (300.0, 100.0, 700.0, 400.0)
-    m.add([big_tv], now=100.0)
-    inside = (400.0, 150.0, 500.0, 350.0)      # fully in front of TV
-    outside = (650.0, 150.0, 780.0, 380.0)     # stepping out
-    o = obs({0: rows((5, inside)), 2: rows((5, inside)),
-             4: rows((5, outside))})
-    _o, dropped = apply_veto(o, m, now=101.0)
-    assert dropped == set()                    # one dip clears the veto
-
-
-def test_single_frame_flicker_not_vetoed():
-    m = ScreenMap()
-    m.add([SCREEN], now=100.0)
-    o = obs({0: rows((3, PHANTOM))})
-    _o, dropped = apply_veto(o, m, now=101.0)
-    assert dropped == set()
-
-
-def test_region_expiry():
-    m = ScreenMap(ttl_s=60.0)
-    m.add([SCREEN], now=100.0)
-    o = obs({0: rows((1, PHANTOM)), 2: rows((1, PHANTOM))})
-    _o, dropped = apply_veto(o, m, now=200.0)  # 100s later: expired
-    assert dropped == set()
-
-
-def test_region_refresh_and_union_bound():
-    m = ScreenMap(ttl_s=60.0)
-    m.add([SCREEN], now=0.0)
-    m.add([SCREEN], now=50.0)                  # same display refreshes
-    assert len(m.live(now=55.0)) == 1
-    # 100+ junk regions never grow the map unbounded.
-    for i in range(40):
-        m.add([(i * 30.0, 500.0, i * 30.0 + 20.0, 520.0)], now=50.0)
-    assert len(m.live(now=55.0)) <= 16
-
-
-def test_empty_map_is_inert():
-    m = ScreenMap()
-    o = obs({0: rows((1, PHANTOM))})
-    _o, dropped = apply_veto(o, m, now=10.0)
-    assert dropped == set()
-
-
-# ── movement, and why a screen is different (2026-08-24) ───────────
-#
-# The camera has no depth — one lens, no stereo, no sensor — so a person
-# standing against a painted wall and a face painted ON it are the same
-# pixels. Containment alone cannot separate them, and the rule discards
-# anything sitting >=80% inside a region on every frame it is seen.
-#
-# Movement separates them: a painting is nailed to a wall. But that
-# reasoning does NOT transfer to a screen, because a screen shows people
-# who walk about — which is the 8:44 incident this whole file exists
-# for, a face on a laptop minting person tracks and parking a lock for
-# eleven minutes. So the two kinds of region are judged differently.
-import numpy as np
-
-from identity.display_veto import KIND_SCREEN, KIND_STATIC, ScreenMap
+from identity.display_veto import ScreenMap
 
 _REGION = (100.0, 100.0, 400.0, 400.0)
 
@@ -126,52 +17,52 @@ def _track(dx: float, tid: int = 7):
     }
 
 
-def _veto(kind: str, dx: float) -> bool:
+def _veto(dx: float) -> bool:
     m = ScreenMap()
-    m.add([_REGION], now=0.0, kind=kind)
+    m.add([_REGION], now=0.0)
     return bool(m.veto_track_ids(_track(dx), now=1.0))
 
 
-def test_a_still_thing_inside_a_painting_is_dropped():
-    """The phantom case: painted faces on a wall, which do not move."""
-    assert _veto(KIND_STATIC, dx=0) is True
+def test_a_thing_inside_a_region_is_dropped():
+    """The phantom case: painted faces on a wall."""
+    assert _veto(dx=0) is True
 
 
-def test_a_moving_thing_inside_a_painting_is_kept():
-    """THE guard. A person standing in front of their own artwork is
-    contained exactly like the artwork is, and discarding them is
-    silent — nothing downstream ever learns they were in the room."""
-    assert _veto(KIND_STATIC, dx=30) is False
+def test_movement_no_longer_spares_anything():
+    """There WAS a movement exemption here, and it is gone.
+
+    It existed to protect a person standing in front of their own
+    artwork. Measured on the real geometry (2026-08-25), it protected
+    nothing: a painting panel is 0.05 x 0.11 of frame and a standing
+    adult is 0.19 x 0.20, so the most of a person that can ever fall
+    inside one is 0.16 containment — against a floor of 0.93. The
+    containment floor alone already makes vetoing a person impossible,
+    six times over.
+
+    What the exemption did do was spare the paintings: a mask wobble of
+    a couple of pixels, amplified by a downshifted frame where one pixel
+    is 3.6x larger once normalised, crossed the movement bar often
+    enough to keep the phantoms alive indefinitely.
+    """
+    assert _veto(dx=30) is True
 
 
-def test_a_moving_thing_inside_a_SCREEN_is_still_dropped():
-    """The 8:44 incident. A televised person walks about, so movement
-    proves nothing on a display and the containment rule must stand on
-    its own. Without this the movement guard would re-open the exact
-    hole this file was written to close."""
-    assert _veto(KIND_SCREEN, dx=30) is True
+def test_a_person_sized_box_is_never_vetoed():
+    """The guard that actually does the work, stated directly.
 
-
-def test_a_still_thing_inside_a_screen_is_dropped():
-    assert _veto(KIND_SCREEN, dx=0) is True
-
-
-def test_screen_wins_when_a_region_is_seen_as_both():
-    """Concepts are searched one per pass and can land on the same box.
-    The stricter rule has an incident behind it, so it wins."""
+    Real numbers from the TV Room: the father's track and one grounded
+    painting panel. He cannot reach the floor however still he stands.
+    """
     m = ScreenMap()
-    m.add([_REGION], now=0.0, kind=KIND_STATIC)
-    m.add([_REGION], now=0.0, kind=KIND_SCREEN)
-    assert bool(m.veto_track_ids(_track(30), now=1.0)) is True
+    panel = (0.9006, 0.2006, 0.9549, 0.3086)
+    m.add([panel], now=0.0)
+    person = (724 / 2304, 518 / 1296, 1156 / 2304, 778 / 1296)
+    rows = {
+        i: np.array([[person[0], person[1], person[2], person[3], 5]])
+        for i in range(3)
+    }
+    assert m.veto_track_ids(rows, now=1.0) == set()
 
-
-def test_the_movement_floor_is_above_measured_jitter():
-    """Static painted faces drifted 6.5-9.0px with the room EMPTY —
-    mask jitter, not motion. A floor at or below that spares the very
-    things the veto exists to drop."""
-    # The floor is now a FRACTION of frame width (see move_frac);
-    # 9px of measured jitter at 2304 wide is 0.0039.
-    assert ScreenMap().move_frac > 9.0 / 2304.0
 
 
 def test_the_containment_floor_is_above_the_measured_paintings():
@@ -200,18 +91,22 @@ def _tmp() -> str:
     return str(Path(tempfile.mkdtemp()) / "regions.json")
 
 
-def test_regions_and_their_kinds_survive():
-    """The kind must survive too, or a television comes back as a
-    painting and a moving face on it stops being suppressed."""
+def test_regions_survive_a_restart():
+    """Furniture does not move, so the map should not start blind.
+
+    No `kind` any more: with one rule, a television and a painting are
+    treated identically, and the field existed only to pick who got the
+    movement exemption.
+    """
     path = _tmp()
     m = ScreenMap()
-    m.add([(1.0, 2.0, 3.0, 4.0)], kind=KIND_SCREEN)
-    m.add([(5.0, 6.0, 7.0, 8.0)], kind=KIND_STATIC)
-    save_regions(path, m.live_kinds())
+    m.add([(0.1, 0.2, 0.3, 0.4)])
+    m.add([(0.5, 0.6, 0.7, 0.8)])
+    save_regions(path, m.live())
 
     assert load_regions(path) == [
-        ((1.0, 2.0, 3.0, 4.0), KIND_SCREEN),
-        ((5.0, 6.0, 7.0, 8.0), KIND_STATIC),
+        (0.1, 0.2, 0.3, 0.4),
+        (0.5, 0.6, 0.7, 0.8),
     ]
 
 
@@ -238,11 +133,10 @@ def test_rows_that_make_no_sense_are_skipped_individually():
     from identity.display_veto import _REGION_FORMAT
     path = _tmp()
     Path(path).write_text(json.dumps([
-        {"box": [0.1, 0.2, 0.3, 0.4], "kind": KIND_SCREEN, "v": _REGION_FORMAT},
-        {"box": ["x", "y"], "kind": KIND_STATIC, "v": _REGION_FORMAT},
+        {"box": [0.1, 0.2, 0.3, 0.4], "v": _REGION_FORMAT},
+        {"box": ["x", "y"], "v": _REGION_FORMAT},
         {"nope": True},
         {"box": [0.9, 0.9, 0.95, 0.95], "v": _REGION_FORMAT},
     ]))
     got = load_regions(path)
-    assert got == [((0.1, 0.2, 0.3, 0.4), KIND_SCREEN),
-                   ((0.9, 0.9, 0.95, 0.95), KIND_STATIC)]
+    assert got == [(0.1, 0.2, 0.3, 0.4), (0.9, 0.9, 0.95, 0.95)]

@@ -31,7 +31,7 @@ import numpy as np
 from identity.gallery import CrossClipBodyGallery
 from identity.body_embeddings import extract_body_embedding
 from identity.display_veto import (
-    KIND_SCREEN, KIND_STATIC, ScreenMap, apply_veto,
+    ScreenMap, apply_veto,
     load_regions, save_regions,
 )
 from identity.matching import topk_mean_cosine_match
@@ -763,9 +763,9 @@ class CameraLoop:
             f"screen_regions_{camera_id}.json",
         )
         self.screen_map = ScreenMap()
-        for _box, _kind in load_regions(self._screen_path):
+        for _box in load_regions(self._screen_path):
             # No frame size: what is on disk is already normalised.
-            self.screen_map.add([_box], kind=_kind)
+            self.screen_map.add([_box])
         self.ring: list[tuple[int, float, np.ndarray]] = []  # fed by intake
         # Frame idx is OWNED HERE, not by the intake reader — a LiveKit
         # re-subscribe spawns a fresh reader, and a reader-local counter
@@ -1073,22 +1073,6 @@ class CameraLoop:
         self._last_shipped = batch[-1]
         if want_screens:
             self._screens_at = now
-            # Tag by what found them. Anything screen-like keeps the
-            # strict rule (movement proves nothing on a display); art and
-            # statues get the movement exemption, because they cannot
-            # move and a person in front of them can.
-            # getattr: older pod builds and unit fakes have no such
-            # field, and a missing concept must not break a tick.
-            # Absent means "assume static", which is the LENIENT
-            # kind — a screen wrongly treated as static merely
-            # spares a moving track for one batch, where a painting
-            # wrongly treated as a screen would discard a person.
-            _c = (getattr(obs, "screen_concept", "") or "").lower()
-            _kind = (KIND_SCREEN
-                     if ("screen" in _c or "television" in _c
-                         or "monitor" in _c or "laptop" in _c
-                         or "phone" in _c)
-                     else KIND_STATIC)
             # The size the POD measured them in, which is the only
             # size that can be right. `_frame_wh()` is the intake
             # reader's last-seen size and is a DIFFERENT frame whenever
@@ -1104,8 +1088,7 @@ class CameraLoop:
             else:
                 self.screen_map.add(
                     [r[:4] for r in obs.screen_regions],
-                    frame_wh=_gwh,
-                    now=time.monotonic(), kind=_kind,
+                    frame_wh=_gwh, now=time.monotonic(),
                 )
             # HOW MANY did the pod actually find. `screen_pass ok` on the
             # pod only says the call did not throw — an empty result
@@ -1114,11 +1097,13 @@ class CameraLoop:
             # and the veto suppressed nothing with no way to see why.
             save_regions(
                 self._screen_path,
-                self.screen_map.live_kinds(time.monotonic()),
+                self.screen_map.live(time.monotonic()),
             )
             log.warning(
-                "identity.screen_regions cam=%s kind=%s found=%d live=%d",
-                self.camera_id, _kind, len(obs.screen_regions),
+                "identity.screen_regions cam=%s concept=%s found=%d live=%d",
+                self.camera_id,
+                (getattr(obs, "screen_concept", "") or "?"),
+                len(obs.screen_regions),
                 len(self.screen_map.live(time.monotonic())),
             )
         # How much the DETECTOR returned, before anything of ours

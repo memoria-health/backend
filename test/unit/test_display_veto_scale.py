@@ -26,7 +26,7 @@ for _n in ("cv2",):
 import numpy as np
 
 from identity.display_veto import (
-    KIND_STATIC, ScreenMap, _REGION_FORMAT, load_regions, save_regions,
+    ScreenMap, _REGION_FORMAT, load_regions, save_regions,
 )
 
 BIG = (2304, 1296)
@@ -49,7 +49,7 @@ def _painting_at(w, h):
 def test_a_region_grounded_big_still_vetoes_a_small_frame() -> None:
     """Ground at 2304x1296, then have the SFU drop us to 320x180."""
     m = ScreenMap()
-    m.add([_painting_at(*BIG)], frame_wh=BIG, kind=KIND_STATIC)
+    m.add([_painting_at(*BIG)], frame_wh=BIG)
 
     # The same painted face, now measured in a 320x180 frame.
     dropped = m.veto_track_ids(_rows(_painting_at(*SMALL)), SMALL)
@@ -61,7 +61,7 @@ def test_a_region_grounded_big_still_vetoes_a_small_frame() -> None:
 def test_it_still_vetoes_when_the_size_never_changes() -> None:
     """The ordinary case must not regress."""
     m = ScreenMap()
-    m.add([_painting_at(*BIG)], frame_wh=BIG, kind=KIND_STATIC)
+    m.add([_painting_at(*BIG)], frame_wh=BIG)
     assert m.veto_track_ids(_rows(_painting_at(*BIG)), BIG) == {7}
 
 
@@ -73,35 +73,26 @@ def test_a_person_elsewhere_is_never_vetoed_at_any_size() -> None:
     reports nobody there.
     """
     m = ScreenMap()
-    m.add([_painting_at(*BIG)], frame_wh=BIG, kind=KIND_STATIC)
+    m.add([_painting_at(*BIG)], frame_wh=BIG)
     for w, h in (BIG, SMALL, (640, 360), (1920, 1080)):
         person = (0.70 * w, 0.40 * h, 0.85 * w, 0.95 * h)
         assert m.veto_track_ids(_rows(person), (w, h)) == set(), (
             f"a person was vetoed at {w}x{h}")
 
 
-def test_movement_is_judged_in_frame_fractions() -> None:
-    """A step across the room is a step at every resolution.
+def test_the_same_wall_vetoes_at_every_rung() -> None:
+    """One region, four resolutions, same verdict.
 
-    With a pixel threshold, the same physical movement measured in a
-    320-wide frame is 7x smaller than in a 2304-wide one — so a moving
-    person would be spared on the big rung and discarded on the small.
+    This replaces a test of the movement exemption, which is gone: it
+    protected nothing a 0.93 containment floor did not already protect,
+    and it was what spared the paintings. What still matters is that the
+    verdict does not depend on which rung the SFU happens to be sending.
     """
     m = ScreenMap()
-    for w, h in (BIG, SMALL):
-        m2 = ScreenMap()
-        m2.add([(0.0, 0.0, 1.0 * w, 1.0 * h)], frame_wh=(w, h),
-               kind=KIND_STATIC)
-        # A box that moves 10% of the frame width across three frames.
-        rows = {
-            i: np.array(
-                [[0.10 * w + i * 0.05 * w, 0.10 * h,
-                  0.20 * w + i * 0.05 * w, 0.30 * h, 3]], dtype=float)
-            for i in range(3)
-        }
-        assert m2.veto_track_ids(rows, (w, h)) == set(), (
-            f"a clearly moving track was vetoed at {w}x{h}")
-
+    m.add([_painting_at(*BIG)], frame_wh=BIG)
+    for w, h in (BIG, SMALL, (640, 360), (1920, 1080), (1280, 720)):
+        assert m.veto_track_ids(_rows(_painting_at(w, h)), (w, h)) == {7}, (
+            f"the same painting escaped the veto at {w}x{h}")
 
 def test_a_pixel_era_region_file_is_discarded(tmp_path) -> None:
     """Old files hold pixels. Reading them as fractions vetoes nothing
@@ -118,11 +109,10 @@ def test_a_pixel_era_region_file_is_discarded(tmp_path) -> None:
 
 def test_a_saved_region_round_trips(tmp_path) -> None:
     path = str(tmp_path / "regions.json")
-    save_regions(path, [((0.25, 0.25, 0.45, 0.55), KIND_STATIC)])
+    save_regions(path, [(0.25, 0.25, 0.45, 0.55)])
     got = load_regions(path)
     assert len(got) == 1
-    assert got[0][1] == KIND_STATIC
-    assert got[0][0] == pytest.approx((0.25, 0.25, 0.45, 0.55))
+    assert got[0] == pytest.approx((0.25, 0.25, 0.45, 0.55))
 
 
 def test_regions_are_scaled_by_the_frame_they_were_measured_in() -> None:
@@ -146,7 +136,7 @@ def test_regions_are_scaled_by_the_frame_they_were_measured_in() -> None:
     # A painting on the right edge, in the GROUNDING frame's pixels.
     painting_ground = (0.82 * W_GROUND, 0.20 * H_GROUND,
                        1.00 * W_GROUND, 0.44 * H_GROUND)
-    m.add([painting_ground], frame_wh=(W_GROUND, H_GROUND), kind=KIND_STATIC)
+    m.add([painting_ground], frame_wh=(W_GROUND, H_GROUND))
 
     # The same painting, as the tracker reports it in a full-size frame.
     painting_full = (0.82 * W_INTAKE, 0.20 * H_INTAKE,
@@ -155,8 +145,7 @@ def test_regions_are_scaled_by_the_frame_they_were_measured_in() -> None:
 
     # And the wrong denominator must NOT accidentally work.
     wrong = ScreenMap()
-    wrong.add([painting_ground], frame_wh=(W_INTAKE, H_INTAKE),
-              kind=KIND_STATIC)
+    wrong.add([painting_ground], frame_wh=(W_INTAKE, H_INTAKE))
     assert wrong.veto_track_ids(_rows(painting_full), (W_INTAKE, H_INTAKE)) == set(), (
         "scaling by the intake size happened to work — the test cannot "
         "distinguish the bug from the fix")
