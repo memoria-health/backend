@@ -55,6 +55,9 @@ class EffectiveDims:
     # 0/0 = no confirmation (every row today — parity).
     confirm_k: int = 0
     confirm_n: int = 0
+    # Which field/values the confirm watches. Empty = `<ident>_detected`.
+    confirm_field: str = ""
+    confirm_values: tuple[str, ...] = ()
     # How this detector FIRES (2026-07-18 unification) — the one
     # readable answer to "when does an event happen":
     #   instant     first qualifying occurrence (point/state downstream)
@@ -107,6 +110,7 @@ def resolve_dims(row: "Detector") -> EffectiveDims:
     ev = parse_eventing(getattr(row, "eventing", None))
     confirm = dict(
         confirm_k=ev.confirm_k, confirm_n=ev.confirm_n,
+        confirm_field=ev.confirm_field, confirm_values=ev.confirm_values,
         fire_rule=_fire_rule(row.alert_trigger, ev.entry_m),
         entry_m=ev.entry_m, entry_t_seconds=ev.entry_t_seconds,
     )

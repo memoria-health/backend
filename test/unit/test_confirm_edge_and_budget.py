@@ -89,3 +89,69 @@ def test_asking_for_nothing_costs_nothing() -> None:
     b = ConfirmBudget(cap_per_hour=5)
     assert b.take(0) == 0
     assert b.spent_last_hour == 0
+
+
+# ── Scoping a confirm to a FIELD and its VALUES ────────────────────────
+#
+# The edge alone is not enough for a state detector. `sleep_detected`
+# means ASLEEP, so its edge fires on every drift in and out of sleep —
+# 1,712 over 7 days of real ticks. What a caregiver wants re-checked
+# lives in `sleep_activity`, and only three of its six values are events:
+#
+#   none <-> awake_in_bed   1,286 of 1,510 transitions   noise
+#   entering_bed  26 | leaving_bed 27 | sitting_up 18     ~10 a night
+#
+# So the confirm is scoped to a field and a set of its values, which is
+# the primitive docs/plans/2026-08-24-sleep-detector-rework.md called
+# missing.
+
+SLEEP_EVENTS = ("entering_bed", "leaving_bed", "sitting_up")
+
+
+def _due(now, prev, field="sleep_activity", values=SLEEP_EVENTS):
+    return _confirm_is_due("sleep_detected", now, prev, field, values)
+
+
+def test_entering_a_watched_value_is_an_edge():
+    assert _due({"sleep_activity": "leaving_bed"},
+                {"sleep_activity": "none"}) is True
+
+
+def test_holding_a_watched_value_is_not_re_confirmed():
+    """The 905-votes-a-night bug, in its new clothes. Someone can be
+    mid-way out of bed across several ticks; that is one event."""
+    assert _due({"sleep_activity": "leaving_bed"},
+                {"sleep_activity": "leaving_bed"}) is False
+
+
+def test_the_noisy_values_never_fire():
+    """none <-> awake_in_bed is 85% of all activity transitions and is
+    not an event. If this ever returns True the confirm is back to
+    running most of the night."""
+    assert _due({"sleep_activity": "awake_in_bed"},
+                {"sleep_activity": "none"}) is False
+    assert _due({"sleep_activity": "none"},
+                {"sleep_activity": "awake_in_bed"}) is False
+    assert _due({"sleep_activity": "stirring"},
+                {"sleep_activity": "none"}) is False
+
+
+def test_moving_between_two_watched_values_still_counts():
+    """Sitting up and then getting out of bed is two things happening,
+    not one."""
+    assert _due({"sleep_activity": "leaving_bed"},
+                {"sleep_activity": "sitting_up"}) is True
+
+
+def test_no_previous_tick_counts_as_an_edge():
+    assert _due({"sleep_activity": "entering_bed"}, None) is True
+    assert _due({"sleep_activity": "none"}, None) is False
+
+
+def test_without_a_scope_it_is_the_old_detected_edge():
+    """Parity: every detector that names no field behaves exactly as
+    before, so this cannot change a fall."""
+    assert _confirm_is_due("fall_detected", {"fall_detected": True},
+                           {"fall_detected": False}) is True
+    assert _confirm_is_due("fall_detected", {"fall_detected": True},
+                           {"fall_detected": True}) is False

@@ -50,6 +50,23 @@ class EventingConfig:
     entry_t_seconds: int = 0  # window those ticks must land in (0 = on-sight)
     confirm_k: int = 0        # re-checks that must agree (0 = no confirm)
     confirm_n: int = 0        # re-check calls to spend on a fire
+    # WHICH field, and which of its values, a confirm watches. Empty =
+    # the detector's own `<ident>_detected`, which is the parity default.
+    #
+    # A state detector needs this. `sleep_detected` means ASLEEP, so an
+    # edge on it fires on every drift in and out of sleep — measured over
+    # 7 days, 1,712 of them. What a caregiver wants checked lives in
+    # `sleep_activity`, and only three of its six values are events:
+    # entering_bed (26), leaving_bed (27), sitting_up (18). The other
+    # three are noise — none <-> awake_in_bed alone accounts for 1,286
+    # of 1,510 activity transitions.
+    #
+    #   {"confirm": {"k":2, "n":3,
+    #                "on": {"field": "sleep_activity",
+    #                       "values": ["entering_bed","leaving_bed",
+    #                                  "sitting_up"]}}}
+    confirm_field: str = ""
+    confirm_values: tuple[str, ...] = ()
 
 
 def parse_eventing(raw: object) -> EventingConfig:
@@ -82,7 +99,25 @@ def parse_eventing(raw: object) -> EventingConfig:
     n = _pos_int(confirm, "n", 0)
     if k > n:
         k = n = 0  # unsatisfiable config — treat as no confirm
-    return EventingConfig(entry_m=m, entry_t_seconds=t, confirm_k=k, confirm_n=n)
+    # `on`: scope the confirm to one field and a set of its values. Both
+    # halves must be usable or the whole scope is dropped back to parity
+    # (`<ident>_detected`) — a half-parsed scope would silently watch
+    # the wrong thing, which is worse than watching the default.
+    field, values = "", ()
+    on = confirm.get("on") if isinstance(confirm, dict) else None
+    if isinstance(on, dict):
+        f = on.get("field")
+        vs = on.get("values")
+        if isinstance(f, str) and f.strip() and isinstance(vs, (list, tuple)):
+            clean = tuple(
+                str(v) for v in vs[:32] if isinstance(v, (str, int, float))
+            )
+            if clean:
+                field, values = f.strip(), clean
+    return EventingConfig(
+        entry_m=m, entry_t_seconds=t, confirm_k=k, confirm_n=n,
+        confirm_field=field, confirm_values=values,
+    )
 
 
 def detection_keys_for(identifier: str) -> tuple[str, str]:
