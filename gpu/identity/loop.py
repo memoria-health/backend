@@ -845,6 +845,11 @@ class CameraLoop:
         # against 40 deaths that had exactly the single overlapping
         # successor it exists to find.
         self._dead_boxes: dict[int, tuple[tuple, float]] = {}
+        # Track ids this service last judged to be a display or a
+        # painting, sent back to the pod so it stops counting them as
+        # people. Never used to remove anything — see the note at the
+        # trigger in continuous._observe_locked.
+        self._not_people: set[int] = set()
         # Furniture survives a restart, so the regions do too. Without
         # this, every restart begins blind and re-tracks every painted
         # face until the next search two minutes later — and the tracks
@@ -1127,6 +1132,10 @@ class CameraLoop:
                 session_state=(
                     self._session_state if _STATELESS_DISPATCH else None
                 ),
+                # LAST tick's verdict — this tick's is not known until
+                # the pod has answered. One tick stale is harmless: it
+                # only suppresses a COUNT, and furniture does not move.
+                not_people=self._not_people,
             )
             self.home.last_pod_ok = time.time()  # pod-progress watchdog feed
         if _STATELESS_DISPATCH:
@@ -1216,6 +1225,14 @@ class CameraLoop:
         # threw it away" — the distinction every theory about track
         # churn so far has had to guess at.
         rows_before = sum(len(r) for r in obs.rows_by_frame.values())
+        # Which ids the POD is reporting, read BEFORE the veto strips
+        # them out. Needed to retire `_not_people` entries: after
+        # apply_veto the surviving rows can never contain a vetoed id,
+        # so asking the mutated bundle would retire every entry every
+        # tick and the list would never accumulate.
+        pod_ids = {
+            int(r[4]) for rows in obs.rows_by_frame.values() for r in rows
+        }
 
         obs, vetoed = apply_veto(
             obs, self.screen_map,
@@ -1225,6 +1242,13 @@ class CameraLoop:
             now=time.monotonic(),
         )
         rows_after = sum(len(r) for r in obs.rows_by_frame.values())
+        # Accumulate rather than replace. A painted face is vetoed on
+        # ~99% of ticks and spared on the odd one (a mask wobble), so a
+        # tick-by-tick replacement would drop it from the list at exactly
+        # the moment it flickers — and the disagreement, and the
+        # expensive re-look, would come straight back. Bounded, and
+        # every id is retired the moment the pod stops reporting it.
+        self._not_people = (self._not_people | set(vetoed or ())) & pod_ids
 
         prev_boxes = {t: tv.bbox for t, tv in self.state.tracks.items()}
         # Snapshot what we are about to lose. `state.apply` mutates in

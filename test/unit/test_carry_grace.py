@@ -59,3 +59,33 @@ def test_a_track_that_was_never_seeded_is_not_invented():
     """Grace can only ever preserve something that already existed."""
     out, _misses, _held = carry_grace({}, {9: B}, {})
     assert out == {9: B}
+
+
+# ── The paintings must not be COUNTED as people ────────────────────────
+#
+# Identity sends the pod the ids it has judged to be a display or a
+# painting. The pod keeps TRACKING them — it must, or a wrong judgement
+# would blind it permanently — but stops counting them when asking
+# whether its view of the room matches YOLO's.
+
+
+def test_wire_ids_that_make_no_sense_are_dropped_individually():
+    """A bad value costs one unnecessary re-look, never a lost person,
+    so each is skipped rather than failing the whole list."""
+    from perception.server import _int_set
+    assert _int_set([1, "2", None, "x", 3.7]) == {1, 2, 3}
+
+
+def test_a_missing_or_wrong_shaped_list_is_simply_empty():
+    """An older identity service sends nothing. The pod must then behave
+    exactly as it did before this existed."""
+    from perception.server import _int_set
+    assert _int_set(None) == set()
+    assert _int_set("7") == set()
+    assert _int_set({"a": 1}) == set()
+
+
+def test_the_list_is_bounded():
+    """A hostile or corrupt response must not allocate without limit."""
+    from perception.server import _int_set
+    assert len(_int_set(list(range(500)))) == 64

@@ -710,13 +710,16 @@ class CameraSession:
         self.tick += 1
         return out
 
-    def observe(self, frames, *, person_thr: float, sam_pred) -> "dict[int, dict]":
+    def observe(self, frames, *, person_thr: float, sam_pred,
+                not_people: "set[int] | None" = None) -> "dict[int, dict]":
         with self._lock:
             return self._observe_locked(
                 frames, person_thr=person_thr, sam_pred=sam_pred,
+                not_people=not_people,
             )
 
-    def _observe_locked(self, frames, *, person_thr: float, sam_pred) -> "dict[int, dict]":
+    def _observe_locked(self, frames, *, person_thr: float, sam_pred,
+                        not_people: "set[int] | None" = None) -> "dict[int, dict]":
         """One tick. Returns {frame_pos: {track_id: (bbox_xyxy, mask)}} with
         STABLE track ids across ticks. NEMARA_TRACKER=sam3 routes to SAM3's
         own whole-clip tracker; default 'edgetam' = SAM3-ground+EdgeTAM-carry."""
@@ -900,15 +903,28 @@ class CameraSession:
                     for x1, y1, x2, y2, _conf in boxes
                 )
         if mode == "carry":
+            # COUNT ONLY. `not_people` are ids the identity service has
+            # judged to be a display or a painting. They stay tracked —
+            # nothing here removes them — but they must not be counted as
+            # people when asking "does my view of the room match YOLO's".
+            #
+            # The TV Room's painted faces made this comparison read
+            # dets=1 live=8 forever. A disagreement that can never be
+            # resolved forced a full re-look on 33% of ticks (vs 12% in
+            # the bedroom), each ~1.3s against ~130ms to carry what we
+            # already had. It bought nothing: the re-look re-found the
+            # same paintings every time.
+            people = len(self.last_masks) - sum(
+                1 for t in self.last_masks if t in (not_people or ()))
             force, self._under_streak = person_trigger.should_force_reground(
-                dets, len(self.last_masks), self._under_streak,
+                dets, people, self._under_streak,
             )
             if force:
                 self.last_ground = -(10 ** 9)
                 log.info(
-                    "continuous.trigger cam=%s tick=%d dets=%s live=%d "
-                    "— forcing reground", self.camera_id, self.tick,
-                    dets, len(self.last_masks),
+                    "continuous.trigger cam=%s tick=%d dets=%s people=%d "
+                    "(tracked=%d) — forcing reground", self.camera_id,
+                    self.tick, dets, people, len(self.last_masks),
                 )
         if _DEBUG_DIR:
             try:

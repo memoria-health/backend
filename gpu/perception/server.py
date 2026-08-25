@@ -328,6 +328,21 @@ _REQUIRE_GPU_FACES = os.environ.get(
 ).strip() not in ("0", "false", "")
 
 
+def _int_set(raw) -> "set[int]":
+    """Track ids off the wire. Anything malformed is simply not in the
+    set — this only ever suppresses a COUNT, so a bad value costs one
+    unnecessary re-look, never a lost person."""
+    out: "set[int]" = set()
+    if not isinstance(raw, (list, tuple)):
+        return out
+    for v in raw[:64]:
+        try:
+            out.add(int(v))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def _lever_on(name: str, default: str = "1") -> bool:
     """Levers default ON since 2026-08-24, and here is why.
 
@@ -816,6 +831,7 @@ def _observe_sync(
     camera_id: str = "default",
     client_stamp: str = "UNSTAMPED",
     session_state: "dict | None" = None,
+    not_people: "set[int] | None" = None,
 ) -> dict:
     """The whole perception pass, run in a worker thread under
     `_perception_lock` so /health stays responsive while SAM grinds
@@ -923,6 +939,7 @@ def _observe_sync(
             session = continuous.get_session(camera_id)
         session_out = session.observe(
             imgs, person_thr=person_thr, sam_pred=pred,
+            not_people=not_people,
         )
         for pos in sorted(session_out):
             if pos >= len(pos_to_orig):
@@ -1387,6 +1404,7 @@ async def observe_raw(request: Request) -> JSONResponse:
             str(header.get("camera_id", "default")),
             client_stamp,
             _sess if isinstance(_sess, dict) else None,
+            _int_set(header.get("not_people")),
         )
     finally:
         global _last_request_ts

@@ -183,6 +183,96 @@ def state(request: Request) -> JSONResponse:
     })
 
 
+_LINK_STATS_EVERY_S = float(
+    os.environ.get("NEMARA_LINK_STATS_EVERY_S", "20"))
+_LINK_STATS_TASK = None
+
+
+async def _log_link_stats(room) -> None:
+    """Why the SFU keeps handing us a smaller picture than we asked for.
+
+    Measured 2026-08-25: we request HIGH on every layer request and are
+    still given 320x180 — so the downshift is not self-inflicted, and the
+    publisher's own encoder reports no limitation on any layer. That
+    leaves the path to THIS subscriber, and nothing was measuring it.
+
+    `available_incoming_bitrate` is the number that decides it: LiveKit
+    downshifts a subscriber when its estimate of that falls below what
+    the layer costs. If it sits comfortably above the stream's bitrate
+    while we are being downshifted anyway, bandwidth is NOT the reason
+    and the next place to look is the SFU's own policy.
+
+    Read-only, every 20s, from the connection the service already holds
+    — a second subscriber would compete for the very bandwidth being
+    measured and change the answer.
+    """
+    while True:
+        await asyncio.sleep(_LINK_STATS_EVERY_S)
+        try:
+            if not room.isconnected():
+                continue
+            stats = await room.get_rtc_stats()
+            # We are the SUBSCRIBER. The stats are split by peer
+            # connection and the publisher half describes what this
+            # process sends, which is nothing.
+            # The SDK splits stats by peer connection and 1.1.14 does not
+            # always populate the half you expect, so take whichever
+            # carries entries rather than assuming. Reported below so a
+            # future empty result is legible instead of mysterious.
+            _pub = list(getattr(stats, "publisher_stats", None) or [])
+            _sub = list(getattr(stats, "subscriber_stats", None) or [])
+            _src = _sub or _pub
+            pair, video = None, []
+            for s in _src:
+                which = s.WhichOneof("stats")
+                if which == "candidate_pair":
+                    cp = s.candidate_pair.candidate_pair
+                    # The nominated pair is the one actually carrying
+                    # traffic; the others are stale ICE candidates whose
+                    # numbers describe a path we are not using.
+                    if cp.nominated or pair is None:
+                        pair = cp
+                elif which == "inbound_rtp":
+                    if s.inbound_rtp.stream.kind == "video":
+                        video.append(s.inbound_rtp)
+            # ALWAYS say something. The first version logged only when it
+            # found a candidate pair and a video stream, so an empty
+            # stats list produced no line and no error — indistinguishable
+            # from the task not running, which cost two deploys to work
+            # out. Same failure this codebase already learned from
+            # `screen_pass ok` meaning only "the call did not throw".
+            if pair is None:
+                kinds: dict = {}
+                for s in _src:
+                    k = s.WhichOneof("stats") or "?"
+                    kinds[k] = kinds.get(k, 0) + 1
+                log.warning(
+                    "identity.link no candidate pair — pub=%d sub=%d "
+                    "kinds=%s video=%d",
+                    len(_pub), len(_sub), kinds, len(video),
+                )
+            else:
+                log.warning(
+                    "identity.link avail_in=%.0fkbps rtt=%.0fms bytes_in=%s "
+                    "video_streams=%d",
+                    pair.available_incoming_bitrate / 1000.0,
+                    pair.current_round_trip_time * 1000.0,
+                    pair.bytes_received, len(video),
+                )
+            for r in video[:4]:
+                log.warning(
+                    "identity.link_video %sx%s fps=%.1f decoded=%s "
+                    "dropped=%s lost=%s jitter=%.0fms",
+                    r.inbound.frame_width, r.inbound.frame_height,
+                    r.inbound.frames_per_second, r.inbound.frames_decoded,
+                    r.inbound.frames_dropped, r.received.packets_lost,
+                    r.received.jitter * 1000.0,
+                )
+        except Exception:  # noqa: BLE001 — a probe must never kill the service
+            log.exception("identity.link_stats_failed")
+            return
+
+
 async def _mjpeg(cam_id: str):
     # ASYNC on purpose (2026-07-27): the sync version ran in FastAPI's
     # ~40-thread pool, one thread pinned per open stream — and when a
@@ -920,6 +1010,13 @@ async def _run_livekit(
         "identity.connected participants=%s",
         [p.identity for p in room.remote_participants.values()],
     )
+    # Held in a module global on purpose. asyncio keeps only a WEAK
+    # reference to a running task, so a bare create_task() whose result
+    # nobody stores can be garbage-collected before it ever runs — which
+    # is exactly what happened here: the code shipped, the process
+    # restarted, and not one stats line was ever emitted.
+    global _LINK_STATS_TASK
+    _LINK_STATS_TASK = asyncio.create_task(_log_link_stats(room))
     # Missed-subscription recovery walk (2026-07-29): auto_subscribe
     # covers the happy path, but a gateway restart can re-publish
     # tracks without a track_subscribed callback ever reaching us —
