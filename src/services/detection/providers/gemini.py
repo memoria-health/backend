@@ -229,12 +229,28 @@ async def gemini_provider(
     video_metadata = (
         genai_types.VideoMetadata(fps=int(sample_fps)) if sample_fps else None
     )
+    # PROMPT FIRST, VIDEO LAST (2026-08-26) — this ordering is what makes
+    # implicit caching possible, and it was impossible before.
+    #
+    # Gemini's implicit cache matches a common PREFIX: the cacheable span
+    # must start at the beginning of the content, and a middle or suffix
+    # never caches. With the video first, every request began with a unique
+    # MP4, so the prompt behind it could not be a shared prefix — the cache
+    # had literally never been hit once. The prompt is byte-identical across
+    # every call with the same detector set, so leading with it turns that
+    # span into a real cache hit at 10% of the input rate.
+    #
+    # Caveat worth knowing: Gemini 3.x requires a >=4,096-token prefix, and
+    # BASE_PROMPT alone is only ~855. A bucket caches only once its detector
+    # fragments carry it past the floor (~9 detectors at ~390 each), so
+    # SMALL detector sets still do not cache. See the measured table in
+    # docs/plans/2026-08-26-soak-requirements.md §5.
     parts: list[genai_types.Part] = [
+        genai_types.Part(text=full_prompt),
         genai_types.Part(
             inline_data=genai_types.Blob(data=mp4, mime_type="video/mp4"),
             video_metadata=video_metadata,
         ),
-        genai_types.Part(text=full_prompt),
     ]
     config_kwargs: dict[str, object] = {
         "response_mime_type": "application/json",

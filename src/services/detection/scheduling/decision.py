@@ -15,13 +15,17 @@ Three primitives:
                          today's on-sight rising edge exactly.
   per-detector cooldown  point-shape re-fire spacing from the row's
                          `cooldown_seconds`, replacing the global 30s.
-  k-of-N confirm         config parsing for the executor's re-check
-                         pass (N extra calls on the SAME clip; ≥k must
-                         agree — Aryaman 2026-07-13). No built-in
-                         carries config, so parity holds.
+  single-pass confirm    config parsing for the executor's re-check
+                         pass. ONE extra call on the SAME clip, on the
+                         stronger `settings.confirm_model`. k-of-N was
+                         REMOVED 2026-08-26 — see `parse_eventing` for
+                         the measurement that retired it. Any stored k/n
+                         clamps to 1/1, so old rows need no delta.
 
-Eventing JSONB shape (detectors.eventing, NULL today):
-    {"entry": {"m": 3, "t_seconds": 600}, "confirm": {"k": 2, "n": 3}}
+Eventing JSONB shape (detectors.eventing, NULL today). `k`/`n` are
+accepted for backward compatibility and clamped to 1:
+    {"entry": {"m": 3, "t_seconds": 600},
+     "confirm": {"on": {"field": "sleep_activity", "values": [...]}}}
 Absent/junk keys fall back to parity defaults, never raise — a
 malformed row must degrade to today's behavior, not kill promotion.
 """
@@ -82,6 +86,29 @@ def parse_eventing(raw: object) -> EventingConfig:
     n = _pos_int(confirm, "n", 0)
     if k > n:
         k = n = 0  # unsatisfiable config — treat as no confirm
+    if n > 0:
+        # SINGLE PASS — k-of-N REMOVED (Aryaman 2026-08-26).
+        #
+        # k-of-N re-ran the same clip N times on the same model and required
+        # k agreements, to attack the STOCHASTIC false positive (a detector
+        # firing 4/10 on one benign clip). Two things killed it:
+        #
+        # 1. It does not behave like independent sampling. Measured over
+        #    24h on the live system: 6 confirm rounds, and FIVE returned
+        #    votes=0 of 3 — unanimous disagreement with the primary, not a
+        #    split decision. Genuine borderline calls would land 1/3 or 2/3
+        #    sometimes. Unanimity means the confirm pass is answering a
+        #    DIFFERENT question than the primary, so extra votes bought
+        #    nothing but cost and latency.
+        # 2. The design moved to a tier split — a cheap model screens, a
+        #    stronger one (`settings.confirm_model`, gemini-3.7-flash today)
+        #    adjudicates once. Model strength, not repetition, is what
+        #    separates the tiers. Three votes from the strong tier is just
+        #    three times the price of one.
+        #
+        # Any stored `{"k": 2, "n": 3}` clamps here rather than in the DB, so
+        # existing rows keep working and no delta is needed to stop the spend.
+        k = n = 1
     return EventingConfig(entry_m=m, entry_t_seconds=t, confirm_k=k, confirm_n=n)
 
 
