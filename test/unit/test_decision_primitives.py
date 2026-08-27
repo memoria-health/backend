@@ -23,10 +23,25 @@ def test_parse_null_and_junk_yield_parity_defaults() -> None:
 
 
 def test_parse_valid_config() -> None:
+    """Entry dials parse through; confirm always clamps to a SINGLE pass
+    (k-of-N removed 2026-08-26). A stored `{"k": 2, "n": 3}` must keep
+    working and simply stop spending 3 votes — no DB delta required."""
     cfg = parse_eventing({"entry": {"m": 3, "t_seconds": 600},
                           "confirm": {"k": 2, "n": 3}})
     assert (cfg.entry_m, cfg.entry_t_seconds, cfg.confirm_k, cfg.confirm_n) \
-        == (3, 600, 2, 3)
+        == (3, 600, 1, 1)
+
+
+def test_confirm_clamps_to_single_pass_however_it_is_asked() -> None:
+    for raw in ({"confirm": {"k": 2, "n": 3}},
+                {"confirm": {"k": 1, "n": 1}},
+                {"confirm": {"k": 5, "n": 9}}):
+        cfg = parse_eventing(raw)
+        assert (cfg.confirm_k, cfg.confirm_n) == (1, 1), raw
+    # Absent or unsatisfiable still means NO confirm, not a single pass —
+    # arming a confirmer must stay an explicit opt-in.
+    assert parse_eventing({}).confirm_n == 0
+    assert parse_eventing({"confirm": {"k": 3, "n": 1}}).confirm_n == 0
 
 
 def test_parse_unsatisfiable_confirm_disables_it() -> None:
@@ -64,7 +79,7 @@ def test_dims_carry_confirm_config_from_row_eventing() -> None:
         eventing={"confirm": {"k": 2, "n": 3}},
     )
     d = resolve_dims(row)
-    assert (d.confirm_k, d.confirm_n) == (2, 3)
+    assert (d.confirm_k, d.confirm_n) == (1, 1)  # single pass, k-of-N removed
     # And absent eventing = no confirmation (parity).
     row.eventing = None
     d2 = resolve_dims(row)
