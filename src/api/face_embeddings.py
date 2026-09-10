@@ -142,6 +142,13 @@ async def create_face_embeddings(
             )
         pending.append((uuid4(), body, content_type))
 
+    # Release the pooled connection before the sequential Storage uploads
+    # below — same fix as camera_ingest.py's 2026-08-15 tick fix (see its
+    # comment): holding a connection idle across slow network I/O
+    # multiplies pool pressure with concurrent request count. A fresh
+    # session is acquired below just for the INSERTs.
+    await session.close()
+
     # Upload all photos to Storage, then insert all rows, then dispatch
     # all background tasks. Upload before INSERT means a Storage failure
     # doesn't leave behind orphaned processing rows the user can't escape.
@@ -168,19 +175,20 @@ async def create_face_embeddings(
         uploaded.append((embedding_id, key))
 
     rows: list[PatientFaceEmbedding] = []
-    for embedding_id, key in uploaded:
-        row = await face_embedding_repo.insert_processing(
-            session,
-            patient_id=patient_id,
-            source_path=key,
-            embedding_id=embedding_id,  # match the storage key's UUID suffix
-        )
-        rows.append(row)
-    await session.commit()
+    sm = get_sessionmaker()
+    async with sm() as insert_session:
+        for embedding_id, key in uploaded:
+            row = await face_embedding_repo.insert_processing(
+                insert_session,
+                patient_id=patient_id,
+                source_path=key,
+                embedding_id=embedding_id,  # match the storage key's UUID suffix
+            )
+            rows.append(row)
+        await insert_session.commit()
 
     # Dispatch background tasks. Each task processes one photo:
     # download -> SCRFD -> ArcFace -> mark_ready / mark_failed.
-    sm = get_sessionmaker()
     for row in rows:
         asyncio.create_task(
             enrollment_processor.process_enrollment_photo(
