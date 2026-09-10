@@ -38,7 +38,7 @@ Configurable: the family chooses what buzzes their phone.
 | **Fall** | with **time-down escalation** — 10s is a trend entry, 20min is an ambulance. Output is the structured account, not a boolean |
 | **Unresponsiveness** | subsumes syncope, post-ictal, overdose, stroke, down-without-a-fall. "A person is in a state they should not be in, for this long" |
 | **Choking** | gated on *within 20 min of an eating episode*. Actionable in our markets: India multigen households, live-in attendants, facilities with staff. Known miss: silent choking, person turned away |
-| **Wandering** | **anomalous** exit, judged against his own pattern. Any exit is noise; 3am in nightclothes is signal |
+| **Left home alone** | unaccompanied exit, out of character for them. Renamed from `wandering` — that is a diagnosis we cannot make; once out the door we do not know if they are disoriented or buying milk |
 | **Unattended stove** | 10 min of lit burner, nobody present. Prevention, not detection — a smoke alarm fires when it is already a fire |
 | **Calling for help** | audio. The only channel left when immobile |
 | **Fire / smoke** | cheap, table stakes, do not sell on it |
@@ -54,48 +54,30 @@ the fall escalation ladder), intruder (commodity, not senior-specific),
 blood/vomiting (subsumed), wet flooring (a risk, not an event), potential
 heart issue (**we cannot see cardiac function — remove from the deck**).
 
-## 2. Layer 2 — Measurement (always on, never a checkbox)
+## 1b. Routine and behaviour (7, family-facing)
 
-Runs continuously on CV, costs ~nothing, and **must not be switchable** —
-a family toggling it off puts holes in the baseline and makes every trend
-worthless.
+Measured always; only the alert is configurable.
 
-**Mobility** — the strongest clinical signal available
-- Gait speed, mean **and variability** (variability is the MCI marker)
-- Sit-to-stand count and duration
-- Time on feet vs sedentary
-- Life-space: rooms visited, time out of home
-- Transfers: bed ↔ chair ↔ standing
+**Sleep** — bedtime, sleep onset, wake time, night wakings.
+**Meals** — whether they ate, when, how long it took.
+**Medication** — whether taken, and within the expected window. Flags a second dose shortly after a first (2/3 of adverse-drug-event hospitalisations are unintentional overdoses).
+**Activity** — how the day is spent across lying, sitting, standing, moving.
+**Bathroom usage** — how often they go. A change is often the first UTI sign.
+**Agitation** — pacing, restlessness, raised voice, and when in the day.
+**Repetitive speech** — the same thing said repeatedly in a short window. Common in dementia; a *sudden increase* indicates delirium, which in an older adult means infection until proven otherwise.
 
-**Nutrition and hydration**
-- Meals: count, times, **duration** (slowing = dysphagia or apathy)
-- Fluid events: count and distribution through the day
+## 2. Physical measurements (4) — always on, never a checkbox
 
-**Sleep and circadian**
-- Onset, wake, duration, night wakings, out-of-bed events
-- **Circadian regularity** — day-to-day variance in timing
-- Daytime napping
+Continuous, CV-derived, ~free, and not switchable. Family sees trends only.
 
-**Behaviour — track the behaviour, never label the state**
+**Sit-to-stand time** — how long to stand up, whether armrests are needed, whether an attempt fails. Anchors: 5xSTS norms 7.8/9.3/10.8 s by decade; >12 s discriminates stroke; ~10.9 s sarcopenia cutoff. Measures *weakness*, the Fried criterion that predicts inability to get off the floor.
+**Gait speed** — walking speed and its day-to-day consistency. Sixth vital sign: <0.8 m/s elevated risk, <0.6 m/s ~1.9x frail. **Variability tracks MCI** (ORCATECH/ISAAC) and moves before the mean does.
+**Time out of home** — hours away from the house. A real Life-Space Assessment level boundary; contraction is an early mobility-decline sign.
+**Rooms visited** *(exploratory)* — distinct camera-covered rooms per day. Plausible proxy for the innermost LSA zone but **unvalidated, and confounded by camera placement.** Do not attach LSA's predictive evidence to it.
 
-    "paced for 22 minutes"                   NOT  "agitation episode"
-    "stood in doorway, turned back, 4x"      NOT  "confusion episode"
-    "started fewer activities than usual"    NOT  "apathy"
+**Instrument anchors:** Fried frailty (weight loss, exhaustion, weakness, slow gait, low activity) — we observe **3 of 5**. SPPB (gait speed, chair stand, balance) — we observe **2 of 3**. No proprietary Memoria score.
 
-Observables: pacing, repetitive motion, task abandonment, retracing,
-doorway hesitation, raised voice, **reduced initiation** (apathy is among
-the earliest dementia markers and nobody notices it for years).
-`Nervousness` is cut — no reliable observable distinguishes it from
-ordinary movement.
-
-**Care**
-- Medication events and timing adherence
-- Bathroom frequency (behaviour change here is often the first UTI sign)
-
-**Anchor:** the Fried frailty phenotype (weight loss, exhaustion,
-weakness, slow gait, low activity) is the standard clinical instrument.
-**Three of its five criteria are directly observable here.** Anchor to it
-rather than inventing a score.
+**Derivations, not tracked things:** sedentary time, nighttime activity, transfer counts, meal-duration trend, circadian regularity, failed-rise counts, bathroom-frequency change. Each is a query over the above. **Store base events, derive on read** — so a change in definition never costs us history.
 
 ## 3. Layer 3 — Outputs
 
