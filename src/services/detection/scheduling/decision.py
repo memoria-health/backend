@@ -24,10 +24,25 @@ Three primitives:
 
 Eventing JSONB shape (detectors.eventing, NULL today). `k`/`n` are
 accepted for backward compatibility and clamped to 1:
-    {"entry": {"m": 3, "t_seconds": 600},
-     "confirm": {"on": {"field": "sleep_activity", "values": [...]}}}
+    {"entry": {"m": 3, "t_seconds": 600}, "confirm": {"k": 1, "n": 1}}
 Absent/junk keys fall back to parity defaults, never raise — a
 malformed row must degrade to today's behavior, not kill promotion.
+
+NOT IMPLEMENTED HERE: transition-scoped confirm. An earlier version of
+this docstring showed a `"confirm": {"on": {"field": ..., "values": [...]}}`
+shape. `parse_eventing` has never read the `on` key on this branch, so
+such a row parses to k=0/n=0 and the confirm SILENTLY NEVER RUNS — it
+fails safe rather than expensive, but it does nothing and says nothing.
+The shape was copied here from `chore/deploy-prep`, which does implement
+it; the two must not be described as one until that branch merges.
+
+Why it matters when it lands: `<ident>_detected` means "is asleep" for a
+state detector, so a confirm that votes on the LEVEL re-asks "is this
+person still asleep" every tick — 905 rounds and 33.2M input tokens in
+7h on one camera, measured 2026-08-23. Scoping the confirm to a FIELD
+and a set of VALUES turns that into ~3 rounds a night, because it fires
+on the transition instead. Until then, do not write an `on` key into a
+`detectors.eventing` row and expect anything to happen.
 """
 
 from __future__ import annotations
