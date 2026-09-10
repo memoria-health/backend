@@ -5,7 +5,21 @@ Runtime behavior is ALREADY correct for these rows — `resolve_dims`
 falls back to the in-code catalog (`dims_source="catalog"`); this
 script just copies the catalog answer into the row columns so the DB
 is truthful and introspection (SQL, dashboards) sees real dims.
+
 Customs with NULL columns are left alone — the P5 compiler owns them.
+That sentence is a SCOPE note, not an all-clear. "Runtime behavior is
+already correct" is true ONLY for presets, which have a catalog entry to
+fall back to. A CUSTOM has none, so `resolve_dims` drops past the
+catalog branch to `_LEGACY_DEFAULT`, which is
+`subject_scope="anyone"` — and the fail-quiet identity gate in
+`event_promotion.py` arms on `subject_scope == "patient"`. So a custom
+with NULL dims silently BYPASSES that gate and can attribute a routine
+event to a resident identity never confirmed, on a camera covering more
+than one person. Found 2026-08-26: 7 of 8 customs in prod predated the
+compiler writing dims and were resolving to "anyone".
+
+Fixing those needs a re-compile (`_compile_and_update_detector`), not
+this script — there is no catalog answer to copy.
 
     uv run python scripts/backfill_detector_dims.py --dry-run
     uv run python scripts/backfill_detector_dims.py
