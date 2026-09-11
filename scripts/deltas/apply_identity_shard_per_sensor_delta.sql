@@ -65,10 +65,25 @@ CREATE UNIQUE INDEX IF NOT EXISTS cameras_identity_node_port_uidx
 CREATE INDEX IF NOT EXISTS cameras_identity_node_idx
   ON public.cameras (identity_node_id);
 
--- The claim's hot query is "unassigned, oldest first". Partial, because
--- the assigned rows are the majority and it never scans them. This
--- matters MORE than it did on patients: the unassigned pool used to be a
--- handful of homes and is now every sensor row.
+-- The claim's hot query is "unassigned", ordered LIVE SENSORS FIRST and
+-- only then oldest-waiting:
+--
+--   ORDER BY (c.online AND NOT c.disabled) DESC, created_at
+--
+-- Do not read this index as "oldest first" — it is not the claim policy,
+-- it is the tiebreak WITHIN each liveness group, plus the predicate that
+-- keeps the scan off assigned rows. Said plainly because the short
+-- version misleads: on 2026-08-26 an operator read "oldest first" here,
+-- saw seven May/June test phones holding slots, and reported the
+-- priority queue as broken. It was not — those sensors were dormant, the
+-- one live sensor held a slot throughout, and the five roster tests that
+-- cover exactly this all pass. See `_LIVE_SENSOR` in
+-- src/api/identity_roster.py for the policy itself, including the
+-- eviction that makes a dormant holder yield to a live claimant.
+--
+-- Partial, because the assigned rows are the majority and it never scans
+-- them. This matters MORE than it did on patients: the unassigned pool
+-- used to be a handful of homes and is now every sensor row.
 CREATE INDEX IF NOT EXISTS cameras_identity_unassigned_idx
   ON public.cameras (created_at)
   WHERE identity_node_id IS NULL;

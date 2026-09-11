@@ -8,6 +8,7 @@
 
 -- ── extensions ───────────────────────────────────────────────────
 create extension if not exists pgcrypto;       -- gen_random_uuid()
+create extension if not exists pg_cron;        -- analyses retention purge, below
 
 
 -- ══════════════════════════════════════════════════════════════════
@@ -828,6 +829,33 @@ create index analyses_camera_created_idx
 -- Patient-scoped active-camera resolution scans by patient + recency.
 create index analyses_patient_captured_idx
   on public.analyses(patient_id, captured_at desc);
+
+-- `skipped` ticks (closed-state short-circuit, no LLM called — see the
+-- `analyses` comment above) carry no analytical value beyond a short
+-- debugging window and are the bulk of row volume in an idle room
+-- (~80% of monthly rows). Purged aggressively; real LLM-analyzed rows
+-- get a longer window. Scheduled via pg_cron so it runs without a
+-- backend deploy — `cron.schedule` upserts by job name, so re-running
+-- this file (e.g. `make db-reset`) updates the existing schedule
+-- instead of duplicating it.
+create or replace function public.purge_stale_analyses()
+returns void
+language sql
+as $$
+  delete from public.analyses
+  where provider = 'skipped'
+    and created_at < now() - interval '5 days';
+
+  delete from public.analyses
+  where provider <> 'skipped'
+    and created_at < now() - interval '90 days';
+$$;
+
+select cron.schedule(
+  'purge-stale-analyses',
+  '0 4 * * *',  -- daily, 04:00 UTC (off-peak)
+  $$ select public.purge_stale_analyses(); $$
+);
 
 
 -- ── caregiver_devices ────────────────────────────────────────────
