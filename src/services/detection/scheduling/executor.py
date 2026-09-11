@@ -192,26 +192,37 @@ class ConfirmBudget:
         return sum(1 for t in self._spent if t > cutoff)
 
 
-def _confirm_is_due(ident: str, fields: dict, prev: dict | None) -> bool:
+def _confirm_is_due(
+    ident: str, fields: dict, prev: dict | None,
+    field: str = "", values: "tuple[str, ...]" = (),
+) -> bool:
     """Should this detector be re-checked THIS tick?
 
-    Only when its verdict CHANGED. `<ident>_detected` is a level, and
-    the confirmer used to vote on the level: true today, true in ten
-    seconds, true all night. For a fall that reads the same either way,
-    because a fall is over by the next tick. For a state detector it is
-    the difference between checking a claim and re-checking a fact.
+    Only on a CHANGE, never on a state. `<ident>_detected` is a level,
+    and the confirmer used to vote on the level: true today, true in ten
+    seconds, true all night. A fall reads the same either way because it
+    is over by the next tick; for a state detector it is the difference
+    between checking a claim and re-checking a fact. Sleep proved it —
+    905 re-confirmations of a sleeping man in one night.
 
-    Sleep is the case that proved it. `sleep_detected` means ASLEEP —
-    the ordinary, desired condition that holds for eight hours — so
-    arming a confirmer to check disturbances instead re-confirmed the
-    quiet state 905 times in one night. What a caregiver wanted checked
-    was the MOMENT it changed, which is exactly this edge.
+    With `field`/`values`, the edge is scoped: fire when that field
+    ENTERS one of those values. Sleep again — an edge on
+    `sleep_detected` is every drift in and out of sleep (1,712 over 7
+    days), while entering_bed / leaving_bed / sitting_up together are
+    about ten a night. Transitions BETWEEN two watched values still
+    count; a transition out to an unwatched one does not.
 
-    No previous tick means treat it as an edge: a detector that comes up
-    true on the first tick after a restart has genuinely just changed as
-    far as anything here can tell, and guessing the other way would skip
-    the one check that matters.
+    No previous tick counts as an edge. A detector true on the first
+    tick after a restart has genuinely just changed as far as anything
+    here can tell, and guessing otherwise skips the check that matters.
     """
+    if field and values:
+        now = str(fields.get(field, ""))
+        if now not in values:
+            return False
+        if prev is None:
+            return True
+        return str(prev.get(field, "")) != now
     now_true = bool(fields.get(ident))
     if prev is None:
         return now_true
@@ -666,8 +677,13 @@ async def run_scheduled_calls(
             detected_key, _conf_key = detection_keys_for(ident)
             if n <= 0:
                 continue
-            # ON THE CHANGE, not on the state. See `_confirm_is_due`.
-            if not _confirm_is_due(detected_key, merged_fields, prev_detected):
+            # ON THE CHANGE, not on the state — and on the field the
+            # detector nominated, if it nominated one. See
+            # `_confirm_is_due`.
+            if not _confirm_is_due(
+                detected_key, merged_fields, prev_detected,
+                due.dims.confirm_field, due.dims.confirm_values,
+            ):
                 continue
             # And never more than the hour's allowance, however often it
             # changes. A partial grant is refused outright rather than

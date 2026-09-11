@@ -14,18 +14,24 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 from uuid import UUID
 
 from identity.gallery import CrossClipBodyGallery
 from identity.journal import EventJournal
 from identity.pod_client import SamServiceClient
+import numpy as np
+
 from identity.seat import (
-    Candidate, Seat, carry_seat, resolve_track_conflicts, update_seat,
+    Candidate, Seat, carry_seat, heal_seat, notary_contradiction,
+    resolve_track_conflicts, update_seat,
 )
 
 # Same logger name as before the split, so every existing grep, alert
 # and runbook that keys on "identity.loop" keeps working.
+if TYPE_CHECKING:                       # the per-camera half; quoted
+    from identity.loop import CameraLoop  # below, so no import cycle
+
 log = logging.getLogger("identity.loop")
 
 
@@ -106,6 +112,11 @@ class IdentityHome:
     # simply not located right now, which is the honest answer and the
     # one every consumer must treat as "unknown" rather than "absent".
     seats: dict[UUID, Seat] = field(default_factory=dict)
+    # Seats whose track died with no successor YET. Withheld from
+    # `seats` — nothing downstream may read a parked resident as located
+    # — and re-attached if one arrives inside DEAD_BOX_TTL_S.
+    _parked: dict[UUID, Seat] = field(default_factory=dict)
+    _parked_at: dict[UUID, float] = field(default_factory=dict)
     # camera-id-8-prefix → the residents that camera watches. Refreshed
     # alongside the galleries, so sharing a camera with a second
     # resident takes effect without restarting the node.
@@ -434,6 +445,31 @@ class IdentityHome:
                         str(pid)[:8], seat.track_id, carried.track_id,
                     )
                 elif carried is None and seat.key not in live:
+                    # WAIT FOR THE SUCCESSOR INSTEAD OF DYING.
+                    #
+                    # carry_seat only sees tracks alive AT THIS INSTANT,
+                    # and the replacement is often a few ticks behind.
+                    # Live 2026-08-26: T1 died at 21:38:44 with live=[],
+                    # the seat was dropped, and T2 was born at 21:38:47 —
+                    # three seconds later, in the same place, the same
+                    # person. The dead box was still valid; there was no
+                    # longer a seat to carry onto it.
+                    #
+                    # So the seat is PARKED for as long as that box stays
+                    # meaningful, and re-attaches on any tick where
+                    # exactly one live track overlaps it. Not a ghost: it
+                    # is withheld from `seats` while parked, so nothing
+                    # downstream reads the person as located.
+                    if now - self._parked_at.get(pid, now) <= DEAD_BOX_TTL_S:
+                        self._parked.setdefault(pid, seat)
+                        self._parked_at.setdefault(pid, now)
+                        log.info(
+                            "identity.seat_parked pid=%s track=%s cam=%s — "
+                            "no successor yet, holding %.0fs for one",
+                            str(pid)[:8], seat.track_id, seat.camera_id,
+                            DEAD_BOX_TTL_S,
+                        )
+                        continue
                     log.info(
                         "identity.seat_lost pid=%s track=%s cam=%s — died "
                         "with no single overlapping successor",
@@ -445,6 +481,37 @@ class IdentityHome:
                 )
                 if s is not None:
                     kept[pid] = s
+                    self._parked.pop(pid, None)
+                    self._parked_at.pop(pid, None)
+            # A parked seat re-attaches the moment exactly one live
+            # track occupies the space its old one vacated. Same three
+            # conservative rules as carry_seat: one candidate only, never
+            # one another resident holds, and a real overlap.
+            for pid in list(self._parked):
+                if pid in kept:
+                    self._parked.pop(pid, None)
+                    self._parked_at.pop(pid, None)
+                    continue
+                if now - self._parked_at.get(pid, 0.0) > DEAD_BOX_TTL_S:
+                    log.info(
+                        "identity.seat_lost pid=%s — parked %.0fs with no "
+                        "successor", str(pid)[:8], DEAD_BOX_TTL_S)
+                    self._parked.pop(pid, None)
+                    self._parked_at.pop(pid, None)
+                    continue
+                back = carry_seat(
+                    self._parked[pid], live, boxes,
+                    taken=frozenset(s.key for q, s in kept.items() if q != pid),
+                )
+                if back is not None and back.key in live:
+                    log.info(
+                        "identity.seat_reattached pid=%s %s -> %s (same "
+                        "person, successor arrived late)",
+                        str(pid)[:8], self._parked[pid].track_id,
+                        back.track_id)
+                    kept[pid] = back
+                    self._parked.pop(pid, None)
+                    self._parked_at.pop(pid, None)
             self.seats = kept
             new = dict(self.seats)
         self._journal_transitions(old, new, now)

@@ -22,27 +22,28 @@ Three primitives:
                          the measurement that retired it. Any stored k/n
                          clamps to 1/1, so old rows need no delta.
 
-Eventing JSONB shape (detectors.eventing, NULL today). `k`/`n` are
-accepted for backward compatibility and clamped to 1:
-    {"entry": {"m": 3, "t_seconds": 600}, "confirm": {"k": 1, "n": 1}}
+Eventing JSONB shape (detectors.eventing). `k`/`n` are accepted for
+backward compatibility and clamped to 1:
+    {"entry": {"m": 3, "t_seconds": 600},
+     "confirm": {"on": {"field": "sleep_activity",
+                        "values": ["entering_bed", "leaving_bed",
+                                   "sitting_up"]}}}
 Absent/junk keys fall back to parity defaults, never raise — a
 malformed row must degrade to today's behavior, not kill promotion.
 
-NOT IMPLEMENTED HERE: transition-scoped confirm. An earlier version of
-this docstring showed a `"confirm": {"on": {"field": ..., "values": [...]}}`
-shape. `parse_eventing` has never read the `on` key on this branch, so
-such a row parses to k=0/n=0 and the confirm SILENTLY NEVER RUNS — it
-fails safe rather than expensive, but it does nothing and says nothing.
-The shape was copied here from `chore/deploy-prep`, which does implement
-it; the two must not be described as one until that branch merges.
+TRANSITION-SCOPED CONFIRM (`on`) is implemented here as of this merge.
+Without it a confirm votes on the detector's own `<ident>_detected`,
+which for a STATE detector is a level, not an event: `sleep_detected`
+means ASLEEP, so an edge on it fires on every drift in and out of sleep
+— 1,712 of them over 7 days. What a caregiver wants checked lives in
+`sleep_activity`, and only three of its six values are events:
+entering_bed (26), leaving_bed (27), sitting_up (18). The other three
+are noise; `none <-> awake_in_bed` alone is 1,286 of 1,510 activity
+transitions. Verified live 2026-08-26: 3 confirm rounds for the night.
 
-Why it matters when it lands: `<ident>_detected` means "is asleep" for a
-state detector, so a confirm that votes on the LEVEL re-asks "is this
-person still asleep" every tick — 905 rounds and 33.2M input tokens in
-7h on one camera, measured 2026-08-23. Scoping the confirm to a FIELD
-and a set of VALUES turns that into ~3 rounds a night, because it fires
-on the transition instead. Until then, do not write an `on` key into a
-`detectors.eventing` row and expect anything to happen.
+Both halves of `on` must parse or the whole scope drops back to parity.
+A half-parsed scope would silently watch the wrong field, which is worse
+than watching the default.
 """
 
 from __future__ import annotations
@@ -69,6 +70,23 @@ class EventingConfig:
     entry_t_seconds: int = 0  # window those ticks must land in (0 = on-sight)
     confirm_k: int = 0        # re-checks that must agree (0 = no confirm)
     confirm_n: int = 0        # re-check calls to spend on a fire
+    # WHICH field, and which of its values, a confirm watches. Empty =
+    # the detector's own `<ident>_detected`, which is the parity default.
+    #
+    # A state detector needs this. `sleep_detected` means ASLEEP, so an
+    # edge on it fires on every drift in and out of sleep — measured over
+    # 7 days, 1,712 of them. What a caregiver wants checked lives in
+    # `sleep_activity`, and only three of its six values are events:
+    # entering_bed (26), leaving_bed (27), sitting_up (18). The other
+    # three are noise — none <-> awake_in_bed alone accounts for 1,286
+    # of 1,510 activity transitions.
+    #
+    #   {"confirm": {"k":2, "n":3,
+    #                "on": {"field": "sleep_activity",
+    #                       "values": ["entering_bed","leaving_bed",
+    #                                  "sitting_up"]}}}
+    confirm_field: str = ""
+    confirm_values: tuple[str, ...] = ()
 
 
 def parse_eventing(raw: object) -> EventingConfig:
@@ -124,7 +142,25 @@ def parse_eventing(raw: object) -> EventingConfig:
         # Any stored `{"k": 2, "n": 3}` clamps here rather than in the DB, so
         # existing rows keep working and no delta is needed to stop the spend.
         k = n = 1
-    return EventingConfig(entry_m=m, entry_t_seconds=t, confirm_k=k, confirm_n=n)
+    # `on`: scope the confirm to one field and a set of its values. Both
+    # halves must be usable or the whole scope is dropped back to parity
+    # (`<ident>_detected`) — a half-parsed scope would silently watch
+    # the wrong thing, which is worse than watching the default.
+    field, values = "", ()
+    on = confirm.get("on") if isinstance(confirm, dict) else None
+    if isinstance(on, dict):
+        f = on.get("field")
+        vs = on.get("values")
+        if isinstance(f, str) and f.strip() and isinstance(vs, (list, tuple)):
+            clean = tuple(
+                str(v) for v in vs[:32] if isinstance(v, (str, int, float))
+            )
+            if clean:
+                field, values = f.strip(), clean
+    return EventingConfig(
+        entry_m=m, entry_t_seconds=t, confirm_k=k, confirm_n=n,
+        confirm_field=field, confirm_values=values,
+    )
 
 
 def detection_keys_for(identifier: str) -> tuple[str, str]:

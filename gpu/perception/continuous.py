@@ -86,6 +86,21 @@ _IR_REMAP_IOU = float(os.environ.get("NEMARA_IR_REMAP_IOU", "0.10"))
 # grace x reground_every ticks (~1 min) before the daytime rule
 # reasserts. 0 disables.
 _IR_GROUND_GRACE = int(os.environ.get("NEMARA_IR_GROUND_GRACE", "4"))
+# Ticks either side of a DAY<->NIGHT switch during which a track may keep
+# missing without dying. The camera changes its whole appearance in one
+# frame — colour to grayscale, new exposure, IR illuminator on — so every
+# mask EdgeTAM is carrying was built on pixels that no longer exist. The
+# masks fail, the tracks die, and the person is re-numbered while lying
+# perfectly still.
+#
+# It is the clearest case of "a change in the image is not a change in
+# the room" we have: the switch is global, detectable, and lasts one
+# frame. 6 ticks is ~6s, enough to cover a forced reground on the new
+# appearance without holding a departed person meaningfully longer.
+_IR_SWITCH_GRACE_TICKS = int(
+    os.environ.get("NEMARA_IR_SWITCH_GRACE_TICKS", "6"))
+_IR_SWITCH_MISS_GRACE = int(
+    os.environ.get("NEMARA_IR_SWITCH_MISS_GRACE", "5"))
 # Consecutive CARRY ticks a track's mask may fail to propagate before we
 # accept it is gone. 2, matching identity's MISSES_BEFORE_DEATH — the
 # same "one blink is not an absence" rule, applied a layer earlier so the
@@ -356,7 +371,8 @@ class CameraSession:
         # session_state, so a worker hop resets the streak — the grace
         # gets slightly MORE lenient under stateless dispatch, never
         # tighter, and the mask-decay exit still bounds a phantom.
-        self._ir = False
+        self._ir: bool | None = None
+        self._ir_switch_left = 0
         self._empty_ground_streak = 0
         # Consecutive carry ticks each track's mask has failed to
         # propagate. Transient like `_empty_ground_streak` and for the
@@ -731,7 +747,23 @@ class CameraSession:
         # person_trigger: lowering DETECTION floors at night is safe —
         # a phantom dies at the next ground; an invisible person is the
         # failure that matters.
+        was_ir = self._ir
         self._ir = bool(_IR_BOOST and frames and _pt().is_ir(frames[-1]))
+        # DAY <-> NIGHT. The whole image changes in one frame, so every
+        # carried mask was built on pixels that no longer exist. Hold the
+        # ids across it rather than re-numbering a person who has not
+        # moved. Only after the first tick (was_ir is None at boot).
+        if was_ir is not None and self._ir != was_ir:
+            self._ir_switch_left = _IR_SWITCH_GRACE_TICKS
+            log.warning(
+                "continuous.ir_switch cam=%s tick=%d %s — holding tracks "
+                "for %d ticks while the carry re-acquires",
+                self.camera_id, self.tick,
+                "day->night" if self._ir else "night->day",
+                _IR_SWITCH_GRACE_TICKS,
+            )
+        elif self._ir_switch_left > 0:
+            self._ir_switch_left -= 1
         if self._ir:
             person_thr = min(person_thr, _IR_PERSON_THR)
             # Enhance the WHOLE batch, not just grounding inputs
@@ -818,8 +850,10 @@ class CameraSession:
         # next ground, which is what costs the seat. CARRY ONLY: a ground
         # is the existence authority.
         if mode == "carry" and seed:
+            grace = (_IR_SWITCH_MISS_GRACE if self._ir_switch_left > 0
+                     else _CARRY_MISS_GRACE)
             new_masks, self._mask_misses, held = carry_grace(
-                seed, new_masks, self._mask_misses)
+                seed, new_masks, self._mask_misses, grace)
             for tid, n in held:
                 log.info(
                     "continuous.carry_blink cam=%s tick=%d tid=%d "
